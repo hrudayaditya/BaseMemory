@@ -1,4 +1,5 @@
 use super::error::ChunkerError;
+use super::log_warn;
 use super::policy::{LanguagePolicy, SemanticInfo};
 use super::{Chunk, ChunkConfig, ChunkKind, Granularity, SymbolKind};
 use crate::hasher::xxhash_content;
@@ -120,6 +121,15 @@ fn collect_split_children<'tree>(
             collect_split_children(ctx, child, results);
         }
     }
+}
+
+fn count_semantic_units(ctx: &WalkerContext<'_>, node: Node<'_>) -> usize {
+    let mut count = usize::from(classify(ctx.policy, node, ctx.source).is_some());
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        count += count_semantic_units(ctx, child);
+    }
+    count
 }
 
 fn find_split_children<'tree>(ctx: &WalkerContext<'_>, node: Node<'tree>) -> Vec<Node<'tree>> {
@@ -259,6 +269,108 @@ fn build_semantic_chunk(
     chunks
 }
 
+fn floor_char_boundary(source: &str, mut index: usize) -> usize {
+    if index >= source.len() {
+        return source.len();
+    }
+
+    while index > 0 && !source.is_char_boundary(index) {
+        index -= 1;
+    }
+
+    index
+}
+
+fn split_chunk_at_line_boundaries(
+    ctx: &WalkerContext<'_>,
+    chunk: &Chunk,
+) -> Result<Vec<Chunk>, ChunkerError> {
+    let max_len = ctx.config.max_chunk_chars_usize();
+    if chunk.text.len() <= max_len || chunk.granularity != Granularity::Fine {
+        return Ok(vec![chunk.clone()]);
+    }
+
+    log_warn(format!(
+        "chunker force-split on line boundaries file_path={} language={} chunk_size={} max_chunk_chars={} symbol_name={}",
+        ctx.file_path,
+        ctx.language,
+        chunk.text.len(),
+        max_len,
+        chunk.symbol_name.as_deref().unwrap_or("<anonymous>")
+    ));
+
+    let start = chunk.start_byte as usize;
+    let end = chunk.end_byte as usize;
+    let mut segments = Vec::new();
+    let mut segment_start = start;
+
+    while segment_start < end {
+        let max_end = floor_char_boundary(ctx.source, (segment_start + max_len).min(end));
+        let mut segment_end = ctx
+            .line_starts
+            .iter()
+            .copied()
+            .take_while(|line_start| *line_start <= max_end)
+            .filter(|line_start| *line_start > segment_start)
+            .last()
+            .unwrap_or(max_end);
+
+        if segment_end <= segment_start {
+            segment_end = max_end;
+        }
+
+        if segment_end <= segment_start {
+            return Err(ChunkerError::ChunkTooLarge {
+                file_path: ctx.file_path.to_string(),
+                language: ctx.language.to_string(),
+                chunk_len: chunk.text.len(),
+                max_len,
+            });
+        }
+
+        let pending = PendingChunk {
+            symbol_name: chunk.symbol_name.clone(),
+            symbol_kind: chunk.symbol_kind.clone(),
+            chunk_kind: chunk.chunk_kind.clone(),
+            granularity: Granularity::Fine,
+            start_byte: segment_start,
+            end_byte: segment_end,
+        };
+
+        let finalized = ctx.finalize_chunk(pending)?;
+        if finalized.text.len() > max_len {
+            return Err(ChunkerError::ChunkTooLarge {
+                file_path: ctx.file_path.to_string(),
+                language: ctx.language.to_string(),
+                chunk_len: finalized.text.len(),
+                max_len,
+            });
+        }
+
+        segments.push(finalized);
+        segment_start = segment_end;
+    }
+
+    Ok(segments)
+}
+
+fn enforce_fine_chunk_max_size(
+    ctx: &WalkerContext<'_>,
+    chunks: Vec<Chunk>,
+) -> Result<Vec<Chunk>, ChunkerError> {
+    let mut result = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        if chunk.granularity == Granularity::Fine
+            && chunk.text.len() > ctx.config.max_chunk_chars_usize()
+        {
+            result.extend(split_chunk_at_line_boundaries(ctx, &chunk)?);
+        } else {
+            result.push(chunk);
+        }
+    }
+    Ok(result)
+}
+
 fn build_node_chunks(ctx: &WalkerContext<'_>, node: Node<'_>) -> Vec<PendingChunk> {
     if let Some(info) = classify(ctx.policy, node, ctx.source) {
         return build_semantic_chunk(ctx, node, info);
@@ -349,6 +461,16 @@ pub fn chunk_tree(
     };
 
     let root = tree.root_node();
+    let semantic_unit_count = count_semantic_units(&ctx, root);
+    if semantic_unit_count == 0 {
+        log_warn(format!(
+            "chunker found no semantic units for supported language file_path={} language={} root_kind={}",
+            file_path,
+            language,
+            root.kind()
+        ));
+    }
+
     let mut pending = build_node_chunks(&ctx, root);
     pending.sort_by_key(|chunk| (chunk.start_byte, chunk.end_byte, chunk.granularity as u8));
 
@@ -356,6 +478,7 @@ pub fn chunk_tree(
     for chunk in pending {
         chunks.push(ctx.finalize_chunk(chunk)?);
     }
+    let mut chunks = enforce_fine_chunk_max_size(&ctx, chunks)?;
 
     if config.emit_coarse_chunks {
         for (node, info) in top_level_semantic_nodes(&ctx, root) {

@@ -237,14 +237,7 @@ export function createWatcherWithIndexer(
   const fileWatcher = new FileWatcher(projectRoot, config);
 
   fileWatcher.start(async (changes) => {
-    const hasAddOrChange = changes.some(
-      (c) => c.type === "add" || c.type === "change"
-    );
-    const hasDelete = changes.some((c) => c.type === "unlink");
-
-    if (hasAddOrChange || hasDelete) {
-      await indexer.index();
-    }
+    await indexer.handleFileChanges(changes);
   });
 
   let gitWatcher: GitHeadWatcher | null = null;
@@ -253,7 +246,7 @@ export function createWatcherWithIndexer(
     gitWatcher = new GitHeadWatcher(projectRoot);
     gitWatcher.start(async (oldBranch, newBranch) => {
       console.log(`Branch changed: ${oldBranch ?? "(none)"} -> ${newBranch}`);
-      await indexer.index();
+      await indexer.handleBranchChange(oldBranch, newBranch);
     });
   }
 

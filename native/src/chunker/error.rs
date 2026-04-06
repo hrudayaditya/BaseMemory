@@ -14,4 +14,19 @@ pub enum ChunkerError {
         start: usize,
         end: usize,
     },
+
+    #[error("fine chunk coverage invariant failed for {file_path} ({language}): {details}")]
+    CoverageInvariant {
+        file_path: String,
+        language: String,
+        details: String,
+    },
+
+    #[error("chunk size invariant failed for {file_path} ({language}): chunk length {chunk_len} exceeds max {max_len}")]
+    ChunkTooLarge {
+        file_path: String,
+        language: String,
+        chunk_len: usize,
+        max_len: usize,
+    },
 }

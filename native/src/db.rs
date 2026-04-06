@@ -13,7 +13,7 @@ pub enum DbError {
 pub type DbResult<T> = Result<T, DbError>;
 
 /// Schema version for migrations
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
 /// Maximum number of SQL bind parameters per query.
 /// SQLite defaults to 999 (SQLITE_MAX_VARIABLE_NUMBER). We use 900 to stay safely under.
@@ -209,6 +209,40 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> DbResult<()> {
             r#"
             CREATE INDEX IF NOT EXISTS idx_chunks_name ON chunks(name);
             CREATE INDEX IF NOT EXISTS idx_chunks_name_lower ON chunks(lower(name));
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
+    if from_version < 5 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS merkle_snapshots (
+                branch TEXT PRIMARY KEY,
+                root_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS merkle_nodes (
+                branch TEXT NOT NULL,
+                path TEXT NOT NULL,
+                parent_path TEXT,
+                node_kind TEXT NOT NULL,
+                node_hash TEXT NOT NULL,
+                size_bytes INTEGER,
+                PRIMARY KEY (branch, path),
+                FOREIGN KEY (branch) REFERENCES merkle_snapshots(branch) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_merkle_nodes_branch_parent
+                ON merkle_nodes(branch, parent_path);
+            CREATE INDEX IF NOT EXISTS idx_merkle_nodes_branch_kind
+                ON merkle_nodes(branch, node_kind);
             "#,
         )?;
 
@@ -681,6 +715,20 @@ pub struct BranchDelta {
 pub fn chunk_exists_on_branch(conn: &Connection, branch: &str, chunk_id: &str) -> DbResult<bool> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM branch_chunks WHERE branch = ? AND chunk_id = ?",
+        params![branch, chunk_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Check if a chunk exists on any branch other than the current one
+pub fn chunk_exists_on_other_branches(
+    conn: &Connection,
+    branch: &str,
+    chunk_id: &str,
+) -> DbResult<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM branch_chunks WHERE branch != ? AND chunk_id = ?",
         params![branch, chunk_id],
         |row| row.get(0),
     )?;
@@ -1345,7 +1393,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4");
+        assert_eq!(version, "5");
     }
 
     #[test]
@@ -1779,7 +1827,7 @@ mod tests {
     }
 
     #[test]
-    fn test_migration_v4_adds_cascade_on_call_edges_and_chunk_name_indexes() {
+    fn test_migration_v5_adds_cascade_on_call_edges_chunk_indexes_and_merkle_tables() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("migration-v2.db");
 
@@ -1853,7 +1901,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "4");
+        assert_eq!(schema_version, "5");
 
         let on_delete: String = conn
             .query_row("PRAGMA foreign_key_list(call_edges)", [], |row| row.get(6))
@@ -1871,6 +1919,24 @@ mod tests {
         assert!(index_names
             .iter()
             .any(|name| name == "idx_chunks_name_lower"));
+
+        let merkle_snapshot_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'merkle_snapshots'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(merkle_snapshot_exists, "merkle_snapshots");
+
+        let merkle_nodes_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'merkle_nodes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(merkle_nodes_exists, "merkle_nodes");
     }
 
     #[test]

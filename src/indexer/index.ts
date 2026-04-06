@@ -27,6 +27,11 @@ import {
   hashFile,
   hashContent,
   extractCalls,
+  buildMerkleSnapshot,
+  diffMerkleFromEvents,
+  diffMerkleSnapshots,
+  type MerkleDiff,
+  type MerkleIgnoreRules,
 } from "../native/index.js";
 import type { SymbolData, CallEdgeData } from "../native/index.js";
 import { getBranchOrDefault, getBaseBranch, isGitRepo } from "../git/index.js";
@@ -176,6 +181,28 @@ interface PendingChunk {
   content: string;
   contentHash: string;
   metadata: ChunkMetadata;
+}
+
+interface ParsedChunkCandidate {
+  content: string;
+  startLine: number;
+  endLine: number;
+  chunkType: ChunkMetadata["chunkType"];
+  name?: string;
+  language: string;
+  chunkHash: string;
+}
+
+interface ParsedFileCandidate {
+  path: string;
+  hash: string;
+  content: string;
+  chunks: ParsedChunkCandidate[];
+}
+
+interface FileGraphData {
+  symbols: SymbolData[];
+  edges: CallEdgeData[];
 }
 
 interface FailedBatch {
@@ -1744,6 +1771,824 @@ export class Indexer {
     };
   }
 
+  private getOrCreateSet(map: Map<string, Set<string>>, key: string): Set<string> {
+    const existing = map.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const created = new Set<string>();
+    map.set(key, created);
+    return created;
+  }
+
+  private buildBranchStoreChunkMaps(
+    store: VectorStore,
+    branchChunkIds: Set<string>
+  ): {
+    existingChunks: Map<string, string>;
+    existingChunksByFile: Map<string, Set<string>>;
+  } {
+    const existingChunks = new Map<string, string>();
+    const existingChunksByFile = new Map<string, Set<string>>();
+
+    for (const { key, metadata } of store.getAllMetadata()) {
+      if (!branchChunkIds.has(key)) {
+        continue;
+      }
+
+      existingChunks.set(key, metadata.hash);
+      this.getOrCreateSet(existingChunksByFile, metadata.filePath).add(key);
+    }
+
+    return {
+      existingChunks,
+      existingChunksByFile,
+    };
+  }
+
+  private parseFilesForIndexing(
+    files: Array<{ path: string; content: string; hash: string }>
+  ): {
+    parsedFiles: ParsedFileCandidate[];
+    parseMs: number;
+  } {
+    const parseStartTime = performance.now();
+    const parsedFiles = files.map((file) => {
+      const semanticChunks = chunkFile(
+        file.path,
+        getChunkerLanguage(file.path),
+        file.content,
+        {
+          targetTokenBudget: 1500,
+          maxChunkChars: 3000,
+          minChunkChars: 200,
+          mergeSmallSiblings: true,
+          attachComments: true,
+          emitCoarseChunks: true,
+        }
+      );
+
+      const chunks = semanticChunks
+        .filter((chunk) => chunk.granularity === "Fine")
+        .map((chunk) => ({
+          content: chunk.text,
+          startLine: chunk.startLine,
+          endLine: chunk.endLine,
+          chunkType: mapSemanticChunkType(chunk.symbolKind),
+          name: chunk.symbolName,
+          language: chunk.language,
+          chunkHash: chunk.chunkHash,
+        }));
+
+      return {
+        path: file.path,
+        hash: file.hash,
+        content: file.content,
+        chunks,
+      };
+    });
+
+    return {
+      parsedFiles,
+      parseMs: performance.now() - parseStartTime,
+    };
+  }
+
+  private buildFileGraphData(parsedFiles: ParsedFileCandidate[]): Map<string, FileGraphData> {
+    const graphData = new Map<string, FileGraphData>();
+
+    for (const parsed of parsedFiles) {
+      const fileSymbols: SymbolData[] = [];
+      for (const chunk of parsed.chunks) {
+        if (!chunk.name || !CALL_GRAPH_SYMBOL_CHUNK_TYPES.has(chunk.chunkType)) {
+          continue;
+        }
+
+        const symbolId = `sym_${hashContent(parsed.path + ":" + chunk.name + ":" + chunk.chunkType + ":" + chunk.startLine).slice(0, 16)}`;
+        fileSymbols.push({
+          id: symbolId,
+          filePath: parsed.path,
+          name: chunk.name,
+          kind: chunk.chunkType,
+          startLine: chunk.startLine,
+          startCol: 0,
+          endLine: chunk.endLine,
+          endCol: 0,
+          language: chunk.language,
+        });
+      }
+
+      const symbolsByName = new Map<string, SymbolData[]>();
+      for (const symbol of fileSymbols) {
+        const existing = symbolsByName.get(symbol.name) ?? [];
+        existing.push(symbol);
+        symbolsByName.set(symbol.name, existing);
+      }
+
+      const fileLanguage = parsed.chunks[0]?.language;
+      if (!fileLanguage || !CALL_GRAPH_LANGUAGES.has(fileLanguage)) {
+        graphData.set(parsed.path, { symbols: fileSymbols, edges: [] });
+        continue;
+      }
+
+      const callSites = extractCalls(parsed.content, fileLanguage);
+      if (callSites.length === 0) {
+        graphData.set(parsed.path, { symbols: fileSymbols, edges: [] });
+        continue;
+      }
+
+      const edges: CallEdgeData[] = [];
+      for (const site of callSites) {
+        const enclosingSymbol = fileSymbols.find(
+          (symbol) => site.line >= symbol.startLine && site.line <= symbol.endLine
+        );
+        if (!enclosingSymbol) {
+          continue;
+        }
+
+        const edgeId = `edge_${hashContent(enclosingSymbol.id + ":" + site.calleeName + ":" + site.line + ":" + site.column).slice(0, 16)}`;
+        const candidates = symbolsByName.get(site.calleeName);
+        const resolvedId = candidates && candidates.length === 1 ? candidates[0].id : undefined;
+        edges.push({
+          id: edgeId,
+          fromSymbolId: enclosingSymbol.id,
+          targetName: site.calleeName,
+          toSymbolId: resolvedId,
+          callType: site.callType,
+          line: site.line,
+          col: site.column,
+          isResolved: resolvedId !== undefined,
+        });
+      }
+
+      graphData.set(parsed.path, {
+        symbols: fileSymbols,
+        edges,
+      });
+    }
+
+    return graphData;
+  }
+
+  private removeChunkFromRetrievalIfUnreferenced(
+    database: Database,
+    store: VectorStore,
+    invertedIndex: InvertedIndex,
+    chunkId: string
+  ): boolean {
+    if (database.chunkExistsOnOtherBranches(this.currentBranch, chunkId)) {
+      return false;
+    }
+
+    store.remove(chunkId);
+    invertedIndex.removeChunk(chunkId);
+    return true;
+  }
+
+  private rollbackMaterializedChunksForFiles(
+    failedFiles: Set<string>,
+    materializedChunkIdsByFile: Map<string, Set<string>>,
+    database: Database,
+    store: VectorStore,
+    invertedIndex: InvertedIndex
+  ): void {
+    for (const filePath of failedFiles) {
+      const materialized = materializedChunkIdsByFile.get(filePath);
+      if (!materialized) {
+        continue;
+      }
+
+      for (const chunkId of materialized) {
+        this.removeChunkFromRetrievalIfUnreferenced(database, store, invertedIndex, chunkId);
+      }
+    }
+  }
+
+  private restoreFailedFileBranchState(
+    failedFiles: Set<string>,
+    currentChunkIds: Set<string>,
+    allSymbolIds: Set<string>,
+    oldChunkIdsByFile: Map<string, Set<string>>,
+    newChunkIdsByFile: Map<string, Set<string>>,
+    oldSymbolIdsByFile: Map<string, Set<string>>,
+    newSymbolIdsByFile: Map<string, Set<string>>
+  ): void {
+    for (const filePath of failedFiles) {
+      const newChunkIds = newChunkIdsByFile.get(filePath);
+      if (newChunkIds) {
+        for (const chunkId of newChunkIds) {
+          currentChunkIds.delete(chunkId);
+        }
+      }
+
+      const oldChunkIds = oldChunkIdsByFile.get(filePath);
+      if (oldChunkIds) {
+        for (const chunkId of oldChunkIds) {
+          currentChunkIds.add(chunkId);
+        }
+      }
+
+      const newSymbolIds = newSymbolIdsByFile.get(filePath);
+      if (newSymbolIds) {
+        for (const symbolId of newSymbolIds) {
+          allSymbolIds.delete(symbolId);
+        }
+      }
+
+      const oldSymbolIds = oldSymbolIdsByFile.get(filePath);
+      if (oldSymbolIds) {
+        for (const symbolId of oldSymbolIds) {
+          allSymbolIds.add(symbolId);
+        }
+      }
+    }
+  }
+
+  private commitFileHashChanges(
+    successfulFileHashes: Map<string, string>,
+    removedFilePaths: Iterable<string>
+  ): void {
+    for (const [filePath, hash] of successfulFileHashes) {
+      this.fileHashCache.set(filePath, hash);
+    }
+
+    for (const filePath of removedFilePaths) {
+      this.fileHashCache.delete(filePath);
+    }
+
+    this.saveFileHashCache();
+  }
+
+  private async buildCommittedMerkleSnapshot(
+    baseSnapshot: string | null,
+    committedRelativePaths: string[]
+  ): Promise<string | null> {
+    if (!baseSnapshot || committedRelativePaths.length === 0) {
+      return null;
+    }
+
+    const prepared = await diffMerkleFromEvents(
+      baseSnapshot,
+      this.normalizeDirtyPaths(committedRelativePaths),
+      this.projectRoot,
+      this.buildMerkleIgnoreRules()
+    );
+    return prepared.nextSnapshot;
+  }
+
+  private buildMerkleIgnoreRules(): MerkleIgnoreRules {
+    return {
+      include: [...this.config.include],
+      exclude: [...this.config.exclude],
+      maxFileSize: this.config.indexing.maxFileSize,
+    };
+  }
+
+  private normalizeDirtyPaths(paths: string[]): string[] {
+    return Array.from(
+      new Set(
+        paths
+          .map((filePath) => filePath.replace(/\\/g, "/").replace(/^\.\//, "").replace(/^\/+/, ""))
+          .filter((filePath) => filePath.length > 0)
+      )
+    ).sort();
+  }
+
+  private toAbsolutePath(relativePath: string): string {
+    return path.join(this.projectRoot, relativePath);
+  }
+
+  private async syncMerkleSnapshotForCurrentBranch(): Promise<void> {
+    const { database } = await this.ensureInitialized();
+    const payload = await buildMerkleSnapshot(
+      this.projectRoot,
+      this.currentBranch,
+      this.buildMerkleIgnoreRules()
+    );
+    database.saveMerkleSnapshot(payload.snapshot);
+  }
+
+  async handleFileChanges(changes: Array<{ type: "add" | "change" | "unlink"; path: string }>): Promise<void> {
+    if (changes.length === 0) {
+      return;
+    }
+
+    try {
+      const { database } = await this.ensureInitialized();
+      this.refreshBranchInfo();
+
+      const snapshot = database.getMerkleSnapshot(this.currentBranch);
+      if (!snapshot) {
+        this.logger.branch("warn", "Merkle snapshot missing, falling back to full index", {
+          branch: this.currentBranch,
+        });
+        await this.index();
+        return;
+      }
+
+      const changedPaths = this.normalizeDirtyPaths(
+        changes.map((change) =>
+          path.isAbsolute(change.path) ? path.relative(this.projectRoot, change.path) : change.path
+        )
+      );
+
+      const prepared = await diffMerkleFromEvents(
+        snapshot,
+        changedPaths,
+        this.projectRoot,
+        this.buildMerkleIgnoreRules()
+      );
+
+      if (
+        prepared.changedFiles.length === 0 &&
+        prepared.addedFiles.length === 0 &&
+        prepared.removedFiles.length === 0
+      ) {
+        database.saveMerkleSnapshot(prepared.nextSnapshot);
+        return;
+      }
+
+      await this.indexDirtySet(
+        {
+          changedFiles: prepared.changedFiles,
+          addedFiles: prepared.addedFiles,
+          removedFiles: prepared.removedFiles,
+        },
+        prepared.nextSnapshot,
+        snapshot
+      );
+    } catch (error) {
+      this.logger.branch("warn", "Merkle hot update failed, falling back to full index", {
+        branch: this.currentBranch,
+        error: getErrorMessage(error),
+      });
+      await this.index();
+    }
+  }
+
+  async handleBranchChange(_oldBranch: string | null, newBranch: string): Promise<void> {
+    try {
+      const { database } = await this.ensureInitialized();
+      this.refreshBranchInfo();
+
+      const storedSnapshot = database.getMerkleSnapshot(newBranch);
+      if (!storedSnapshot) {
+        this.logger.branch("warn", "Merkle snapshot missing for branch, falling back to full index", {
+          branch: newBranch,
+        });
+        await this.index();
+        return;
+      }
+
+      const currentSnapshot = await buildMerkleSnapshot(
+        this.projectRoot,
+        newBranch,
+        this.buildMerkleIgnoreRules()
+      );
+      const diff = await diffMerkleSnapshots(storedSnapshot, currentSnapshot.snapshot);
+
+      if (
+        diff.changedFiles.length === 0 &&
+        diff.addedFiles.length === 0 &&
+        diff.removedFiles.length === 0
+      ) {
+        database.saveMerkleSnapshot(currentSnapshot.snapshot);
+        return;
+      }
+
+      await this.indexDirtySet(diff, currentSnapshot.snapshot, storedSnapshot);
+    } catch (error) {
+      this.logger.branch("warn", "Merkle branch update failed, falling back to full index", {
+        branch: newBranch,
+        error: getErrorMessage(error),
+      });
+      await this.index();
+    }
+  }
+
+  async indexDirtySet(
+    diff: MerkleDiff,
+    nextSnapshot?: string,
+    baseSnapshot: string | null = null
+  ): Promise<IndexStats> {
+    const { store, provider, invertedIndex, database, configuredProviderInfo } = await this.ensureInitialized();
+    this.refreshBranchInfo();
+
+    if (!this.indexCompatibility?.compatible) {
+      throw new Error(
+        `${this.indexCompatibility?.reason} ` +
+        `Run index_codebase with force=true to rebuild the index.`
+      );
+    }
+
+    const changedRelativePaths = this.normalizeDirtyPaths([
+      ...diff.changedFiles,
+      ...diff.addedFiles,
+    ]);
+    const removedRelativePaths = this.normalizeDirtyPaths(diff.removedFiles);
+    const touchedRelativePaths = this.normalizeDirtyPaths([
+      ...changedRelativePaths,
+      ...removedRelativePaths,
+    ]);
+
+    if (touchedRelativePaths.length === 0) {
+      if (nextSnapshot) {
+        database.saveMerkleSnapshot(nextSnapshot);
+      }
+      return {
+        totalFiles: 0,
+        totalChunks: 0,
+        indexedChunks: 0,
+        failedChunks: 0,
+        tokensUsed: 0,
+        durationMs: 0,
+        existingChunks: 0,
+        removedChunks: 0,
+        skippedFiles: [],
+        parseFailures: [],
+      };
+    }
+
+    this.acquireIndexingLock();
+    this.logger.recordIndexingStart();
+
+    const startTime = Date.now();
+    const stats: IndexStats = {
+      totalFiles: touchedRelativePaths.length,
+      totalChunks: 0,
+      indexedChunks: 0,
+      failedChunks: 0,
+      tokensUsed: 0,
+      durationMs: 0,
+      existingChunks: 0,
+      removedChunks: 0,
+      skippedFiles: [],
+      parseFailures: [],
+    };
+
+    try {
+      this.loadFileHashCache();
+
+      const branchChunkIds = new Set(database.getBranchChunkIds(this.currentBranch));
+      const branchSymbolIds = new Set(database.getBranchSymbolIds(this.currentBranch));
+      const currentChunkIds = new Set(branchChunkIds);
+      const allSymbolIds = new Set(branchSymbolIds);
+      const existingChunks = new Map<string, string>();
+      const oldChunkIdsForTouchedFiles = new Set<string>();
+      const oldChunkIdsByFile = new Map<string, Set<string>>();
+      const oldSymbolIdsByFile = new Map<string, Set<string>>();
+      const touchedAbsolutePaths = touchedRelativePaths.map((relativePath) => this.toAbsolutePath(relativePath));
+      const changedAbsolutePaths = changedRelativePaths.map((relativePath) => this.toAbsolutePath(relativePath));
+      const removedAbsolutePaths = removedRelativePaths.map((relativePath) => this.toAbsolutePath(relativePath));
+      const parsedInput: Array<{ path: string; content: string; hash: string }> = [];
+
+      for (const filePath of touchedAbsolutePaths) {
+        const fileChunks = database
+          .getChunksByFile(filePath)
+          .filter((chunk) => branchChunkIds.has(chunk.chunkId));
+
+        for (const chunk of fileChunks) {
+          existingChunks.set(chunk.chunkId, chunk.contentHash);
+          oldChunkIdsForTouchedFiles.add(chunk.chunkId);
+          this.getOrCreateSet(oldChunkIdsByFile, filePath).add(chunk.chunkId);
+          currentChunkIds.delete(chunk.chunkId);
+        }
+
+        const fileSymbols = database
+          .getSymbolsByFile(filePath)
+          .filter((symbol) => branchSymbolIds.has(symbol.id));
+        for (const symbol of fileSymbols) {
+          this.getOrCreateSet(oldSymbolIdsByFile, filePath).add(symbol.id);
+        }
+      }
+
+      for (const filePath of changedAbsolutePaths) {
+        if (!existsSync(filePath)) {
+          continue;
+        }
+
+        const content = await fsPromises.readFile(filePath, "utf-8");
+        const hash = hashFile(filePath);
+        parsedInput.push({ path: filePath, content, hash });
+      }
+
+      const { parsedFiles, parseMs } = this.parseFilesForIndexing(parsedInput);
+      this.logger.recordFilesParsed(parsedFiles.length);
+      this.logger.recordParseDuration(parseMs);
+
+      const pendingChunks: PendingChunk[] = [];
+      const chunkDataBatch: ChunkData[] = [];
+      const newChunkIdsByFile = new Map<string, Set<string>>();
+
+      for (const parsed of parsedFiles) {
+        if (parsed.chunks.length === 0) {
+          stats.parseFailures.push(path.relative(this.projectRoot, parsed.path));
+        }
+
+        let fileChunkCount = 0;
+        for (const chunk of parsed.chunks) {
+          if (fileChunkCount >= this.config.indexing.maxChunksPerFile) {
+            break;
+          }
+
+          if (this.config.indexing.semanticOnly && chunk.chunkType === "other") {
+            continue;
+          }
+
+          const id = generateChunkId(parsed.path, chunk);
+          const contentHash = chunk.chunkHash;
+          currentChunkIds.add(id);
+          this.getOrCreateSet(newChunkIdsByFile, parsed.path).add(id);
+
+          chunkDataBatch.push({
+            chunkId: id,
+            contentHash,
+            filePath: parsed.path,
+            startLine: chunk.startLine,
+            endLine: chunk.endLine,
+            nodeType: chunk.chunkType,
+            name: chunk.name,
+            language: chunk.language,
+          });
+
+          if (existingChunks.get(id) === contentHash && invertedIndex.hasChunk(id)) {
+            fileChunkCount++;
+            continue;
+          }
+
+          const text = createEmbeddingText(chunk, parsed.path);
+          pendingChunks.push({
+            id,
+            text,
+            content: chunk.content,
+            contentHash,
+            metadata: {
+              filePath: parsed.path,
+              startLine: chunk.startLine,
+              endLine: chunk.endLine,
+              chunkType: chunk.chunkType,
+              name: chunk.name,
+              language: chunk.language,
+              hash: contentHash,
+            },
+          });
+          fileChunkCount++;
+        }
+      }
+
+      if (chunkDataBatch.length > 0) {
+        database.upsertChunksBatch(chunkDataBatch);
+      }
+
+      const fileGraphData = this.buildFileGraphData(parsedFiles);
+      const newSymbolIdsByFile = new Map<string, Set<string>>();
+      for (const [filePath, graph] of fileGraphData) {
+        if (graph.symbols.length === 0) {
+          continue;
+        }
+
+        const symbolIds = this.getOrCreateSet(newSymbolIdsByFile, filePath);
+        for (const symbol of graph.symbols) {
+          symbolIds.add(symbol.id);
+        }
+      }
+
+      const allContentHashes = pendingChunks.map((chunk) => chunk.contentHash);
+      const missingHashes = new Set(database.getMissingEmbeddings(allContentHashes));
+      const chunksNeedingEmbedding = pendingChunks.filter((chunk) => missingHashes.has(chunk.contentHash));
+      const chunksWithExistingEmbedding = pendingChunks.filter((chunk) => !missingHashes.has(chunk.contentHash));
+      const failedFiles = new Set<string>();
+      const materializedChunkIdsByFile = new Map<string, Set<string>>();
+      const markChunkMaterialized = (filePath: string, chunkId: string): void => {
+        this.getOrCreateSet(materializedChunkIdsByFile, filePath).add(chunkId);
+      };
+
+      for (const chunk of chunksWithExistingEmbedding) {
+        const embeddingBuffer = database.getEmbedding(chunk.contentHash);
+        if (!embeddingBuffer) {
+          failedFiles.add(chunk.metadata.filePath);
+          stats.failedChunks++;
+          this.addFailedBatch([chunk], `Missing cached embedding for content hash ${chunk.contentHash}`);
+          this.logger.recordEmbeddingError();
+          continue;
+        }
+        const vector = bufferToFloat32Array(embeddingBuffer);
+        store.add(chunk.id, Array.from(vector), chunk.metadata);
+        invertedIndex.removeChunk(chunk.id);
+        invertedIndex.addChunk(chunk.id, chunk.content);
+        markChunkMaterialized(chunk.metadata.filePath, chunk.id);
+        stats.indexedChunks++;
+      }
+
+      const providerRateLimits = this.getProviderRateLimits(configuredProviderInfo.provider);
+      const queue = new PQueue({
+        concurrency: providerRateLimits.concurrency,
+        interval: providerRateLimits.intervalMs,
+        intervalCap: providerRateLimits.concurrency,
+      });
+      const dynamicBatches = createDynamicBatches(chunksNeedingEmbedding);
+      let rateLimitBackoffMs = 0;
+
+      for (const batch of dynamicBatches) {
+        queue.add(async () => {
+          const liveBatch = batch.filter((chunk) => !failedFiles.has(chunk.metadata.filePath));
+          if (liveBatch.length === 0) {
+            return;
+          }
+
+          if (rateLimitBackoffMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, rateLimitBackoffMs));
+          }
+
+          try {
+            const result = await pRetry(
+              async () => provider.embedBatch(liveBatch.map((chunk) => chunk.text)),
+              {
+                retries: this.config.indexing.retries,
+                minTimeout: Math.max(this.config.indexing.retryDelayMs, providerRateLimits.minRetryMs),
+                maxTimeout: providerRateLimits.maxRetryMs,
+                factor: 2,
+                shouldRetry: (error) => !((error as { error?: Error }).error instanceof CustomProviderNonRetryableError),
+                onFailedAttempt: (error) => {
+                  if (isRateLimitError(error)) {
+                    rateLimitBackoffMs = Math.min(
+                      providerRateLimits.maxRetryMs,
+                      (rateLimitBackoffMs || providerRateLimits.minRetryMs) * 2
+                    );
+                  }
+                },
+              }
+            );
+
+            if (rateLimitBackoffMs > 0) {
+              rateLimitBackoffMs = Math.max(0, rateLimitBackoffMs - 2000);
+            }
+
+            store.addBatch(
+              liveBatch.map((chunk, index) => ({
+                id: chunk.id,
+                vector: result.embeddings[index],
+                metadata: chunk.metadata,
+              }))
+            );
+            database.upsertEmbeddingsBatch(
+              liveBatch.map((chunk, index) => ({
+                contentHash: chunk.contentHash,
+                embedding: float32ArrayToBuffer(result.embeddings[index]),
+                chunkText: chunk.text,
+                model: configuredProviderInfo.modelInfo.model,
+              }))
+            );
+            for (const chunk of liveBatch) {
+              invertedIndex.removeChunk(chunk.id);
+              invertedIndex.addChunk(chunk.id, chunk.content);
+              markChunkMaterialized(chunk.metadata.filePath, chunk.id);
+            }
+
+            stats.indexedChunks += liveBatch.length;
+            stats.tokensUsed += result.totalTokensUsed;
+          } catch (error) {
+            stats.failedChunks += liveBatch.length;
+            this.addFailedBatch(liveBatch, getErrorMessage(error));
+            this.logger.recordEmbeddingError();
+            for (const chunk of liveBatch) {
+              failedFiles.add(chunk.metadata.filePath);
+            }
+          }
+        });
+      }
+
+      await queue.onIdle();
+
+      this.rollbackMaterializedChunksForFiles(
+        failedFiles,
+        materializedChunkIdsByFile,
+        database,
+        store,
+        invertedIndex
+      );
+      this.restoreFailedFileBranchState(
+        failedFiles,
+        currentChunkIds,
+        allSymbolIds,
+        oldChunkIdsByFile,
+        newChunkIdsByFile,
+        oldSymbolIdsByFile,
+        newSymbolIdsByFile
+      );
+
+      for (const removedFilePath of removedAbsolutePaths) {
+        const oldSymbolIds = oldSymbolIdsByFile.get(removedFilePath);
+        if (oldSymbolIds) {
+          for (const symbolId of oldSymbolIds) {
+            allSymbolIds.delete(symbolId);
+          }
+        }
+
+        database.deleteCallEdgesByFile(removedFilePath);
+        database.deleteSymbolsByFile(removedFilePath);
+      }
+
+      const successfulParsedFiles = parsedFiles.filter((parsed) => !failedFiles.has(parsed.path));
+      for (const parsed of successfulParsedFiles) {
+        const oldSymbolIds = oldSymbolIdsByFile.get(parsed.path);
+        if (oldSymbolIds) {
+          for (const symbolId of oldSymbolIds) {
+            allSymbolIds.delete(symbolId);
+          }
+        }
+
+        const newSymbolIds = newSymbolIdsByFile.get(parsed.path);
+        if (newSymbolIds) {
+          for (const symbolId of newSymbolIds) {
+            allSymbolIds.add(symbolId);
+          }
+        }
+
+        database.deleteCallEdgesByFile(parsed.path);
+        database.deleteSymbolsByFile(parsed.path);
+
+        const graph = fileGraphData.get(parsed.path);
+        if (!graph) {
+          continue;
+        }
+
+        if (graph.symbols.length > 0) {
+          database.upsertSymbolsBatch(graph.symbols);
+        }
+
+        if (graph.edges.length > 0) {
+          database.upsertCallEdgesBatch(graph.edges);
+        }
+      }
+
+      const staleChunkIds = Array.from(oldChunkIdsForTouchedFiles).filter(
+        (chunkId) => !currentChunkIds.has(chunkId)
+      );
+
+      let globallyRemovedChunks = 0;
+      for (const chunkId of staleChunkIds) {
+        if (this.removeChunkFromRetrievalIfUnreferenced(database, store, invertedIndex, chunkId)) {
+          globallyRemovedChunks++;
+        }
+      }
+      stats.removedChunks = globallyRemovedChunks;
+
+      const rolledBackChunkCount = Array.from(failedFiles).reduce(
+        (total, filePath) => total + (materializedChunkIdsByFile.get(filePath)?.size ?? 0),
+        0
+      );
+      stats.indexedChunks = Math.max(0, stats.indexedChunks - rolledBackChunkCount);
+
+      database.clearBranch(this.currentBranch);
+      database.addChunksToBranchBatch(this.currentBranch, Array.from(currentChunkIds));
+      database.clearBranchSymbols(this.currentBranch);
+      database.addSymbolsToBranchBatch(this.currentBranch, Array.from(allSymbolIds));
+
+      store.save();
+      invertedIndex.save();
+
+      const successfulFileHashes = new Map<string, string>();
+      for (const parsed of successfulParsedFiles) {
+        successfulFileHashes.set(parsed.path, parsed.hash);
+      }
+      this.commitFileHashChanges(successfulFileHashes, removedAbsolutePaths);
+
+      const committedRelativePaths =
+        failedFiles.size === 0
+          ? touchedRelativePaths
+          : [
+              ...successfulParsedFiles.map((parsed) => path.relative(this.projectRoot, parsed.path)),
+              ...removedRelativePaths,
+            ];
+      const committedSnapshot =
+        failedFiles.size === 0
+          ? nextSnapshot ?? null
+          : await this.buildCommittedMerkleSnapshot(baseSnapshot, committedRelativePaths);
+      if (committedSnapshot) {
+        database.saveMerkleSnapshot(committedSnapshot);
+      }
+
+      if (this.config.indexing.autoGc && stats.removedChunks > 0) {
+        await this.maybeRunOrphanGc();
+      }
+
+      const committedPendingChunks = pendingChunks.filter(
+        (chunk) => !failedFiles.has(chunk.metadata.filePath)
+      ).length;
+      stats.totalChunks = committedPendingChunks;
+      stats.existingChunks = Math.max(0, currentChunkIds.size - committedPendingChunks);
+      stats.durationMs = Date.now() - startTime;
+      this.saveIndexMetadata(configuredProviderInfo);
+      this.indexCompatibility = { compatible: true };
+      this.logger.recordIndexingEnd();
+      return stats;
+    } finally {
+      this.releaseIndexingLock();
+    }
+  }
+
   async estimateCost(): Promise<CostEstimate> {
     const { configuredProviderInfo } = await this.ensureInitialized();
 
@@ -1759,6 +2604,7 @@ export class Indexer {
 
   async index(onProgress?: ProgressCallback): Promise<IndexStats> {
     const { store, provider, invertedIndex, database, configuredProviderInfo } = await this.ensureInitialized();
+    this.refreshBranchInfo();
 
     if (!this.indexCompatibility?.compatible) {
       throw new Error(
@@ -1813,11 +2659,9 @@ export class Indexer {
 
     const changedFiles: Array<{ path: string; content: string; hash: string }> = [];
     const unchangedFilePaths = new Set<string>();
-    const currentFileHashes = new Map<string, string>();
 
     for (const f of files) {
       const currentHash = hashFile(f.path);
-      currentFileHashes.set(f.path, currentHash);
 
       if (this.fileHashCache.get(f.path) === currentHash) {
         unchangedFilePaths.add(f.path);
@@ -1842,74 +2686,62 @@ export class Indexer {
       totalChunks: 0,
     });
 
-    const parseStartTime = performance.now();
-    const parsedFiles = changedFiles.map((file) => {
-      const semanticChunks = chunkFile(
-        file.path,
-        getChunkerLanguage(file.path),
-        file.content,
-        {
-          targetTokenBudget: 1500,
-          maxChunkChars: 3000,
-          minChunkChars: 200,
-          mergeSmallSiblings: true,
-          attachComments: true,
-          emitCoarseChunks: true,
-        }
-      );
-
-      const chunks = semanticChunks
-        .filter((chunk) => chunk.granularity === "Fine")
-        .map((chunk) => ({
-          content: chunk.text,
-          startLine: chunk.startLine,
-          endLine: chunk.endLine,
-          chunkType: mapSemanticChunkType(chunk.symbolKind),
-          name: chunk.symbolName,
-          language: chunk.language,
-          chunkHash: chunk.chunkHash,
-        }));
-
-      return {
-        path: file.path,
-        chunks,
-        hash: file.hash,
-      };
-    });
-    const parseMs = performance.now() - parseStartTime;
+    const { parsedFiles, parseMs } = this.parseFilesForIndexing(changedFiles);
 
     this.logger.recordFilesParsed(parsedFiles.length);
     this.logger.recordParseDuration(parseMs);
     this.logger.debug("Parsed changed files", { parsedCount: parsedFiles.length, parseMs: parseMs.toFixed(2) });
 
-    const existingChunks = new Map<string, string>();
-    const existingChunksByFile = new Map<string, Set<string>>();
-    for (const { key, metadata } of store.getAllMetadata()) {
-      existingChunks.set(key, metadata.hash);
-      const fileChunks = existingChunksByFile.get(metadata.filePath) || new Set();
-      fileChunks.add(key);
-      existingChunksByFile.set(metadata.filePath, fileChunks);
+    const branchChunkIds = new Set(database.getBranchChunkIds(this.currentBranch));
+    const branchSymbolIds = new Set(database.getBranchSymbolIds(this.currentBranch));
+    const { existingChunks, existingChunksByFile } = this.buildBranchStoreChunkMaps(store, branchChunkIds);
+    const currentChunkIds = new Set(branchChunkIds);
+    const allSymbolIds = new Set(branchSymbolIds);
+    const currentFilePaths = new Set(files.map((file) => file.path));
+    const removedAbsolutePathSet = new Set<string>(
+      Array.from(this.fileHashCache.keys()).filter((filePath) => !currentFilePaths.has(filePath))
+    );
+    for (const filePath of existingChunksByFile.keys()) {
+      if (!currentFilePaths.has(filePath)) {
+        removedAbsolutePathSet.add(filePath);
+      }
     }
+    const removedAbsolutePaths = Array.from(removedAbsolutePathSet).sort();
+    const touchedAbsolutePaths = Array.from(
+      new Set<string>([
+        ...changedFiles.map((file) => file.path),
+        ...removedAbsolutePaths,
+      ])
+    ).sort();
+    const oldChunkIdsForTouchedFiles = new Set<string>();
+    const oldChunkIdsByFile = new Map<string, Set<string>>();
+    const oldSymbolIdsByFile = new Map<string, Set<string>>();
 
-    const currentChunkIds = new Set<string>();
-    const currentFilePaths = new Set<string>();
-    const pendingChunks: PendingChunk[] = [];
+    for (const filePath of touchedAbsolutePaths) {
+      const fileChunks = database
+        .getChunksByFile(filePath)
+        .filter((chunk) => branchChunkIds.has(chunk.chunkId));
 
-    for (const filePath of unchangedFilePaths) {
-      currentFilePaths.add(filePath);
-      const fileChunks = existingChunksByFile.get(filePath);
-      if (fileChunks) {
-        for (const chunkId of fileChunks) {
-          currentChunkIds.add(chunkId);
-        }
+      for (const chunk of fileChunks) {
+        existingChunks.set(chunk.chunkId, chunk.contentHash);
+        oldChunkIdsForTouchedFiles.add(chunk.chunkId);
+        this.getOrCreateSet(oldChunkIdsByFile, filePath).add(chunk.chunkId);
+        currentChunkIds.delete(chunk.chunkId);
+      }
+
+      const fileSymbols = database
+        .getSymbolsByFile(filePath)
+        .filter((symbol) => branchSymbolIds.has(symbol.id));
+      for (const symbol of fileSymbols) {
+        this.getOrCreateSet(oldSymbolIdsByFile, filePath).add(symbol.id);
       }
     }
 
+    const pendingChunks: PendingChunk[] = [];
     const chunkDataBatch: ChunkData[] = [];
+    const newChunkIdsByFile = new Map<string, Set<string>>();
 
     for (const parsed of parsedFiles) {
-      currentFilePaths.add(parsed.path);
-
       if (parsed.chunks.length === 0) {
         const relativePath = path.relative(this.projectRoot, parsed.path);
         stats.parseFailures.push(relativePath);
@@ -1928,6 +2760,7 @@ export class Indexer {
         const id = generateChunkId(parsed.path, chunk);
         const contentHash = chunk.chunkHash;
         currentChunkIds.add(id);
+        this.getOrCreateSet(newChunkIdsByFile, parsed.path).add(id);
 
         chunkDataBatch.push({
           chunkId: id,
@@ -1940,7 +2773,7 @@ export class Indexer {
           language: chunk.language,
         });
 
-        if (existingChunks.get(id) === contentHash) {
+        if (existingChunks.get(id) === contentHash && invertedIndex.hasChunk(id)) {
           fileChunkCount++;
           continue;
         }
@@ -1965,164 +2798,17 @@ export class Indexer {
       database.upsertChunksBatch(chunkDataBatch);
     }
 
-
-    // ── Call Graph Extraction ────────────────────────────────────────
-    // Extract symbols and call edges from changed files.
-    const allSymbolIds = new Set<string>();
-    const symbolsByFile = new Map<string, SymbolData[]>();
-
-    // For changed files: delete old symbols/edges, extract new ones
-    for (let i = 0; i < parsedFiles.length; i++) {
-      const parsed = parsedFiles[i];
-      const changedFile = changedFiles[i];
-
-      // Clean up old call graph data for this file
-      database.deleteCallEdgesByFile(parsed.path);
-      database.deleteSymbolsByFile(parsed.path);
-
-      // Build symbols from parsed chunks
-      const fileSymbols: SymbolData[] = [];
-
-      for (const chunk of parsed.chunks) {
-        if (!chunk.name || !CALL_GRAPH_SYMBOL_CHUNK_TYPES.has(chunk.chunkType)) continue;
-
-        const symbolId = `sym_${hashContent(parsed.path + ":" + chunk.name + ":" + chunk.chunkType + ":" + chunk.startLine).slice(0, 16)}`;
-        const symbol: SymbolData = {
-          id: symbolId,
-          filePath: parsed.path,
-          name: chunk.name,
-          kind: chunk.chunkType,
-          startLine: chunk.startLine,
-          startCol: 0,
-          endLine: chunk.endLine,
-          endCol: 0,
-          language: chunk.language,
-        };
-        fileSymbols.push(symbol);
-        allSymbolIds.add(symbolId);
+    const fileGraphData = this.buildFileGraphData(parsedFiles);
+    const newSymbolIdsByFile = new Map<string, Set<string>>();
+    for (const [filePath, graph] of fileGraphData) {
+      if (graph.symbols.length === 0) {
+        continue;
       }
 
-      const symbolsByName = new Map<string, SymbolData[]>();
-      for (const symbol of fileSymbols) {
-        const existing = symbolsByName.get(symbol.name) ?? [];
-        existing.push(symbol);
-        symbolsByName.set(symbol.name, existing);
+      const symbolIds = this.getOrCreateSet(newSymbolIdsByFile, filePath);
+      for (const symbol of graph.symbols) {
+        symbolIds.add(symbol.id);
       }
-
-      if (fileSymbols.length > 0) {
-        database.upsertSymbolsBatch(fileSymbols);
-        symbolsByFile.set(parsed.path, fileSymbols);
-      }
-
-      // Extract call sites from file content (only for supported languages)
-      const fileLanguage = parsed.chunks[0]?.language;
-      if (!fileLanguage || !CALL_GRAPH_LANGUAGES.has(fileLanguage)) continue;
-
-      const callSites = extractCalls(changedFile.content, fileLanguage);
-      if (callSites.length === 0) continue;
-
-      // Map each call site to its enclosing symbol
-      const edges: CallEdgeData[] = [];
-      for (const site of callSites) {
-        // Find the enclosing symbol (function/method that contains this call)
-        const enclosingSymbol = fileSymbols.find(
-          (sym) => site.line >= sym.startLine && site.line <= sym.endLine
-        );
-        if (!enclosingSymbol) continue;
-
-        const edgeId = `edge_${hashContent(enclosingSymbol.id + ":" + site.calleeName + ":" + site.line + ":" + site.column).slice(0, 16)}`;
-        edges.push({
-          id: edgeId,
-          fromSymbolId: enclosingSymbol.id,
-          targetName: site.calleeName,
-          toSymbolId: undefined,
-          callType: site.callType,
-          line: site.line,
-          col: site.column,
-          isResolved: false,
-        });
-      }
-
-      if (edges.length > 0) {
-        database.upsertCallEdgesBatch(edges);
-
-        // Resolve same-file calls
-        for (const edge of edges) {
-          const candidates = symbolsByName.get(edge.targetName);
-          if (candidates && candidates.length === 1) {
-            database.resolveCallEdge(edge.id, candidates[0].id);
-          }
-        }
-      }
-    }
-
-    // Collect symbol IDs from unchanged files for branch association
-    for (const filePath of unchangedFilePaths) {
-      const existingSymbols = database.getSymbolsByFile(filePath);
-      for (const sym of existingSymbols) {
-        allSymbolIds.add(sym.id);
-      }
-    }
-
-    let removedCount = 0;
-    for (const [chunkId] of existingChunks) {
-      if (!currentChunkIds.has(chunkId)) {
-        store.remove(chunkId);
-        invertedIndex.removeChunk(chunkId);
-        removedCount++;
-      }
-    }
-
-    stats.totalChunks = pendingChunks.length;
-    stats.existingChunks = currentChunkIds.size - pendingChunks.length;
-    stats.removedChunks = removedCount;
-
-    this.logger.recordChunksProcessed(currentChunkIds.size);
-    this.logger.recordChunksRemoved(removedCount);
-    this.logger.info("Chunk analysis complete", {
-      pending: pendingChunks.length,
-      existing: stats.existingChunks,
-      removed: removedCount,
-    });
-
-    if (pendingChunks.length === 0 && removedCount === 0) {
-      database.clearBranch(this.currentBranch);
-      database.addChunksToBranchBatch(this.currentBranch, Array.from(currentChunkIds));
-      database.clearBranchSymbols(this.currentBranch);
-      database.addSymbolsToBranchBatch(this.currentBranch, Array.from(allSymbolIds));
-      this.fileHashCache = currentFileHashes;
-      this.saveFileHashCache();
-      stats.durationMs = Date.now() - startTime;
-      onProgress?.({
-        phase: "complete",
-        filesProcessed: files.length,
-        totalFiles: files.length,
-        chunksProcessed: 0,
-        totalChunks: 0,
-      });
-      this.releaseIndexingLock();
-      return stats;
-    }
-
-    if (pendingChunks.length === 0) {
-      database.clearBranch(this.currentBranch);
-      database.addChunksToBranchBatch(this.currentBranch, Array.from(currentChunkIds));
-      database.clearBranchSymbols(this.currentBranch);
-      database.addSymbolsToBranchBatch(this.currentBranch, Array.from(allSymbolIds));
-      store.save();
-      invertedIndex.save();
-      this.fileHashCache = currentFileHashes;
-      this.saveFileHashCache();
-      stats.durationMs = Date.now() - startTime;
-      onProgress?.({
-        phase: "complete",
-        filesProcessed: files.length,
-        totalFiles: files.length,
-        chunksProcessed: 0,
-        totalChunks: 0,
-      });
-      this.releaseIndexingLock();
-      return stats;
     }
 
     onProgress?.({
@@ -2133,11 +2819,10 @@ export class Indexer {
       totalChunks: pendingChunks.length,
     });
 
-    const allContentHashes = pendingChunks.map((c) => c.contentHash);
+    const allContentHashes = pendingChunks.map((chunk) => chunk.contentHash);
     const missingHashes = new Set(database.getMissingEmbeddings(allContentHashes));
-
-    const chunksNeedingEmbedding = pendingChunks.filter((c) => missingHashes.has(c.contentHash));
-    const chunksWithExistingEmbedding = pendingChunks.filter((c) => !missingHashes.has(c.contentHash));
+    const chunksNeedingEmbedding = pendingChunks.filter((chunk) => missingHashes.has(chunk.contentHash));
+    const chunksWithExistingEmbedding = pendingChunks.filter((chunk) => !missingHashes.has(chunk.contentHash));
 
     this.logger.cache("info", "Embedding cache lookup", {
       needsEmbedding: chunksNeedingEmbedding.length,
@@ -2145,15 +2830,28 @@ export class Indexer {
     });
     this.logger.recordChunksFromCache(chunksWithExistingEmbedding.length);
 
+    const failedFiles = new Set<string>();
+    const materializedChunkIdsByFile = new Map<string, Set<string>>();
+    const markChunkMaterialized = (filePath: string, chunkId: string): void => {
+      this.getOrCreateSet(materializedChunkIdsByFile, filePath).add(chunkId);
+    };
+
     for (const chunk of chunksWithExistingEmbedding) {
       const embeddingBuffer = database.getEmbedding(chunk.contentHash);
-      if (embeddingBuffer) {
-        const vector = bufferToFloat32Array(embeddingBuffer);
-        store.add(chunk.id, Array.from(vector), chunk.metadata);
-        invertedIndex.removeChunk(chunk.id);
-        invertedIndex.addChunk(chunk.id, chunk.content);
-        stats.indexedChunks++;
+      if (!embeddingBuffer) {
+        failedFiles.add(chunk.metadata.filePath);
+        stats.failedChunks++;
+        this.addFailedBatch([chunk], `Missing cached embedding for content hash ${chunk.contentHash}`);
+        this.logger.recordEmbeddingError();
+        continue;
       }
+
+      const vector = bufferToFloat32Array(embeddingBuffer);
+      store.add(chunk.id, Array.from(vector), chunk.metadata);
+      invertedIndex.removeChunk(chunk.id);
+      invertedIndex.addChunk(chunk.id, chunk.content);
+      markChunkMaterialized(chunk.metadata.filePath, chunk.id);
+      stats.indexedChunks++;
     }
 
     const providerRateLimits = this.getProviderRateLimits(configuredProviderInfo.provider);
@@ -2167,14 +2865,19 @@ export class Indexer {
 
     for (const batch of dynamicBatches) {
       queue.add(async () => {
+        const liveBatch = batch.filter((chunk) => !failedFiles.has(chunk.metadata.filePath));
+        if (liveBatch.length === 0) {
+          return;
+        }
+
         if (rateLimitBackoffMs > 0) {
-          await new Promise(resolve => setTimeout(resolve, rateLimitBackoffMs));
+          await new Promise((resolve) => setTimeout(resolve, rateLimitBackoffMs));
         }
 
         try {
           const result = await pRetry(
             async () => {
-              const texts = batch.map((c) => c.text);
+              const texts = liveBatch.map((chunk) => chunk.text);
               return provider.embedBatch(texts);
             },
             {
@@ -2186,14 +2889,17 @@ export class Indexer {
               onFailedAttempt: (error) => {
                 const message = getErrorMessage(error);
                 if (isRateLimitError(error)) {
-                  rateLimitBackoffMs = Math.min(providerRateLimits.maxRetryMs, (rateLimitBackoffMs || providerRateLimits.minRetryMs) * 2);
-                  this.logger.embedding("warn", `Rate limited, backing off`, {
+                  rateLimitBackoffMs = Math.min(
+                    providerRateLimits.maxRetryMs,
+                    (rateLimitBackoffMs || providerRateLimits.minRetryMs) * 2
+                  );
+                  this.logger.embedding("warn", "Rate limited, backing off", {
                     attempt: error.attemptNumber,
                     retriesLeft: error.retriesLeft,
                     backoffMs: rateLimitBackoffMs,
                   });
                 } else {
-                  this.logger.embedding("error", `Embedding batch failed`, {
+                  this.logger.embedding("error", "Embedding batch failed", {
                     attempt: error.attemptNumber,
                     error: message,
                   });
@@ -2206,34 +2912,34 @@ export class Indexer {
             rateLimitBackoffMs = Math.max(0, rateLimitBackoffMs - 2000);
           }
 
-          const items = batch.map((chunk, idx) => ({
-            id: chunk.id,
-            vector: result.embeddings[idx],
-            metadata: chunk.metadata,
-          }));
-
-          store.addBatch(items);
-
-          const embeddingBatchItems = batch.map((chunk, i) => ({
-            contentHash: chunk.contentHash,
-            embedding: float32ArrayToBuffer(result.embeddings[i]),
-            chunkText: chunk.text,
-            model: configuredProviderInfo.modelInfo.model,
-          }));
-          database.upsertEmbeddingsBatch(embeddingBatchItems);
-
-          for (const chunk of batch) {
+          store.addBatch(
+            liveBatch.map((chunk, index) => ({
+              id: chunk.id,
+              vector: result.embeddings[index],
+              metadata: chunk.metadata,
+            }))
+          );
+          database.upsertEmbeddingsBatch(
+            liveBatch.map((chunk, index) => ({
+              contentHash: chunk.contentHash,
+              embedding: float32ArrayToBuffer(result.embeddings[index]),
+              chunkText: chunk.text,
+              model: configuredProviderInfo.modelInfo.model,
+            }))
+          );
+          for (const chunk of liveBatch) {
             invertedIndex.removeChunk(chunk.id);
             invertedIndex.addChunk(chunk.id, chunk.content);
+            markChunkMaterialized(chunk.metadata.filePath, chunk.id);
           }
 
-          stats.indexedChunks += batch.length;
+          stats.indexedChunks += liveBatch.length;
           stats.tokensUsed += result.totalTokensUsed;
 
-          this.logger.recordChunksEmbedded(batch.length);
+          this.logger.recordChunksEmbedded(liveBatch.length);
           this.logger.recordEmbeddingApiCall(result.totalTokensUsed);
-          this.logger.embedding("debug", `Embedded batch`, {
-            batchSize: batch.length,
+          this.logger.embedding("debug", "Embedded batch", {
+            batchSize: liveBatch.length,
             tokens: result.totalTokensUsed,
           });
 
@@ -2245,25 +2951,120 @@ export class Indexer {
             totalChunks: pendingChunks.length,
           });
         } catch (error) {
-          stats.failedChunks += batch.length;
-          this.addFailedBatch(batch, getErrorMessage(error));
+          stats.failedChunks += liveBatch.length;
+          this.addFailedBatch(liveBatch, getErrorMessage(error));
           this.logger.recordEmbeddingError();
-          this.logger.embedding("error", `Failed to embed batch after retries`, {
-            batchSize: batch.length,
+          this.logger.embedding("error", "Failed to embed batch after retries", {
+            batchSize: liveBatch.length,
             error: getErrorMessage(error),
           });
+          for (const chunk of liveBatch) {
+            failedFiles.add(chunk.metadata.filePath);
+          }
         }
       });
     }
 
     await queue.onIdle();
 
+    this.rollbackMaterializedChunksForFiles(
+      failedFiles,
+      materializedChunkIdsByFile,
+      database,
+      store,
+      invertedIndex
+    );
+    this.restoreFailedFileBranchState(
+      failedFiles,
+      currentChunkIds,
+      allSymbolIds,
+      oldChunkIdsByFile,
+      newChunkIdsByFile,
+      oldSymbolIdsByFile,
+      newSymbolIdsByFile
+    );
+
+    for (const removedFilePath of removedAbsolutePaths) {
+      const oldSymbolIds = oldSymbolIdsByFile.get(removedFilePath);
+      if (oldSymbolIds) {
+        for (const symbolId of oldSymbolIds) {
+          allSymbolIds.delete(symbolId);
+        }
+      }
+
+      database.deleteCallEdgesByFile(removedFilePath);
+      database.deleteSymbolsByFile(removedFilePath);
+    }
+
+    const successfulParsedFiles = parsedFiles.filter((parsed) => !failedFiles.has(parsed.path));
+    for (const parsed of successfulParsedFiles) {
+      const oldSymbolIds = oldSymbolIdsByFile.get(parsed.path);
+      if (oldSymbolIds) {
+        for (const symbolId of oldSymbolIds) {
+          allSymbolIds.delete(symbolId);
+        }
+      }
+
+      const newSymbolIds = newSymbolIdsByFile.get(parsed.path);
+      if (newSymbolIds) {
+        for (const symbolId of newSymbolIds) {
+          allSymbolIds.add(symbolId);
+        }
+      }
+
+      database.deleteCallEdgesByFile(parsed.path);
+      database.deleteSymbolsByFile(parsed.path);
+
+      const graph = fileGraphData.get(parsed.path);
+      if (!graph) {
+        continue;
+      }
+
+      if (graph.symbols.length > 0) {
+        database.upsertSymbolsBatch(graph.symbols);
+      }
+
+      if (graph.edges.length > 0) {
+        database.upsertCallEdgesBatch(graph.edges);
+      }
+    }
+
+    let removedCount = 0;
+    const staleChunkIds = Array.from(oldChunkIdsForTouchedFiles).filter(
+      (chunkId) => !currentChunkIds.has(chunkId)
+    );
+    for (const chunkId of staleChunkIds) {
+      if (this.removeChunkFromRetrievalIfUnreferenced(database, store, invertedIndex, chunkId)) {
+        removedCount++;
+      }
+    }
+
+    const rolledBackChunkCount = Array.from(failedFiles).reduce(
+      (total, filePath) => total + (materializedChunkIdsByFile.get(filePath)?.size ?? 0),
+      0
+    );
+    stats.indexedChunks = Math.max(0, stats.indexedChunks - rolledBackChunkCount);
+    const committedPendingChunks = pendingChunks.filter(
+      (chunk) => !failedFiles.has(chunk.metadata.filePath)
+    ).length;
+    stats.totalChunks = committedPendingChunks;
+    stats.existingChunks = Math.max(0, currentChunkIds.size - committedPendingChunks);
+    stats.removedChunks = removedCount;
+
+    this.logger.recordChunksProcessed(currentChunkIds.size);
+    this.logger.recordChunksRemoved(removedCount);
+    this.logger.info("Chunk analysis complete", {
+      pending: committedPendingChunks,
+      existing: stats.existingChunks,
+      removed: removedCount,
+    });
+
     onProgress?.({
       phase: "storing",
       filesProcessed: files.length,
       totalFiles: files.length,
       chunksProcessed: stats.indexedChunks,
-      totalChunks: pendingChunks.length,
+      totalChunks: committedPendingChunks,
     });
 
     database.clearBranch(this.currentBranch);
@@ -2273,8 +3074,26 @@ export class Indexer {
 
     store.save();
     invertedIndex.save();
-    this.fileHashCache = currentFileHashes;
-    this.saveFileHashCache();
+
+    const successfulFileHashes = new Map<string, string>();
+    for (const parsed of successfulParsedFiles) {
+      successfulFileHashes.set(parsed.path, parsed.hash);
+    }
+    this.commitFileHashChanges(successfulFileHashes, removedAbsolutePaths);
+
+    if (failedFiles.size === 0) {
+      await this.syncMerkleSnapshotForCurrentBranch();
+    } else {
+      const committedRelativePaths = [
+        ...successfulParsedFiles.map((parsed) => path.relative(this.projectRoot, parsed.path)),
+        ...removedAbsolutePaths.map((filePath) => path.relative(this.projectRoot, filePath)),
+      ];
+      const storedSnapshot = database.getMerkleSnapshot(this.currentBranch);
+      const committedSnapshot = await this.buildCommittedMerkleSnapshot(storedSnapshot, committedRelativePaths);
+      if (committedSnapshot) {
+        database.saveMerkleSnapshot(committedSnapshot);
+      }
+    }
 
     // Auto-GC after indexing: check if orphan count exceeds threshold
     if (this.config.indexing.autoGc && stats.removedChunks > 0) {
@@ -2695,6 +3514,7 @@ export class Indexer {
     // Clear file hash cache so all files are re-parsed
     this.fileHashCache.clear();
     this.saveFileHashCache();
+    database.clearAllMerkleSnapshots();
 
     // Clear branch catalog
     database.clearBranch(this.currentBranch);

@@ -5,6 +5,7 @@ mod chunker;
 mod db;
 mod hasher;
 mod inverted_index;
+mod merkle;
 mod parser;
 mod store;
 mod types;
@@ -16,6 +17,18 @@ use std::path::PathBuf;
 pub use chunker::{Chunk, ChunkConfig, ChunkKind, Granularity, SymbolKind};
 pub use hasher::*;
 pub use inverted_index::*;
+pub use merkle::{
+    build_merkle_snapshot as build_merkle_snapshot_internal,
+    diff_from_events as diff_merkle_from_events_internal,
+    diff_snapshots as diff_merkle_snapshots_internal,
+    FileHash as MerkleFileHash,
+    IgnoreRules as InternalMerkleIgnoreRules,
+    MerkleDiff as InternalMerkleDiff,
+    MerkleError as InternalMerkleError,
+    MerkleNode as InternalMerkleNode,
+    MerkleNodeKind as InternalMerkleNodeKind,
+    MerkleSnapshot as InternalMerkleSnapshot,
+};
 pub use parser::*;
 pub use store::*;
 pub use types::*;
@@ -71,6 +84,213 @@ pub fn extract_calls(content: String, language: String) -> Result<Vec<CallSiteDa
                 .collect()
         })
         .map_err(|e| Error::from_reason(e.to_string()))
+}
+
+#[napi(object)]
+pub struct MerkleIgnoreRules {
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub max_file_size: Option<u32>,
+}
+
+#[napi(object)]
+pub struct MerkleDiffData {
+    pub changed_files: Vec<String>,
+    pub added_files: Vec<String>,
+    pub removed_files: Vec<String>,
+}
+
+#[napi(object)]
+pub struct PreparedMerkleDiffData {
+    pub changed_files: Vec<String>,
+    pub added_files: Vec<String>,
+    pub removed_files: Vec<String>,
+    pub next_snapshot: String,
+}
+
+#[napi(object)]
+pub struct MerkleSnapshotPayload {
+    pub branch: String,
+    pub root_hash: String,
+    pub total_nodes: u32,
+    pub total_files: u32,
+    pub snapshot: String,
+}
+
+impl From<MerkleIgnoreRules> for merkle::IgnoreRules {
+    fn from(value: MerkleIgnoreRules) -> Self {
+        Self {
+            include: value.include,
+            exclude: value.exclude,
+            max_file_size: value
+                .max_file_size
+                .map(|size| size as u64)
+                .unwrap_or(merkle::types::DEFAULT_MAX_FILE_SIZE),
+        }
+    }
+}
+
+fn serialize_snapshot(snapshot: &merkle::MerkleSnapshot) -> Result<String> {
+    serde_json::to_string(snapshot).map_err(|error| Error::from_reason(error.to_string()))
+}
+
+fn deserialize_snapshot(snapshot: &str) -> Result<merkle::MerkleSnapshot> {
+    serde_json::from_str(snapshot).map_err(|error| Error::from_reason(error.to_string()))
+}
+
+fn merkle_diff_to_js(diff: merkle::MerkleDiff) -> MerkleDiffData {
+    MerkleDiffData {
+        changed_files: diff.changed_files,
+        added_files: diff.added_files,
+        removed_files: diff.removed_files,
+    }
+}
+
+fn merkle_snapshot_payload(snapshot: merkle::MerkleSnapshot) -> Result<MerkleSnapshotPayload> {
+    let branch = snapshot.branch.clone();
+    let root_hash = snapshot.root_hash.clone();
+    let total_nodes = snapshot.total_nodes() as u32;
+    let total_files = snapshot.total_files() as u32;
+    let snapshot = serialize_snapshot(&snapshot)?;
+
+    Ok(MerkleSnapshotPayload {
+        branch,
+        root_hash,
+        total_nodes,
+        total_files,
+        snapshot,
+    })
+}
+
+pub struct BuildMerkleSnapshotTask {
+    repo_root: String,
+    branch: String,
+    ignore_rules: merkle::IgnoreRules,
+}
+
+impl napi::Task for BuildMerkleSnapshotTask {
+    type Output = MerkleSnapshotPayload;
+    type JsValue = MerkleSnapshotPayload;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let snapshot = merkle::build_merkle_snapshot(
+            std::path::Path::new(&self.repo_root),
+            &self.branch,
+            &self.ignore_rules,
+        )
+        .map_err(|error| Error::from_reason(error.to_string()))?;
+        merkle_snapshot_payload(snapshot)
+    }
+
+    fn resolve(&mut self, _env: napi::Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+pub struct DiffMerkleSnapshotsTask {
+    old_snapshot: String,
+    new_snapshot: String,
+}
+
+impl napi::Task for DiffMerkleSnapshotsTask {
+    type Output = MerkleDiffData;
+    type JsValue = MerkleDiffData;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let old_snapshot = deserialize_snapshot(&self.old_snapshot)?;
+        let new_snapshot = deserialize_snapshot(&self.new_snapshot)?;
+        let diff = merkle::diff_snapshots(&old_snapshot, &new_snapshot)
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        Ok(merkle_diff_to_js(diff))
+    }
+
+    fn resolve(&mut self, _env: napi::Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+pub struct DiffMerkleFromEventsTask {
+    old_snapshot: String,
+    changed_paths: Vec<String>,
+    repo_root: String,
+    ignore_rules: merkle::IgnoreRules,
+}
+
+impl napi::Task for DiffMerkleFromEventsTask {
+    type Output = PreparedMerkleDiffData;
+    type JsValue = PreparedMerkleDiffData;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let old_snapshot = deserialize_snapshot(&self.old_snapshot)?;
+        let (diff, next_snapshot) = merkle::diff_from_events(
+            &old_snapshot,
+            &self.changed_paths,
+            std::path::Path::new(&self.repo_root),
+            &self.ignore_rules,
+        )
+        .map_err(|error| Error::from_reason(error.to_string()))?;
+
+        let next_snapshot = serialize_snapshot(&next_snapshot)?;
+        Ok(PreparedMerkleDiffData {
+            changed_files: diff.changed_files,
+            added_files: diff.added_files,
+            removed_files: diff.removed_files,
+            next_snapshot,
+        })
+    }
+
+    fn resolve(&mut self, _env: napi::Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+#[napi]
+pub fn build_merkle_snapshot(
+    repo_root: String,
+    branch: String,
+    ignore_rules: Option<MerkleIgnoreRules>,
+) -> AsyncTask<BuildMerkleSnapshotTask> {
+    AsyncTask::new(BuildMerkleSnapshotTask {
+        repo_root,
+        branch,
+        ignore_rules: ignore_rules.unwrap_or(MerkleIgnoreRules {
+            include: Vec::new(),
+            exclude: Vec::new(),
+            max_file_size: None,
+        })
+        .into(),
+    })
+}
+
+#[napi]
+pub fn diff_merkle_snapshots(
+    old_snapshot: String,
+    new_snapshot: String,
+) -> AsyncTask<DiffMerkleSnapshotsTask> {
+    AsyncTask::new(DiffMerkleSnapshotsTask {
+        old_snapshot,
+        new_snapshot,
+    })
+}
+
+#[napi]
+pub fn diff_merkle_from_events(
+    old_snapshot: String,
+    changed_paths: Vec<String>,
+    repo_root: String,
+    ignore_rules: Option<MerkleIgnoreRules>,
+) -> AsyncTask<DiffMerkleFromEventsTask> {
+    AsyncTask::new(DiffMerkleFromEventsTask {
+        old_snapshot,
+        changed_paths,
+        repo_root,
+        ignore_rules: ignore_rules.unwrap_or(MerkleIgnoreRules {
+            include: Vec::new(),
+            exclude: Vec::new(),
+            max_file_size: None,
+        })
+        .into(),
+    })
 }
 
 #[napi]
@@ -648,6 +868,20 @@ impl Database {
     }
 
     #[napi]
+    pub fn chunk_exists_on_other_branches(
+        &self,
+        branch: String,
+        chunk_id: String,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        db::chunk_exists_on_other_branches(&conn, &branch, &chunk_id)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
     pub fn get_all_branches(&self) -> Result<Vec<String>> {
         let conn = self
             .conn
@@ -681,6 +915,50 @@ impl Database {
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
         db::delete_metadata(&conn, &key).map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn get_merkle_snapshot(&self, branch: String) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let snapshot = merkle::store::load_snapshot(&conn, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        snapshot
+            .map(|value| serialize_snapshot(&value))
+            .transpose()
+    }
+
+    #[napi]
+    pub fn save_merkle_snapshot(&self, snapshot: String) -> Result<()> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let snapshot = deserialize_snapshot(&snapshot)?;
+        merkle::store::save_snapshot(&mut conn, &snapshot)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn delete_merkle_snapshot(&self, branch: String) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        merkle::store::delete_snapshot(&conn, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn clear_all_merkle_snapshots(&self) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        merkle::store::clear_all_snapshots(&conn)
+            .map_err(|e| Error::from_reason(e.to_string()))
     }
 
     #[napi]

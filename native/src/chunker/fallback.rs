@@ -94,8 +94,7 @@ pub fn chunk_by_lines(
         }
 
         let emitted_lines = end_line_index.saturating_sub(start_line_index);
-        let overlap_lines = ((emitted_lines as f32) * 0.12f32).round() as usize;
-        let step = emitted_lines.saturating_sub(overlap_lines).max(1);
+        let step = emitted_lines.max(1);
         start_line_index = start_line_index.saturating_add(step);
     }
 

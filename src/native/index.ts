@@ -174,6 +174,30 @@ export interface SearchResult {
   metadata: ChunkMetadata;
 }
 
+export interface MerkleIgnoreRules {
+  include: string[];
+  exclude: string[];
+  maxFileSize?: number;
+}
+
+export interface MerkleDiff {
+  changedFiles: string[];
+  addedFiles: string[];
+  removedFiles: string[];
+}
+
+export interface PreparedMerkleDiff extends MerkleDiff {
+  nextSnapshot: string;
+}
+
+export interface MerkleSnapshotPayload {
+  branch: string;
+  rootHash: string;
+  totalNodes: number;
+  totalFiles: number;
+  snapshot: string;
+}
+
 export interface ChunkMetadata {
   filePath: string;
   startLine: number;
@@ -254,6 +278,63 @@ export function hashContent(content: string): string {
 
 export function hashFile(filePath: string): string {
   return native.hashFile(filePath);
+}
+
+function mapMerkleDiff(diff: any): MerkleDiff {
+  return {
+    changedFiles: diff.changedFiles ?? diff.changed_files ?? [],
+    addedFiles: diff.addedFiles ?? diff.added_files ?? [],
+    removedFiles: diff.removedFiles ?? diff.removed_files ?? [],
+  };
+}
+
+function mapMerkleSnapshotPayload(payload: any): MerkleSnapshotPayload {
+  return {
+    branch: payload.branch,
+    rootHash: payload.rootHash ?? payload.root_hash,
+    totalNodes: payload.totalNodes ?? payload.total_nodes,
+    totalFiles: payload.totalFiles ?? payload.total_files,
+    snapshot: payload.snapshot,
+  };
+}
+
+export async function buildMerkleSnapshot(
+  repoRoot: string,
+  branch: string,
+  ignoreRules: MerkleIgnoreRules
+): Promise<MerkleSnapshotPayload> {
+  const payload = await native.buildMerkleSnapshot(repoRoot, branch, {
+    include: ignoreRules.include,
+    exclude: ignoreRules.exclude,
+    maxFileSize: ignoreRules.maxFileSize,
+  });
+  return mapMerkleSnapshotPayload(payload);
+}
+
+export async function diffMerkleSnapshots(
+  oldSnapshot: string,
+  newSnapshot: string
+): Promise<MerkleDiff> {
+  const diff = await native.diffMerkleSnapshots(oldSnapshot, newSnapshot);
+  return mapMerkleDiff(diff);
+}
+
+export async function diffMerkleFromEvents(
+  oldSnapshot: string,
+  changedPaths: string[],
+  repoRoot: string,
+  ignoreRules: MerkleIgnoreRules
+): Promise<PreparedMerkleDiff> {
+  const payload = await native.diffMerkleFromEvents(oldSnapshot, changedPaths, repoRoot, {
+    include: ignoreRules.include,
+    exclude: ignoreRules.exclude,
+    maxFileSize: ignoreRules.maxFileSize,
+  });
+
+  return {
+    ...mapMerkleDiff(payload),
+    nextSnapshot: payload.nextSnapshot ?? payload.next_snapshot,
+  };
 }
 
 
@@ -753,6 +834,10 @@ export class Database {
     return this.inner.chunkExistsOnBranch(branch, chunkId);
   }
 
+  chunkExistsOnOtherBranches(branch: string, chunkId: string): boolean {
+    return this.inner.chunkExistsOnOtherBranches(branch, chunkId);
+  }
+
   getAllBranches(): string[] {
     return this.inner.getAllBranches();
   }
@@ -767,6 +852,22 @@ export class Database {
 
   deleteMetadata(key: string): boolean {
     return this.inner.deleteMetadata(key);
+  }
+
+  getMerkleSnapshot(branch: string): string | null {
+    return this.inner.getMerkleSnapshot(branch) ?? null;
+  }
+
+  saveMerkleSnapshot(snapshot: string): void {
+    this.inner.saveMerkleSnapshot(snapshot);
+  }
+
+  deleteMerkleSnapshot(branch: string): boolean {
+    return this.inner.deleteMerkleSnapshot(branch);
+  }
+
+  clearAllMerkleSnapshots(): void {
+    this.inner.clearAllMerkleSnapshots();
   }
 
   gcOrphanEmbeddings(): number {
