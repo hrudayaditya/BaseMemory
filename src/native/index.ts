@@ -822,6 +822,10 @@ export class Database {
     return this.inner.clearBranch(branch);
   }
 
+  clearAllBranches(): number {
+    return this.inner.clearAllBranches();
+  }
+
   getBranchChunkIds(branch: string): string[] {
     return this.inner.getBranchChunkIds(branch);
   }
@@ -909,8 +913,16 @@ export class Database {
     return this.inner.getSymbolsByNameCi(name);
   }
 
+  symbolExistsOnOtherBranches(branch: string, symbolId: string): boolean {
+    return this.inner.symbolExistsOnOtherBranches(branch, symbolId);
+  }
+
   deleteSymbolsByFile(filePath: string): number {
     return this.inner.deleteSymbolsByFile(filePath);
+  }
+
+  deleteSymbol(symbolId: string): boolean {
+    return this.inner.deleteSymbol(symbolId);
   }
 
   // ── Call Edge methods ────────────────────────────────────────────
@@ -940,6 +952,10 @@ export class Database {
     return this.inner.deleteCallEdgesByFile(filePath);
   }
 
+  deleteCallEdgesBySymbol(symbolId: string): number {
+    return this.inner.deleteCallEdgesBySymbol(symbolId);
+  }
+
   resolveCallEdge(edgeId: string, toSymbolId: string): void {
     this.inner.resolveCallEdge(edgeId, toSymbolId);
   }
@@ -961,6 +977,10 @@ export class Database {
 
   clearBranchSymbols(branch: string): number {
     return this.inner.clearBranchSymbols(branch);
+  }
+
+  clearAllBranchSymbols(): number {
+    return this.inner.clearAllBranchSymbols();
   }
 
   // ── GC methods for symbols/edges ─────────────────────────────────

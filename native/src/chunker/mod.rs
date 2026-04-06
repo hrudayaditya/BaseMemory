@@ -378,31 +378,46 @@ fn enforce_fine_chunk_max_size(
     Ok(result)
 }
 
-#[cfg(debug_assertions)]
-fn coverage_failure(
-    file_path: &str,
-    language: &str,
-    details: String,
-) -> Result<Vec<Chunk>, ChunkerError> {
-    let error = ChunkerError::CoverageInvariant {
-        file_path: file_path.to_string(),
-        language: language.to_string(),
-        details,
-    };
-    panic!("{error}");
+fn single_fallback_chunk(file_path: &str, language: &str, source_code: &str) -> Vec<Chunk> {
+    let line_starts = build_line_index(source_code);
+    let end_byte = source_code.len();
+
+    ensure_non_empty_chunks(
+        file_path,
+        language,
+        source_code,
+        vec![Chunk {
+            file_path: file_path.to_string(),
+            language: language.to_string(),
+            symbol_name: None,
+            symbol_kind: None,
+            chunk_kind: ChunkKind::Code,
+            granularity: Granularity::Fine,
+            start_byte: 0,
+            end_byte: end_byte as u32,
+            start_line: 1,
+            end_line: line_for_byte(&line_starts, end_byte.saturating_sub(1)).max(1),
+            text: source_code.to_string(),
+            chunk_hash: xxhash_content(source_code),
+        }],
+    )
 }
 
-#[cfg(not(debug_assertions))]
 fn coverage_failure(
     file_path: &str,
     language: &str,
+    source_code: &str,
+    config: &ChunkConfig,
     details: String,
 ) -> Result<Vec<Chunk>, ChunkerError> {
-    Err(ChunkerError::CoverageInvariant {
-        file_path: file_path.to_string(),
-        language: language.to_string(),
-        details,
-    })
+    log_warn(format!(
+        "chunker coverage invariant encountered file_path={} language={} details={}",
+        file_path, language, details
+    ));
+
+    let fallback_chunks = chunk_by_lines(file_path, language, source_code, config);
+    let fallback_chunks = ensure_non_empty_chunks(file_path, language, source_code, fallback_chunks);
+    enforce_fine_chunk_max_size(file_path, language, source_code, config, fallback_chunks)
 }
 
 fn enforce_fine_chunk_coverage(
@@ -444,6 +459,8 @@ fn enforce_fine_chunk_coverage(
             return coverage_failure(
                 file_path,
                 language,
+                source_code,
+                config,
                 format!(
                     "overlap detected: previous_end={} current_start={} current_end={}",
                     covered_until, start, end
@@ -532,7 +549,7 @@ fn enforce_fine_chunk_coverage(
                     cursor, start
                 )
             };
-            return coverage_failure(file_path, language, details);
+            return coverage_failure(file_path, language, source_code, config, details);
         }
 
         cursor = end;
@@ -542,6 +559,8 @@ fn enforce_fine_chunk_coverage(
         return coverage_failure(
             file_path,
             language,
+            source_code,
+            config,
             format!(
                 "final coverage ended at {} but source length is {}",
                 cursor,
@@ -601,9 +620,11 @@ pub fn chunk_file(
             file_path,
             normalized_language
         ));
-        return Err(ChunkerError::ParseFailed {
-            file_path: file_path.to_string(),
-        });
+        return Ok(single_fallback_chunk(
+            file_path,
+            policy.language_name,
+            source_code,
+        ));
     };
 
     if tree.root_node().has_error() {

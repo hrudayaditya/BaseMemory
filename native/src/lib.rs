@@ -835,6 +835,16 @@ impl Database {
     }
 
     #[napi]
+    pub fn clear_all_branches(&self) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = db::clear_all_branches(&conn).map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    #[napi]
     pub fn get_branch_chunk_ids(&self, branch: String) -> Result<Vec<String>> {
         let conn = self
             .conn
@@ -1142,6 +1152,20 @@ impl Database {
     }
 
     #[napi]
+    pub fn symbol_exists_on_other_branches(
+        &self,
+        branch: String,
+        symbol_id: String,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        db::symbol_exists_on_other_branches(&conn, &branch, &symbol_id)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
     pub fn delete_symbols_by_file(&self, file_path: String) -> Result<u32> {
         let conn = self
             .conn
@@ -1150,6 +1174,15 @@ impl Database {
         let count = db::delete_symbols_by_file(&conn, &file_path)
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(count as u32)
+    }
+
+    #[napi]
+    pub fn delete_symbol(&self, symbol_id: String) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        db::delete_symbol(&conn, &symbol_id).map_err(|e| Error::from_reason(e.to_string()))
     }
 
     // ── Call Edge methods ────────────────────────────────────────────
@@ -1286,6 +1319,17 @@ impl Database {
     }
 
     #[napi]
+    pub fn delete_call_edges_by_symbol(&self, symbol_id: String) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = db::delete_call_edges_by_symbol(&conn, &symbol_id)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    #[napi]
     pub fn resolve_call_edge(&self, edge_id: String, to_symbol_id: String) -> Result<()> {
         let conn = self
             .conn
@@ -1337,6 +1381,17 @@ impl Database {
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let count = db::clear_branch_symbols(&conn, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    #[napi]
+    pub fn clear_all_branch_symbols(&self) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = db::clear_all_branch_symbols(&conn)
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(count as u32)
     }

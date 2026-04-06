@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync, promises as fsPromises } from "fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync, promises as fsPromises } from "fs";
 import * as path from "path";
 import { performance } from "perf_hooks";
 import PQueue from "p-queue";
@@ -1341,36 +1341,63 @@ function unionCandidates(
   return Array.from(byId.values());
 }
 
+// Keep one Indexer instance per resolved project root in-process so every
+// entrypoint for the same repo shares the same mutation queue and crash marker.
+const indexerInstances = new Map<string, Indexer>();
+
+function resolveIndexerProjectRoot(projectRoot: string): string {
+  const absolutePath = path.resolve(projectRoot);
+  try {
+    return realpathSync(absolutePath);
+  } catch {
+    return absolutePath;
+  }
+}
+
 export class Indexer {
-  private config: ParsedCodebaseIndexConfig;
-  private projectRoot: string;
-  private indexPath: string;
+  private config!: ParsedCodebaseIndexConfig;
+  private projectRoot!: string;
+  private indexPath!: string;
   private store: VectorStore | null = null;
   private invertedIndex: InvertedIndex | null = null;
   private database: Database | null = null;
   private provider: EmbeddingProviderInterface | null = null;
   private configuredProviderInfo: ConfiguredProviderInfo | null = null;
   private fileHashCache: Map<string, string> = new Map();
-  private fileHashCachePath: string = "";
+  private fileHashCacheDir: string = "";
   private failedBatchesPath: string = "";
   private currentBranch: string = "default";
   private baseBranch: string = "main";
-  private logger: Logger;
+  private logger!: Logger;
   private queryEmbeddingCache: Map<string, { embedding: number[]; timestamp: number }> = new Map();
   private readonly maxQueryCacheSize = 100;
   private readonly queryCacheTtlMs = 5 * 60 * 1000;
   private readonly querySimilarityThreshold = 0.85;
   private indexCompatibility: IndexCompatibility | null = null;
   private indexingLockPath: string = "";
+  private indexingQueue: Promise<void> = Promise.resolve();
 
   constructor(projectRoot: string, config: ParsedCodebaseIndexConfig) {
-    this.projectRoot = projectRoot;
+    const resolvedProjectRoot = resolveIndexerProjectRoot(projectRoot);
+    const existing = indexerInstances.get(resolvedProjectRoot);
+    if (existing) {
+      if (JSON.stringify(existing.config) !== JSON.stringify(config)) {
+        throw new Error(
+          `Indexer for ${resolvedProjectRoot} already exists in this process with a different config. ` +
+          "Reuse the existing instance instead of constructing a second one."
+        );
+      }
+      return existing;
+    }
+
+    this.projectRoot = resolvedProjectRoot;
     this.config = config;
     this.indexPath = this.getIndexPath();
-    this.fileHashCachePath = path.join(this.indexPath, "file-hashes.json");
+    this.fileHashCacheDir = path.join(this.indexPath, "file-hashes");
     this.failedBatchesPath = path.join(this.indexPath, "failed-batches.json");
     this.indexingLockPath = path.join(this.indexPath, "indexing.lock");
     this.logger = initializeLogger(config.debug);
+    indexerInstances.set(resolvedProjectRoot, this);
   }
 
   private getIndexPath(): string {
@@ -1381,12 +1408,20 @@ export class Indexer {
     return path.join(this.projectRoot, ".opencode", "index");
   }
 
+  private getFileHashCachePath(branch: string = this.currentBranch): string {
+    const cacheKey = encodeURIComponent(branch || "default");
+    return path.join(this.fileHashCacheDir, `${cacheKey}.json`);
+  }
+
   private loadFileHashCache(): void {
+    const cachePath = this.getFileHashCachePath();
     try {
-      if (existsSync(this.fileHashCachePath)) {
-        const data = readFileSync(this.fileHashCachePath, "utf-8");
+      if (existsSync(cachePath)) {
+        const data = readFileSync(cachePath, "utf-8");
         const parsed = JSON.parse(data);
         this.fileHashCache = new Map(Object.entries(parsed));
+      } else {
+        this.fileHashCache = new Map();
       }
     } catch {
       this.fileHashCache = new Map();
@@ -1398,20 +1433,78 @@ export class Indexer {
     for (const [k, v] of this.fileHashCache) {
       obj[k] = v;
     }
-    this.atomicWriteSync(this.fileHashCachePath, JSON.stringify(obj));
+    this.atomicWriteSync(this.getFileHashCachePath(), JSON.stringify(obj));
+  }
+
+  private clearAllFileHashCaches(): void {
+    this.fileHashCache.clear();
+    if (existsSync(this.fileHashCacheDir)) {
+      rmSync(this.fileHashCacheDir, { recursive: true, force: true });
+    }
   }
 
   private atomicWriteSync(targetPath: string, data: string): void {
     const tempPath = `${targetPath}.tmp`;
+    mkdirSync(path.dirname(targetPath), { recursive: true });
     writeFileSync(tempPath, data);
     renameSync(tempPath, targetPath);
   }
 
-  private checkForInterruptedIndexing(): boolean {
-    return existsSync(this.indexingLockPath);
+  private readIndexingLock(): { pid?: number; startedAt?: string } | null {
+    if (!existsSync(this.indexingLockPath)) {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(readFileSync(this.indexingLockPath, "utf-8")) as {
+        pid?: unknown;
+        startedAt?: unknown;
+      };
+      return {
+        pid: typeof parsed.pid === "number" ? parsed.pid : undefined,
+        startedAt: typeof parsed.startedAt === "string" ? parsed.startedAt : undefined,
+      };
+    } catch {
+      return {};
+    }
   }
 
+  private isProcessAlive(pid: number): boolean {
+    if (!Number.isInteger(pid) || pid <= 0) {
+      return false;
+    }
+
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EPERM") {
+        return true;
+      }
+      if (code === "ESRCH") {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  // Concurrent multi-process mutation of the same repo index is not supported.
+  // This marker file is only a crash/restart guard; in-process serialization comes
+  // from runSerializedIndexOperation().
   private acquireIndexingLock(): void {
+    const existingLock = this.readIndexingLock();
+    if (
+      existingLock?.pid !== undefined &&
+      existingLock.pid !== process.pid &&
+      this.isProcessAlive(existingLock.pid)
+    ) {
+      throw new Error(
+        `Index at ${this.indexPath} is already being modified by process ${existingLock.pid}. ` +
+        "Concurrent multi-process indexing of the same repo is not supported."
+      );
+    }
+
     const lockData = {
       startedAt: new Date().toISOString(),
       pid: process.pid,
@@ -1420,22 +1513,59 @@ export class Indexer {
   }
 
   private releaseIndexingLock(): void {
-    if (existsSync(this.indexingLockPath)) {
+    const existingLock = this.readIndexingLock();
+    if (
+      existsSync(this.indexingLockPath) &&
+      (existingLock?.pid === undefined || existingLock.pid === process.pid)
+    ) {
       unlinkSync(this.indexingLockPath);
     }
   }
 
-  private async recoverFromInterruptedIndexing(): Promise<void> {
-    this.logger.warn("Detected interrupted indexing session, recovering...");
+  private async recoverFromInterruptedIndexing(lockData: { pid?: number; startedAt?: string }): Promise<void> {
+    const { database } = await this.ensureInitialized();
+    this.logger.warn("Detected interrupted indexing session, recovering...", {
+      previousPid: lockData.pid,
+      startedAt: lockData.startedAt,
+    });
 
-    if (existsSync(this.fileHashCachePath)) {
-      unlinkSync(this.fileHashCachePath);
+    this.clearAllFileHashCaches();
+    database.clearAllMerkleSnapshots();
+
+    this.acquireIndexingLock();
+    try {
+      await this.healthCheckInternal({ useCrashMarker: false });
+    } finally {
+      this.releaseIndexingLock();
     }
 
-    await this.healthCheck();
-    this.releaseIndexingLock();
+    this.logger.info(
+      "Recovery complete, cleared stale Merkle snapshots and file hash caches; next index will rebuild them from disk"
+    );
+  }
 
-    this.logger.info("Recovery complete, next index will re-process all files");
+  private async runSerializedIndexOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const waitForPrevious = this.indexingQueue.catch(() => {});
+    let releaseQueue: () => void = () => {};
+    this.indexingQueue = new Promise<void>((resolve) => {
+      releaseQueue = resolve;
+    });
+
+    await waitForPrevious;
+    try {
+      return await operation();
+    } finally {
+      releaseQueue();
+    }
+  }
+
+  private async runWithCrashMarker<T>(operation: () => Promise<T>): Promise<T> {
+    this.acquireIndexingLock();
+    try {
+      return await operation();
+    } finally {
+      this.releaseIndexingLock();
+    }
   }
 
   private loadFailedBatches(): FailedBatch[] {
@@ -1560,12 +1690,35 @@ export class Indexer {
     const dbIsNew = !existsSync(dbPath);
     this.database = new Database(dbPath);
 
-    // Recover from interrupted indexing AFTER store, invertedIndex, and database
-    // are all initialized. healthCheck() calls ensureInitialized() which checks
-    // these fields — if they're not set, it re-enters initialize() causing infinite
-    // recursion and 70GB+ memory usage.
-    if (this.checkForInterruptedIndexing()) {
-      await this.recoverFromInterruptedIndexing();
+    if (isGitRepo(this.projectRoot)) {
+      this.currentBranch = getBranchOrDefault(this.projectRoot);
+      this.baseBranch = getBaseBranch(this.projectRoot);
+      this.logger.branch("info", "Detected git repository", {
+        currentBranch: this.currentBranch,
+        baseBranch: this.baseBranch,
+      });
+    } else {
+      this.currentBranch = "default";
+      this.baseBranch = "default";
+      this.logger.branch("debug", "Not a git repository, using default branch");
+    }
+
+    // Recover from interrupted indexing AFTER store, invertedIndex, database,
+    // and branch state are all initialized. Recovery uses branch-scoped cleanup
+    // and must know which branch is currently checked out.
+    const existingLock = this.readIndexingLock();
+    if (existingLock) {
+      if (
+        existingLock.pid !== undefined &&
+        existingLock.pid !== process.pid &&
+        this.isProcessAlive(existingLock.pid)
+      ) {
+        throw new Error(
+          `Index at ${this.indexPath} is already being modified by process ${existingLock.pid}. ` +
+          "Concurrent multi-process indexing of the same repo is not supported."
+        );
+      }
+      await this.recoverFromInterruptedIndexing(existingLock);
     }
 
     if (dbIsNew && this.store.count() > 0) {
@@ -1579,19 +1732,6 @@ export class Indexer {
         storedMetadata: this.indexCompatibility.storedMetadata,
         configuredProviderInfo: this.configuredProviderInfo,
       });
-    }
-
-    if (isGitRepo(this.projectRoot)) {
-      this.currentBranch = getBranchOrDefault(this.projectRoot);
-      this.baseBranch = getBaseBranch(this.projectRoot);
-      this.logger.branch("info", "Detected git repository", {
-        currentBranch: this.currentBranch,
-        baseBranch: this.baseBranch,
-      });
-    } else {
-      this.currentBranch = "default";
-      this.baseBranch = "default";
-      this.logger.branch("debug", "Not a git repository, using default branch");
     }
 
     // Auto-GC: Run garbage collection if enabled and interval has elapsed
@@ -1619,7 +1759,7 @@ export class Indexer {
     }
 
     if (shouldRunGc) {
-      await this.healthCheck();
+      await this.healthCheckInternal();
       this.database.setMetadata("lastGcTimestamp", now.toString());
     }
   }
@@ -1811,46 +1951,59 @@ export class Indexer {
     files: Array<{ path: string; content: string; hash: string }>
   ): {
     parsedFiles: ParsedFileCandidate[];
+    failedFilePaths: string[];
     parseMs: number;
   } {
     const parseStartTime = performance.now();
-    const parsedFiles = files.map((file) => {
-      const semanticChunks = chunkFile(
-        file.path,
-        getChunkerLanguage(file.path),
-        file.content,
-        {
-          targetTokenBudget: 1500,
-          maxChunkChars: 3000,
-          minChunkChars: 200,
-          mergeSmallSiblings: true,
-          attachComments: true,
-          emitCoarseChunks: true,
-        }
-      );
+    const parsedFiles: ParsedFileCandidate[] = [];
+    const failedFilePaths: string[] = [];
 
-      const chunks = semanticChunks
-        .filter((chunk) => chunk.granularity === "Fine")
-        .map((chunk) => ({
-          content: chunk.text,
-          startLine: chunk.startLine,
-          endLine: chunk.endLine,
-          chunkType: mapSemanticChunkType(chunk.symbolKind),
-          name: chunk.symbolName,
-          language: chunk.language,
-          chunkHash: chunk.chunkHash,
-        }));
+    for (const file of files) {
+      try {
+        const semanticChunks = chunkFile(
+          file.path,
+          getChunkerLanguage(file.path),
+          file.content,
+          {
+            targetTokenBudget: 1500,
+            maxChunkChars: 3000,
+            minChunkChars: 200,
+            mergeSmallSiblings: true,
+            attachComments: true,
+            emitCoarseChunks: true,
+          }
+        );
 
-      return {
-        path: file.path,
-        hash: file.hash,
-        content: file.content,
-        chunks,
-      };
-    });
+        const chunks = semanticChunks
+          .filter((chunk) => chunk.granularity === "Fine")
+          .map((chunk) => ({
+            content: chunk.text,
+            startLine: chunk.startLine,
+            endLine: chunk.endLine,
+            chunkType: mapSemanticChunkType(chunk.symbolKind),
+            name: chunk.symbolName,
+            language: chunk.language,
+            chunkHash: chunk.chunkHash,
+          }));
+
+        parsedFiles.push({
+          path: file.path,
+          hash: file.hash,
+          content: file.content,
+          chunks,
+        });
+      } catch (error) {
+        failedFilePaths.push(file.path);
+        this.logger.warn("Chunking failed for file, skipping it for this pass", {
+          filePath: file.path,
+          error: getErrorMessage(error),
+        });
+      }
+    }
 
     return {
       parsedFiles,
+      failedFilePaths,
       parseMs: performance.now() - parseStartTime,
     };
   }
@@ -1943,6 +2096,25 @@ export class Indexer {
 
     store.remove(chunkId);
     invertedIndex.removeChunk(chunkId);
+    return true;
+  }
+
+  private clearCallEdgesForSymbolIfUnreferenced(database: Database, symbolId: string): boolean {
+    if (database.symbolExistsOnOtherBranches(this.currentBranch, symbolId)) {
+      return false;
+    }
+
+    database.deleteCallEdgesBySymbol(symbolId);
+    return true;
+  }
+
+  private removeSymbolFromGraphIfUnreferenced(database: Database, symbolId: string): boolean {
+    if (database.symbolExistsOnOtherBranches(this.currentBranch, symbolId)) {
+      return false;
+    }
+
+    database.deleteCallEdgesBySymbol(symbolId);
+    database.deleteSymbol(symbolId);
     return true;
   }
 
@@ -2074,6 +2246,12 @@ export class Indexer {
       return;
     }
 
+    await this.runSerializedIndexOperation(() => this.handleFileChangesInternal(changes));
+  }
+
+  private async handleFileChangesInternal(
+    changes: Array<{ type: "add" | "change" | "unlink"; path: string }>
+  ): Promise<void> {
     try {
       const { database } = await this.ensureInitialized();
       this.refreshBranchInfo();
@@ -2083,7 +2261,7 @@ export class Indexer {
         this.logger.branch("warn", "Merkle snapshot missing, falling back to full index", {
           branch: this.currentBranch,
         });
-        await this.index();
+        await this.indexInternal();
         return;
       }
 
@@ -2109,7 +2287,7 @@ export class Indexer {
         return;
       }
 
-      await this.indexDirtySet(
+      await this.indexDirtySetInternal(
         {
           changedFiles: prepared.changedFiles,
           addedFiles: prepared.addedFiles,
@@ -2123,11 +2301,15 @@ export class Indexer {
         branch: this.currentBranch,
         error: getErrorMessage(error),
       });
-      await this.index();
+      await this.indexInternal();
     }
   }
 
   async handleBranchChange(_oldBranch: string | null, newBranch: string): Promise<void> {
+    await this.runSerializedIndexOperation(() => this.handleBranchChangeInternal(_oldBranch, newBranch));
+  }
+
+  private async handleBranchChangeInternal(_oldBranch: string | null, newBranch: string): Promise<void> {
     try {
       const { database } = await this.ensureInitialized();
       this.refreshBranchInfo();
@@ -2137,7 +2319,7 @@ export class Indexer {
         this.logger.branch("warn", "Merkle snapshot missing for branch, falling back to full index", {
           branch: newBranch,
         });
-        await this.index();
+        await this.indexInternal();
         return;
       }
 
@@ -2157,17 +2339,27 @@ export class Indexer {
         return;
       }
 
-      await this.indexDirtySet(diff, currentSnapshot.snapshot, storedSnapshot);
+      await this.indexDirtySetInternal(diff, currentSnapshot.snapshot, storedSnapshot);
     } catch (error) {
       this.logger.branch("warn", "Merkle branch update failed, falling back to full index", {
         branch: newBranch,
         error: getErrorMessage(error),
       });
-      await this.index();
+      await this.indexInternal();
     }
   }
 
   async indexDirtySet(
+    diff: MerkleDiff,
+    nextSnapshot?: string,
+    baseSnapshot: string | null = null
+  ): Promise<IndexStats> {
+    return this.runSerializedIndexOperation(() =>
+      this.indexDirtySetInternal(diff, nextSnapshot, baseSnapshot)
+    );
+  }
+
+  private async indexDirtySetInternal(
     diff: MerkleDiff,
     nextSnapshot?: string,
     baseSnapshot: string | null = null
@@ -2236,6 +2428,7 @@ export class Indexer {
       const allSymbolIds = new Set(branchSymbolIds);
       const existingChunks = new Map<string, string>();
       const oldChunkIdsForTouchedFiles = new Set<string>();
+      const oldSymbolIdsForTouchedFiles = new Set<string>();
       const oldChunkIdsByFile = new Map<string, Set<string>>();
       const oldSymbolIdsByFile = new Map<string, Set<string>>();
       const touchedAbsolutePaths = touchedRelativePaths.map((relativePath) => this.toAbsolutePath(relativePath));
@@ -2260,6 +2453,7 @@ export class Indexer {
           .filter((symbol) => branchSymbolIds.has(symbol.id));
         for (const symbol of fileSymbols) {
           this.getOrCreateSet(oldSymbolIdsByFile, filePath).add(symbol.id);
+          oldSymbolIdsForTouchedFiles.add(symbol.id);
         }
       }
 
@@ -2273,9 +2467,13 @@ export class Indexer {
         parsedInput.push({ path: filePath, content, hash });
       }
 
-      const { parsedFiles, parseMs } = this.parseFilesForIndexing(parsedInput);
+      const { parsedFiles, failedFilePaths, parseMs } = this.parseFilesForIndexing(parsedInput);
       this.logger.recordFilesParsed(parsedFiles.length);
       this.logger.recordParseDuration(parseMs);
+
+      for (const filePath of failedFilePaths) {
+        stats.parseFailures.push(path.relative(this.projectRoot, filePath));
+      }
 
       const pendingChunks: PendingChunk[] = [];
       const chunkDataBatch: ChunkData[] = [];
@@ -2358,7 +2556,7 @@ export class Indexer {
       const missingHashes = new Set(database.getMissingEmbeddings(allContentHashes));
       const chunksNeedingEmbedding = pendingChunks.filter((chunk) => missingHashes.has(chunk.contentHash));
       const chunksWithExistingEmbedding = pendingChunks.filter((chunk) => !missingHashes.has(chunk.contentHash));
-      const failedFiles = new Set<string>();
+      const failedFiles = new Set<string>(failedFilePaths);
       const materializedChunkIdsByFile = new Map<string, Set<string>>();
       const markChunkMaterialized = (filePath: string, chunkId: string): void => {
         this.getOrCreateSet(materializedChunkIdsByFile, filePath).add(chunkId);
@@ -2486,8 +2684,6 @@ export class Indexer {
           }
         }
 
-        database.deleteCallEdgesByFile(removedFilePath);
-        database.deleteSymbolsByFile(removedFilePath);
       }
 
       const successfulParsedFiles = parsedFiles.filter((parsed) => !failedFiles.has(parsed.path));
@@ -2506,8 +2702,11 @@ export class Indexer {
           }
         }
 
-        database.deleteCallEdgesByFile(parsed.path);
-        database.deleteSymbolsByFile(parsed.path);
+        if (oldSymbolIds) {
+          for (const symbolId of oldSymbolIds) {
+            this.clearCallEdgesForSymbolIfUnreferenced(database, symbolId);
+          }
+        }
 
         const graph = fileGraphData.get(parsed.path);
         if (!graph) {
@@ -2534,6 +2733,13 @@ export class Indexer {
         }
       }
       stats.removedChunks = globallyRemovedChunks;
+
+      const staleSymbolIds = Array.from(oldSymbolIdsForTouchedFiles).filter(
+        (symbolId) => !allSymbolIds.has(symbolId)
+      );
+      for (const symbolId of staleSymbolIds) {
+        this.removeSymbolFromGraphIfUnreferenced(database, symbolId);
+      }
 
       const rolledBackChunkCount = Array.from(failedFiles).reduce(
         (total, filePath) => total + (materializedChunkIdsByFile.get(filePath)?.size ?? 0),
@@ -2603,6 +2809,10 @@ export class Indexer {
   }
 
   async index(onProgress?: ProgressCallback): Promise<IndexStats> {
+    return this.runSerializedIndexOperation(() => this.indexInternal(onProgress));
+  }
+
+  private async indexInternal(onProgress?: ProgressCallback): Promise<IndexStats> {
     const { store, provider, invertedIndex, database, configuredProviderInfo } = await this.ensureInitialized();
     this.refreshBranchInfo();
 
@@ -2614,32 +2824,33 @@ export class Indexer {
     }
 
     this.acquireIndexingLock();
-    this.logger.recordIndexingStart();
-    this.logger.info("Starting indexing", { projectRoot: this.projectRoot });
+    try {
+      this.logger.recordIndexingStart();
+      this.logger.info("Starting indexing", { projectRoot: this.projectRoot });
 
-    const startTime = Date.now();
-    const stats: IndexStats = {
-      totalFiles: 0,
-      totalChunks: 0,
-      indexedChunks: 0,
-      failedChunks: 0,
-      tokensUsed: 0,
-      durationMs: 0,
-      existingChunks: 0,
-      removedChunks: 0,
-      skippedFiles: [],
-      parseFailures: [],
-    };
+      const startTime = Date.now();
+      const stats: IndexStats = {
+        totalFiles: 0,
+        totalChunks: 0,
+        indexedChunks: 0,
+        failedChunks: 0,
+        tokensUsed: 0,
+        durationMs: 0,
+        existingChunks: 0,
+        removedChunks: 0,
+        skippedFiles: [],
+        parseFailures: [],
+      };
 
-    onProgress?.({
-      phase: "scanning",
-      filesProcessed: 0,
-      totalFiles: 0,
-      chunksProcessed: 0,
-      totalChunks: 0,
-    });
+      onProgress?.({
+        phase: "scanning",
+        filesProcessed: 0,
+        totalFiles: 0,
+        chunksProcessed: 0,
+        totalChunks: 0,
+      });
 
-    this.loadFileHashCache();
+      this.loadFileHashCache();
 
     const { files, skipped } = await collectFiles(
       this.projectRoot,
@@ -2686,11 +2897,15 @@ export class Indexer {
       totalChunks: 0,
     });
 
-    const { parsedFiles, parseMs } = this.parseFilesForIndexing(changedFiles);
+    const { parsedFiles, failedFilePaths, parseMs } = this.parseFilesForIndexing(changedFiles);
 
     this.logger.recordFilesParsed(parsedFiles.length);
     this.logger.recordParseDuration(parseMs);
     this.logger.debug("Parsed changed files", { parsedCount: parsedFiles.length, parseMs: parseMs.toFixed(2) });
+
+    for (const filePath of failedFilePaths) {
+      stats.parseFailures.push(path.relative(this.projectRoot, filePath));
+    }
 
     const branchChunkIds = new Set(database.getBranchChunkIds(this.currentBranch));
     const branchSymbolIds = new Set(database.getBranchSymbolIds(this.currentBranch));
@@ -2714,6 +2929,7 @@ export class Indexer {
       ])
     ).sort();
     const oldChunkIdsForTouchedFiles = new Set<string>();
+    const oldSymbolIdsForTouchedFiles = new Set<string>();
     const oldChunkIdsByFile = new Map<string, Set<string>>();
     const oldSymbolIdsByFile = new Map<string, Set<string>>();
 
@@ -2734,6 +2950,7 @@ export class Indexer {
         .filter((symbol) => branchSymbolIds.has(symbol.id));
       for (const symbol of fileSymbols) {
         this.getOrCreateSet(oldSymbolIdsByFile, filePath).add(symbol.id);
+        oldSymbolIdsForTouchedFiles.add(symbol.id);
       }
     }
 
@@ -2830,7 +3047,7 @@ export class Indexer {
     });
     this.logger.recordChunksFromCache(chunksWithExistingEmbedding.length);
 
-    const failedFiles = new Set<string>();
+    const failedFiles = new Set<string>(failedFilePaths);
     const materializedChunkIdsByFile = new Map<string, Set<string>>();
     const markChunkMaterialized = (filePath: string, chunkId: string): void => {
       this.getOrCreateSet(materializedChunkIdsByFile, filePath).add(chunkId);
@@ -2991,9 +3208,6 @@ export class Indexer {
           allSymbolIds.delete(symbolId);
         }
       }
-
-      database.deleteCallEdgesByFile(removedFilePath);
-      database.deleteSymbolsByFile(removedFilePath);
     }
 
     const successfulParsedFiles = parsedFiles.filter((parsed) => !failedFiles.has(parsed.path));
@@ -3012,8 +3226,11 @@ export class Indexer {
         }
       }
 
-      database.deleteCallEdgesByFile(parsed.path);
-      database.deleteSymbolsByFile(parsed.path);
+      if (oldSymbolIds) {
+        for (const symbolId of oldSymbolIds) {
+          this.clearCallEdgesForSymbolIfUnreferenced(database, symbolId);
+        }
+      }
 
       const graph = fileGraphData.get(parsed.path);
       if (!graph) {
@@ -3037,6 +3254,13 @@ export class Indexer {
       if (this.removeChunkFromRetrievalIfUnreferenced(database, store, invertedIndex, chunkId)) {
         removedCount++;
       }
+    }
+
+    const staleSymbolIds = Array.from(oldSymbolIdsForTouchedFiles).filter(
+      (symbolId) => !allSymbolIds.has(symbolId)
+    );
+    for (const symbolId of staleSymbolIds) {
+      this.removeSymbolFromGraphIfUnreferenced(database, symbolId);
     }
 
     const rolledBackChunkCount = Array.from(failedFiles).reduce(
@@ -3128,8 +3352,10 @@ export class Indexer {
       totalChunks: pendingChunks.length,
     });
 
-    this.releaseIndexingLock();
-    return stats;
+      return stats;
+    } finally {
+      this.releaseIndexingLock();
+    }
   }
 
   private async getQueryEmbedding(query: string, provider: EmbeddingProviderInterface): Promise<number[]> {
@@ -3503,149 +3729,231 @@ export class Indexer {
     };
   }
 
+  // clearIndex is intentionally a global reset. It is only used by force=true
+  // before a rebuild, so it wipes retrieval state, branch catalogs, file-hash
+  // caches, failed-batch backlog, and Merkle snapshots across every branch.
   async clearIndex(): Promise<void> {
+    return this.runSerializedIndexOperation(() => this.clearIndexInternal());
+  }
+
+  private async clearIndexInternal(): Promise<void> {
     const { store, invertedIndex, database } = await this.ensureInitialized();
 
-    store.clear();
-    store.save();
-    invertedIndex.clear();
-    invertedIndex.save();
+    await this.runWithCrashMarker(async () => {
+      store.clear();
+      store.save();
+      invertedIndex.clear();
+      invertedIndex.save();
 
-    // Clear file hash cache so all files are re-parsed
-    this.fileHashCache.clear();
-    this.saveFileHashCache();
-    database.clearAllMerkleSnapshots();
+      this.clearAllFileHashCaches();
+      this.saveFailedBatches([]);
+      database.clearAllMerkleSnapshots();
+      database.clearAllBranches();
+      database.clearAllBranchSymbols();
+      database.gcOrphanSymbols();
+      database.gcOrphanCallEdges();
+      database.gcOrphanChunks();
+      database.gcOrphanEmbeddings();
 
-    // Clear branch catalog
-    database.clearBranch(this.currentBranch);
-    database.clearBranchSymbols(this.currentBranch);
+      // Clear index metadata so compatibility is re-evaluated from scratch.
+      database.deleteMetadata("index.version");
+      database.deleteMetadata("index.embeddingProvider");
+      database.deleteMetadata("index.embeddingModel");
+      database.deleteMetadata("index.embeddingDimensions");
+      database.deleteMetadata("index.createdAt");
+      database.deleteMetadata("index.updatedAt");
 
-    // Clear index metadata so compatibility is re-evaluated from scratch
-    database.deleteMetadata("index.version");
-    database.deleteMetadata("index.embeddingProvider");
-    database.deleteMetadata("index.embeddingModel");
-    database.deleteMetadata("index.embeddingDimensions");
-    database.deleteMetadata("index.createdAt");
-    database.deleteMetadata("index.updatedAt");
-
-    // Re-validate compatibility (no stored metadata = compatible)
-    this.indexCompatibility = this.validateIndexCompatibility(this.configuredProviderInfo!);
+      // Re-validate compatibility (no stored metadata = compatible).
+      this.indexCompatibility = this.validateIndexCompatibility(this.configuredProviderInfo!);
+    });
   }
 
   async healthCheck(): Promise<HealthCheckResult> {
+    return this.runSerializedIndexOperation(() => this.healthCheckInternal());
+  }
+
+  private async healthCheckInternal(
+    options: { useCrashMarker?: boolean } = {}
+  ): Promise<HealthCheckResult> {
     const { store, invertedIndex, database } = await this.ensureInitialized();
+    const run = async (): Promise<HealthCheckResult> => {
+      this.refreshBranchInfo();
+      this.loadFileHashCache();
+      this.logger.gc("info", "Starting health check", { branch: this.currentBranch });
 
-    this.logger.gc("info", "Starting health check");
+      const branchChunkIds = new Set(database.getBranchChunkIds(this.currentBranch));
+      const branchSymbolIds = new Set(database.getBranchSymbolIds(this.currentBranch));
+      const { existingChunksByFile } = this.buildBranchStoreChunkMaps(store, branchChunkIds);
+      const currentChunkIds = new Set(branchChunkIds);
+      const allSymbolIds = new Set(branchSymbolIds);
+      const missingFilePaths = new Set<string>();
 
-    const allMetadata = store.getAllMetadata();
-    const filePathsToChunkKeys = new Map<string, string[]>();
-
-    for (const { key, metadata } of allMetadata) {
-      const existing = filePathsToChunkKeys.get(metadata.filePath) || [];
-      existing.push(key);
-      filePathsToChunkKeys.set(metadata.filePath, existing);
-    }
-
-    const removedFilePaths: string[] = [];
-    let removedCount = 0;
-
-    for (const [filePath, chunkKeys] of filePathsToChunkKeys) {
-      if (!existsSync(filePath)) {
-        for (const key of chunkKeys) {
-          store.remove(key);
-          invertedIndex.removeChunk(key);
-          removedCount++;
+      for (const filePath of existingChunksByFile.keys()) {
+        if (!existsSync(filePath)) {
+          missingFilePaths.add(filePath);
         }
-        database.deleteChunksByFile(filePath);
-        database.deleteCallEdgesByFile(filePath);
-        database.deleteSymbolsByFile(filePath);
-        removedFilePaths.push(filePath);
       }
+      for (const filePath of this.fileHashCache.keys()) {
+        if (!existsSync(filePath)) {
+          missingFilePaths.add(filePath);
+        }
+      }
+
+      const removedFilePaths = Array.from(missingFilePaths).sort();
+      let removedCount = 0;
+
+      for (const filePath of removedFilePaths) {
+        const chunkKeys = existingChunksByFile.get(filePath);
+        if (chunkKeys) {
+          for (const key of chunkKeys) {
+            currentChunkIds.delete(key);
+            if (this.removeChunkFromRetrievalIfUnreferenced(database, store, invertedIndex, key)) {
+              removedCount++;
+            }
+          }
+        }
+
+        const fileSymbols = database
+          .getSymbolsByFile(filePath)
+          .filter((symbol) => branchSymbolIds.has(symbol.id));
+        for (const symbol of fileSymbols) {
+          allSymbolIds.delete(symbol.id);
+          this.removeSymbolFromGraphIfUnreferenced(database, symbol.id);
+        }
+      }
+
+      if (removedFilePaths.length > 0) {
+        database.clearBranch(this.currentBranch);
+        database.addChunksToBranchBatch(this.currentBranch, Array.from(currentChunkIds));
+        database.clearBranchSymbols(this.currentBranch);
+        database.addSymbolsToBranchBatch(this.currentBranch, Array.from(allSymbolIds));
+        this.commitFileHashChanges(new Map<string, string>(), removedFilePaths);
+
+        // healthCheck performs out-of-band cleanup, so invalidate the current
+        // branch snapshot instead of trying to patch it incrementally.
+        database.deleteMerkleSnapshot(this.currentBranch);
+      }
+
+      if (removedCount > 0) {
+        store.save();
+        invertedIndex.save();
+      }
+
+      const gcOrphanEmbeddings = database.gcOrphanEmbeddings();
+      const gcOrphanChunks = database.gcOrphanChunks();
+      const gcOrphanSymbols = database.gcOrphanSymbols();
+      const gcOrphanCallEdges = database.gcOrphanCallEdges();
+
+      this.logger.recordGc(removedCount, gcOrphanChunks, gcOrphanEmbeddings);
+      this.logger.gc("info", "Health check complete", {
+        branch: this.currentBranch,
+        removedStale: removedCount,
+        orphanEmbeddings: gcOrphanEmbeddings,
+        orphanChunks: gcOrphanChunks,
+        removedFiles: removedFilePaths.length,
+        invalidatedMerkleSnapshot: removedFilePaths.length > 0,
+      });
+
+      return {
+        removed: removedCount,
+        filePaths: removedFilePaths,
+        gcOrphanEmbeddings,
+        gcOrphanChunks,
+        gcOrphanSymbols,
+        gcOrphanCallEdges,
+      };
+    };
+
+    if (options.useCrashMarker === false) {
+      return run();
     }
-
-    if (removedCount > 0) {
-      store.save();
-      invertedIndex.save();
-    }
-
-    const gcOrphanEmbeddings = database.gcOrphanEmbeddings();
-    const gcOrphanChunks = database.gcOrphanChunks();
-    const gcOrphanSymbols = database.gcOrphanSymbols();
-    const gcOrphanCallEdges = database.gcOrphanCallEdges();
-
-    this.logger.recordGc(removedCount, gcOrphanChunks, gcOrphanEmbeddings);
-    this.logger.gc("info", "Health check complete", {
-      removedStale: removedCount,
-      orphanEmbeddings: gcOrphanEmbeddings,
-      orphanChunks: gcOrphanChunks,
-      removedFiles: removedFilePaths.length,
-    });
-
-    return { removed: removedCount, filePaths: removedFilePaths, gcOrphanEmbeddings, gcOrphanChunks, gcOrphanSymbols, gcOrphanCallEdges };
+    return this.runWithCrashMarker(run);
   }
 
   async retryFailedBatches(): Promise<{ succeeded: number; failed: number; remaining: number }> {
-    const { store, provider, invertedIndex } = await this.ensureInitialized();
+    return this.runSerializedIndexOperation(() => this.retryFailedBatchesInternal());
+  }
 
-    const failedBatches = this.loadFailedBatches();
-    if (failedBatches.length === 0) {
-      return { succeeded: 0, failed: 0, remaining: 0 };
-    }
+  private async retryFailedBatchesInternal(): Promise<{ succeeded: number; failed: number; remaining: number }> {
+    const { provider, database, configuredProviderInfo } = await this.ensureInitialized();
 
-    let succeeded = 0;
-    let failed = 0;
-    const stillFailing: FailedBatch[] = [];
-
-    for (const batch of failedBatches) {
-      try {
-        const result = await pRetry(
-          async () => {
-            const texts = batch.chunks.map((c) => c.text);
-            return provider.embedBatch(texts);
-          },
-          {
-            retries: this.config.indexing.retries,
-            minTimeout: this.config.indexing.retryDelayMs,
-          }
-        );
-
-        const items = batch.chunks.map((chunk, idx) => ({
-          id: chunk.id,
-          vector: result.embeddings[idx],
-          metadata: chunk.metadata,
-        }));
-
-        store.addBatch(items);
-
-        for (const chunk of batch.chunks) {
-          invertedIndex.removeChunk(chunk.id);
-          invertedIndex.addChunk(chunk.id, chunk.content);
-        }
-
-        this.logger.recordChunksEmbedded(batch.chunks.length);
-        this.logger.recordEmbeddingApiCall(result.totalTokensUsed);
-
-        succeeded += batch.chunks.length;
-      } catch (error) {
-        failed += batch.chunks.length;
-        this.logger.recordEmbeddingError();
-        stillFailing.push({
-          ...batch,
-          attemptCount: batch.attemptCount + 1,
-          lastAttempt: new Date().toISOString(),
-          error: String(error),
-        });
+    return this.runWithCrashMarker(async () => {
+      const failedBatches = this.loadFailedBatches();
+      if (failedBatches.length === 0) {
+        return { succeeded: 0, failed: 0, remaining: 0 };
       }
-    }
 
-    this.saveFailedBatches(stillFailing);
+      let succeeded = 0;
+      let failed = 0;
+      const stillFailing: FailedBatch[] = [];
+      const successfulRetryFiles = new Set<string>();
 
-    if (succeeded > 0) {
-      store.save();
-      invertedIndex.save();
-    }
+      for (const batch of failedBatches) {
+        try {
+          const result = await pRetry(
+            async () => {
+              const texts = batch.chunks.map((c) => c.text);
+              return provider.embedBatch(texts);
+            },
+            {
+              retries: this.config.indexing.retries,
+              minTimeout: this.config.indexing.retryDelayMs,
+            }
+          );
 
-    return { succeeded, failed, remaining: stillFailing.length };
+          database.upsertEmbeddingsBatch(
+            batch.chunks.map((chunk, idx) => ({
+              contentHash: chunk.contentHash,
+              embedding: float32ArrayToBuffer(result.embeddings[idx]),
+              chunkText: chunk.text,
+              model: configuredProviderInfo.modelInfo.model,
+            }))
+          );
+
+          for (const chunk of batch.chunks) {
+            successfulRetryFiles.add(chunk.metadata.filePath);
+          }
+
+          this.logger.recordChunksEmbedded(batch.chunks.length);
+          this.logger.recordEmbeddingApiCall(result.totalTokensUsed);
+
+          succeeded += batch.chunks.length;
+        } catch (error) {
+          failed += batch.chunks.length;
+          this.logger.recordEmbeddingError();
+          stillFailing.push({
+            ...batch,
+            attemptCount: batch.attemptCount + 1,
+            lastAttempt: new Date().toISOString(),
+            error: String(error),
+          });
+        }
+      }
+
+      this.saveFailedBatches(stillFailing);
+
+      const remainingFailedFiles = new Set<string>();
+      for (const batch of stillFailing) {
+        for (const chunk of batch.chunks) {
+          remainingFailedFiles.add(chunk.metadata.filePath);
+        }
+      }
+
+      const fullyRecoveredFiles = Array.from(successfulRetryFiles).filter(
+        (filePath) => !remainingFailedFiles.has(filePath)
+      );
+
+      if (fullyRecoveredFiles.length > 0) {
+        await this.handleFileChangesInternal(
+          fullyRecoveredFiles.map((filePath) => ({
+            type: "change" as const,
+            path: filePath,
+          }))
+        );
+      }
+
+      return { succeeded, failed, remaining: this.loadFailedBatches().length };
+    });
   }
 
   getFailedBatchesCount(): number {
@@ -3662,8 +3970,12 @@ export class Indexer {
 
   refreshBranchInfo(): void {
     if (isGitRepo(this.projectRoot)) {
+      const previousBranch = this.currentBranch;
       this.currentBranch = getBranchOrDefault(this.projectRoot);
       this.baseBranch = getBaseBranch(this.projectRoot);
+      if (this.currentBranch !== previousBranch) {
+        this.loadFileHashCache();
+      }
     }
   }
 

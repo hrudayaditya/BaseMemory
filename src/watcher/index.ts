@@ -1,8 +1,9 @@
+import * as fs from "fs";
 import chokidar, { FSWatcher } from "chokidar";
 import * as path from "path";
 
 import { CodebaseIndexConfig } from "../config/schema.js";
-import { createIgnoreFilter, shouldIncludeFile } from "../utils/files.js";
+import { createIgnoreFilter, matchesExcludePattern, shouldIncludeFile } from "../utils/files.js";
 import { Indexer } from "../indexer/index.js";
 import { isGitRepo, getHeadPath, getCurrentBranch } from "../git/index.js";
 
@@ -39,12 +40,18 @@ export class FileWatcher {
     const ignoreFilter = createIgnoreFilter(this.projectRoot);
 
     this.watcher = chokidar.watch(this.projectRoot, {
-      ignored: (filePath: string) => {
+      ignored: (filePath: string, stats?: fs.Stats) => {
         const relativePath = path.relative(this.projectRoot, filePath);
         if (!relativePath) return false;
 
-        if (ignoreFilter.ignores(relativePath)) {
+        if (ignoreFilter.ignores(relativePath, this.isDirectoryPath(filePath, stats))) {
           return true;
+        }
+
+        for (const pattern of this.config.exclude) {
+          if (matchesExcludePattern(relativePath, pattern)) {
+            return true;
+          }
         }
 
         return false;
@@ -77,6 +84,18 @@ export class FileWatcher {
 
     this.pendingChanges.set(filePath, type);
     this.scheduleFlush();
+  }
+
+  private isDirectoryPath(filePath: string, stats?: fs.Stats): boolean {
+    if (stats) {
+      return stats.isDirectory();
+    }
+
+    try {
+      return fs.statSync(filePath).isDirectory();
+    } catch {
+      return false;
+    }
   }
 
   private scheduleFlush(): void {

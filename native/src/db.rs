@@ -654,6 +654,12 @@ pub fn clear_branch(conn: &Connection, branch: &str) -> DbResult<usize> {
     Ok(count)
 }
 
+/// Remove all branch-chunk associations across every branch
+pub fn clear_all_branches(conn: &Connection) -> DbResult<usize> {
+    let count = conn.execute("DELETE FROM branch_chunks", [])?;
+    Ok(count)
+}
+
 /// Get all chunk IDs for a branch
 pub fn get_branch_chunk_ids(conn: &Connection, branch: &str) -> DbResult<Vec<String>> {
     let mut stmt = conn.prepare("SELECT chunk_id FROM branch_chunks WHERE branch = ?")?;
@@ -965,6 +971,20 @@ pub fn get_symbols_by_name_ci(conn: &Connection, name: &str) -> DbResult<Vec<Sym
     Ok(results)
 }
 
+/// Check if a symbol exists on any branch other than the current one
+pub fn symbol_exists_on_other_branches(
+    conn: &Connection,
+    branch: &str,
+    symbol_id: &str,
+) -> DbResult<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM branch_symbols WHERE branch != ? AND symbol_id = ?",
+        params![branch, symbol_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 /// Delete all symbols for a file
 pub fn delete_symbols_by_file(conn: &Connection, file_path: &str) -> DbResult<usize> {
     let count = conn.execute(
@@ -972,6 +992,12 @@ pub fn delete_symbols_by_file(conn: &Connection, file_path: &str) -> DbResult<us
         params![file_path],
     )?;
     Ok(count)
+}
+
+/// Delete a single symbol by id
+pub fn delete_symbol(conn: &Connection, symbol_id: &str) -> DbResult<bool> {
+    let count = conn.execute("DELETE FROM symbols WHERE id = ?", params![symbol_id])?;
+    Ok(count > 0)
 }
 
 // ============================================================================
@@ -1160,6 +1186,15 @@ pub fn delete_call_edges_by_file(conn: &Connection, file_path: &str) -> DbResult
     Ok(count)
 }
 
+/// Delete all call edges where the source symbol matches a symbol id
+pub fn delete_call_edges_by_symbol(conn: &Connection, symbol_id: &str) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM call_edges WHERE from_symbol_id = ?",
+        params![symbol_id],
+    )?;
+    Ok(count)
+}
+
 /// Resolve a call edge by setting the target symbol
 pub fn resolve_call_edge(conn: &Connection, edge_id: &str, to_symbol_id: &str) -> DbResult<()> {
     conn.execute(
@@ -1233,6 +1268,12 @@ pub fn clear_branch_symbols(conn: &Connection, branch: &str) -> DbResult<usize> 
         "DELETE FROM branch_symbols WHERE branch = ?",
         params![branch],
     )?;
+    Ok(count)
+}
+
+/// Remove all branch-symbol associations across every branch
+pub fn clear_all_branch_symbols(conn: &Connection) -> DbResult<usize> {
+    let count = conn.execute("DELETE FROM branch_symbols", [])?;
     Ok(count)
 }
 
