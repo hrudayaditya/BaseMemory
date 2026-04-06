@@ -4,6 +4,7 @@ pub mod languages;
 pub mod policy;
 pub mod walker;
 
+use crate::hasher::xxhash_content;
 use crate::types::Language;
 use error::ChunkerError;
 use fallback::chunk_by_lines;
@@ -110,6 +111,34 @@ fn normalize_language(file_path: &str, language: &str) -> String {
         .to_string()
 }
 
+fn ensure_non_empty_chunks(
+    file_path: &str,
+    language: &str,
+    source_code: &str,
+    mut chunks: Vec<Chunk>,
+) -> Vec<Chunk> {
+    if !chunks.is_empty() || source_code.is_empty() {
+        return chunks;
+    }
+
+    chunks.push(Chunk {
+        file_path: file_path.to_string(),
+        language: language.to_string(),
+        symbol_name: None,
+        symbol_kind: None,
+        chunk_kind: ChunkKind::Code,
+        granularity: Granularity::Fine,
+        start_byte: 0,
+        end_byte: source_code.len() as u32,
+        start_line: 1,
+        end_line: source_code.lines().count().max(1) as u32,
+        text: source_code.to_string(),
+        chunk_hash: xxhash_content(source_code),
+    });
+
+    chunks
+}
+
 pub fn chunk_file(
     file_path: &str,
     language: &str,
@@ -118,11 +147,12 @@ pub fn chunk_file(
 ) -> Result<Vec<Chunk>, ChunkerError> {
     let normalized_language = normalize_language(file_path, language);
     let Some(policy) = get_policy(&normalized_language) else {
-        return Ok(chunk_by_lines(
+        let chunks = chunk_by_lines(file_path, &normalized_language, source_code, config);
+        return Ok(ensure_non_empty_chunks(
             file_path,
             &normalized_language,
             source_code,
-            config,
+            chunks,
         ));
     };
 
@@ -140,14 +170,21 @@ pub fn chunk_file(
         });
     };
 
-    walker::chunk_tree(
+    let chunks = walker::chunk_tree(
         file_path,
         policy.language_name,
         source_code,
         config,
         policy,
         &tree,
-    )
+    )?;
+
+    Ok(ensure_non_empty_chunks(
+        file_path,
+        policy.language_name,
+        source_code,
+        chunks,
+    ))
 }
 
 #[cfg(test)]
@@ -214,6 +251,17 @@ export function foo() {
 
         assert!(!chunks.is_empty());
         assert!(chunks.iter().all(|chunk| chunk.symbol_kind.is_none()));
+    }
+
+    #[test]
+    fn guarantees_at_least_one_chunk_for_unrecognized_non_empty_source() {
+        let source = "plain text without a known language";
+        let chunks = chunk_file("notes.unknown", "unknown", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(!chunks.is_empty());
+        assert_eq!(chunks[0].start_byte, 0);
+        assert_eq!(chunks[0].end_byte, source.len() as u32);
     }
 
     #[test]

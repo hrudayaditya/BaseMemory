@@ -5,6 +5,9 @@ use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 use std::path::Path;
 
+#[deprecated(
+    note = "Lossy compatibility path: drops symbol_kind, chunk_kind, granularity, byte spans, and chunk_hash. Use chunk_file() directly instead. This will be removed in Phase 2."
+)]
 pub fn parse_file_internal(file_path: &str, content: &str) -> Result<Vec<CodeChunk>> {
     let ext = Path::new(file_path)
         .extension()
@@ -27,6 +30,9 @@ pub fn parse_file_internal(file_path: &str, content: &str) -> Result<Vec<CodeChu
         .collect())
 }
 
+#[deprecated(
+    note = "Lossy compatibility path: drops symbol_kind, chunk_kind, granularity, byte spans, and chunk_hash. Use chunk_file() directly instead. This will be removed in Phase 2."
+)]
 pub fn parse_files_parallel(files: Vec<FileInput>) -> Result<Vec<ParsedFile>> {
     let results: Vec<ParsedFile> = files
         .par_iter()
