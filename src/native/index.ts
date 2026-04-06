@@ -73,6 +73,44 @@ export interface CodeChunk {
   language: string;
 }
 
+export type ChunkSymbolKind =
+  | "Function"
+  | "Method"
+  | "Class"
+  | "Interface"
+  | "Struct"
+  | "Test"
+  | "Module"
+  | "Block";
+
+export type ChunkKind = "Code" | "Test" | "Doc" | "Config";
+
+export type Granularity = "Fine" | "Coarse";
+
+export interface ChunkConfig {
+  targetTokenBudget: number;
+  maxChunkChars: number;
+  minChunkChars: number;
+  mergeSmallSiblings: boolean;
+  attachComments: boolean;
+  emitCoarseChunks: boolean;
+}
+
+export interface SemanticChunk {
+  filePath: string;
+  language: string;
+  symbolName?: string;
+  symbolKind?: ChunkSymbolKind;
+  chunkKind: ChunkKind;
+  granularity: Granularity;
+  startByte: number;
+  endByte: number;
+  startLine: number;
+  endLine: number;
+  text: string;
+  chunkHash: string;
+}
+
 export type ChunkType =
   | "function"
   | "class"
@@ -146,6 +184,28 @@ export interface ChunkMetadata {
   hash: string;
 }
 
+const DEFAULT_CHUNK_CONFIG: ChunkConfig = {
+  targetTokenBudget: 1500,
+  maxChunkChars: 3000,
+  minChunkChars: 200,
+  mergeSmallSiblings: true,
+  attachComments: true,
+  emitCoarseChunks: true,
+};
+
+export function chunkFile(
+  filePath: string,
+  language: string,
+  sourceCode: string,
+  config: Partial<ChunkConfig> = {}
+): SemanticChunk[] {
+  const result = native.chunkFile(filePath, language, sourceCode, {
+    ...DEFAULT_CHUNK_CONFIG,
+    ...config,
+  });
+  return result.map(mapSemanticChunk);
+}
+
 export function parseFile(filePath: string, content: string): CodeChunk[] {
   const result = native.parseFile(filePath, content);
   return result.map(mapChunk);
@@ -168,6 +228,23 @@ function mapChunk(c: any): CodeChunk {
     chunkType: (c.chunkType ?? c.chunk_type) as ChunkType,
     name: c.name ?? undefined,
     language: c.language,
+  };
+}
+
+function mapSemanticChunk(c: any): SemanticChunk {
+  return {
+    filePath: c.filePath ?? c.file_path,
+    language: c.language,
+    symbolName: c.symbolName ?? c.symbol_name ?? undefined,
+    symbolKind: c.symbolKind ?? c.symbol_kind ?? undefined,
+    chunkKind: c.chunkKind ?? c.chunk_kind,
+    granularity: c.granularity,
+    startByte: c.startByte ?? c.start_byte,
+    endByte: c.endByte ?? c.end_byte,
+    startLine: c.startLine ?? c.start_line,
+    endLine: c.endLine ?? c.end_line,
+    text: c.text,
+    chunkHash: c.chunkHash ?? c.chunk_hash,
   };
 }
 

@@ -13,12 +13,28 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::path::PathBuf;
 
-pub use chunker::*;
+pub use chunker::{Chunk, ChunkConfig, ChunkKind, Granularity, SymbolKind};
 pub use hasher::*;
 pub use inverted_index::*;
 pub use parser::*;
 pub use store::*;
 pub use types::*;
+
+#[napi]
+pub fn chunk_file(
+    file_path: String,
+    language: String,
+    source_code: String,
+    config: Option<ChunkConfig>,
+) -> Result<Vec<Chunk>> {
+    chunker::chunk_file(
+        &file_path,
+        &language,
+        &source_code,
+        &config.unwrap_or_default(),
+    )
+    .map_err(|e| Error::from_reason(e.to_string()))
+}
 
 #[napi]
 pub fn parse_file(file_path: String, content: String) -> Result<Vec<CodeChunk>> {

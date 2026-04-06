@@ -18,10 +18,9 @@ import {
   VectorStore,
   InvertedIndex,
   Database,
-  parseFiles,
+  chunkFile,
   createEmbeddingText,
   generateChunkId,
-  generateChunkHash,
   ChunkMetadata,
   ChunkData,
   createDynamicBatches,
@@ -34,27 +33,12 @@ import { getBranchOrDefault, getBaseBranch, isGitRepo } from "../git/index.js";
 
 const CALL_GRAPH_LANGUAGES = new Set(["typescript", "tsx", "javascript", "jsx", "python", "go", "rust", "php"]);
 const CALL_GRAPH_SYMBOL_CHUNK_TYPES = new Set([
-  "function_declaration",
   "function",
-  "arrow_function",
-  "method_definition",
-  "class_declaration",
-  "interface_declaration",
-  "type_alias_declaration",
-  "enum_declaration",
-  "function_definition",
-  "class_definition",
-  "decorated_definition",
-  "method_declaration",
-  "type_declaration",
-  "type_spec",
-  "function_item",
-  "impl_item",
-  "struct_item",
-  "enum_item",
-  "trait_item",
-  "mod_item",
-  "trait_declaration",
+  "method",
+  "class",
+  "interface",
+  "struct",
+  "module",
 ]);
 
 function float32ArrayToBuffer(arr: number[]): Buffer {
@@ -77,6 +61,53 @@ function getErrorMessage(error: unknown): string {
     return String((error as { message: unknown }).message);
   }
   return String(error);
+}
+
+function getChunkerLanguage(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case ".ts":
+    case ".mts":
+    case ".cts":
+      return "typescript";
+    case ".tsx":
+      return "tsx";
+    case ".js":
+    case ".mjs":
+    case ".cjs":
+      return "javascript";
+    case ".jsx":
+      return "jsx";
+    case ".py":
+    case ".pyi":
+      return "python";
+    case ".rs":
+      return "rust";
+    case ".go":
+      return "go";
+    default:
+      return "";
+  }
+}
+
+function mapSemanticChunkType(symbolKind: string | undefined): ChunkMetadata["chunkType"] {
+  switch (symbolKind) {
+    case "Function":
+    case "Test":
+      return "function";
+    case "Method":
+      return "method";
+    case "Class":
+      return "class";
+    case "Interface":
+      return "interface";
+    case "Struct":
+      return "struct";
+    case "Module":
+      return "module";
+    default:
+      return "other";
+  }
 }
 
 function isRateLimitError(error: unknown): boolean {
@@ -1812,7 +1843,39 @@ export class Indexer {
     });
 
     const parseStartTime = performance.now();
-    const parsedFiles = parseFiles(changedFiles);
+    const parsedFiles = changedFiles.map((file) => {
+      const semanticChunks = chunkFile(
+        file.path,
+        getChunkerLanguage(file.path),
+        file.content,
+        {
+          targetTokenBudget: 1500,
+          maxChunkChars: 3000,
+          minChunkChars: 200,
+          mergeSmallSiblings: true,
+          attachComments: true,
+          emitCoarseChunks: true,
+        }
+      );
+
+      const chunks = semanticChunks
+        .filter((chunk) => chunk.granularity === "Fine")
+        .map((chunk) => ({
+          content: chunk.text,
+          startLine: chunk.startLine,
+          endLine: chunk.endLine,
+          chunkType: mapSemanticChunkType(chunk.symbolKind),
+          name: chunk.symbolName,
+          language: chunk.language,
+          chunkHash: chunk.chunkHash,
+        }));
+
+      return {
+        path: file.path,
+        chunks,
+        hash: file.hash,
+      };
+    });
     const parseMs = performance.now() - parseStartTime;
 
     this.logger.recordFilesParsed(parsedFiles.length);
@@ -1863,7 +1926,7 @@ export class Indexer {
         }
 
         const id = generateChunkId(parsed.path, chunk);
-        const contentHash = generateChunkHash(chunk);
+        const contentHash = chunk.chunkHash;
         currentChunkIds.add(id);
 
         chunkDataBatch.push({

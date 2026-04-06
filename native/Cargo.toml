@@ -30,6 +30,7 @@ tree-sitter-yaml = "0.7"
 tree-sitter-php = "0.23"
 tree-sitter-language = "0.1"
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Keep xxh3 available for stable per-chunk hashes that match the embedded text payload.
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import {
+  chunkFile,
   parseFile,
   parseFiles,
   hashContent,
@@ -72,7 +73,7 @@ const add = (a, b) => a + b;
       expect(chunks).toBeInstanceOf(Array);
     });
 
-    it("should parse PHP files", () => {
+    it("should parse PHP files semantically", () => {
       const content = `
 <?php
 
@@ -104,7 +105,7 @@ interface Logger {
       expect(chunks.some((c) => c.content.includes("interface Logger"))).toBe(true);
     });
 
-    it("should parse PHP .inc files", () => {
+    it("should parse PHP .inc files semantically", () => {
       const content = `
 <?php
 
@@ -125,6 +126,60 @@ trait Timestampable {
       expect(chunks.length).toBeGreaterThanOrEqual(2);
       expect(chunks.some((c) => c.content.includes("function helper"))).toBe(true);
       expect(chunks.some((c) => c.content.includes("trait Timestampable"))).toBe(true);
+    });
+  });
+
+  describe("chunkFile", () => {
+    it("should return semantic metadata for supported languages", () => {
+      const content = `
+// utility
+export function validateEmail(email: string): boolean {
+  return email.includes("@");
+}
+`;
+
+      const chunks = chunkFile("test.ts", "typescript", content);
+      const fine = chunks.find((chunk) => chunk.symbolName === "validateEmail" && chunk.granularity === "Fine");
+
+      expect(fine).toBeDefined();
+      expect(fine?.symbolKind).toBe("Function");
+      expect(fine?.chunkHash).toHaveLength(16);
+      expect(fine?.text.startsWith("// utility")).toBe(true);
+    });
+
+    it("should emit coarse chunks for container symbols", () => {
+      const content = `
+export class UserService {
+  getUser(id: string) {
+    return id;
+  }
+}
+`;
+
+      const chunks = chunkFile("service.ts", "typescript", content);
+
+      expect(chunks.some((chunk) => chunk.symbolName === "UserService" && chunk.granularity === "Coarse")).toBe(true);
+    });
+
+    it("should return semantic metadata for Java and config files", () => {
+      const javaContent = `
+public class UserService {
+  public String getUser(String id) {
+    return id;
+  }
+}
+`;
+      const jsonContent = `{
+  "service": {
+    "name": "users"
+  }
+}`;
+
+      const javaChunks = chunkFile("UserService.java", "java", javaContent);
+      const jsonChunks = chunkFile("config.json", "json", jsonContent);
+
+      expect(javaChunks.some((chunk) => chunk.symbolName === "UserService" && chunk.granularity === "Coarse")).toBe(true);
+      expect(jsonChunks.some((chunk) => chunk.chunkKind === "Config")).toBe(true);
     });
   });
 
