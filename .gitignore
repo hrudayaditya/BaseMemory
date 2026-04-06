@@ -1,0 +1,60 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+*.node
+native/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Test coverage
+coverage/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Cache
+.cache/
+*.tsbuildinfo
+
+# Native build artifacts
+
+native/index.d.ts
+native/index.js
+
+# Package manager locks (keep one)
+yarn.lock
+pnpm-lock.yaml
+
+# Symlinks to cache
+opencode-codebase-index
+
+# Local index data
+.opencode/
+
+# Test files
+test-*.cjs
+test-*.mjs
+
+# Benchmark results
+benchmark-results/
+benchmarks/results/
+
+# Local agent/session artifacts
+.sisyphus/
+.superset/

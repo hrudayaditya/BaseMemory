@@ -1,0 +1,138 @@
+name: Eval Quality Gate
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: read
+  models: read
+
+jobs:
+  eval-quality:
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+        with:
+          toolchain: stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+        with:
+          workspaces: native -> target
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build native module
+        working-directory: native
+        run: |
+          cargo build --release
+          npx napi build --release --platform
+
+      - name: Resolve eval provider config
+        id: eval-provider
+        env:
+          EVAL_EMBED_BASE_URL: ${{ secrets.EVAL_EMBED_BASE_URL }}
+          EVAL_EMBED_API_KEY: ${{ secrets.EVAL_EMBED_API_KEY }}
+          EVAL_EMBED_MODEL: ${{ secrets.EVAL_EMBED_MODEL }}
+          EVAL_EMBED_DIMENSIONS: ${{ secrets.EVAL_EMBED_DIMENSIONS }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          MODEL="${EVAL_EMBED_MODEL:-text-embedding-3-small}"
+          DIMS="${EVAL_EMBED_DIMENSIONS:-1536}"
+
+          if [ -n "$EVAL_EMBED_BASE_URL" ] || [ -n "$EVAL_EMBED_API_KEY" ]; then
+            if [ -z "$EVAL_EMBED_BASE_URL" ] || [ -z "$EVAL_EMBED_API_KEY" ]; then
+              echo "If overriding the default GitHub Models provider, both EVAL_EMBED_BASE_URL and EVAL_EMBED_API_KEY must be set."
+              exit 1
+            fi
+
+            echo "provider_source=custom-secrets" >> "$GITHUB_OUTPUT"
+            echo "budget_path=benchmarks/budgets/default.json" >> "$GITHUB_OUTPUT"
+            echo "against_path=benchmarks/baselines/eval-baseline-summary.json" >> "$GITHUB_OUTPUT"
+            echo "base_url=$EVAL_EMBED_BASE_URL" >> "$GITHUB_OUTPUT"
+            echo "api_key=$EVAL_EMBED_API_KEY" >> "$GITHUB_OUTPUT"
+          else
+            if [ -z "$GITHUB_TOKEN" ]; then
+              echo "Missing GitHub Actions token for GitHub Models fallback."
+              exit 1
+            fi
+
+            echo "provider_source=github-models" >> "$GITHUB_OUTPUT"
+            echo "budget_path=benchmarks/budgets/github-models.json" >> "$GITHUB_OUTPUT"
+            echo "against_path=" >> "$GITHUB_OUTPUT"
+            echo "base_url=https://models.inference.ai.azure.com" >> "$GITHUB_OUTPUT"
+            echo "api_key=$GITHUB_TOKEN" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Eval quality gate provider::Using GitHub Models via GITHUB_TOKEN with the GitHub Models CI budget."
+          fi
+
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "dimensions=$DIMS" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure baseline exists for baseline-driven budget
+        if: steps.eval-provider.outputs.against_path != ''
+        run: |
+          if [ ! -f "${{ steps.eval-provider.outputs.against_path }}" ]; then
+            echo "Missing baseline summary: ${{ steps.eval-provider.outputs.against_path }}"
+            exit 1
+          fi
+
+      - name: Create eval quality config from secrets
+        run: |
+          cat > .github/eval-quality-config.json <<EOF
+          {
+            "embeddingProvider": "custom",
+            "customProvider": {
+              "baseUrl": "${{ steps.eval-provider.outputs.base_url }}",
+              "apiKey": "${{ steps.eval-provider.outputs.api_key }}",
+              "model": "${{ steps.eval-provider.outputs.model }}",
+              "dimensions": ${{ steps.eval-provider.outputs.dimensions }},
+              "timeoutMs": 30000
+            },
+            "indexing": {
+              "autoIndex": false,
+              "watchFiles": false,
+              "respectGitignore": true,
+              "semanticOnly": false,
+              "requireProjectMarker": false
+            },
+            "search": {
+              "maxResults": 10,
+              "minScore": 0,
+              "hybridWeight": 0.4,
+              "fusionStrategy": "rrf",
+              "rrfK": 60,
+              "rerankTopN": 20,
+              "enableCrossLanguage": true
+            },
+            "debug": {
+              "enabled": false,
+              "logLevel": "info",
+              "metrics": true
+            }
+          }
+          EOF
+
+      - name: Run eval quality gate (real provider config required)
+        run: |
+          ARGS=(eval run --config .github/eval-quality-config.json --reindex --ci --budget "${{ steps.eval-provider.outputs.budget_path }}")
+          if [ -n "${{ steps.eval-provider.outputs.against_path }}" ]; then
+            ARGS+=(--against "${{ steps.eval-provider.outputs.against_path }}")
+          fi
+          npx tsx src/cli.ts "${ARGS[@]}"
+
+      - name: Cleanup eval quality config
+        if: always()
+        run: rm -f .github/eval-quality-config.json
