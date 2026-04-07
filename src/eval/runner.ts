@@ -1,14 +1,20 @@
 import { existsSync } from "fs";
 import { readFileSync } from "fs";
 import { rmSync } from "fs";
+import { createServer, type Server } from "http";
 import * as os from "os";
 import * as path from "path";
 import { performance } from "perf_hooks";
 
-import { parseConfig } from "../config/schema.js";
+import { parseConfig, type ParsedCodebaseIndexConfig } from "../config/schema.js";
 import type { SearchConfig as ConfigSearchConfig } from "../config/schema.js";
 import { getDefaultModelForProvider } from "../config/index.js";
 import { Indexer } from "../indexer/index.js";
+import {
+  getSearchRecipe,
+  mapEvalQueryTypeToTaskType,
+  type SearchTaskType,
+} from "../indexer/search-recipes.js";
 
 import { evaluateBudgetGate } from "./budget.js";
 import { compareSummaries } from "./compare.js";
@@ -32,6 +38,206 @@ import type {
   SweepDefinition,
   SweepRunSummary,
 } from "./types.js";
+
+const EVAL_MOCK_MODEL_ID = "mock-embedding-model";
+const EVAL_PROVIDER_PROBE_TIMEOUT_MS = 1_500;
+const DEFAULT_EVAL_TASK_TYPE: SearchTaskType = "general";
+const DEFAULT_EVAL_GRAPH_DEPTH = 0;
+const MIXED_EFFECTIVE_TASK_TYPE = "mixed";
+const MIXED_EFFECTIVE_FINAL_RERANK_TOP_N = -1;
+
+function buildMockEmbedding(text: string): number[] {
+  let seed = 0;
+  for (const ch of String(text)) {
+    seed = (seed * 31 + ch.charCodeAt(0)) % 1000;
+  }
+  return Array.from({ length: 8 }, (_, idx) => ((seed + idx * 17) % 997) / 997);
+}
+
+function isLocalEvalHostname(hostname: string): boolean {
+  return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1";
+}
+
+function isBundledEvalMockConfig(config: ParsedCodebaseIndexConfig): boolean {
+  if (config.embeddingProvider !== "custom" || !config.customProvider) {
+    return false;
+  }
+
+  try {
+    const baseUrl = new URL(config.customProvider.baseUrl);
+    return isLocalEvalHostname(baseUrl.hostname) && config.customProvider.model === EVAL_MOCK_MODEL_ID;
+  } catch {
+    return false;
+  }
+}
+
+async function probeCustomEmbeddingEndpoint(
+  baseUrl: string,
+  model: string,
+  timeoutMs: number = EVAL_PROVIDER_PROBE_TIMEOUT_MS
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(`${baseUrl}/embeddings`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        input: ["eval probe"],
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return {
+        ok: false,
+        reason: `HTTP ${response.status}: ${errorText}`,
+      };
+    }
+
+    return { ok: true };
+  } catch (error: unknown) {
+    if (error instanceof Error && error.name === "AbortError") {
+      return {
+        ok: false,
+        reason: `timed out after ${timeoutMs}ms`,
+      };
+    }
+    return {
+      ok: false,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function startBundledEvalMockServer(baseUrl: string): Promise<Server> {
+  const parsed = new URL(baseUrl);
+  const requestPath = `${parsed.pathname.replace(/\/+$/, "")}/embeddings`;
+  const tagsPath = "/api/tags";
+  const port = Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80));
+
+  const server = createServer((req, res) => {
+    if (req.method === "POST" && req.url === requestPath) {
+      let body = "";
+      req.on("data", (chunk) => {
+        body += chunk.toString();
+      });
+      req.on("end", () => {
+        const payload = JSON.parse(body || "{}") as { input?: string | string[] };
+        const texts = Array.isArray(payload.input)
+          ? payload.input
+          : typeof payload.input === "string"
+            ? [payload.input]
+            : [];
+        const data = texts.map((text) => ({
+          embedding: buildMockEmbedding(text),
+        }));
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            data,
+            usage: {
+              total_tokens: Math.max(1, texts.length * 8),
+            },
+          })
+        );
+      });
+      return;
+    }
+
+    if (req.method === "GET" && req.url === tagsPath) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ models: [{ name: EVAL_MOCK_MODEL_ID }] }));
+      return;
+    }
+
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("not found");
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, parsed.hostname, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+
+  return server;
+}
+
+async function closeServer(server: Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+async function withEvalEmbeddingEnvironment<T>(
+  config: ParsedCodebaseIndexConfig,
+  action: () => Promise<T>
+): Promise<T> {
+  if (config.embeddingProvider !== "custom" || !config.customProvider) {
+    return action();
+  }
+
+  const { baseUrl, model, timeoutMs } = config.customProvider;
+  let bundledMockServer: Server | null = null;
+  let probe = await probeCustomEmbeddingEndpoint(baseUrl, model, timeoutMs);
+
+  if (!probe.ok && isBundledEvalMockConfig(config)) {
+    bundledMockServer = await startBundledEvalMockServer(baseUrl);
+    probe = await probeCustomEmbeddingEndpoint(baseUrl, model, timeoutMs);
+  }
+
+  if (!probe.ok) {
+    throw new Error(
+      `Evaluation embedding provider is unreachable at ${baseUrl}/embeddings for model '${model}': ${probe.reason}. ` +
+      `This previously caused eval to record zero hits against an empty retrievable corpus. ` +
+      `Start the configured provider or use the built-in eval mock via customProvider.model='${EVAL_MOCK_MODEL_ID}' on a local baseUrl.`
+    );
+  }
+
+  try {
+    return await action();
+  } finally {
+    if (bundledMockServer) {
+      await closeServer(bundledMockServer);
+    }
+  }
+}
+
+async function assertSearchableEvalCorpus(indexer: Indexer, indexStats: Awaited<ReturnType<Indexer["index"]>>): Promise<void> {
+  if (indexStats.failedChunks > 0) {
+    const detail = indexStats.failedBatchesPath
+      ? ` See ${indexStats.failedBatchesPath} for failed embedding batches.`
+      : "";
+    throw new Error(
+      `Evaluation indexing failed: ${indexStats.failedChunks} chunk(s) did not reach a durable retrievable state.${detail}`
+    );
+  }
+
+  const status = await indexer.getStatus();
+  if (!status.indexed || status.vectorCount === 0) {
+    throw new Error(
+      `Evaluation produced no searchable vectors at ${status.indexPath}. ` +
+      `Refusing to emit retrieval metrics for an empty corpus.`
+    );
+  }
+}
 
 function toAbsolute(projectRoot: string, maybeRelative: string): string {
   return path.isAbsolute(maybeRelative) ? maybeRelative : path.join(projectRoot, maybeRelative);
@@ -110,24 +316,83 @@ export interface EvalRunResult {
   gate?: EvalGateResult;
 }
 
-export async function runEvaluation(options: EvalRunOptions): Promise<EvalRunResult> {
-  const datasetPath = toAbsolute(options.projectRoot, options.datasetPath);
-  const againstPath = options.againstPath ? toAbsolute(options.projectRoot, options.againstPath) : undefined;
-  const budgetPath = options.budgetPath ? toAbsolute(options.projectRoot, options.budgetPath) : undefined;
+interface EvalQueryPlan {
+  taskType: SearchTaskType;
+  finalRerankTopN: number;
+  graphDepth: number;
+  filterByBranch: boolean;
+}
 
-  const dataset = loadGoldenDataset(datasetPath);
-  const parsedConfig = loadParsedConfig(options.projectRoot, options.configPath);
-  const effectiveConfig = resolveSearchConfig(parsedConfig, options.searchOverrides);
-
-  if (options.reindex) {
-    clearIndexRoot(options.projectRoot, effectiveConfig.scope);
+function resolveEvalTaskType(
+  effectiveConfig: ReturnType<typeof resolveSearchConfig>,
+  queryType: PerQueryEvalResult["queryType"]
+): SearchTaskType {
+  if (!effectiveConfig.eval.useQueryTypes || !queryType) {
+    return DEFAULT_EVAL_TASK_TYPE;
   }
 
-  const indexer = new Indexer(options.projectRoot, effectiveConfig);
+  return mapEvalQueryTypeToTaskType(queryType);
+}
 
-  await indexer.index();
+function resolveEvalQueryPlan(
+  effectiveConfig: ReturnType<typeof resolveSearchConfig>,
+  queryType: PerQueryEvalResult["queryType"],
+  expectedBranch?: string
+): EvalQueryPlan {
+  const taskType = resolveEvalTaskType(effectiveConfig, queryType);
+  const recipe = getSearchRecipe(taskType);
 
+  return {
+    taskType,
+    finalRerankTopN: recipe.finalRerankTopN,
+    graphDepth: DEFAULT_EVAL_GRAPH_DEPTH,
+    filterByBranch: expectedBranch ? true : false,
+  };
+}
+
+function summarizeEffectiveEvalConfig(plans: EvalQueryPlan[]): Pick<
+  EvalSummary["searchConfig"],
+  "effectiveTaskType" | "effectiveFinalRerankTopN" | "effectiveGraphDepth"
+> {
+  if (plans.length === 0) {
+    return {
+      effectiveTaskType: DEFAULT_EVAL_TASK_TYPE,
+      effectiveFinalRerankTopN: getSearchRecipe(DEFAULT_EVAL_TASK_TYPE).finalRerankTopN,
+      effectiveGraphDepth: DEFAULT_EVAL_GRAPH_DEPTH,
+    };
+  }
+
+  const [firstPlan] = plans;
+  const sameTaskType = plans.every((plan) => plan.taskType === firstPlan.taskType);
+  const sameFinalRerankTopN = plans.every(
+    (plan) => plan.finalRerankTopN === firstPlan.finalRerankTopN
+  );
+  const sameGraphDepth = plans.every((plan) => plan.graphDepth === firstPlan.graphDepth);
+
+  return {
+    effectiveTaskType: sameTaskType ? firstPlan.taskType : MIXED_EFFECTIVE_TASK_TYPE,
+    effectiveFinalRerankTopN: sameFinalRerankTopN
+      ? firstPlan.finalRerankTopN
+      : MIXED_EFFECTIVE_FINAL_RERANK_TOP_N,
+    effectiveGraphDepth: sameGraphDepth ? firstPlan.graphDepth : DEFAULT_EVAL_GRAPH_DEPTH,
+  };
+}
+
+/**
+ * Orchestrates eval output artifact writing for a completed run.
+ * Writes summary.json, per-query.json, compare.json, and summary.md.
+ */
+async function finalizeEvaluationRun(
+  options: EvalRunOptions,
+  indexer: Indexer,
+  effectiveConfig: ReturnType<typeof resolveSearchConfig>,
+  datasetPath: string,
+  againstPath: string | undefined,
+  budgetPath: string | undefined
+): Promise<EvalRunResult> {
+  const dataset = loadGoldenDataset(datasetPath);
   const perQuery: PerQueryEvalResult[] = [];
+  const effectivePlans: EvalQueryPlan[] = [];
 
   for (const query of dataset.queries) {
     if (query.expected.branch && query.expected.branch !== indexer.getCurrentBranch()) {
@@ -136,14 +401,23 @@ export async function runEvaluation(options: EvalRunOptions): Promise<EvalRunRes
       );
     }
 
+    const queryPlan = resolveEvalQueryPlan(
+      effectiveConfig,
+      query.queryType,
+      query.expected.branch
+    );
+    effectivePlans.push(queryPlan);
+
     const start = performance.now();
-    const result = await indexer.search(query.query, 10, {
+    const searchResponse = await indexer.searchDetailed(query.query, 10, {
       metadataOnly: true,
-      filterByBranch: query.expected.branch ? true : false,
+      filterByBranch: queryPlan.filterByBranch,
+      taskType: queryPlan.taskType,
+      graphDepth: queryPlan.graphDepth,
     });
     const elapsed = performance.now() - start;
 
-    const materialized = result.map((item) => ({
+    const materialized = searchResponse.primaryResults.map((item) => ({
       filePath: item.filePath,
       startLine: item.startLine,
       endLine: item.endLine,
@@ -152,7 +426,13 @@ export async function runEvaluation(options: EvalRunOptions): Promise<EvalRunRes
       name: item.name,
     }));
 
-    perQuery.push(buildPerQueryResult(query, materialized, elapsed, 10));
+    perQuery.push(
+      buildPerQueryResult(query, materialized, elapsed, 10, {
+        effectiveTaskType: queryPlan.taskType,
+        effectiveFinalRerankTopN: queryPlan.finalRerankTopN,
+        effectiveGraphDepth: queryPlan.graphDepth,
+      })
+    );
   }
 
   const logger = indexer.getLogger();
@@ -162,6 +442,7 @@ export async function runEvaluation(options: EvalRunOptions): Promise<EvalRunRes
     effectiveConfig.embeddingProvider === "custom" || effectiveConfig.embeddingProvider === "auto"
       ? 0
       : getDefaultModelForProvider(effectiveConfig.embeddingProvider).costPer1MTokens;
+  const effectiveSearchConfig = summarizeEffectiveEvalConfig(effectivePlans);
 
   const summary: EvalSummary = {
     generatedAt: new Date().toISOString(),
@@ -176,6 +457,10 @@ export async function runEvaluation(options: EvalRunOptions): Promise<EvalRunRes
       hybridWeight: effectiveConfig.search.hybridWeight,
       rrfK: effectiveConfig.search.rrfK,
       rerankTopN: effectiveConfig.search.rerankTopN,
+      useQueryTypes: effectiveConfig.eval.useQueryTypes,
+      effectiveTaskType: effectiveSearchConfig.effectiveTaskType,
+      effectiveFinalRerankTopN: effectiveSearchConfig.effectiveFinalRerankTopN,
+      effectiveGraphDepth: effectiveSearchConfig.effectiveGraphDepth,
     },
     metrics: computeEvalMetrics(
       dataset.queries,
@@ -184,6 +469,12 @@ export async function runEvaluation(options: EvalRunOptions): Promise<EvalRunRes
       metricSnapshot.embeddingTokensUsed,
       costPer1MTokensUsd
     ),
+  };
+  summary.metrics.reranker = {
+    appliedCount: metricSnapshot.rerankerAppliedCount,
+    failureCount: metricSnapshot.rerankerFailureCount,
+    backendUsage: metricSnapshot.rerankerBackendCounts,
+    lastMs: metricSnapshot.rerankerMs,
   };
 
   const outputDir = createRunDirectory(toAbsolute(options.projectRoot, options.outputRoot));
@@ -228,10 +519,54 @@ export async function runEvaluation(options: EvalRunOptions): Promise<EvalRunRes
   return { outputDir, summary, perQuery, comparison, gate };
 }
 
+function applySearchConfigToIndexer(
+  indexer: Indexer,
+  effectiveConfig: ReturnType<typeof resolveSearchConfig>
+): void {
+  const mutableIndexer = indexer as unknown as {
+    config: ReturnType<typeof resolveSearchConfig>;
+  };
+  mutableIndexer.config = {
+    ...mutableIndexer.config,
+    search: { ...effectiveConfig.search },
+  };
+}
+
+export async function runEvaluation(options: EvalRunOptions): Promise<EvalRunResult> {
+  const datasetPath = toAbsolute(options.projectRoot, options.datasetPath);
+  const againstPath = options.againstPath ? toAbsolute(options.projectRoot, options.againstPath) : undefined;
+  const budgetPath = options.budgetPath ? toAbsolute(options.projectRoot, options.budgetPath) : undefined;
+  const parsedConfig = loadParsedConfig(options.projectRoot, options.configPath);
+  const effectiveConfig = resolveSearchConfig(parsedConfig, options.searchOverrides);
+
+  return withEvalEmbeddingEnvironment(parsedConfig, async () => {
+    if (options.reindex) {
+      clearIndexRoot(options.projectRoot, effectiveConfig.scope);
+    }
+
+    const indexer = new Indexer(options.projectRoot, effectiveConfig);
+    const indexStats = await indexer.index();
+    await assertSearchableEvalCorpus(indexer, indexStats);
+
+    return finalizeEvaluationRun(
+      options,
+      indexer,
+      effectiveConfig,
+      datasetPath,
+      againstPath,
+      budgetPath
+    );
+  });
+}
+
 export async function runSweep(
   options: EvalRunOptions,
   sweep: SweepDefinition
 ): Promise<{ outputDir: string; aggregate: SweepAggregateReport }> {
+  const datasetPath = toAbsolute(options.projectRoot, options.datasetPath);
+  const againstPath = options.againstPath ? toAbsolute(options.projectRoot, options.againstPath) : undefined;
+  const budgetPath = options.budgetPath ? toAbsolute(options.projectRoot, options.budgetPath) : undefined;
+  const parsedConfig = loadParsedConfig(options.projectRoot, options.configPath);
   const fusionValues: Array<"rrf" | "weighted" | undefined> =
     sweep.fusionStrategy && sweep.fusionStrategy.length > 0
       ? [...sweep.fusionStrategy]
@@ -244,31 +579,53 @@ export async function runSweep(
     sweep.rerankTopN && sweep.rerankTopN.length > 0 ? [...sweep.rerankTopN] : [undefined];
 
   const runs: SweepRunSummary[] = [];
+  let sweepIndexer: Indexer | null = null;
 
-  for (const fusion of fusionValues) {
-    for (const hybridWeight of weightValues) {
-      for (const rrfK of rrfValues) {
-        for (const rerankTopN of rerankValues) {
-          const run = await runEvaluation({
-            ...options,
-            searchOverrides: {
+  await withEvalEmbeddingEnvironment(parsedConfig, async () => {
+    for (const fusion of fusionValues) {
+      for (const hybridWeight of weightValues) {
+        for (const rrfK of rrfValues) {
+          for (const rerankTopN of rerankValues) {
+            const effectiveConfig = resolveSearchConfig(parsedConfig, {
               ...(fusion !== undefined ? { fusionStrategy: fusion } : {}),
               ...(hybridWeight !== undefined ? { hybridWeight } : {}),
               ...(rrfK !== undefined ? { rrfK } : {}),
               ...(rerankTopN !== undefined ? { rerankTopN } : {}),
-            },
-          });
+            });
 
-          runs.push({
-            searchConfig: run.summary.searchConfig,
-            summary: run.summary,
-            comparison: run.comparison,
-            gate: run.gate,
-          });
+            if (!sweepIndexer) {
+              if (options.reindex) {
+                clearIndexRoot(options.projectRoot, effectiveConfig.scope);
+              }
+              sweepIndexer = new Indexer(options.projectRoot, effectiveConfig);
+              const indexStats = await sweepIndexer.index();
+              await assertSearchableEvalCorpus(sweepIndexer, indexStats);
+            } else {
+              // Search-parameter sweeps do not change indexed artifacts, so reuse
+              // the same indexer instance and swap only the search config.
+              applySearchConfigToIndexer(sweepIndexer, effectiveConfig);
+            }
+
+            const run = await finalizeEvaluationRun(
+              options,
+              sweepIndexer,
+              effectiveConfig,
+              datasetPath,
+              againstPath,
+              budgetPath
+            );
+
+            runs.push({
+              searchConfig: run.summary.searchConfig,
+              summary: run.summary,
+              comparison: run.comparison,
+              gate: run.gate,
+            });
+          }
         }
       }
     }
-  }
+  });
 
   const bestByHitAt5 = [...runs].sort(
     (a, b) => b.summary.metrics.hitAt5 - a.summary.metrics.hitAt5

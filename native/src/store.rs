@@ -2,7 +2,7 @@ use crate::SearchResult;
 use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -195,6 +195,56 @@ impl VectorStoreInner {
         Ok(search_results)
     }
 
+    pub fn search_filtered(
+        &self,
+        query_vector: &[f32],
+        limit: usize,
+        allowed_keys: &HashSet<String>,
+    ) -> Result<Vec<SearchResult>> {
+        if query_vector.len() != self.dimensions {
+            return Err(anyhow!(
+                "Query vector dimension mismatch: expected {}, got {}",
+                self.dimensions,
+                query_vector.len()
+            ));
+        }
+
+        if allowed_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let allowed_ids: HashSet<u64> = allowed_keys
+            .iter()
+            .filter_map(|key| self.stored.key_to_id.get(key).copied())
+            .collect();
+
+        if allowed_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let results = self
+            .index
+            .filtered_search(query_vector, limit, |key| allowed_ids.contains(&key))?;
+
+        let mut search_results = Vec::with_capacity(results.keys.len());
+
+        for (i, &id) in results.keys.iter().enumerate() {
+            if let Some(key) = self.stored.id_to_key.get(&id) {
+                let metadata = self.stored.metadata.get(key).cloned().unwrap_or_default();
+
+                let score = 1.0 - results.distances[i] as f64;
+
+                search_results.push(SearchResult {
+                    id: key.clone(),
+                    score,
+                    metadata,
+                });
+            }
+        }
+
+        Ok(search_results)
+    }
+
     pub fn remove(&mut self, key: &str) -> Result<bool> {
         if let Some(&id) = self.stored.key_to_id.get(key) {
             self.index.remove(id)?;
@@ -341,5 +391,25 @@ mod tests {
             store.load().unwrap();
             assert_eq!(store.count(), 1);
         }
+    }
+
+    #[test]
+    fn test_vector_store_filtered_search() {
+        let dir = tempdir().unwrap();
+        let index_path = dir.path().join("test.usearch");
+
+        let mut store = VectorStoreInner::new(index_path, 3).unwrap();
+        store
+            .add("vec1", &[1.0, 0.0, 0.0], r#"{"file": "a.ts"}"#)
+            .unwrap();
+        store
+            .add("vec2", &[0.9, 0.1, 0.0], r#"{"file": "b.ts"}"#)
+            .unwrap();
+
+        let allowed = HashSet::from([String::from("vec2")]);
+        let results = store.search_filtered(&[1.0, 0.0, 0.0], 5, &allowed).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "vec2");
     }
 }

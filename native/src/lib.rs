@@ -12,6 +12,7 @@ mod types;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 pub use chunker::{Chunk, ChunkConfig, ChunkKind, Granularity, SymbolKind};
@@ -67,6 +68,11 @@ pub fn hash_content(content: String) -> String {
 #[napi]
 pub fn hash_file(file_path: String) -> Result<String> {
     hasher::xxhash_file(&file_path).map_err(|e| Error::from_reason(e.to_string()))
+}
+
+#[napi]
+pub fn get_chunker_version() -> String {
+    chunker::CHUNKER_VERSION.to_string()
 }
 
 #[napi]
@@ -340,6 +346,20 @@ impl VectorStore {
     }
 
     #[napi]
+    pub fn search_filtered(
+        &self,
+        query_vector: Vec<f64>,
+        limit: u32,
+        allowed_ids: Vec<String>,
+    ) -> Result<Vec<SearchResult>> {
+        let query_f32: Vec<f32> = query_vector.iter().map(|&x| x as f32).collect();
+        let allowed: HashSet<String> = allowed_ids.into_iter().collect();
+        self.inner
+            .search_filtered(&query_f32, limit as usize, &allowed)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
     pub fn remove(&mut self, id: String) -> Result<bool> {
         self.inner
             .remove(&id)
@@ -527,6 +547,23 @@ impl InvertedIndex {
     }
 
     #[napi]
+    pub fn search_filtered(
+        &self,
+        query: String,
+        allowed_chunk_ids: Vec<String>,
+        limit: Option<u32>,
+    ) -> Vec<KeywordSearchResult> {
+        let allowed: HashSet<String> = allowed_chunk_ids.into_iter().collect();
+        let results = self.inner.search_filtered(&query, &allowed);
+        let limit = limit.unwrap_or(100) as usize;
+        results
+            .into_iter()
+            .take(limit)
+            .map(|(chunk_id, score)| KeywordSearchResult { chunk_id, score })
+            .collect()
+    }
+
+    #[napi]
     pub fn has_chunk(&self, chunk_id: String) -> bool {
         self.inner.has_chunk(&chunk_id)
     }
@@ -581,6 +618,39 @@ pub struct DatabaseStats {
     pub branch_count: u32,
     pub symbol_count: u32,
     pub call_edge_count: u32,
+}
+
+#[napi(object)]
+pub struct PipelineStateData {
+    pub branch: String,
+    pub file_path: String,
+    pub stage: String,
+    pub status: String,
+    pub input_hash: Option<String>,
+    pub error: Option<String>,
+    pub updated_at: f64,
+}
+
+#[napi(object)]
+pub struct PipelineRunData {
+    pub run_id: String,
+    pub branch: String,
+    pub run_type: String,
+    pub status: String,
+    pub config_hash: String,
+    pub started_at: f64,
+    pub completed_at: Option<f64>,
+}
+
+#[napi(object)]
+pub struct ConfigVersionData {
+    pub config_hash: String,
+    pub embedding_model_id: String,
+    pub embedding_dimension: u32,
+    pub chunker_version: String,
+    pub graph_extractor_version: String,
+    pub active: bool,
+    pub created_at: f64,
 }
 
 #[napi]
@@ -1009,6 +1079,246 @@ impl Database {
         })
     }
 
+    // ── Pipeline state methods ─────────────────────────────────────
+
+    #[napi]
+    pub fn upsert_pipeline_state(&self, state: PipelineStateData) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let row = db::PipelineStateRow {
+            branch: state.branch,
+            file_path: state.file_path,
+            stage: state.stage,
+            status: state.status,
+            input_hash: state.input_hash,
+            error: state.error,
+            updated_at: state.updated_at as i64,
+        };
+        db::upsert_pipeline_state(&conn, &row).map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn get_pipeline_state(
+        &self,
+        branch: String,
+        file_path: String,
+        stage: String,
+    ) -> Result<Option<PipelineStateData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let result = db::get_pipeline_state(&conn, &branch, &file_path, &stage)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(result.map(|row| PipelineStateData {
+            branch: row.branch,
+            file_path: row.file_path,
+            stage: row.stage,
+            status: row.status,
+            input_hash: row.input_hash,
+            error: row.error,
+            updated_at: row.updated_at as f64,
+        }))
+    }
+
+    #[napi]
+    pub fn get_unfinished_pipeline_files(&self, branch: String) -> Result<Vec<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        db::get_unfinished_pipeline_files(&conn, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn get_known_pipeline_files(&self, branch: String) -> Result<Vec<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        db::get_known_pipeline_files(&conn, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn reset_pipeline_stage(
+        &self,
+        branch: String,
+        stage: String,
+        updated_at: f64,
+    ) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = db::reset_pipeline_stage(&conn, &branch, &stage, updated_at as i64)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    #[napi]
+    pub fn clear_pipeline_state_for_branch(&self, branch: String) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = db::clear_pipeline_state_for_branch(&conn, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    #[napi]
+    pub fn clear_pipeline_state_for_file(&self, branch: String, file_path: String) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = db::clear_pipeline_state_for_file(&conn, &branch, &file_path)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    // ── Pipeline run methods ───────────────────────────────────────
+
+    #[napi]
+    pub fn start_pipeline_run(&self, run: PipelineRunData, cancelled_at: f64) -> Result<()> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let row = db::PipelineRunRow {
+            run_id: run.run_id,
+            branch: run.branch,
+            run_type: run.run_type,
+            status: run.status,
+            config_hash: run.config_hash,
+            started_at: run.started_at as i64,
+            completed_at: run.completed_at.map(|value| value as i64),
+        };
+        db::start_pipeline_run(&mut conn, &row, cancelled_at as i64)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn update_pipeline_run_status(
+        &self,
+        run_id: String,
+        status: String,
+        completed_at: f64,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        db::update_pipeline_run_status(&conn, &run_id, &status, completed_at as i64)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn get_pipeline_run(&self, run_id: String) -> Result<Option<PipelineRunData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let result = db::get_pipeline_run(&conn, &run_id)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(result.map(|row| PipelineRunData {
+            run_id: row.run_id,
+            branch: row.branch,
+            run_type: row.run_type,
+            status: row.status,
+            config_hash: row.config_hash,
+            started_at: row.started_at as f64,
+            completed_at: row.completed_at.map(|value| value as f64),
+        }))
+    }
+
+    #[napi]
+    pub fn cancel_active_pipeline_runs(&self, branch: String, cancelled_at: f64) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = db::cancel_active_pipeline_runs(&conn, &branch, cancelled_at as i64)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    #[napi]
+    pub fn get_active_pipeline_runs(&self) -> Result<Vec<PipelineRunData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows =
+            db::get_active_pipeline_runs(&conn).map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PipelineRunData {
+                run_id: row.run_id,
+                branch: row.branch,
+                run_type: row.run_type,
+                status: row.status,
+                config_hash: row.config_hash,
+                started_at: row.started_at as f64,
+                completed_at: row.completed_at.map(|value| value as f64),
+            })
+            .collect())
+    }
+
+    #[napi]
+    pub fn prune_finished_pipeline_runs(&self, older_than: f64) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = db::prune_finished_pipeline_runs(&conn, older_than as i64)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    // ── Config version methods ─────────────────────────────────────
+
+    #[napi]
+    pub fn get_active_config_version(&self) -> Result<Option<ConfigVersionData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let result = db::get_active_config_version(&conn)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(result.map(|row| ConfigVersionData {
+            config_hash: row.config_hash,
+            embedding_model_id: row.embedding_model_id,
+            embedding_dimension: row.embedding_dimension as u32,
+            chunker_version: row.chunker_version,
+            graph_extractor_version: row.graph_extractor_version,
+            active: row.active,
+            created_at: row.created_at as f64,
+        }))
+    }
+
+    #[napi]
+    pub fn activate_config_version(&self, config_version: ConfigVersionData) -> Result<()> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let row = db::ConfigVersionRow {
+            config_hash: config_version.config_hash,
+            embedding_model_id: config_version.embedding_model_id,
+            embedding_dimension: config_version.embedding_dimension as i64,
+            chunker_version: config_version.chunker_version,
+            graph_extractor_version: config_version.graph_extractor_version,
+            active: config_version.active,
+            created_at: config_version.created_at as i64,
+        };
+        db::activate_config_version(&mut conn, &row).map_err(|e| Error::from_reason(e.to_string()))
+    }
+
     // ── Symbol methods ──────────────────────────────────────────────
 
     #[napi]
@@ -1076,6 +1386,27 @@ impl Database {
                 language: r.language,
             })
             .collect())
+    }
+
+    #[napi]
+    pub fn get_symbol_by_id(&self, symbol_id: String) -> Result<Option<SymbolData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let row = db::get_symbol_by_id(&conn, &symbol_id)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(row.map(|r| SymbolData {
+            id: r.id,
+            file_path: r.file_path,
+            name: r.name,
+            kind: r.kind,
+            start_line: r.start_line,
+            start_col: r.start_col,
+            end_line: r.end_line,
+            end_col: r.end_col,
+            language: r.language,
+        }))
     }
 
     #[napi]
@@ -1289,6 +1620,35 @@ impl Database {
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let rows = db::get_callers_with_context(&conn, &symbol_name, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| CallEdgeData {
+                id: r.id,
+                from_symbol_id: r.from_symbol_id,
+                from_symbol_name: Some(r.from_symbol_name),
+                from_symbol_file_path: Some(r.from_symbol_file_path),
+                target_name: r.target_name,
+                to_symbol_id: r.to_symbol_id,
+                call_type: r.call_type,
+                line: r.line,
+                col: r.col,
+                is_resolved: r.is_resolved,
+            })
+            .collect())
+    }
+
+    #[napi]
+    pub fn get_callers_with_context_by_target_symbol_id(
+        &self,
+        target_symbol_id: String,
+        branch: String,
+    ) -> Result<Vec<CallEdgeData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows = db::get_callers_with_context_by_target_symbol_id(&conn, &target_symbol_id, &branch)
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(rows
             .into_iter()

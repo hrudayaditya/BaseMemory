@@ -117,22 +117,3 @@ pub fn has_descendant_kind(node: Node<'_>, kinds: &[&str]) -> bool {
     }
     false
 }
-
-fn call_expression_name(node: Node<'_>, source: &str) -> Option<String> {
-    let function = node.child_by_field_name("function")?;
-    match function.kind() {
-        "identifier" | "property_identifier" => {
-            node_text(function, source).map(ToString::to_string)
-        }
-        "member_expression" => function
-            .child_by_field_name("property")
-            .and_then(|child| node_text(child, source).map(ToString::to_string)),
-        _ => None,
-    }
-}
-
-pub fn classify_test_call(node: Node<'_>, source: &str, callees: &[&str]) -> bool {
-    call_expression_name(node, source)
-        .map(|value| callees.iter().any(|callee| value == *callee))
-        .unwrap_or(false)
-}

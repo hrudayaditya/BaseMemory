@@ -16,7 +16,7 @@ export interface GoldenExpected {
 export interface GoldenQuery {
   id: string;
   query: string;
-  queryType: GoldenQueryType;
+  queryType?: GoldenQueryType;
   expected: GoldenExpected;
 }
 
@@ -59,7 +59,10 @@ export type FailureBucket =
 export interface PerQueryEvalResult {
   id: string;
   query: string;
-  queryType: GoldenQueryType;
+  queryType?: GoldenQueryType;
+  effectiveTaskType?: string;
+  effectiveFinalRerankTopN?: number;
+  effectiveGraphDepth?: number;
   latencyMs: number;
   hitAt1: boolean;
   hitAt3: boolean;
@@ -92,7 +95,21 @@ export interface EvalMetrics {
     estimatedCostUsd: number;
     costPer1MTokensUsd: number;
   };
+  reranker?: {
+    appliedCount: number;
+    failureCount: number;
+    backendUsage: Record<string, number>;
+    lastMs: number;
+  };
   failureBuckets: Record<FailureBucket, number>;
+}
+
+export interface EvalSearchConfig
+  extends Pick<SearchConfig, "fusionStrategy" | "hybridWeight" | "rrfK" | "rerankTopN"> {
+  useQueryTypes: boolean;
+  effectiveTaskType: string;
+  effectiveFinalRerankTopN: number;
+  effectiveGraphDepth: number;
 }
 
 export interface EvalSummary {
@@ -103,7 +120,7 @@ export interface EvalSummary {
   datasetVersion: string;
   queryCount: number;
   topK: number;
-  searchConfig: Pick<SearchConfig, "fusionStrategy" | "hybridWeight" | "rrfK" | "rerankTopN">;
+  searchConfig: EvalSearchConfig;
   metrics: EvalMetrics;
 }
 

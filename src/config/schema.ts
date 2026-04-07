@@ -49,6 +49,10 @@ export interface DebugConfig {
   metrics: boolean;
 }
 
+export interface EvalConfig {
+  useQueryTypes: boolean;
+}
+
 export interface CustomProviderConfig {
   /** Base URL of the OpenAI-compatible embeddings API. The path /embeddings is appended automatically (e.g. "http://localhost:11434/v1", "https://api.example.com/v1") */
   baseUrl: string;
@@ -79,6 +83,7 @@ export interface CodebaseIndexConfig {
   indexing?: Partial<IndexingConfig>;
   search?: Partial<SearchConfig>;
   debug?: Partial<DebugConfig>;
+  eval?: Partial<EvalConfig>;
   include: string[];
   exclude: string[];
 }
@@ -87,6 +92,7 @@ export type ParsedCodebaseIndexConfig = CodebaseIndexConfig & {
   indexing: IndexingConfig;
   search: SearchConfig;
   debug: DebugConfig;
+  eval: EvalConfig;
 };
 
 function getDefaultIndexingConfig(): IndexingConfig {
@@ -132,6 +138,12 @@ function getDefaultDebugConfig(): DebugConfig {
     logGc: true,
     logBranch: true,
     metrics: true,
+  };
+}
+
+function getDefaultEvalConfig(): EvalConfig {
+  return {
+    useQueryTypes: false,
   };
 }
 
@@ -187,6 +199,7 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
   const defaultIndexing = getDefaultIndexingConfig();
   const defaultSearch = getDefaultSearchConfig();
   const defaultDebug = getDefaultDebugConfig();
+  const defaultEval = getDefaultEvalConfig();
 
   const rawIndexing = (input.indexing && typeof input.indexing === "object" ? input.indexing : {}) as Record<string, unknown>;
   const indexing: IndexingConfig = {
@@ -225,6 +238,14 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
     logGc: typeof rawDebug.logGc === "boolean" ? rawDebug.logGc : defaultDebug.logGc,
     logBranch: typeof rawDebug.logBranch === "boolean" ? rawDebug.logBranch : defaultDebug.logBranch,
     metrics: typeof rawDebug.metrics === "boolean" ? rawDebug.metrics : defaultDebug.metrics,
+  };
+
+  const rawEval = (input.eval && typeof input.eval === "object" ? input.eval : {}) as Record<string, unknown>;
+  const evalConfig: EvalConfig = {
+    useQueryTypes:
+      typeof rawEval.useQueryTypes === "boolean"
+        ? rawEval.useQueryTypes
+        : defaultEval.useQueryTypes,
   };
 
   let embeddingProvider: EmbeddingProvider | 'custom' | 'auto';
@@ -293,6 +314,7 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
     indexing,
     search,
     debug,
+    eval: evalConfig,
   };
 }
 

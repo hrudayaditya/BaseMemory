@@ -130,7 +130,11 @@ export function buildPerQueryResult(
   query: GoldenQuery,
   results: PerQueryEvalResult["results"],
   latencyMs: number,
-  k: number
+  k: number,
+  effective?: Pick<
+    PerQueryEvalResult,
+    "effectiveTaskType" | "effectiveFinalRerankTopN" | "effectiveGraphDepth"
+  >
 ): PerQueryEvalResult {
   const relevantPaths = getRelevantPaths(query);
   const deduped = uniqueResultsByPath(results);
@@ -141,6 +145,9 @@ export function buildPerQueryResult(
     id: query.id,
     query: query.query,
     queryType: query.queryType,
+    effectiveTaskType: effective?.effectiveTaskType,
+    effectiveFinalRerankTopN: effective?.effectiveFinalRerankTopN,
+    effectiveGraphDepth: effective?.effectiveGraphDepth,
     latencyMs,
     hitAt1: hitAt(1),
     hitAt3: hitAt(3),

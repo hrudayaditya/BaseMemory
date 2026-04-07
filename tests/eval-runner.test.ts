@@ -4,13 +4,25 @@ import * as path from "path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+const createServerMock = vi.fn();
+
+vi.mock("http", async () => {
+  const actual = await vi.importActual<typeof import("http")>("http");
+  return {
+    ...actual,
+    createServer: (...args: unknown[]) => createServerMock(...args),
+  };
+});
+
 import { runEvaluation, runSweep } from "../src/eval/runner.js";
+import { Indexer } from "../src/indexer/index.js";
 
 describe("eval runner", () => {
   let tempDir: string;
   let fetchSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
+    createServerMock.mockReset();
     fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy.mockImplementation(async (_url, init) => {
       const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[] };
@@ -55,6 +67,9 @@ describe("eval runner", () => {
           },
           indexing: {
             watchFiles: false,
+          },
+          eval: {
+            useQueryTypes: false,
           },
           search: {
             maxResults: 10,
@@ -121,9 +136,194 @@ describe("eval runner", () => {
     });
 
     expect(result.summary.queryCount).toBe(1);
+    expect(result.summary.searchConfig.effectiveTaskType).toBe("general");
+    expect(result.summary.searchConfig.effectiveFinalRerankTopN).toBe(0);
+    expect(result.summary.searchConfig.effectiveGraphDepth).toBe(0);
     expect(readFileSync(path.join(result.outputDir, "summary.json"), "utf-8")).toContain("\"metrics\"");
     expect(readFileSync(path.join(result.outputDir, "summary.md"), "utf-8")).toContain("# Evaluation Summary");
     expect(readFileSync(path.join(result.outputDir, "per-query.json"), "utf-8")).toContain("\"queries\"");
+  });
+
+  it("uses the general task type for all eval queries when useQueryTypes is false", async () => {
+    const searchDetailedSpy = vi.spyOn(Indexer.prototype, "searchDetailed");
+
+    writeFileSync(
+      path.join(tempDir, "benchmarks", "golden", "small.json"),
+      JSON.stringify(
+        {
+          version: "1.0.0",
+          name: "small",
+          queries: [
+            {
+              id: "q1",
+              query: "where is rankHybridResults implementation",
+              queryType: "definition",
+              expected: {
+                filePath: "src/indexer/index.ts",
+              },
+            },
+            {
+              id: "q2",
+              query: "find similar code",
+              queryType: "similarity",
+              expected: {
+                filePath: "src/tools/index.ts",
+              },
+            },
+          ],
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+
+    const result = await runEvaluation({
+      projectRoot: tempDir,
+      datasetPath: "benchmarks/golden/small.json",
+      outputRoot: "benchmarks/results",
+      ciMode: false,
+      reindex: false,
+    });
+
+    const taskTypes = searchDetailedSpy.mock.calls.map((call) => call[2]?.taskType);
+    expect(taskTypes).toEqual(["general", "general"]);
+    expect(result.summary.searchConfig.useQueryTypes).toBe(false);
+    expect(result.summary.searchConfig.effectiveTaskType).toBe("general");
+    expect(result.summary.searchConfig.effectiveFinalRerankTopN).toBe(0);
+
+    searchDetailedSpy.mockRestore();
+  });
+
+  it("uses mapped per-query task types when useQueryTypes is true", async () => {
+    const searchDetailedSpy = vi.spyOn(Indexer.prototype, "searchDetailed");
+
+    writeFileSync(
+      path.join(tempDir, ".opencode", "codebase-index.json"),
+      JSON.stringify(
+        {
+          embeddingProvider: "custom",
+          customProvider: {
+            baseUrl: "http://localhost:11434/v1",
+            model: "mock-embedding-model",
+            dimensions: 8,
+          },
+          indexing: {
+            watchFiles: false,
+          },
+          eval: {
+            useQueryTypes: true,
+          },
+          search: {
+            maxResults: 10,
+            minScore: 0,
+            fusionStrategy: "rrf",
+            rrfK: 60,
+            rerankTopN: 20,
+          },
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+
+    writeFileSync(
+      path.join(tempDir, "benchmarks", "golden", "small.json"),
+      JSON.stringify(
+        {
+          version: "1.0.0",
+          name: "small",
+          queries: [
+            {
+              id: "q1",
+              query: "where is rankHybridResults implementation",
+              queryType: "definition",
+              expected: {
+                filePath: "src/indexer/index.ts",
+              },
+            },
+            {
+              id: "q2",
+              query: "find the tool implementation",
+              expected: {
+                filePath: "src/tools/index.ts",
+              },
+            },
+          ],
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+
+    const result = await runEvaluation({
+      projectRoot: tempDir,
+      datasetPath: "benchmarks/golden/small.json",
+      outputRoot: "benchmarks/results",
+      ciMode: false,
+      reindex: false,
+    });
+
+    const taskTypes = searchDetailedSpy.mock.calls.map((call) => call[2]?.taskType);
+    expect(taskTypes).toEqual(["definition", "general"]);
+    expect(result.summary.searchConfig.useQueryTypes).toBe(true);
+    expect(result.summary.searchConfig.effectiveTaskType).toBe("mixed");
+    expect(result.summary.searchConfig.effectiveFinalRerankTopN).toBe(-1);
+
+    searchDetailedSpy.mockRestore();
+  });
+
+  it("records effective recipe fields for a definition-only eval run", async () => {
+    writeFileSync(
+      path.join(tempDir, ".opencode", "codebase-index.json"),
+      JSON.stringify(
+        {
+          embeddingProvider: "custom",
+          customProvider: {
+            baseUrl: "http://localhost:11434/v1",
+            model: "mock-embedding-model",
+            dimensions: 8,
+          },
+          indexing: {
+            watchFiles: false,
+          },
+          eval: {
+            useQueryTypes: true,
+          },
+          search: {
+            maxResults: 10,
+            minScore: 0,
+            fusionStrategy: "rrf",
+            rrfK: 60,
+            rerankTopN: 20,
+          },
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+
+    const result = await runEvaluation({
+      projectRoot: tempDir,
+      datasetPath: "benchmarks/golden/small.json",
+      outputRoot: "benchmarks/results",
+      ciMode: false,
+      reindex: false,
+    });
+
+    const summaryJson = JSON.parse(
+      readFileSync(path.join(result.outputDir, "summary.json"), "utf-8")
+    ) as { searchConfig: Record<string, unknown> };
+
+    expect(result.summary.searchConfig.effectiveTaskType).toBe("definition");
+    expect(result.summary.searchConfig.effectiveFinalRerankTopN).toBeGreaterThan(0);
+    expect(result.summary.searchConfig.effectiveGraphDepth).toBe(0);
+    expect(summaryJson.searchConfig.effectiveTaskType).toBe("definition");
+    expect(summaryJson.searchConfig.effectiveFinalRerankTopN).toBeGreaterThan(0);
+    expect(summaryJson.searchConfig.effectiveGraphDepth).toBe(0);
   });
 
   it("compares against baseline and writes compare artifact", async () => {
@@ -329,5 +529,122 @@ describe("eval runner", () => {
     });
 
     expect(result.gate?.passed).toBe(true);
+  });
+
+  it("bootstraps the bundled eval mock when the configured mock endpoint is offline", async () => {
+    const fakeServer = {
+      once: vi.fn().mockReturnThis(),
+      off: vi.fn().mockReturnThis(),
+      listen: vi.fn((_: number, __: string, cb?: () => void) => {
+        cb?.();
+        return fakeServer;
+      }),
+      close: vi.fn((cb?: (error?: Error) => void) => {
+        cb?.();
+        return fakeServer;
+      }),
+    };
+    createServerMock.mockReturnValueOnce(fakeServer);
+    let fetchCalls = 0;
+    fetchSpy.mockImplementation(async (_url, init) => {
+      fetchCalls += 1;
+      if (fetchCalls === 1) {
+        throw new TypeError("fetch failed");
+      }
+
+      const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[] };
+      const texts = Array.isArray(body.input) ? body.input : [];
+      const data = texts.map((text) => {
+        let seed = 0;
+        for (const ch of text) {
+          seed = (seed * 31 + ch.charCodeAt(0)) % 1000;
+        }
+        return {
+          embedding: Array.from({ length: 8 }, (_, idx) => ((seed + idx * 17) % 997) / 997),
+        };
+      });
+
+      return new Response(
+        JSON.stringify({
+          data,
+          usage: { total_tokens: Math.max(1, texts.length * 8) },
+        }),
+        { status: 200 }
+      );
+    });
+
+    writeFileSync(
+      path.join(tempDir, ".opencode", "codebase-index.json"),
+      JSON.stringify(
+        {
+          embeddingProvider: "custom",
+          customProvider: {
+            baseUrl: "http://127.0.0.1:11435/v1",
+            model: "mock-embedding-model",
+            dimensions: 8,
+          },
+          indexing: {
+            watchFiles: false,
+          },
+          search: {
+            maxResults: 10,
+            minScore: 0,
+            fusionStrategy: "rrf",
+            rrfK: 60,
+            rerankTopN: 20,
+          },
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+
+    const result = await runEvaluation({
+      projectRoot: tempDir,
+      datasetPath: "benchmarks/golden/small.json",
+      outputRoot: "benchmarks/results",
+      ciMode: false,
+      reindex: true,
+    });
+
+    expect(result.summary.metrics.hitAt10).toBeGreaterThan(0);
+    expect(result.summary.metrics.embedding.callCount).toBeGreaterThan(0);
+    expect(createServerMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails loudly when a non-mock custom embedding endpoint is unreachable", async () => {
+    fetchSpy.mockRejectedValue(new TypeError("fetch failed"));
+
+    writeFileSync(
+      path.join(tempDir, ".opencode", "codebase-index.json"),
+      JSON.stringify(
+        {
+          embeddingProvider: "custom",
+          customProvider: {
+            baseUrl: "http://127.0.0.1:9/v1",
+            model: "real-embedding-model",
+            dimensions: 8,
+          },
+          indexing: {
+            watchFiles: false,
+          },
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+
+    await expect(
+      runEvaluation({
+        projectRoot: tempDir,
+        datasetPath: "benchmarks/golden/small.json",
+        outputRoot: "benchmarks/results",
+        ciMode: false,
+        reindex: true,
+      })
+    ).rejects.toThrow(/Evaluation embedding provider is unreachable/);
+    expect(createServerMock).not.toHaveBeenCalled();
   });
 });

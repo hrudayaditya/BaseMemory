@@ -29,6 +29,10 @@ export interface Metrics {
   vectorSearchMs: number;
   keywordSearchMs: number;
   fusionMs: number;
+  rerankerMs: number;
+  rerankerAppliedCount: number;
+  rerankerFailureCount: number;
+  rerankerBackendCounts: Record<string, number>;
   
   cacheHits: number;
   cacheMisses: number;
@@ -71,6 +75,10 @@ function createEmptyMetrics(): Metrics {
     vectorSearchMs: 0,
     keywordSearchMs: 0,
     fusionMs: 0,
+    rerankerMs: 0,
+    rerankerAppliedCount: 0,
+    rerankerFailureCount: 0,
+    rerankerBackendCounts: {},
     cacheHits: 0,
     cacheMisses: 0,
     queryCacheHits: 0,
@@ -218,7 +226,10 @@ export class Logger {
     this.metrics.embeddingErrors++;
   }
 
-  recordSearch(durationMs: number, breakdown?: { embeddingMs: number; vectorMs: number; keywordMs: number; fusionMs: number }): void {
+  recordSearch(
+    durationMs: number,
+    breakdown?: { embeddingMs: number; vectorMs: number; keywordMs: number; fusionMs: number; rerankMs?: number }
+  ): void {
     if (!this.config.metrics) return;
     this.metrics.searchCount++;
     this.metrics.searchTotalMs += durationMs;
@@ -230,6 +241,23 @@ export class Logger {
       this.metrics.vectorSearchMs = breakdown.vectorMs;
       this.metrics.keywordSearchMs = breakdown.keywordMs;
       this.metrics.fusionMs = breakdown.fusionMs;
+      this.metrics.rerankerMs = breakdown.rerankMs ?? 0;
+    }
+  }
+
+  recordReranker(applied: boolean, backend: string | null, failedBackend?: string | null): void {
+    if (!this.config.metrics) return;
+
+    if (applied) {
+      this.metrics.rerankerAppliedCount++;
+    }
+
+    if (failedBackend) {
+      this.metrics.rerankerFailureCount++;
+    }
+
+    if (backend) {
+      this.metrics.rerankerBackendCounts[backend] = (this.metrics.rerankerBackendCounts[backend] ?? 0) + 1;
     }
   }
 
@@ -339,6 +367,12 @@ export class Logger {
         lines.push(`    - Vector search: ${m.vectorSearchMs.toFixed(2)}ms`);
         lines.push(`    - Keyword search: ${m.keywordSearchMs.toFixed(2)}ms`);
         lines.push(`    - Fusion: ${m.fusionMs.toFixed(2)}ms`);
+        lines.push(`    - Final reranker: ${m.rerankerMs.toFixed(2)}ms`);
+      }
+      lines.push(`  Reranker applied: ${m.rerankerAppliedCount}`);
+      lines.push(`  Reranker failures: ${m.rerankerFailureCount}`);
+      if (Object.keys(m.rerankerBackendCounts).length > 0) {
+        lines.push(`  Reranker backends: ${JSON.stringify(m.rerankerBackendCounts)}`);
       }
     }
     

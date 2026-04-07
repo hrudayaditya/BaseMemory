@@ -114,6 +114,26 @@ impl InvertedIndexInner {
     }
 
     pub fn search(&self, query: &str) -> Vec<(String, f64)> {
+        self.search_internal(query, None)
+    }
+
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        allowed_chunk_ids: &HashSet<String>,
+    ) -> Vec<(String, f64)> {
+        if allowed_chunk_ids.is_empty() {
+            return Vec::new();
+        }
+
+        self.search_internal(query, Some(allowed_chunk_ids))
+    }
+
+    fn search_internal(
+        &self,
+        query: &str,
+        allowed_chunk_ids: Option<&HashSet<String>>,
+    ) -> Vec<(String, f64)> {
         let query_tokens = self.tokenize(query);
         if query_tokens.is_empty() {
             return Vec::new();
@@ -123,6 +143,11 @@ impl InvertedIndexInner {
         for token in &query_tokens {
             if let Some(chunks) = self.term_to_chunks.get(token) {
                 for chunk_id in chunks {
+                    if let Some(allowed_ids) = allowed_chunk_ids {
+                        if !allowed_ids.contains(chunk_id) {
+                            continue;
+                        }
+                    }
                     candidate_chunks.insert(chunk_id.clone());
                 }
             }
@@ -248,6 +273,23 @@ mod tests {
         assert_eq!(index.document_count(), 1);
         assert!(!index.has_chunk("chunk1"));
         assert!(index.has_chunk("chunk2"));
+    }
+
+    #[test]
+    fn test_inverted_index_filtered_search() {
+        let dir = tempdir().unwrap();
+        let index_path = dir.path().join("inverted-index.json");
+
+        let mut index = InvertedIndexInner::new(index_path);
+
+        index.add_chunk("chunk1", "function handle error throws exception");
+        index.add_chunk("chunk2", "function handle error with retries");
+
+        let allowed = HashSet::from([String::from("chunk2")]);
+        let results = index.search_filtered("handle error", &allowed);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "chunk2");
     }
 
     #[test]

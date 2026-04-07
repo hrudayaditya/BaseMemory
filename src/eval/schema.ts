@@ -101,7 +101,8 @@ function parseQuery(input: unknown, index: number): GoldenQuery {
   return {
     id,
     query,
-    queryType: parseQueryType(queryType, `${path}.queryType`),
+    queryType:
+      queryType === undefined ? undefined : parseQueryType(queryType, `${path}.queryType`),
     expected: parseExpected(expected, `${path}.expected`),
   };
 }

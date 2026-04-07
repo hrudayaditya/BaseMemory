@@ -1,20 +1,16 @@
 {
-  "generatedAt": "2026-04-07T18:48:05.550Z",
+  "generatedAt": "2026-04-07T05:21:07.845Z",
   "projectRoot": "/Users/aady/Desktop/OpenSourceContributions/BaseMemory",
   "datasetPath": "/Users/aady/Desktop/OpenSourceContributions/BaseMemory/benchmarks/golden/small.json",
   "datasetName": "small",
-  "datasetVersion": "1.1.0",
-  "queryCount": 10,
+  "datasetVersion": "1.0.0",
+  "queryCount": 4,
   "topK": 10,
   "searchConfig": {
     "fusionStrategy": "rrf",
     "hybridWeight": 0.4,
     "rrfK": 60,
-    "rerankTopN": 20,
-    "useQueryTypes": false,
-    "effectiveTaskType": "general",
-    "effectiveFinalRerankTopN": 0,
-    "effectiveGraphDepth": 0
+    "rerankTopN": 20
   },
   "metrics": {
     "hitAt1": 1,
@@ -22,32 +18,26 @@
     "hitAt5": 1,
     "hitAt10": 1,
     "mrrAt10": 1,
-    "ndcgAt10": 0.9831554629583621,
+    "ndcgAt10": 0.9032867981913646,
     "latencyMs": {
-      "p50": 2.4032914999997956,
-      "p95": 5.296877050000235,
-      "p99": 6.823741810000339
+      "p50": 2.4781664999991335,
+      "p95": 4.67187944999996,
+      "p99": 4.913309490000156
     },
     "tokenEstimate": {
-      "queryTokens": 116,
-      "embeddingTokensUsed": 17184
+      "queryTokens": 43,
+      "embeddingTokensUsed": 17288
     },
     "embedding": {
-      "callCount": 165,
+      "callCount": 150,
       "estimatedCostUsd": 0,
       "costPer1MTokensUsd": 0
     },
     "failureBuckets": {
       "wrong-file": 0,
-      "wrong-symbol": 0,
+      "wrong-symbol": 2,
       "docs-tests-outranking-source": 0,
       "no-relevant-hit-top-k": 0
-    },
-    "reranker": {
-      "appliedCount": 0,
-      "failureCount": 0,
-      "backendUsage": {},
-      "lastMs": 0.0018749999999272404
     }
   }
 }

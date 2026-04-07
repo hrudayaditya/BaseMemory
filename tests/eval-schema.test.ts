@@ -27,6 +27,28 @@ describe("eval schema", () => {
     expect(dataset.queries).toHaveLength(1);
   });
 
+  it("allows queries without queryType", () => {
+    const dataset = parseGoldenDataset(
+      {
+        version: "1.0.0",
+        name: "small",
+        queries: [
+          {
+            id: "q1",
+            query: "where is rankHybridResults implementation",
+            expected: {
+              filePath: "src/indexer/index.ts",
+              symbol: "rankHybridResults",
+            },
+          },
+        ],
+      },
+      "dataset.json"
+    );
+
+    expect(dataset.queries[0].queryType).toBeUndefined();
+  });
+
   it("rejects dataset with missing expected path", () => {
     expect(() =>
       parseGoldenDataset(

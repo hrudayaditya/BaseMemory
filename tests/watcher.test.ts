@@ -36,6 +36,9 @@ const createTestConfig = (overrides: Partial<ParsedCodebaseIndexConfig> = {}): P
     minScore: 0.1,
     includeContext: true,
     hybridWeight: 0.5,
+    fusionStrategy: "rrf",
+    rrfK: 60,
+    rerankTopN: 20,
     contextLines: 0,
   },
   debug: {
@@ -47,6 +50,9 @@ const createTestConfig = (overrides: Partial<ParsedCodebaseIndexConfig> = {}): P
     logGc: true,
     logBranch: true,
     metrics: true,
+  },
+  eval: {
+    useQueryTypes: false,
   },
   ...overrides,
 });

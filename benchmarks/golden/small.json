@@ -1,7 +1,7 @@
 {
-  "version": "1.0.0",
+  "version": "1.1.0",
   "name": "small",
-  "description": "Smoke-sized golden eval set for retrieval quality checks.",
+  "description": "Expanded smoke-sized golden eval set for retrieval quality checks.",
   "queries": [
     {
       "id": "def-rank-hybrid-results",
@@ -39,6 +39,60 @@
           "src/config/schema.ts",
           "src/indexer/index.ts"
         ]
+      }
+    },
+    {
+      "id": "sem-finalize-eval-artifacts",
+      "query": "orchestrates eval output artifact writing",
+      "queryType": "similarity",
+      "expected": {
+        "filePath": "src/eval/runner.ts",
+        "symbol": "finalizeEvaluationRun"
+      }
+    },
+    {
+      "id": "impl-implementation-lookup-tool",
+      "query": "where is implementation_lookup tool implementation",
+      "queryType": "implementation-intent",
+      "expected": {
+        "filePath": "src/tools/index.ts",
+        "symbol": "implementation_lookup"
+      }
+    },
+    {
+      "id": "def-typescript-chunker-policy",
+      "query": "where is classify_ts_js_node implementation",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "native/src/chunker/languages/typescript.rs",
+        "symbol": "classify_ts_js_node"
+      }
+    },
+    {
+      "id": "def-build-merkle-snapshot",
+      "query": "where is buildMerkleSnapshot implementation",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/native/index.ts",
+        "symbol": "buildMerkleSnapshot"
+      }
+    },
+    {
+      "id": "sem-index-codebase-caller",
+      "query": "which tool formats index stats after indexing and returns progress",
+      "queryType": "similarity",
+      "expected": {
+        "filePath": "src/tools/index.ts",
+        "symbol": "index_codebase"
+      }
+    },
+    {
+      "id": "impl-call-graph-tool",
+      "query": "where is call_graph tool implementation",
+      "queryType": "implementation-intent",
+      "expected": {
+        "filePath": "src/tools/index.ts",
+        "symbol": "call_graph"
       }
     }
   ]

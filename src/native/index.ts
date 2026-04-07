@@ -280,6 +280,10 @@ export function hashFile(filePath: string): string {
   return native.hashFile(filePath);
 }
 
+export function getChunkerVersion(): string {
+  return native.getChunkerVersion();
+}
+
 function mapMerkleDiff(diff: any): MerkleDiff {
   return {
     changedFiles: diff.changedFiles ?? diff.changed_files ?? [],
@@ -383,6 +387,20 @@ export class VectorStore {
       );
     }
     const results = this.inner.search(queryVector, limit);
+    return results.map((r: any) => ({
+      id: r.id,
+      score: r.score,
+      metadata: JSON.parse(r.metadata) as ChunkMetadata,
+    }));
+  }
+
+  searchFiltered(queryVector: number[], allowedIds: string[], limit: number = 10): SearchResult[] {
+    if (queryVector.length !== this.dimensions) {
+      throw new Error(
+        `Query vector dimension mismatch: expected ${this.dimensions}, got ${queryVector.length}`
+      );
+    }
+    const results = this.inner.searchFiltered(queryVector, limit, allowedIds);
     return results.map((r: any) => ({
       id: r.id,
       score: r.score,
@@ -702,6 +720,15 @@ export class InvertedIndex {
     return map;
   }
 
+  searchFiltered(query: string, allowedChunkIds: string[], limit?: number): Map<string, number> {
+    const results = this.inner.searchFiltered(query, allowedChunkIds, limit ?? 100);
+    const map = new Map<string, number>();
+    for (const r of results) {
+      map.set(r.chunkId, r.score);
+    }
+    return map;
+  }
+
   hasChunk(chunkId: string): boolean {
     return this.inner.hasChunk(chunkId);
   }
@@ -738,6 +765,36 @@ export interface DatabaseStats {
   branchCount: number;
   symbolCount: number;
   callEdgeCount: number;
+}
+
+export interface PipelineStateData {
+  branch: string;
+  filePath: string;
+  stage: string;
+  status: string;
+  inputHash?: string;
+  error?: string;
+  updatedAt: number;
+}
+
+export interface PipelineRunData {
+  runId: string;
+  branch: string;
+  runType: string;
+  status: string;
+  configHash: string;
+  startedAt: number;
+  completedAt?: number;
+}
+
+export interface StoredConfigVersionData {
+  configHash: string;
+  embeddingModelId: string;
+  embeddingDimension: number;
+  chunkerVersion: string;
+  graphExtractorVersion: string;
+  active: boolean;
+  createdAt: number;
 }
 
 export class Database {
@@ -886,6 +943,135 @@ export class Database {
     return this.inner.getStats();
   }
 
+  upsertPipelineState(state: PipelineStateData): void {
+    this.inner.upsertPipelineState({
+      branch: state.branch,
+      filePath: state.filePath,
+      stage: state.stage,
+      status: state.status,
+      inputHash: state.inputHash,
+      error: state.error,
+      updatedAt: state.updatedAt,
+    });
+  }
+
+  getPipelineState(branch: string, filePath: string, stage: string): PipelineStateData | null {
+    const result = this.inner.getPipelineState(branch, filePath, stage);
+    if (result === null || result === undefined) {
+      return null;
+    }
+    return {
+      branch: result.branch,
+      filePath: result.filePath ?? result.file_path,
+      stage: result.stage,
+      status: result.status,
+      inputHash: result.inputHash ?? result.input_hash ?? undefined,
+      error: result.error ?? undefined,
+      updatedAt: result.updatedAt ?? result.updated_at,
+    };
+  }
+
+  getUnfinishedPipelineFiles(branch: string): string[] {
+    return this.inner.getUnfinishedPipelineFiles(branch);
+  }
+
+  getKnownPipelineFiles(branch: string): string[] {
+    return this.inner.getKnownPipelineFiles(branch);
+  }
+
+  resetPipelineStage(branch: string, stage: string, updatedAt: number): number {
+    return this.inner.resetPipelineStage(branch, stage, updatedAt);
+  }
+
+  clearPipelineStateForBranch(branch: string): number {
+    return this.inner.clearPipelineStateForBranch(branch);
+  }
+
+  clearPipelineStateForFile(branch: string, filePath: string): number {
+    return this.inner.clearPipelineStateForFile(branch, filePath);
+  }
+
+  startPipelineRun(run: PipelineRunData, cancelledAt: number): void {
+    this.inner.startPipelineRun({
+      runId: run.runId,
+      branch: run.branch,
+      runType: run.runType,
+      status: run.status,
+      configHash: run.configHash,
+      startedAt: run.startedAt,
+      completedAt: run.completedAt,
+    }, cancelledAt);
+  }
+
+  updatePipelineRunStatus(runId: string, status: string, completedAt: number): boolean {
+    return this.inner.updatePipelineRunStatus(runId, status, completedAt);
+  }
+
+  getPipelineRun(runId: string): PipelineRunData | null {
+    const result = this.inner.getPipelineRun(runId);
+    if (result === null || result === undefined) {
+      return null;
+    }
+    return {
+      runId: result.runId ?? result.run_id,
+      branch: result.branch,
+      runType: result.runType ?? result.run_type,
+      status: result.status,
+      configHash: result.configHash ?? result.config_hash,
+      startedAt: result.startedAt ?? result.started_at,
+      completedAt: result.completedAt ?? result.completed_at ?? undefined,
+    };
+  }
+
+  cancelActivePipelineRuns(branch: string, cancelledAt: number): number {
+    return this.inner.cancelActivePipelineRuns(branch, cancelledAt);
+  }
+
+  getActivePipelineRuns(): PipelineRunData[] {
+    const results = this.inner.getActivePipelineRuns();
+    return results.map((result: any) => ({
+      runId: result.runId ?? result.run_id,
+      branch: result.branch,
+      runType: result.runType ?? result.run_type,
+      status: result.status,
+      configHash: result.configHash ?? result.config_hash,
+      startedAt: result.startedAt ?? result.started_at,
+      completedAt: result.completedAt ?? result.completed_at ?? undefined,
+    }));
+  }
+
+  pruneFinishedPipelineRuns(olderThan: number): number {
+    return this.inner.pruneFinishedPipelineRuns(olderThan);
+  }
+
+  getActiveConfigVersion(): StoredConfigVersionData | null {
+    const result = this.inner.getActiveConfigVersion();
+    if (result === null || result === undefined) {
+      return null;
+    }
+    return {
+      configHash: result.configHash ?? result.config_hash,
+      embeddingModelId: result.embeddingModelId ?? result.embedding_model_id,
+      embeddingDimension: result.embeddingDimension ?? result.embedding_dimension,
+      chunkerVersion: result.chunkerVersion ?? result.chunker_version,
+      graphExtractorVersion: result.graphExtractorVersion ?? result.graph_extractor_version,
+      active: result.active,
+      createdAt: result.createdAt ?? result.created_at,
+    };
+  }
+
+  activateConfigVersion(configVersion: StoredConfigVersionData): void {
+    this.inner.activateConfigVersion({
+      configHash: configVersion.configHash,
+      embeddingModelId: configVersion.embeddingModelId,
+      embeddingDimension: configVersion.embeddingDimension,
+      chunkerVersion: configVersion.chunkerVersion,
+      graphExtractorVersion: configVersion.graphExtractorVersion,
+      active: configVersion.active,
+      createdAt: configVersion.createdAt,
+    });
+  }
+
   // ── Symbol methods ──────────────────────────────────────────────
 
   upsertSymbol(symbol: SymbolData): void {
@@ -899,6 +1085,10 @@ export class Database {
 
   getSymbolsByFile(filePath: string): SymbolData[] {
     return this.inner.getSymbolsByFile(filePath);
+  }
+
+  getSymbolById(symbolId: string): SymbolData | null {
+    return this.inner.getSymbolById(symbolId) ?? null;
   }
 
   getSymbolByName(name: string, filePath: string): SymbolData | null {
@@ -942,6 +1132,10 @@ export class Database {
 
   getCallersWithContext(targetName: string, branch: string): CallEdgeData[] {
     return this.inner.getCallersWithContext(targetName, branch);
+  }
+
+  getCallersWithContextByTargetSymbolId(targetSymbolId: string, branch: string): CallEdgeData[] {
+    return this.inner.getCallersWithContextByTargetSymbolId(targetSymbolId, branch);
   }
 
   getCallees(symbolId: string, branch: string): CallEdgeData[] {

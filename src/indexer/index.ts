@@ -14,6 +14,14 @@ import {
 import { collectFiles, SkippedFile } from "../utils/files.js";
 import { createCostEstimate, CostEstimate } from "../utils/cost.js";
 import { Logger, initializeLogger } from "../utils/logger.js";
+import { IncrementalIndexOrchestrator } from "./incremental-index-orchestrator.js";
+import { expandGraphContext, type GraphExpansionEntry, type GraphExpansionSeed } from "./graph-expansion.js";
+import { SearchReranker, type RerankerCandidate } from "./reranker.js";
+import {
+  getSearchRecipe,
+  type SearchPathPreference,
+  type SearchTaskType,
+} from "./search-recipes.js";
 import {
   VectorStore,
   InvertedIndex,
@@ -29,7 +37,6 @@ import {
   extractCalls,
   buildMerkleSnapshot,
   diffMerkleFromEvents,
-  diffMerkleSnapshots,
   type MerkleDiff,
   type MerkleIgnoreRules,
 } from "../native/index.js";
@@ -66,6 +73,28 @@ function getErrorMessage(error: unknown): string {
     return String((error as { message: unknown }).message);
   }
   return String(error);
+}
+
+function buildLineStartByteOffsets(content: string): number[] {
+  const buffer = Buffer.from(content, "utf8");
+  const lineStarts = [0];
+
+  for (let idx = 0; idx < buffer.length; idx += 1) {
+    if (buffer[idx] === 0x0a) {
+      lineStarts.push(idx + 1);
+    }
+  }
+
+  return lineStarts;
+}
+
+function lineColumnToByteOffset(lineStarts: number[], line: number, column: number): number | null {
+  const lineStart = lineStarts[line - 1];
+  if (lineStart === undefined) {
+    return null;
+  }
+
+  return lineStart + Math.max(0, column);
 }
 
 function getChunkerLanguage(filePath: string): string {
@@ -144,6 +173,35 @@ export interface SearchResult {
   name?: string;
 }
 
+export interface GraphContextResult extends SearchResult {
+  relation: "caller" | "callee";
+  depth: number;
+  viaSymbol?: string;
+}
+
+export interface SearchResponse {
+  primaryResults: SearchResult[];
+  expandedContext: GraphContextResult[];
+  taskType: SearchTaskType;
+  reranker: {
+    applied: boolean;
+    backend: string | null;
+  };
+}
+
+export interface SearchOptions {
+  hybridWeight?: number;
+  fileType?: string;
+  directory?: string;
+  chunkType?: string;
+  contextLines?: number;
+  filterByBranch?: boolean;
+  metadataOnly?: boolean;
+  definitionIntent?: boolean;
+  taskType?: SearchTaskType;
+  graphDepth?: number;
+}
+
 export interface HealthCheckResult {
   removed: number;
   filePaths: string[];
@@ -187,6 +245,8 @@ interface ParsedChunkCandidate {
   content: string;
   startLine: number;
   endLine: number;
+  startByte: number;
+  endByte: number;
   chunkType: ChunkMetadata["chunkType"];
   name?: string;
   language: string;
@@ -220,12 +280,21 @@ interface HybridRankOptions {
   rerankTopN: number;
   limit: number;
   hybridWeight: number;
+  pathPreference?: SearchPathPreference;
 }
 
 interface SemanticRankOptions {
   rerankTopN: number;
   limit: number;
+  pathPreference?: SearchPathPreference;
   prioritizeSourcePaths?: boolean;
+}
+
+interface HardRetrievalFilters {
+  fileType?: string;
+  directory?: string;
+  chunkType?: string;
+  excludeFile?: string;
 }
 
 interface IndexMetadata {
@@ -251,6 +320,7 @@ interface IndexCompatibility {
 
 const INDEX_METADATA_VERSION = "1";
 const RANKING_TOKEN_CACHE_LIMIT = 4096;
+const DEFAULT_RETRIEVAL_CANDIDATE_K = 50;
 
 const rankingQueryTokenCache = new Map<string, Set<string>>();
 const rankingNameTokenCache = new Map<string, Set<string>>();
@@ -419,6 +489,46 @@ function chunkTypeBoost(chunkType: string): number {
     default:
       return 0;
   }
+}
+
+function resolveRetrievalCandidateLimit(limit: number): number {
+  return Math.max(DEFAULT_RETRIEVAL_CANDIDATE_K, limit * 4);
+}
+
+function normalizeDirectoryFilter(directory: string): string {
+  return directory.replace(/^\/|\/$/g, "");
+}
+
+export function matchesHardRetrievalFilters(
+  metadata: ChunkMetadata,
+  filters: HardRetrievalFilters
+): boolean {
+  if (filters.excludeFile && metadata.filePath === filters.excludeFile) {
+    return false;
+  }
+
+  if (filters.fileType) {
+    const ext = metadata.filePath.split(".").pop()?.toLowerCase();
+    if (ext !== filters.fileType.toLowerCase().replace(/^\./, "")) {
+      return false;
+    }
+  }
+
+  if (filters.directory) {
+    const normalizedDir = normalizeDirectoryFilter(filters.directory);
+    if (
+      !metadata.filePath.includes(`/${normalizedDir}/`) &&
+      !metadata.filePath.includes(`${normalizedDir}/`)
+    ) {
+      return false;
+    }
+  }
+
+  if (filters.chunkType && metadata.chunkType !== filters.chunkType) {
+    return false;
+  }
+
+  return true;
 }
 
 function isTestOrDocPath(filePath: string): boolean {
@@ -779,7 +889,7 @@ export function rerankResults(
   query: string,
   candidates: RankedCandidate[],
   rerankTopN: number,
-  options?: { prioritizeSourcePaths?: boolean }
+  options?: { pathPreference?: SearchPathPreference }
 ): RankedCandidate[] {
   if (rerankTopN <= 0 || candidates.length <= 1) {
     return candidates;
@@ -794,7 +904,13 @@ export function rerankResults(
   const queryTokenList = Array.from(queryTokens);
   const intent = classifyQueryIntentRaw(query);
   const docIntent = classifyDocIntent(queryTokenList);
-  const preferSourcePaths = options?.prioritizeSourcePaths ?? intent === "source";
+  const pathPreference = options?.pathPreference ?? "auto";
+  const preferSourcePaths = pathPreference === "source"
+    ? true
+    : pathPreference === "balanced" || pathPreference === "test"
+      ? false
+      : intent === "source";
+  const preferTestPaths = pathPreference === "test";
   const identifierHints = extractIdentifierHints(query);
 
   const head = candidates.slice(0, topN).map((candidate, idx) => {
@@ -834,6 +950,7 @@ export function rerankResults(
     const implementationPathBoost = preferSourcePaths && isLikelyImplementationPath(candidate.metadata.filePath) ? 0.08 : 0;
     const isReadmePath = candidate.metadata.filePath.toLowerCase().includes("readme");
     const testDocPenalty = preferSourcePaths && likelyTestOrDoc ? 0.12 : 0;
+    const testPathBoost = preferTestPaths && likelyTestOrDoc ? 0.16 : 0;
     const readmeDocBoost = !preferSourcePaths && isReadmePath ? 0.08 : 0;
     const identifierBoost = hasIdentifierMatch ? 0.12 : 0;
     const tokenCoverage = queryTokenList.length > 0
@@ -849,6 +966,7 @@ export function rerankResults(
       identifierBoost +
       implementationPathBoost -
       testDocPenalty +
+      testPathBoost +
       readmeDocBoost +
       chunkTypeBoost(candidate.metadata.chunkType);
 
@@ -891,6 +1009,18 @@ export function rerankResults(
 
       return 0;
     });
+  } else if (preferTestPaths) {
+    head.sort((a, b) => {
+      const aTestDoc = a.isTestOrDocPath ? 1 : 0;
+      const bTestDoc = b.isTestOrDocPath ? 1 : 0;
+      if (aTestDoc !== bTestDoc) return bTestDoc - aTestDoc;
+
+      const aId = a.hasIdentifierMatch ? 1 : 0;
+      const bId = b.hasIdentifierMatch ? 1 : 0;
+      if (aId !== bId) return bId - aId;
+
+      return 0;
+    });
   } else if (docIntent === "docs") {
     head.sort((a, b) => {
       const aReadme = a.isReadmePath ? 1 : 0;
@@ -917,8 +1047,11 @@ export function rankHybridResults(
 
   const rerankPoolLimit = Math.max(overfetchLimit, options.rerankTopN * 3, options.limit * 6);
   const rerankPool = fused.slice(0, rerankPoolLimit);
+  const defaultPathPreference = (options.prioritizeSourcePaths ?? (classifyQueryIntentRaw(query) === "source"))
+    ? "source"
+    : "auto";
   return rerankResults(query, rerankPool, options.rerankTopN, {
-    prioritizeSourcePaths: options.prioritizeSourcePaths ?? classifyQueryIntentRaw(query) === "source",
+    pathPreference: options.pathPreference ?? defaultPathPreference,
   });
 }
 
@@ -929,8 +1062,9 @@ export function rankSemanticOnlyResults(
 ): RankedCandidate[] {
   const overfetchLimit = Math.max(options.limit * 4, options.limit);
   const bounded = semanticResults.slice(0, overfetchLimit);
+  const defaultPathPreference = (options.prioritizeSourcePaths ?? false) ? "source" : "auto";
   return rerankResults(query, bounded, options.rerankTopN, {
-    prioritizeSourcePaths: options.prioritizeSourcePaths ?? false,
+    pathPreference: options.pathPreference ?? defaultPathPreference,
   });
 }
 
@@ -940,7 +1074,7 @@ function promoteIdentifierMatches(
   semanticCandidates: RankedCandidate[],
   keywordCandidates: RankedCandidate[],
   database?: Database,
-  branchChunkIds?: Set<string> | null,
+  allowedChunkIds?: Set<string> | null,
   prioritizeSourcePaths: boolean = classifyQueryIntentRaw(query) === "source"
 ): RankedCandidate[] {
   if (combined.length === 0) {
@@ -973,7 +1107,7 @@ function promoteIdentifierMatches(
       for (const symbol of symbols) {
         const chunks = database.getChunksByFile(symbol.filePath);
         for (const chunk of chunks) {
-          if (branchChunkIds && !branchChunkIds.has(chunk.chunkId)) {
+          if (allowedChunkIds && !allowedChunkIds.has(chunk.chunkId)) {
             continue;
           }
 
@@ -1058,7 +1192,7 @@ function promoteIdentifierMatches(
 function buildSymbolDefinitionLane(
   query: string,
   database: Database,
-  branchChunkIds: Set<string> | null,
+  allowedChunkIds: Set<string> | null,
   limit: number,
   fallbackCandidates: RankedCandidate[],
   prioritizeSourcePaths: boolean = classifyQueryIntentRaw(query) === "source"
@@ -1069,7 +1203,14 @@ function buildSymbolDefinitionLane(
 
   const identifierHints = extractIdentifierHints(query);
   const codeTermHints = extractCodeTermHints(query);
-  if (identifierHints.length === 0 && codeTermHints.length === 0) {
+  if (identifierHints.length === 0) {
+    // This lane is intended to recover symbol-definition lookups. Letting
+    // generic code terms fabricate a precedence lane causes semantic queries
+    // to over-promote unrelated implementation chunks ahead of the fused pool.
+    return [];
+  }
+
+  if (codeTermHints.length === 0) {
     return [];
   }
 
@@ -1083,7 +1224,7 @@ function buildSymbolDefinitionLane(
     normalizedIdentifier: string,
     baseScore?: number
   ) => {
-    if (branchChunkIds && !branchChunkIds.has(chunk.chunkId)) {
+    if (allowedChunkIds && !allowedChunkIds.has(chunk.chunkId)) {
       return;
     }
 
@@ -1376,6 +1517,9 @@ export class Indexer {
   private indexCompatibility: IndexCompatibility | null = null;
   private indexingLockPath: string = "";
   private indexingQueue: Promise<void> = Promise.resolve();
+  private recoveredFromInterruptedIndexing = false;
+  private orchestrator!: IncrementalIndexOrchestrator;
+  private readonly searchReranker = new SearchReranker();
 
   constructor(projectRoot: string, config: ParsedCodebaseIndexConfig) {
     const resolvedProjectRoot = resolveIndexerProjectRoot(projectRoot);
@@ -1397,6 +1541,59 @@ export class Indexer {
     this.failedBatchesPath = path.join(this.indexPath, "failed-batches.json");
     this.indexingLockPath = path.join(this.indexPath, "indexing.lock");
     this.logger = initializeLogger(config.debug);
+    this.orchestrator = new IncrementalIndexOrchestrator({
+      logger: this.logger,
+      getConfig: () => this.config,
+      getProjectRoot: () => this.projectRoot,
+      getIndexPath: () => this.indexPath,
+      getCurrentBranch: () => this.currentBranch,
+      setCurrentBranch: (branch) => {
+        this.currentBranch = branch;
+        this.loadFileHashCache();
+      },
+      refreshBranchInfo: () => this.refreshBranchInfo(),
+      ensureInitialized: () => this.ensureInitialized(),
+      assertIndexCompatible: () => this.assertIndexCompatible(),
+      runWithCrashMarker: <T>(operation: () => Promise<T>) => this.runWithCrashMarker(operation),
+      loadFileHashCache: () => this.loadFileHashCache(),
+      commitFileHashChanges: (successfulFileHashes, removedFilePaths) =>
+        this.commitFileHashChanges(successfulFileHashes, removedFilePaths),
+      buildCommittedMerkleSnapshot: (baseSnapshot, committedRelativePaths) =>
+        this.buildCommittedMerkleSnapshot(baseSnapshot, committedRelativePaths),
+      buildMerkleIgnoreRules: () => this.buildMerkleIgnoreRules(),
+      normalizeDirtyPaths: (paths) => this.normalizeDirtyPaths(paths),
+      buildBranchStoreChunkMaps: (store, branchChunkIds) =>
+        this.buildBranchStoreChunkMaps(store, branchChunkIds),
+      parseFilesForIndexing: (files) => this.parseFilesForIndexing(files),
+      buildFileGraphData: (parsedFiles) => this.buildFileGraphData(parsedFiles),
+      removeChunkFromRetrievalIfUnreferenced: (database, store, invertedIndex, chunkId) =>
+        this.removeChunkFromRetrievalIfUnreferenced(database, store, invertedIndex, chunkId),
+      clearCallEdgesForSymbolIfUnreferenced: (database, symbolId) =>
+        this.clearCallEdgesForSymbolIfUnreferenced(database, symbolId),
+      removeSymbolFromGraphIfUnreferenced: (database, symbolId) =>
+        this.removeSymbolFromGraphIfUnreferenced(database, symbolId),
+      getProviderRateLimits: (provider) => {
+        const limits = this.getProviderRateLimits(provider);
+        return {
+          concurrency: limits.concurrency,
+          intervalCap: 1,
+          interval: limits.intervalMs,
+        };
+      },
+      addFailedBatch: (batch, error) => this.addFailedBatch(batch as PendingChunk[], error),
+      saveIndexMetadata: (providerInfo) => this.saveIndexMetadata(providerInfo),
+      markIndexCompatible: () => {
+        this.indexCompatibility = { compatible: true };
+      },
+      consumeRecoveredFromCrash: () => {
+        const recovered = this.recoveredFromInterruptedIndexing;
+        this.recoveredFromInterruptedIndexing = false;
+        return recovered;
+      },
+      getFailedBatchesPath: () => this.failedBatchesPath,
+    });
+    void this.indexDirtySetInternal;
+    void this.indexInternal;
     indexerInstances.set(resolvedProjectRoot, this);
   }
 
@@ -1524,6 +1721,7 @@ export class Indexer {
 
   private async recoverFromInterruptedIndexing(lockData: { pid?: number; startedAt?: string }): Promise<void> {
     const { database } = await this.ensureInitialized();
+    this.recoveredFromInterruptedIndexing = true;
     this.logger.warn("Detected interrupted indexing session, recovering...", {
       previousPid: lockData.pid,
       startedAt: lockData.startedAt,
@@ -1881,6 +2079,15 @@ export class Indexer {
     };
   }
 
+  private assertIndexCompatible(): void {
+    if (!this.indexCompatibility?.compatible) {
+      throw new Error(
+        `${this.indexCompatibility?.reason} ` +
+        `Run index_codebase with force=true to rebuild the index.`
+      );
+    }
+  }
+
   checkCompatibility(): IndexCompatibility {
     if (!this.indexCompatibility) {
       if (!this.configuredProviderInfo) {
@@ -1980,6 +2187,8 @@ export class Indexer {
             content: chunk.text,
             startLine: chunk.startLine,
             endLine: chunk.endLine,
+            startByte: chunk.startByte,
+            endByte: chunk.endByte,
             chunkType: mapSemanticChunkType(chunk.symbolKind),
             name: chunk.symbolName,
             language: chunk.language,
@@ -2012,7 +2221,7 @@ export class Indexer {
     const graphData = new Map<string, FileGraphData>();
 
     for (const parsed of parsedFiles) {
-      const fileSymbols: SymbolData[] = [];
+      const fileSymbols: Array<SymbolData & { startByte: number; endByte: number }> = [];
       for (const chunk of parsed.chunks) {
         if (!chunk.name || !CALL_GRAPH_SYMBOL_CHUNK_TYPES.has(chunk.chunkType)) {
           continue;
@@ -2029,6 +2238,8 @@ export class Indexer {
           endLine: chunk.endLine,
           endCol: 0,
           language: chunk.language,
+          startByte: chunk.startByte,
+          endByte: chunk.endByte,
         });
       }
 
@@ -2047,15 +2258,38 @@ export class Indexer {
 
       const callSites = extractCalls(parsed.content, fileLanguage);
       if (callSites.length === 0) {
-        graphData.set(parsed.path, { symbols: fileSymbols, edges: [] });
+        graphData.set(parsed.path, {
+          symbols: fileSymbols.map(({ startByte: _startByte, endByte: _endByte, ...symbol }) => symbol),
+          edges: [],
+        });
         continue;
       }
 
+      const lineStartBytes = buildLineStartByteOffsets(parsed.content);
       const edges: CallEdgeData[] = [];
       for (const site of callSites) {
-        const enclosingSymbol = fileSymbols.find(
-          (symbol) => site.line >= symbol.startLine && site.line <= symbol.endLine
-        );
+        const siteByteOffset = lineColumnToByteOffset(lineStartBytes, site.line, site.column);
+        if (siteByteOffset === null) {
+          continue;
+        }
+
+        let enclosingSymbol: (SymbolData & { startByte: number; endByte: number }) | undefined;
+        for (const symbol of fileSymbols) {
+          if (siteByteOffset < symbol.startByte || siteByteOffset >= symbol.endByte) {
+            continue;
+          }
+
+          if (
+            !enclosingSymbol ||
+            symbol.startByte > enclosingSymbol.startByte ||
+            (symbol.startByte === enclosingSymbol.startByte && symbol.endByte < enclosingSymbol.endByte) ||
+            (symbol.startByte === enclosingSymbol.startByte &&
+              symbol.endByte === enclosingSymbol.endByte &&
+              symbol.id.localeCompare(enclosingSymbol.id) < 0)
+          ) {
+            enclosingSymbol = symbol;
+          }
+        }
         if (!enclosingSymbol) {
           continue;
         }
@@ -2076,7 +2310,7 @@ export class Indexer {
       }
 
       graphData.set(parsed.path, {
-        symbols: fileSymbols,
+        symbols: fileSymbols.map(({ startByte: _startByte, endByte: _endByte, ...symbol }) => symbol),
         edges,
       });
     }
@@ -2261,7 +2495,7 @@ export class Indexer {
         this.logger.branch("warn", "Merkle snapshot missing, falling back to full index", {
           branch: this.currentBranch,
         });
-        await this.indexInternal();
+        await this.orchestrator.coldStart();
         return;
       }
 
@@ -2287,7 +2521,7 @@ export class Indexer {
         return;
       }
 
-      await this.indexDirtySetInternal(
+      await this.orchestrator.hotUpdate(
         {
           changedFiles: prepared.changedFiles,
           addedFiles: prepared.addedFiles,
@@ -2301,7 +2535,7 @@ export class Indexer {
         branch: this.currentBranch,
         error: getErrorMessage(error),
       });
-      await this.indexInternal();
+      await this.orchestrator.coldStart();
     }
   }
 
@@ -2310,43 +2544,7 @@ export class Indexer {
   }
 
   private async handleBranchChangeInternal(_oldBranch: string | null, newBranch: string): Promise<void> {
-    try {
-      const { database } = await this.ensureInitialized();
-      this.refreshBranchInfo();
-
-      const storedSnapshot = database.getMerkleSnapshot(newBranch);
-      if (!storedSnapshot) {
-        this.logger.branch("warn", "Merkle snapshot missing for branch, falling back to full index", {
-          branch: newBranch,
-        });
-        await this.indexInternal();
-        return;
-      }
-
-      const currentSnapshot = await buildMerkleSnapshot(
-        this.projectRoot,
-        newBranch,
-        this.buildMerkleIgnoreRules()
-      );
-      const diff = await diffMerkleSnapshots(storedSnapshot, currentSnapshot.snapshot);
-
-      if (
-        diff.changedFiles.length === 0 &&
-        diff.addedFiles.length === 0 &&
-        diff.removedFiles.length === 0
-      ) {
-        database.saveMerkleSnapshot(currentSnapshot.snapshot);
-        return;
-      }
-
-      await this.indexDirtySetInternal(diff, currentSnapshot.snapshot, storedSnapshot);
-    } catch (error) {
-      this.logger.branch("warn", "Merkle branch update failed, falling back to full index", {
-        branch: newBranch,
-        error: getErrorMessage(error),
-      });
-      await this.indexInternal();
-    }
+    await this.orchestrator.handleBranchChange(_oldBranch, newBranch);
   }
 
   async indexDirtySet(
@@ -2355,7 +2553,7 @@ export class Indexer {
     baseSnapshot: string | null = null
   ): Promise<IndexStats> {
     return this.runSerializedIndexOperation(() =>
-      this.indexDirtySetInternal(diff, nextSnapshot, baseSnapshot)
+      this.orchestrator.hotUpdate(diff, nextSnapshot, baseSnapshot)
     );
   }
 
@@ -2809,7 +3007,7 @@ export class Indexer {
   }
 
   async index(onProgress?: ProgressCallback): Promise<IndexStats> {
-    return this.runSerializedIndexOperation(() => this.indexInternal(onProgress));
+    return this.runSerializedIndexOperation(() => this.orchestrator.coldStart(onProgress));
   }
 
   private async indexInternal(onProgress?: ProgressCallback): Promise<IndexStats> {
@@ -3443,21 +3641,193 @@ export class Indexer {
     return intersection / union;
   }
 
+  private async readFileContentCached(
+    filePath: string,
+    cache: Map<string, string | null>
+  ): Promise<string | null> {
+    if (cache.has(filePath)) {
+      return cache.get(filePath) ?? null;
+    }
+
+    try {
+      const content = await fsPromises.readFile(filePath, "utf-8");
+      cache.set(filePath, content);
+      return content;
+    } catch {
+      cache.set(filePath, null);
+      return null;
+    }
+  }
+
+  private getChunkContentFromFile(fileContent: string | null, metadata: ChunkMetadata): string {
+    if (fileContent === null) {
+      return "";
+    }
+
+    const lines = fileContent.split("\n");
+    return lines.slice(metadata.startLine - 1, metadata.endLine).join("\n");
+  }
+
+  private async buildRerankerCandidates(
+    candidates: RankedCandidate[],
+    fileContentCache: Map<string, string | null>
+  ): Promise<RerankerCandidate[]> {
+    return Promise.all(
+      candidates.map(async (candidate) => {
+        const fileContent = await this.readFileContentCached(candidate.metadata.filePath, fileContentCache);
+        const content = this.getChunkContentFromFile(fileContent, candidate.metadata);
+
+        return {
+          id: candidate.id,
+          baseScore: candidate.score,
+          metadata: candidate.metadata,
+          content,
+        };
+      })
+    );
+  }
+
+  private async materializeRankedResults(
+    candidates: RankedCandidate[],
+    options: { metadataOnly: boolean; contextLines: number },
+    fileContentCache: Map<string, string | null>
+  ): Promise<SearchResult[]> {
+    return Promise.all(
+      candidates.map(async (candidate) => {
+        let content = "";
+        let startLine = candidate.metadata.startLine;
+        let endLine = candidate.metadata.endLine;
+
+        const fileContent = await this.readFileContentCached(candidate.metadata.filePath, fileContentCache);
+        if (!options.metadataOnly) {
+          if (fileContent === null) {
+            content = "[File not accessible]";
+          } else if (this.config.search.includeContext) {
+            const lines = fileContent.split("\n");
+            startLine = Math.max(1, candidate.metadata.startLine - options.contextLines);
+            endLine = Math.min(lines.length, candidate.metadata.endLine + options.contextLines);
+            content = lines.slice(startLine - 1, endLine).join("\n");
+          }
+        }
+
+        return {
+          filePath: candidate.metadata.filePath,
+          startLine,
+          endLine,
+          content,
+          score: candidate.score,
+          chunkType: candidate.metadata.chunkType,
+          name: candidate.metadata.name,
+        };
+      })
+    );
+  }
+
+  private async materializeExpandedContext(
+    entries: GraphExpansionEntry[],
+    options: { metadataOnly: boolean; contextLines: number },
+    fileContentCache: Map<string, string | null>
+  ): Promise<GraphContextResult[]> {
+    return Promise.all(
+      entries.map(async (entry) => {
+        const [materialized] = await this.materializeRankedResults(
+          [{
+            id: entry.id,
+            score: 0,
+            metadata: entry.metadata,
+          }],
+          options,
+          fileContentCache
+        );
+
+        return {
+          ...materialized,
+          relation: entry.relation,
+          depth: entry.depth,
+          viaSymbol: entry.viaSymbol,
+        };
+      })
+    );
+  }
+
+  private async applyFinalReranker(
+    query: string,
+    candidates: RankedCandidate[],
+    taskType: SearchTaskType,
+    rerankTopN: number,
+    fileContentCache: Map<string, string | null>
+  ): Promise<{ ordered: RankedCandidate[]; applied: boolean; backend: string | null; failedBackend?: string | null }> {
+    if (rerankTopN <= 0 || candidates.length < 2) {
+      return {
+        ordered: candidates,
+        applied: false,
+        backend: null,
+        failedBackend: null,
+      };
+    }
+
+    const headSize = Math.min(rerankTopN, candidates.length);
+    const head = candidates.slice(0, headSize);
+    const tail = candidates.slice(headSize);
+    const rerankerCandidates = await this.buildRerankerCandidates(head, fileContentCache);
+    const reranked = await this.searchReranker.rerank(query, rerankerCandidates, taskType);
+
+    if (!reranked.applied) {
+      if (reranked.failedBackend) {
+        this.logger.search("warn", "Search reranker backend failed; using existing order", {
+          taskType,
+          backend: reranked.failedBackend,
+        });
+      }
+
+      return {
+        ordered: candidates,
+        applied: false,
+        backend: null,
+        failedBackend: reranked.failedBackend,
+      };
+    }
+
+    const headById = new Map(head.map((candidate) => [candidate.id, candidate]));
+    const orderedHead = reranked.candidates
+      .map((candidate) => headById.get(candidate.id))
+      .filter((candidate): candidate is RankedCandidate => candidate !== undefined);
+
+    return {
+      ordered: [...orderedHead, ...tail],
+      applied: true,
+      backend: reranked.backend,
+      failedBackend: reranked.failedBackend,
+    };
+  }
+
   async search(
     query: string,
     limit?: number,
-    options?: {
-      hybridWeight?: number;
-      fileType?: string;
-      directory?: string;
-      chunkType?: string;
-      contextLines?: number;
-      filterByBranch?: boolean;
-      metadataOnly?: boolean;
-      definitionIntent?: boolean;
-    }
+    options?: SearchOptions
   ): Promise<SearchResult[]> {
+    const result = await this.searchDetailed(query, limit, options);
+    return result.primaryResults;
+  }
+
+  async searchDetailed(
+    query: string,
+    limit?: number,
+    options?: SearchOptions
+  ): Promise<SearchResponse> {
     const { store, provider, database } = await this.ensureInitialized();
+
+    if (query.trim().length === 0) {
+      return {
+        primaryResults: [],
+        expandedContext: [],
+        taskType: options?.taskType ?? "general",
+        reranker: {
+          applied: false,
+          backend: null,
+        },
+      };
+    }
 
     const compatibility = this.checkCompatibility();
     if (!compatibility.compatible) {
@@ -3471,16 +3841,60 @@ export class Indexer {
 
     if (store.count() === 0) {
       this.logger.search("debug", "Search on empty index", { query });
-      return [];
+      return {
+        primaryResults: [],
+        expandedContext: [],
+        taskType: options?.taskType ?? "general",
+        reranker: {
+          applied: false,
+          backend: null,
+        },
+      };
     }
 
     const maxResults = limit ?? this.config.search.maxResults;
-    const hybridWeight = options?.hybridWeight ?? this.config.search.hybridWeight;
+    const taskType = options?.taskType ?? "general";
+    const recipe = getSearchRecipe(taskType);
+    const queryIntent = classifyQueryIntentRaw(query);
+    const hybridWeight = options?.hybridWeight ?? recipe.hybridWeight ?? this.config.search.hybridWeight;
     const fusionStrategy = this.config.search.fusionStrategy;
     const rrfK = this.config.search.rrfK;
     const rerankTopN = this.config.search.rerankTopN;
     const filterByBranch = options?.filterByBranch ?? true;
-    const sourceIntent = options?.definitionIntent === true || classifyQueryIntentRaw(query) === "source";
+    const sourceIntent = options?.definitionIntent === true ||
+      recipe.forceDefinitionIntent ||
+      queryIntent === "source";
+    const finalRerankTopN =
+      taskType === "general" && queryIntent === "doc_test" && options?.definitionIntent !== true
+        ? 0
+        : recipe.finalRerankTopN;
+    const prefilterStartTime = performance.now();
+    const allowedChunkIds = this.buildAllowedChunkIds(store, database, {
+      filterByBranch,
+      fileType: options?.fileType,
+      directory: options?.directory,
+      chunkType: options?.chunkType,
+    });
+    const prefilterMs = performance.now() - prefilterStartTime;
+
+    if (allowedChunkIds && allowedChunkIds.size === 0) {
+      this.logger.search("debug", "Search has no candidates after hard filtering", {
+        query,
+        branch: filterByBranch ? this.currentBranch : undefined,
+      });
+      return {
+        primaryResults: [],
+        expandedContext: [],
+        taskType,
+        reranker: {
+          applied: false,
+          backend: null,
+        },
+      };
+    }
+
+    const allowedChunkIdList = allowedChunkIds ? Array.from(allowedChunkIds) : null;
+    const retrievalLimit = resolveRetrievalCandidateLimit(maxResults);
 
     this.logger.search("debug", "Starting search", {
       query,
@@ -3488,7 +3902,7 @@ export class Indexer {
       hybridWeight,
       fusionStrategy,
       rrfK,
-      rerankTopN,
+      rerankTopN: finalRerankTopN,
       filterByBranch,
     });
 
@@ -3497,53 +3911,18 @@ export class Indexer {
     const embedding = await this.getQueryEmbedding(embeddingQuery, provider);
     const embeddingMs = performance.now() - embeddingStartTime;
 
+    // Native vector and BM25 lookups are synchronous NAPI calls today, so these
+    // execute sequentially. Keeping them behind filtered-search helpers makes
+    // worker-thread parallelism straightforward without changing ranking logic.
     const vectorStartTime = performance.now();
-    const semanticResults = store.search(embedding, maxResults * 4);
+    const semanticCandidates = allowedChunkIdList
+      ? store.searchFiltered(embedding, allowedChunkIdList, retrievalLimit)
+      : store.search(embedding, retrievalLimit);
     const vectorMs = performance.now() - vectorStartTime;
 
     const keywordStartTime = performance.now();
-    const keywordResults = await this.keywordSearch(query, maxResults * 4);
+    const keywordCandidates = await this.keywordSearch(query, retrievalLimit, allowedChunkIdList);
     const keywordMs = performance.now() - keywordStartTime;
-
-    let branchChunkIds: Set<string> | null = null;
-    if (filterByBranch && this.currentBranch !== "default") {
-      branchChunkIds = new Set(database.getBranchChunkIds(this.currentBranch));
-    }
-
-    const prefilterStartTime = performance.now();
-    const shouldPrefilterByBranch = branchChunkIds !== null && branchChunkIds.size > 0;
-    const prefilteredSemantic = shouldPrefilterByBranch && branchChunkIds
-      ? semanticResults.filter((r) => branchChunkIds.has(r.id))
-      : semanticResults;
-    const prefilteredKeyword = shouldPrefilterByBranch && branchChunkIds
-      ? keywordResults.filter((r) => branchChunkIds.has(r.id))
-      : keywordResults;
-
-    const semanticCandidates = (shouldPrefilterByBranch && semanticResults.length > 0 && prefilteredSemantic.length === 0)
-      ? semanticResults
-      : prefilteredSemantic;
-    const keywordCandidates = (shouldPrefilterByBranch && keywordResults.length > 0 && prefilteredKeyword.length === 0)
-      ? keywordResults
-      : prefilteredKeyword;
-    const prefilterMs = performance.now() - prefilterStartTime;
-
-    if (branchChunkIds && branchChunkIds.size === 0) {
-      this.logger.search("warn", "Branch prefilter skipped because branch catalog is empty", {
-        branch: this.currentBranch,
-      });
-    }
-
-    if (shouldPrefilterByBranch && semanticResults.length > 0 && prefilteredSemantic.length === 0) {
-      this.logger.search("warn", "Branch prefilter produced no semantic overlap, using unfiltered semantic candidates", {
-        branch: this.currentBranch,
-      });
-    }
-
-    if (shouldPrefilterByBranch && keywordResults.length > 0 && prefilteredKeyword.length === 0) {
-      this.logger.search("warn", "Branch prefilter produced no keyword overlap, using unfiltered keyword candidates", {
-        branch: this.currentBranch,
-      });
-    }
 
     const fusionStartTime = performance.now();
     const combined = rankHybridResults(query, semanticCandidates, keywordCandidates, {
@@ -3553,79 +3932,81 @@ export class Indexer {
       limit: maxResults,
       hybridWeight,
       prioritizeSourcePaths: sourceIntent,
+      pathPreference: recipe.pathPreference,
     });
     const fusionMs = performance.now() - fusionStartTime;
 
-    const rescued = promoteIdentifierMatches(
-      query,
-      combined,
-      semanticCandidates,
-      keywordCandidates,
-      database,
-      branchChunkIds,
-      sourceIntent
-    );
+    const rescued = recipe.enableIdentifierPromotion
+      ? promoteIdentifierMatches(
+          query,
+          combined,
+          semanticCandidates,
+          keywordCandidates,
+          database,
+          allowedChunkIds,
+          sourceIntent
+        )
+      : combined;
 
     const union = unionCandidates(semanticCandidates, keywordCandidates);
 
-    const deterministicIdentifierLane = buildDeterministicIdentifierPass(
-      query,
-      union,
-      maxResults,
-      sourceIntent
-    );
+    const deterministicIdentifierLane = recipe.enableDeterministicIdentifierLane
+      ? buildDeterministicIdentifierPass(
+          query,
+          union,
+          maxResults,
+          sourceIntent
+        )
+      : [];
 
-    const identifierLane = buildIdentifierDefinitionLane(
-      query,
-      union,
-      maxResults,
-      sourceIntent
-    );
+    const identifierLane = recipe.enableIdentifierDefinitionLane
+      ? buildIdentifierDefinitionLane(
+          query,
+          union,
+          maxResults,
+          sourceIntent
+        )
+      : [];
 
-    const symbolLane = buildSymbolDefinitionLane(
-      query,
-      database,
-      branchChunkIds,
-      maxResults,
-      union,
-      sourceIntent
-    );
+    const symbolLane = recipe.enableSymbolDefinitionLane
+      ? buildSymbolDefinitionLane(
+          query,
+          database,
+          allowedChunkIds,
+          maxResults,
+          union,
+          sourceIntent
+        )
+      : [];
 
     const prePrimaryLane = mergeTieredResults(deterministicIdentifierLane, identifierLane, maxResults * 4);
     const primaryLane = mergeTieredResults(prePrimaryLane, symbolLane, maxResults * 4);
     const tiered = mergeTieredResults(primaryLane, rescued, maxResults * 4);
     const hasCodeHints = extractCodeTermHints(query).length > 0 || extractIdentifierHints(query).length > 0;
 
-    const baseFiltered = tiered.filter((r) => {
-      if (r.score < this.config.search.minScore) return false;
-
-      if (options?.fileType) {
-        const ext = r.metadata.filePath.split(".").pop()?.toLowerCase();
-        if (ext !== options.fileType.toLowerCase().replace(/^\./, "")) return false;
-      }
-
-      if (options?.directory) {
-        const normalizedDir = options.directory.replace(/^\/|\/$/g, "");
-        if (!r.metadata.filePath.includes(`/${normalizedDir}/`) &&
-          !r.metadata.filePath.includes(`${normalizedDir}/`)) return false;
-      }
-
-      if (options?.chunkType) {
-        if (r.metadata.chunkType !== options.chunkType) return false;
-      }
-
-      return true;
-    });
+    const baseFiltered = tiered.filter((r) => r.score >= this.config.search.minScore);
 
     const implementationOnly = baseFiltered.filter((r) =>
       isLikelyImplementationPath(r.metadata.filePath) &&
       isImplementationChunkType(r.metadata.chunkType)
     );
 
-    const filtered = (sourceIntent && hasCodeHints && implementationOnly.length > 0
+    const filtered = ((recipe.implementationOnlyOnCodeHints && sourceIntent && hasCodeHints && implementationOnly.length > 0)
       ? implementationOnly
       : baseFiltered
     ).slice(0, maxResults);
+
+    const fileContentCache = new Map<string, string | null>();
+    const rerankStartTime = performance.now();
+    const reranked = await this.applyFinalReranker(
+      query,
+      filtered,
+      taskType,
+      finalRerankTopN,
+      fileContentCache
+    );
+    const rerankMs = performance.now() - rerankStartTime;
+    this.logger.recordReranker(reranked.applied, reranked.backend, reranked.failedBackend);
 
     const totalSearchMs = performance.now() - searchStartTime;
     this.logger.recordSearch(totalSearchMs, {
@@ -3633,6 +4014,7 @@ export class Indexer {
       vectorMs,
       keywordMs,
       fusionMs,
+      rerankMs,
     });
     this.logger.search("info", "Search complete", {
       query,
@@ -3643,55 +4025,58 @@ export class Indexer {
       keywordMs: Math.round(keywordMs * 100) / 100,
       prefilterMs: Math.round(prefilterMs * 100) / 100,
       fusionMs: Math.round(fusionMs * 100) / 100,
+      rerankMs: Math.round(rerankMs * 100) / 100,
+      taskType,
+      rerankerBackend: reranked.backend,
     });
 
     const metadataOnly = options?.metadataOnly ?? false;
-
-    return Promise.all(
-      filtered.map(async (r) => {
-        let content = "";
-        let contextStartLine = r.metadata.startLine;
-        let contextEndLine = r.metadata.endLine;
-
-        if (!metadataOnly && this.config.search.includeContext) {
-          try {
-            const fileContent = await fsPromises.readFile(
-              r.metadata.filePath,
-              "utf-8"
-            );
-            const lines = fileContent.split("\n");
-            const contextLines = options?.contextLines ?? this.config.search.contextLines;
-
-            contextStartLine = Math.max(1, r.metadata.startLine - contextLines);
-            contextEndLine = Math.min(lines.length, r.metadata.endLine + contextLines);
-
-            content = lines
-              .slice(contextStartLine - 1, contextEndLine)
-              .join("\n");
-          } catch {
-            content = "[File not accessible]";
-          }
-        }
-
-        return {
-          filePath: r.metadata.filePath,
-          startLine: contextStartLine,
-          endLine: contextEndLine,
-          content,
-          score: r.score,
-          chunkType: r.metadata.chunkType,
-          name: r.metadata.name,
-        };
-      })
+    const contextLines = options?.contextLines ?? this.config.search.contextLines;
+    const primaryResults = await this.materializeRankedResults(
+      reranked.ordered,
+      { metadataOnly, contextLines },
+      fileContentCache
     );
+
+    let expandedContext: GraphContextResult[] = [];
+    const graphDepth = Math.max(0, Math.min(2, options?.graphDepth ?? 0));
+    if (graphDepth > 0) {
+      const graphSeeds: GraphExpansionSeed[] = reranked.ordered.map((candidate) => ({
+        id: candidate.id,
+        metadata: candidate.metadata,
+      }));
+      const expanded = expandGraphContext(database, graphSeeds, {
+        branch: this.currentBranch,
+        depth: graphDepth,
+        allowedChunkIds,
+      });
+      expandedContext = await this.materializeExpandedContext(
+        expanded,
+        { metadataOnly, contextLines },
+        fileContentCache
+      );
+    }
+
+    return {
+      primaryResults,
+      expandedContext,
+      taskType,
+      reranker: {
+        applied: reranked.applied,
+        backend: reranked.backend,
+      },
+    };
   }
 
   private async keywordSearch(
     query: string,
-    limit: number
+    limit: number,
+    allowedChunkIds?: string[] | null
   ): Promise<Array<{ id: string; score: number; metadata: ChunkMetadata }>> {
     const { store, invertedIndex } = await this.ensureInitialized();
-    const scores = invertedIndex.search(query);
+    const scores = allowedChunkIds
+      ? invertedIndex.searchFiltered(query, allowedChunkIds, limit)
+      : invertedIndex.search(query, limit);
 
     if (scores.size === 0) {
       return [];
@@ -4017,6 +4402,25 @@ export class Indexer {
     }
 
     const filterByBranch = options?.filterByBranch ?? true;
+    const prefilterStartTime = performance.now();
+    const allowedChunkIds = this.buildAllowedChunkIds(store, database, {
+      filterByBranch,
+      fileType: options?.fileType,
+      directory: options?.directory,
+      chunkType: options?.chunkType,
+      excludeFile: options?.excludeFile,
+    });
+    const prefilterMs = performance.now() - prefilterStartTime;
+
+    if (allowedChunkIds && allowedChunkIds.size === 0) {
+      this.logger.search("debug", "Find similar has no candidates after hard filtering", {
+        branch: filterByBranch ? this.currentBranch : undefined,
+      });
+      return [];
+    }
+
+    const allowedChunkIdList = allowedChunkIds ? Array.from(allowedChunkIds) : null;
+    const retrievalLimit = resolveRetrievalCandidateLimit(limit);
 
     this.logger.search("debug", "Starting find similar", {
       codeLength: code.length,
@@ -4030,35 +4434,10 @@ export class Indexer {
     this.logger.recordEmbeddingApiCall(tokensUsed);
 
     const vectorStartTime = performance.now();
-    const semanticResults = store.search(embedding, limit * 2);
+    const semanticCandidates = allowedChunkIdList
+      ? store.searchFiltered(embedding, allowedChunkIdList, retrievalLimit)
+      : store.search(embedding, retrievalLimit);
     const vectorMs = performance.now() - vectorStartTime;
-
-    let branchChunkIds: Set<string> | null = null;
-    if (filterByBranch && this.currentBranch !== "default") {
-      branchChunkIds = new Set(database.getBranchChunkIds(this.currentBranch));
-    }
-
-    const prefilterStartTime = performance.now();
-    const shouldPrefilterByBranch = branchChunkIds !== null && branchChunkIds.size > 0;
-    const prefilteredSemantic = shouldPrefilterByBranch && branchChunkIds
-      ? semanticResults.filter((r) => branchChunkIds.has(r.id))
-      : semanticResults;
-    const semanticCandidates = (shouldPrefilterByBranch && semanticResults.length > 0 && prefilteredSemantic.length === 0)
-      ? semanticResults
-      : prefilteredSemantic;
-    const prefilterMs = performance.now() - prefilterStartTime;
-
-    if (branchChunkIds && branchChunkIds.size === 0) {
-      this.logger.search("warn", "Branch prefilter skipped because branch catalog is empty", {
-        branch: this.currentBranch,
-      });
-    }
-
-    if (shouldPrefilterByBranch && semanticResults.length > 0 && prefilteredSemantic.length === 0) {
-      this.logger.search("warn", "Branch prefilter produced no semantic overlap, using unfiltered semantic candidates", {
-        branch: this.currentBranch,
-      });
-    }
 
     const rerankTopN = this.config.search.rerankTopN;
 
@@ -4068,30 +4447,9 @@ export class Indexer {
       prioritizeSourcePaths: false,
     });
 
-    const filtered = ranked.filter((r) => {
-      if (r.score < this.config.search.minScore) return false;
-
-      if (options?.excludeFile) {
-        if (r.metadata.filePath === options.excludeFile) return false;
-      }
-
-      if (options?.fileType) {
-        const ext = r.metadata.filePath.split(".").pop()?.toLowerCase();
-        if (ext !== options.fileType.toLowerCase().replace(/^\./, "")) return false;
-      }
-
-      if (options?.directory) {
-        const normalizedDir = options.directory.replace(/^\/|\/$/g, "");
-        if (!r.metadata.filePath.includes(`/${normalizedDir}/`) &&
-          !r.metadata.filePath.includes(`${normalizedDir}/`)) return false;
-      }
-
-      if (options?.chunkType) {
-        if (r.metadata.chunkType !== options.chunkType) return false;
-      }
-
-      return true;
-    }).slice(0, limit);
+    const filtered = ranked
+      .filter((r) => r.score >= this.config.search.minScore)
+      .slice(0, limit);
 
     const totalSearchMs = performance.now() - searchStartTime;
     this.logger.recordSearch(totalSearchMs, {
@@ -4139,6 +4497,54 @@ export class Indexer {
         };
       })
     );
+  }
+
+  private buildAllowedChunkIds(
+    store: VectorStore,
+    database: Database,
+    options: HardRetrievalFilters & { filterByBranch?: boolean }
+  ): Set<string> | null {
+    const filterByBranch = options.filterByBranch ?? true;
+    const applyBranchFilter = filterByBranch && this.currentBranch !== "default";
+    const hasMetadataFilters = Boolean(
+      options.fileType || options.directory || options.chunkType || options.excludeFile
+    );
+
+    if (!applyBranchFilter && !hasMetadataFilters) {
+      return null;
+    }
+
+    const branchChunkIds = applyBranchFilter
+      ? new Set(database.getBranchChunkIds(this.currentBranch))
+      : null;
+
+    if (applyBranchFilter && branchChunkIds && branchChunkIds.size === 0) {
+      return new Set<string>();
+    }
+
+    if (!hasMetadataFilters) {
+      return branchChunkIds ?? new Set<string>();
+    }
+
+    const allowedChunkIds = new Set<string>();
+
+    if (branchChunkIds) {
+      const metadataMap = store.getMetadataBatch(Array.from(branchChunkIds));
+      for (const [chunkId, metadata] of metadataMap) {
+        if (matchesHardRetrievalFilters(metadata, options)) {
+          allowedChunkIds.add(chunkId);
+        }
+      }
+      return allowedChunkIds;
+    }
+
+    for (const { key, metadata } of store.getAllMetadata()) {
+      if (matchesHardRetrievalFilters(metadata, options)) {
+        allowedChunkIds.add(key);
+      }
+    }
+
+    return allowedChunkIds;
   }
 
   async getCallers(targetName: string): Promise<CallEdgeData[]> {

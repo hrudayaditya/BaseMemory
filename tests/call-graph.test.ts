@@ -2,8 +2,10 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { extractCalls, Database, hashContent } from "../src/native/index.js";
 import type { SymbolData, CallEdgeData } from "../src/native/index.js";
+
+import { extractCalls, Database, hashContent } from "../src/native/index.js";
+import { Indexer } from "../src/indexer/index.js";
 
 const fixturesDir = path.join(__dirname, "fixtures", "call-graph");
 
@@ -316,6 +318,91 @@ describe("call-graph", () => {
       const callers = db.getCallers("branchFunc", "main");
       expect(callers.length).toBe(1);
       expect(callers[0].fromSymbolId).toBe("sym_br1");
+    });
+
+    it("filters contextual callers by resolved target symbol id", () => {
+      const db = new Database(path.join(tempDir, "test.db"));
+
+      const symbols: SymbolData[] = [
+        {
+          id: "sym_execute_a",
+          filePath: "/src/a.ts",
+          name: "execute",
+          kind: "method",
+          startLine: 1,
+          startCol: 0,
+          endLine: 5,
+          endCol: 0,
+          language: "typescript",
+        },
+        {
+          id: "sym_execute_b",
+          filePath: "/src/b.ts",
+          name: "execute",
+          kind: "method",
+          startLine: 1,
+          startCol: 0,
+          endLine: 5,
+          endCol: 0,
+          language: "typescript",
+        },
+        {
+          id: "sym_caller_a",
+          filePath: "/src/caller-a.ts",
+          name: "callA",
+          kind: "function",
+          startLine: 1,
+          startCol: 0,
+          endLine: 5,
+          endCol: 0,
+          language: "typescript",
+        },
+        {
+          id: "sym_caller_b",
+          filePath: "/src/caller-b.ts",
+          name: "callB",
+          kind: "function",
+          startLine: 1,
+          startCol: 0,
+          endLine: 5,
+          endCol: 0,
+          language: "typescript",
+        },
+      ];
+      db.upsertSymbolsBatch(symbols);
+      db.addSymbolsToBranchBatch("main", symbols.map((symbol) => symbol.id));
+
+      const edges: CallEdgeData[] = [
+        {
+          id: "edge_a",
+          fromSymbolId: "sym_caller_a",
+          fromSymbolName: "callA",
+          fromSymbolFilePath: "/src/caller-a.ts",
+          targetName: "execute",
+          toSymbolId: "sym_execute_a",
+          callType: "Call",
+          line: 3,
+          col: 0,
+          isResolved: true,
+        },
+        {
+          id: "edge_b",
+          fromSymbolId: "sym_caller_b",
+          fromSymbolName: "callB",
+          fromSymbolFilePath: "/src/caller-b.ts",
+          targetName: "execute",
+          toSymbolId: "sym_execute_b",
+          callType: "Call",
+          line: 3,
+          col: 0,
+          isResolved: true,
+        },
+      ];
+      db.upsertCallEdgesBatch(edges);
+
+      const callers = db.getCallersWithContextByTargetSymbolId("sym_execute_a", "main");
+      expect(callers).toHaveLength(1);
+      expect(callers[0].fromSymbolId).toBe("sym_caller_a");
     });
   });
 
@@ -669,6 +756,91 @@ describe("call-graph", () => {
   });
 
   describe("integration", () => {
+    it("attributes nested tool calls to the innermost execute method", () => {
+      const content = `
+import { tool, type ToolDefinition } from "@opencode-ai/plugin";
+
+function someInternalCall() {
+  return "ok";
+}
+
+export const outer: ToolDefinition = tool({
+  async execute() {
+    return someInternalCall();
+  },
+});
+`;
+
+      const outerStart = content.indexOf("export const outer");
+      const outerEnd = content.indexOf("});", outerStart) + 3;
+      const executeStart = content.indexOf("async execute()");
+      const executeEnd = content.indexOf("  },", executeStart) + 4;
+      const helperStart = content.indexOf("function someInternalCall()");
+      const helperEnd = content.indexOf("}\n\nexport", helperStart) + 1;
+
+      const indexer = Object.create(Indexer.prototype) as Indexer;
+
+      const internals = indexer as unknown as {
+        buildFileGraphData: (
+          parsedFiles: unknown[]
+        ) => Map<string, { symbols: SymbolData[]; edges: CallEdgeData[] }>;
+      };
+
+      const parsedFiles = [
+        {
+          path: "src/tools.ts",
+          content,
+          hash: hashContent(content),
+          chunks: [
+            {
+              content: content.slice(helperStart, helperEnd),
+              startLine: 4,
+              endLine: 6,
+              startByte: helperStart,
+              endByte: helperEnd,
+              chunkType: "function",
+              name: "someInternalCall",
+              language: "typescript",
+              chunkHash: hashContent(content.slice(helperStart, helperEnd)),
+            },
+            {
+              content: content.slice(outerStart, outerEnd),
+              startLine: 8,
+              endLine: 12,
+              startByte: outerStart,
+              endByte: outerEnd,
+              chunkType: "module",
+              name: "outer",
+              language: "typescript",
+              chunkHash: hashContent(content.slice(outerStart, outerEnd)),
+            },
+            {
+              content: content.slice(executeStart, executeEnd),
+              startLine: 9,
+              endLine: 11,
+              startByte: executeStart,
+              endByte: executeEnd,
+              chunkType: "method",
+              name: "execute",
+              language: "typescript",
+              chunkHash: hashContent(content.slice(executeStart, executeEnd)),
+            },
+          ],
+        },
+      ];
+
+      const graph = internals.buildFileGraphData(parsedFiles).get("src/tools.ts");
+      expect(graph).toBeDefined();
+
+      const internalCallEdge = graph?.edges.find((edge) => edge.targetName === "someInternalCall");
+      expect(internalCallEdge).toBeDefined();
+
+      const fromSymbol = graph?.symbols.find((symbol) => symbol.id === internalCallEdge?.fromSymbolId);
+      expect(graph?.symbols.some((symbol) => symbol.name === "outer")).toBe(true);
+      expect(graph?.symbols.some((symbol) => symbol.name === "execute")).toBe(true);
+      expect(fromSymbol?.name).toBe("execute");
+    });
+
     it("should build complete call graph for simple project", () => {
       const db = new Database(path.join(tempDir, "test.db"));
       const content = fs.readFileSync(path.join(fixturesDir, "same-file-refs.ts"), "utf-8");

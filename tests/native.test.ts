@@ -181,6 +181,39 @@ public class UserService {
       expect(javaChunks.some((chunk) => chunk.symbolName === "UserService" && chunk.granularity === "Coarse")).toBe(true);
       expect(jsonChunks.some((chunk) => chunk.chunkKind === "Config")).toBe(true);
     });
+
+    it("captures exported tool definitions by exported const name", () => {
+      const content = `
+import { tool, type ToolDefinition } from "@opencode-ai/plugin";
+
+export const find_similar: ToolDefinition = tool({
+  description: "Find code similar to a given snippet.",
+  args: {
+    code: z.string().describe("The code snippet to find similar code for"),
+  },
+  async execute(args) {
+    return args.code;
+  },
+});
+
+export const codebase_search: ToolDefinition = tool({
+  description: "Search codebase by meaning.",
+  args: {
+    query: z.string().describe("Natural language description of what code you're looking for."),
+  },
+  async execute(args) {
+    return args.query;
+  },
+});
+`;
+
+      const chunks = chunkFile("tools.ts", "typescript", content);
+
+      expect(chunks.some((chunk) => chunk.symbolName === "find_similar" && chunk.granularity === "Fine")).toBe(true);
+      expect(chunks.some((chunk) => chunk.symbolName === "codebase_search" && chunk.granularity === "Fine")).toBe(true);
+      expect(chunks.some((chunk) => chunk.symbolName === "The code snippet to find similar code for")).toBe(false);
+      expect(chunks.some((chunk) => chunk.symbolName === "Natural language description of what code you're looking for.")).toBe(false);
+    });
   });
 
   describe("parseFiles", () => {
@@ -298,6 +331,30 @@ public class UserService {
 
       expect(results.length).toBe(2);
       expect(results[0].id).toBe("chunk1");
+    });
+
+    it("should search only within allowed vector ids", () => {
+      store.add("chunk1", [1, 0, 0], {
+        filePath: "test.ts",
+        startLine: 1,
+        endLine: 5,
+        chunkType: "function",
+        language: "typescript",
+        hash: "abc123",
+      });
+      store.add("chunk2", [0.95, 0.05, 0], {
+        filePath: "test2.ts",
+        startLine: 10,
+        endLine: 15,
+        chunkType: "function",
+        language: "typescript",
+        hash: "def456",
+      });
+
+      const results = store.searchFiltered([1, 0.1, 0], ["chunk2"], 5);
+
+      expect(results).toHaveLength(1);
+      expect(results[0]?.id).toBe("chunk2");
     });
 
     it("should remove vectors", () => {

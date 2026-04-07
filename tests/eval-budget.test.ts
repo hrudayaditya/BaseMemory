@@ -17,6 +17,10 @@ function summary(p95: number): EvalSummary {
       hybridWeight: 0.4,
       rrfK: 60,
       rerankTopN: 20,
+      useQueryTypes: false,
+      effectiveTaskType: "general",
+      effectiveFinalRerankTopN: 0,
+      effectiveGraphDepth: 0,
     },
     metrics: {
       hitAt1: 1,

@@ -21,6 +21,19 @@ function formatUsd(value: number): string {
   return `$${value.toFixed(6)}`;
 }
 
+function formatEffectiveFinalRerankTopN(value: number): string {
+  return value < 0 ? "mixed per-query" : String(value);
+}
+
+function formatRawSearchConfig(config: EvalSummary["searchConfig"]): string {
+  const fusionMode = config.fusionStrategy;
+  const hybridBlend = config.hybridWeight;
+  const reciprocalRankWindow = config.rrfK;
+  const earlyRerankLimit = config.rerankTopN;
+
+  return `fusion=${fusionMode}, hybrid weight=${hybridBlend}, RRF k=${reciprocalRankWindow}, early rerank top-N=${earlyRerankLimit}`;
+}
+
 function signed(value: number, digits = 4): string {
   const formatted = value.toFixed(digits);
   return value > 0 ? `+${formatted}` : formatted;
@@ -53,15 +66,27 @@ export function createSummaryMarkdown(
   sweep?: SweepAggregateReport
 ): string {
   const lines: string[] = [];
+  const useQueryTypes = summary.searchConfig.useQueryTypes ?? false;
+  const effectiveTaskType = summary.searchConfig.effectiveTaskType ?? "general";
+  const effectiveFinalRerankTopN = summary.searchConfig.effectiveFinalRerankTopN ?? 0;
+  const effectiveGraphDepth = summary.searchConfig.effectiveGraphDepth ?? 0;
 
   lines.push("# Evaluation Summary");
   lines.push("");
   lines.push(`- Generated: ${summary.generatedAt}`);
   lines.push(`- Dataset: ${summary.datasetName} (v${summary.datasetVersion})`);
   lines.push(`- Query count: ${summary.queryCount}`);
+  lines.push("");
+
+  lines.push("## Search Config");
+  lines.push("");
+  lines.push(`- Raw config: ${formatRawSearchConfig(summary.searchConfig)}`);
+  lines.push(`- Query-type recipe mapping: ${useQueryTypes ? "enabled" : "disabled"}`);
+  lines.push(`- Task recipe: ${effectiveTaskType}`);
   lines.push(
-    `- Search config: fusion=${summary.searchConfig.fusionStrategy}, hybridWeight=${summary.searchConfig.hybridWeight}, rrfK=${summary.searchConfig.rrfK}, rerankTopN=${summary.searchConfig.rerankTopN}`
+    `- Final rerank top-N: ${formatEffectiveFinalRerankTopN(effectiveFinalRerankTopN)}`
   );
+  lines.push(`- Graph depth: ${effectiveGraphDepth}`);
   lines.push("");
 
   lines.push("## Metrics");
@@ -80,6 +105,20 @@ export function createSummaryMarkdown(
   lines.push(`| Embedding calls | ${summary.metrics.embedding.callCount} |`);
   lines.push(`| Embedding tokens | ${summary.metrics.tokenEstimate.embeddingTokensUsed} |`);
   lines.push(`| Estimated embedding cost | ${formatUsd(summary.metrics.embedding.estimatedCostUsd)} |`);
+  if (summary.metrics.reranker) {
+    const rerankerAppliedLabel =
+      summary.metrics.reranker.appliedCount === 0 &&
+      effectiveFinalRerankTopN === 0
+        ? `${summary.metrics.reranker.appliedCount} (disabled in selected recipe)`
+        : summary.metrics.reranker.appliedCount === 0 &&
+            effectiveFinalRerankTopN < 0
+          ? `${summary.metrics.reranker.appliedCount} (varies by query recipe)`
+          : String(summary.metrics.reranker.appliedCount);
+    lines.push(`| Reranker applied queries | ${rerankerAppliedLabel} |`);
+    lines.push(`| Reranker failures | ${summary.metrics.reranker.failureCount} |`);
+    lines.push(`| Reranker last ms | ${formatMs(summary.metrics.reranker.lastMs)} |`);
+    lines.push(`| Reranker backends | ${JSON.stringify(summary.metrics.reranker.backendUsage)} |`);
+  }
   lines.push("");
 
   lines.push("## Failure Buckets");
@@ -141,17 +180,17 @@ export function createSummaryMarkdown(
     lines.push(`- Run count: ${sweep.runCount}`);
     if (sweep.bestByHitAt5) {
       lines.push(
-        `- Best Hit@5: ${formatPct(sweep.bestByHitAt5.summary.metrics.hitAt5)} with fusion=${sweep.bestByHitAt5.searchConfig.fusionStrategy}, hybridWeight=${sweep.bestByHitAt5.searchConfig.hybridWeight}, rrfK=${sweep.bestByHitAt5.searchConfig.rrfK}, rerankTopN=${sweep.bestByHitAt5.searchConfig.rerankTopN}`
+        `- Best Hit@5: ${formatPct(sweep.bestByHitAt5.summary.metrics.hitAt5)} with ${formatRawSearchConfig(sweep.bestByHitAt5.searchConfig)}`
       );
     }
     if (sweep.bestByMrrAt10) {
       lines.push(
-        `- Best MRR@10: ${sweep.bestByMrrAt10.summary.metrics.mrrAt10.toFixed(4)} with fusion=${sweep.bestByMrrAt10.searchConfig.fusionStrategy}, hybridWeight=${sweep.bestByMrrAt10.searchConfig.hybridWeight}, rrfK=${sweep.bestByMrrAt10.searchConfig.rrfK}, rerankTopN=${sweep.bestByMrrAt10.searchConfig.rerankTopN}`
+        `- Best MRR@10: ${sweep.bestByMrrAt10.summary.metrics.mrrAt10.toFixed(4)} with ${formatRawSearchConfig(sweep.bestByMrrAt10.searchConfig)}`
       );
     }
     if (sweep.bestByP95Latency) {
       lines.push(
-        `- Best p95 latency: ${formatMs(sweep.bestByP95Latency.summary.metrics.latencyMs.p95)} with fusion=${sweep.bestByP95Latency.searchConfig.fusionStrategy}, hybridWeight=${sweep.bestByP95Latency.searchConfig.hybridWeight}, rrfK=${sweep.bestByP95Latency.searchConfig.rrfK}, rerankTopN=${sweep.bestByP95Latency.searchConfig.rerankTopN}`
+        `- Best p95 latency: ${formatMs(sweep.bestByP95Latency.summary.metrics.latencyMs.p95)} with ${formatRawSearchConfig(sweep.bestByP95Latency.searchConfig)}`
       );
     }
     lines.push("");

@@ -2,8 +2,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import { Indexer, type IndexStats } from "./indexer/index.js";
+import { SEARCH_TASK_TYPES } from "./indexer/search-recipes.js";
 import type { ParsedCodebaseIndexConfig, LogLevel } from "./config/schema.js";
-import { formatDefinitionLookup } from "./tools/utils.js";
+import { formatDefinitionLookup, formatExpandedContext } from "./tools/utils.js";
 import { formatCostEstimate } from "./utils/cost.js";
 import type { LogEntry } from "./utils/logger.js";
 
@@ -104,6 +105,7 @@ const CHUNK_TYPE_ENUM = [
   "function", "class", "method", "interface", "type",
   "enum", "struct", "impl", "trait", "module", "other",
 ] as const;
+const TASK_TYPE_ENUM = [...SEARCH_TASK_TYPES] as [typeof SEARCH_TASK_TYPES[number], ...typeof SEARCH_TASK_TYPES[number][]];
 
 export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndexConfig): McpServer {
   const server = new McpServer({
@@ -133,28 +135,45 @@ export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndex
       directory: z.string().optional().describe("Filter by directory path (e.g., 'src/utils', 'lib')"),
       chunkType: z.enum(CHUNK_TYPE_ENUM).optional().describe("Filter by code chunk type"),
       contextLines: z.number().optional().describe("Number of extra lines to include before/after each match (default: 0)"),
+      taskType: z.enum(TASK_TYPE_ENUM).optional().describe("Retrieval recipe to apply (default: general)"),
+      graphDepth: z.number().optional().describe("Optional call-graph expansion depth (0-2, default: 0)"),
     },
     async (args) => {
       await ensureInitialized();
-      const results = await indexer.search(args.query, args.limit ?? 5, {
-        fileType: args.fileType,
-        directory: args.directory,
-        chunkType: args.chunkType,
-        contextLines: args.contextLines,
-      });
+      const response = args.graphDepth && args.graphDepth > 0
+        ? await indexer.searchDetailed(args.query, args.limit ?? 5, {
+            fileType: args.fileType,
+            directory: args.directory,
+            chunkType: args.chunkType,
+            contextLines: args.contextLines,
+            taskType: args.taskType,
+            graphDepth: args.graphDepth,
+          })
+        : {
+            primaryResults: await indexer.search(args.query, args.limit ?? 5, {
+              fileType: args.fileType,
+              directory: args.directory,
+              chunkType: args.chunkType,
+              contextLines: args.contextLines,
+              taskType: args.taskType,
+            }),
+            expandedContext: [],
+          };
 
-      if (results.length === 0) {
+      if (response.primaryResults.length === 0) {
         return { content: [{ type: "text", text: "No matching code found. Try a different query or run index_codebase first." }] };
       }
 
-      const formatted = results.map((r, idx) => {
+      const formatted = response.primaryResults.map((r, idx) => {
         const header = r.name
           ? `[${idx + 1}] ${r.chunkType} "${r.name}" in ${r.filePath}:${r.startLine}-${r.endLine}`
           : `[${idx + 1}] ${r.chunkType} in ${r.filePath}:${r.startLine}-${r.endLine}`;
         return `${header} (score: ${r.score.toFixed(2)})\n\`\`\`\n${truncateContent(r.content)}\n\`\`\``;
       });
 
-      return { content: [{ type: "text", text: `Found ${results.length} results for "${args.query}":\n\n${formatted.join("\n\n")}` }] };
+      const primary = `Found ${response.primaryResults.length} results for "${args.query}":\n\n${formatted.join("\n\n")}`;
+      const expanded = formatExpandedContext(response.expandedContext);
+      return { content: [{ type: "text", text: expanded.length > 0 ? `${primary}\n\n${expanded}` : primary }] };
     },
   );
 
@@ -167,27 +186,44 @@ export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndex
       fileType: z.string().optional().describe("Filter by file extension (e.g., 'ts', 'py', 'rs')"),
       directory: z.string().optional().describe("Filter by directory path (e.g., 'src/utils', 'lib')"),
       chunkType: z.enum(CHUNK_TYPE_ENUM).optional().describe("Filter by code chunk type"),
+      taskType: z.enum(TASK_TYPE_ENUM).optional().describe("Retrieval recipe to apply (default: general)"),
+      graphDepth: z.number().optional().describe("Optional call-graph expansion depth (0-2, default: 0)"),
     },
     async (args) => {
       await ensureInitialized();
-      const results = await indexer.search(args.query, args.limit ?? 10, {
-        fileType: args.fileType,
-        directory: args.directory,
-        chunkType: args.chunkType,
-        metadataOnly: true,
-      });
+      const response = args.graphDepth && args.graphDepth > 0
+        ? await indexer.searchDetailed(args.query, args.limit ?? 10, {
+            fileType: args.fileType,
+            directory: args.directory,
+            chunkType: args.chunkType,
+            metadataOnly: true,
+            taskType: args.taskType,
+            graphDepth: args.graphDepth,
+          })
+        : {
+            primaryResults: await indexer.search(args.query, args.limit ?? 10, {
+              fileType: args.fileType,
+              directory: args.directory,
+              chunkType: args.chunkType,
+              metadataOnly: true,
+              taskType: args.taskType,
+            }),
+            expandedContext: [],
+          };
 
-      if (results.length === 0) {
+      if (response.primaryResults.length === 0) {
         return { content: [{ type: "text", text: "No matching code found. Try a different query or run index_codebase first." }] };
       }
 
-      const formatted = results.map((r, idx) => {
+      const formatted = response.primaryResults.map((r, idx) => {
         const location = `${r.filePath}:${r.startLine}-${r.endLine}`;
         const name = r.name ? `"${r.name}"` : "(anonymous)";
         return `[${idx + 1}] ${r.chunkType} ${name} at ${location} (score: ${r.score.toFixed(2)})`;
       });
 
-      return { content: [{ type: "text", text: `Found ${results.length} locations for "${args.query}":\n\n${formatted.join("\n")}\n\nUse Read tool to examine specific files.` }] };
+      const primary = `Found ${response.primaryResults.length} locations for "${args.query}":\n\n${formatted.join("\n")}\n\nUse Read tool to examine specific files.`;
+      const expanded = formatExpandedContext(response.expandedContext, true);
+      return { content: [{ type: "text", text: expanded.length > 0 ? `${primary}\n\n${expanded}` : primary }] };
     },
   );
 
@@ -370,16 +406,32 @@ export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndex
       limit: z.number().optional().default(5).describe("Maximum number of results"),
       fileType: z.string().optional().describe("Filter by file extension (e.g., 'ts', 'py')"),
       directory: z.string().optional().describe("Filter by directory path (e.g., 'src/utils')"),
+      taskType: z.enum(TASK_TYPE_ENUM).optional().describe("Retrieval recipe to apply (default: definition)"),
+      graphDepth: z.number().optional().describe("Optional call-graph expansion depth (0-2, default: 0)"),
     },
     async (args) => {
       await ensureInitialized();
-      const results = await indexer.search(args.query, args.limit ?? 5, {
-        fileType: args.fileType,
-        directory: args.directory,
-        definitionIntent: true,
-      });
+      const response = args.graphDepth && args.graphDepth > 0
+        ? await indexer.searchDetailed(args.query, args.limit ?? 5, {
+            fileType: args.fileType,
+            directory: args.directory,
+            definitionIntent: true,
+            taskType: args.taskType ?? "definition",
+            graphDepth: args.graphDepth,
+          })
+        : {
+            primaryResults: await indexer.search(args.query, args.limit ?? 5, {
+              fileType: args.fileType,
+              directory: args.directory,
+              definitionIntent: true,
+              taskType: args.taskType ?? "definition",
+            }),
+            expandedContext: [],
+          };
 
-      return { content: [{ type: "text", text: formatDefinitionLookup(results, args.query) }] };
+      const primary = formatDefinitionLookup(response.primaryResults, args.query);
+      const expanded = formatExpandedContext(response.expandedContext);
+      return { content: [{ type: "text", text: expanded.length > 0 ? `${primary}\n\n${expanded}` : primary }] };
     },
   );
 

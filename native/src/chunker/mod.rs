@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
 use tree_sitter::Parser;
 
+pub const CHUNKER_VERSION: &str = env!("CHUNKER_VERSION");
+
 #[napi(string_enum)]
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ChunkKind {
@@ -826,5 +828,113 @@ const answer = 42;
                 && entry.contains("file_path=no-semantic-log.ts")
                 && entry.contains("language=typescript")
         }));
+    }
+
+    #[test]
+    fn captures_exported_tool_constants_by_binding_name() {
+        let source = r#"import { tool, type ToolDefinition } from "@opencode-ai/plugin";
+
+export const find_similar: ToolDefinition = tool({
+  description: "Find code similar to a given snippet.",
+  args: {
+    code: z.string().describe("The code snippet to find similar code for"),
+  },
+  async execute(args) {
+    return args.code;
+  },
+});
+
+export const codebase_search: ToolDefinition = tool({
+  description: "Search codebase by meaning.",
+  args: {
+    query: z.string().describe("Natural language description of what code you're looking for."),
+  },
+  async execute(args) {
+    return args.query;
+  },
+});
+"#;
+
+        let chunks = chunk_file("tools.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let find_similar = chunks
+            .iter()
+            .find(|chunk| {
+                chunk.symbol_name.as_deref() == Some("find_similar")
+                    && chunk.granularity == Granularity::Fine
+            })
+            .unwrap_or_else(|| panic!("missing find_similar chunk"));
+        assert_eq!(find_similar.symbol_kind, Some(SymbolKind::Module));
+        assert_eq!(find_similar.chunk_kind, ChunkKind::Code);
+        assert!(find_similar.text.contains("export const find_similar"));
+
+        let codebase_search = chunks
+            .iter()
+            .find(|chunk| {
+                chunk.symbol_name.as_deref() == Some("codebase_search")
+                    && chunk.granularity == Granularity::Fine
+            })
+            .unwrap_or_else(|| panic!("missing codebase_search chunk"));
+        assert_eq!(codebase_search.symbol_kind, Some(SymbolKind::Module));
+        assert_eq!(codebase_search.chunk_kind, ChunkKind::Code);
+        assert!(codebase_search.text.contains("export const codebase_search"));
+
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.symbol_name.as_deref() == Some("The code snippet to find similar code for")
+                || chunk.symbol_name.as_deref()
+                    == Some("Natural language description of what code you're looking for.")
+        }));
+    }
+
+    #[test]
+    fn does_not_treat_fluent_describe_calls_as_tests() {
+        let source = r#"const schema = z.string().describe("schema description");
+"#;
+
+        let chunks = chunk_file("schema.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(!chunks.iter().any(|chunk| chunk.chunk_kind == ChunkKind::Test));
+        assert!(!chunks
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("schema description")));
+    }
+
+    #[test]
+    fn ignores_plain_exported_constants_for_module_fallback() {
+        let source = r#"export const MAX_RETRIES = 3;
+export const config = { key: "value" };
+"#;
+
+        let chunks = chunk_file("constants.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(!chunks
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("MAX_RETRIES")));
+        assert!(!chunks
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("config")));
+    }
+
+    #[test]
+    fn still_detects_bare_describe_test_blocks() {
+        let source = r#"describe("math helpers", () => {
+  it("adds", () => {
+    expect(1 + 1).toBe(2);
+  });
+});
+"#;
+
+        let chunks = chunk_file("math.test.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let describe_chunk = chunks
+            .iter()
+            .find(|chunk| chunk.symbol_name.as_deref() == Some("math helpers"))
+            .unwrap_or_else(|| panic!("missing describe test chunk"));
+        assert_eq!(describe_chunk.chunk_kind, ChunkKind::Test);
+        assert_eq!(describe_chunk.symbol_kind, Some(SymbolKind::Test));
     }
 }

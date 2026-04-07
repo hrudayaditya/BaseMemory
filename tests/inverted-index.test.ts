@@ -63,6 +63,17 @@ describe("InvertedIndex", () => {
       const chunk2Score = results.get("chunk2") || 0;
       expect(chunk1Score).toBeGreaterThan(chunk2Score);
     });
+
+    it("should restrict BM25 retrieval to allowed chunk ids before scoring", () => {
+      index.addChunk("chunk1", "validate user input data");
+      index.addChunk("chunk2", "validate user profile settings");
+
+      const results = index.searchFiltered("validate user", ["chunk2"]);
+
+      expect(results.size).toBe(1);
+      expect(results.has("chunk2")).toBe(true);
+      expect(results.has("chunk1")).toBe(false);
+    });
   });
 
   describe("removeChunk", () => {

@@ -5,6 +5,7 @@ import {
   extractFilePathHint,
   fuseResultsRrf,
   fuseResultsWeighted,
+  matchesHardRetrievalFilters,
   rankSemanticOnlyResults,
   mergeTieredResults,
   rankHybridResults,
@@ -64,6 +65,90 @@ describe("retrieval ranking", () => {
       expect(result.score).toBeGreaterThanOrEqual(0);
       expect(result.score).toBeLessThanOrEqual(1);
     }
+  });
+
+  it("treats documents missing from one list as rank infinity in that lane", () => {
+    const semantic: Candidate[] = [
+      { id: "semanticOnly", score: 0.95, metadata: meta({ filePath: "/repo/src/semantic.ts", name: "semanticBest", chunkType: "function" }) },
+    ];
+    const keyword: Candidate[] = [
+      { id: "keywordOnly", score: 100, metadata: meta({ filePath: "/repo/src/keyword.ts", name: "keywordBest", chunkType: "function" }) },
+    ];
+
+    const fused = fuseResultsRrf(semantic, keyword, 60, 10);
+
+    expect(fused).toHaveLength(2);
+    expect(fused.map((result) => result.id)).toEqual(["keywordOnly", "semanticOnly"]);
+  });
+
+  it("ranks a document present in both lists above one present in only one list", () => {
+    const semantic: Candidate[] = [
+      { id: "both", score: 0.9, metadata: meta({ filePath: "/repo/src/both.ts", name: "both", chunkType: "function" }) },
+      { id: "semanticOnly", score: 0.89, metadata: meta({ filePath: "/repo/src/semantic.ts", name: "semantic", chunkType: "function" }) },
+    ];
+    const keyword: Candidate[] = [
+      { id: "both", score: 3, metadata: meta({ filePath: "/repo/src/both.ts", name: "both", chunkType: "function" }) },
+    ];
+
+    const fused = fuseResultsRrf(semantic, keyword, 60, 10);
+
+    expect(fused[0]?.id).toBe("both");
+    expect(fused[1]?.id).toBe("semanticOnly");
+  });
+
+  it("returns fused results in descending score order", () => {
+    const semantic: Candidate[] = [
+      { id: "a", score: 0.9, metadata: meta({ filePath: "/repo/src/a.ts", name: "a", chunkType: "function" }) },
+      { id: "b", score: 0.89, metadata: meta({ filePath: "/repo/src/b.ts", name: "b", chunkType: "function" }) },
+    ];
+    const keyword: Candidate[] = [
+      { id: "b", score: 2, metadata: meta({ filePath: "/repo/src/b.ts", name: "b", chunkType: "function" }) },
+      { id: "c", score: 1, metadata: meta({ filePath: "/repo/src/c.ts", name: "c", chunkType: "function" }) },
+    ];
+
+    const fused = fuseResultsRrf(semantic, keyword, 60, 10);
+
+    for (let i = 1; i < fused.length; i += 1) {
+      expect(fused[i - 1]!.score).toBeGreaterThanOrEqual(fused[i]!.score);
+    }
+  });
+
+  it("uses the provided RRF k constant when computing fused scores", () => {
+    const semantic: Candidate[] = [
+      { id: "a", score: 0.9, metadata: meta({ filePath: "/repo/src/a.ts", name: "a", chunkType: "function" }) },
+      { id: "b", score: 0.89, metadata: meta({ filePath: "/repo/src/b.ts", name: "b", chunkType: "function" }) },
+    ];
+    const keyword: Candidate[] = [
+      { id: "a", score: 3, metadata: meta({ filePath: "/repo/src/a.ts", name: "a", chunkType: "function" }) },
+      { id: "b", score: 2, metadata: meta({ filePath: "/repo/src/b.ts", name: "b", chunkType: "function" }) },
+    ];
+
+    const lowK = fuseResultsRrf(semantic, keyword, 10, 10);
+    const highK = fuseResultsRrf(semantic, keyword, 100, 10);
+
+    expect(lowK[0]?.id).toBe("a");
+    expect(highK[0]?.id).toBe("a");
+    expect(lowK[1]?.id).toBe("b");
+    expect(highK[1]?.id).toBe("b");
+    expect(lowK[1]?.score).not.toBe(highK[1]?.score);
+  });
+
+  it("applies hard retrieval filters consistently", () => {
+    const candidate = meta({
+      filePath: "/repo/src/services/auth.ts",
+      chunkType: "function",
+    });
+
+    expect(matchesHardRetrievalFilters(candidate, {
+      fileType: "ts",
+      directory: "src/services",
+      chunkType: "function",
+    })).toBe(true);
+
+    expect(matchesHardRetrievalFilters(candidate, { fileType: "py" })).toBe(false);
+    expect(matchesHardRetrievalFilters(candidate, { directory: "docs" })).toBe(false);
+    expect(matchesHardRetrievalFilters(candidate, { chunkType: "class" })).toBe(false);
+    expect(matchesHardRetrievalFilters(candidate, { excludeFile: "/repo/src/services/auth.ts" })).toBe(false);
   });
 
   it("reranks deterministically using name/path/chunk-type signals", () => {

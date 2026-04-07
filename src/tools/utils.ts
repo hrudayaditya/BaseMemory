@@ -1,4 +1,11 @@
-import { IndexStats, IndexProgress, SearchResult, HealthCheckResult, StatusResult } from "../indexer/index.js";
+import {
+  IndexStats,
+  IndexProgress,
+  SearchResult,
+  GraphContextResult,
+  HealthCheckResult,
+  StatusResult,
+} from "../indexer/index.js";
 import type { LogEntry } from "../utils/logger.js";
 
 const MAX_CONTENT_LINES = 30;
@@ -230,4 +237,26 @@ export function formatSearchResults(results: SearchResult[], scoreFormat: ScoreF
   });
 
   return formatted.join("\n\n");
+}
+
+export function formatExpandedContext(results: GraphContextResult[], metadataOnly: boolean = false): string {
+  if (results.length === 0) {
+    return "";
+  }
+
+  const formatted = results.map((result, index) => {
+    const relation = result.relation === "caller" ? "caller" : "callee";
+    const provenance = result.viaSymbol ? ` via ${result.viaSymbol}` : "";
+    const header = result.name
+      ? `[${index + 1}] ${relation} depth=${result.depth} "${result.name}" in ${result.filePath}:${result.startLine}-${result.endLine}${provenance}`
+      : `[${index + 1}] ${relation} depth=${result.depth} in ${result.filePath}:${result.startLine}-${result.endLine}${provenance}`;
+
+    if (metadataOnly) {
+      return header;
+    }
+
+    return `${header}\n\`\`\`\n${truncateContent(result.content)}\n\`\`\``;
+  });
+
+  return `Expanded graph context:\n\n${formatted.join("\n\n")}`;
 }

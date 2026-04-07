@@ -13,7 +13,7 @@ pub enum DbError {
 pub type DbResult<T> = Result<T, DbError>;
 
 /// Schema version for migrations
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 /// Maximum number of SQL bind parameters per query.
 /// SQLite defaults to 999 (SQLITE_MAX_VARIABLE_NUMBER). We use 900 to stay safely under.
@@ -243,6 +243,55 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> DbResult<()> {
                 ON merkle_nodes(branch, parent_path);
             CREATE INDEX IF NOT EXISTS idx_merkle_nodes_branch_kind
                 ON merkle_nodes(branch, node_kind);
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
+    if from_version < 6 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS pipeline_state (
+                branch TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                status TEXT NOT NULL,
+                input_hash TEXT,
+                error TEXT,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (branch, file_path, stage)
+            );
+
+            CREATE TABLE IF NOT EXISTS pipeline_runs (
+                run_id TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                run_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                config_hash TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                PRIMARY KEY (run_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS config_versions (
+                config_hash TEXT NOT NULL,
+                embedding_model_id TEXT NOT NULL,
+                embedding_dimension INTEGER NOT NULL,
+                chunker_version TEXT NOT NULL,
+                graph_extractor_version TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (config_hash)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pipeline_state_branch_status
+                ON pipeline_state (branch, status);
+            CREATE INDEX IF NOT EXISTS idx_pipeline_runs_branch_status
+                ON pipeline_runs (branch, status);
             "#,
         )?;
 
@@ -796,12 +845,22 @@ pub struct CallerRow {
     pub is_resolved: bool,
 }
 
-/// Insert or replace a symbol
+/// Insert or update a symbol without deleting the existing row.
+/// Using REPLACE here would cascade-delete call edges for unchanged symbol ids.
 pub fn upsert_symbol(conn: &Connection, symbol: &SymbolRow) -> DbResult<()> {
     conn.execute(
         r#"
-        INSERT OR REPLACE INTO symbols (id, file_path, name, kind, start_line, start_col, end_line, end_col, language)
+        INSERT INTO symbols (id, file_path, name, kind, start_line, start_col, end_line, end_col, language)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            file_path = excluded.file_path,
+            name = excluded.name,
+            kind = excluded.kind,
+            start_line = excluded.start_line,
+            start_col = excluded.start_col,
+            end_line = excluded.end_line,
+            end_col = excluded.end_col,
+            language = excluded.language
         "#,
         params![
             symbol.id,
@@ -818,7 +877,7 @@ pub fn upsert_symbol(conn: &Connection, symbol: &SymbolRow) -> DbResult<()> {
     Ok(())
 }
 
-/// Batch insert or replace symbols within a single transaction
+/// Batch insert or update symbols within a single transaction
 pub fn upsert_symbols_batch(conn: &mut Connection, symbols: &[SymbolRow]) -> DbResult<()> {
     if symbols.is_empty() {
         return Ok(());
@@ -828,8 +887,17 @@ pub fn upsert_symbols_batch(conn: &mut Connection, symbols: &[SymbolRow]) -> DbR
     {
         let mut stmt = tx.prepare(
             r#"
-            INSERT OR REPLACE INTO symbols (id, file_path, name, kind, start_line, start_col, end_line, end_col, language)
+            INSERT INTO symbols (id, file_path, name, kind, start_line, start_col, end_line, end_col, language)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                file_path = excluded.file_path,
+                name = excluded.name,
+                kind = excluded.kind,
+                start_line = excluded.start_line,
+                start_col = excluded.start_col,
+                end_line = excluded.end_line,
+                end_col = excluded.end_col,
+                language = excluded.language
             "#,
         )?;
 
@@ -880,6 +948,32 @@ pub fn get_symbols_by_file(conn: &Connection, file_path: &str) -> DbResult<Vec<S
         results.push(row?);
     }
     Ok(results)
+}
+
+pub fn get_symbol_by_id(conn: &Connection, symbol_id: &str) -> DbResult<Option<SymbolRow>> {
+    let result = conn
+        .query_row(
+            r#"
+            SELECT id, file_path, name, kind, start_line, start_col, end_line, end_col, language
+            FROM symbols WHERE id = ?
+            "#,
+            params![symbol_id],
+            |row| {
+                Ok(SymbolRow {
+                    id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    name: row.get(2)?,
+                    kind: row.get(3)?,
+                    start_line: row.get(4)?,
+                    start_col: row.get(5)?,
+                    end_line: row.get(6)?,
+                    end_col: row.get(7)?,
+                    language: row.get(8)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(result)
 }
 
 /// Find a symbol by name and file path
@@ -1120,6 +1214,53 @@ pub fn get_callers_with_context(
     )?;
 
     let rows = stmt.query_map(params![branch, symbol_name], |row| {
+        Ok(CallerRow {
+            id: row.get(0)?,
+            from_symbol_id: row.get(1)?,
+            from_symbol_name: row.get(2)?,
+            from_symbol_file_path: row.get(3)?,
+            target_name: row.get(4)?,
+            to_symbol_id: row.get(5)?,
+            call_type: row.get(6)?,
+            line: row.get(7)?,
+            col: row.get(8)?,
+            is_resolved: row.get::<_, i32>(9)? != 0,
+        })
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn get_callers_with_context_by_target_symbol_id(
+    conn: &Connection,
+    target_symbol_id: &str,
+    branch: &str,
+) -> DbResult<Vec<CallerRow>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            ce.id,
+            ce.from_symbol_id,
+            s.name,
+            s.file_path,
+            ce.target_name,
+            ce.to_symbol_id,
+            ce.call_type,
+            ce.line,
+            ce.col,
+            ce.is_resolved
+        FROM call_edges ce
+        INNER JOIN symbols s ON ce.from_symbol_id = s.id
+        INNER JOIN branch_symbols bs ON s.id = bs.symbol_id AND bs.branch = ?
+        WHERE ce.to_symbol_id = ?
+        "#,
+    )?;
+
+    let rows = stmt.query_map(params![branch, target_symbol_id], |row| {
         Ok(CallerRow {
             id: row.get(0)?,
             from_symbol_id: row.get(1)?,
@@ -1412,6 +1553,421 @@ pub struct DbStats {
     pub call_edge_count: u64,
 }
 
+// ============================================================================
+// Pipeline State Operations
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct PipelineStateRow {
+    pub branch: String,
+    pub file_path: String,
+    pub stage: String,
+    pub status: String,
+    pub input_hash: Option<String>,
+    pub error: Option<String>,
+    pub updated_at: i64,
+}
+
+pub fn upsert_pipeline_state(conn: &Connection, state: &PipelineStateRow) -> DbResult<()> {
+    conn.execute(
+        r#"
+        INSERT INTO pipeline_state (branch, file_path, stage, status, input_hash, error, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(branch, file_path, stage) DO UPDATE SET
+            status = excluded.status,
+            input_hash = excluded.input_hash,
+            error = excluded.error,
+            updated_at = excluded.updated_at
+        "#,
+        params![
+            state.branch,
+            state.file_path,
+            state.stage,
+            state.status,
+            state.input_hash,
+            state.error,
+            state.updated_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_pipeline_state(
+    conn: &Connection,
+    branch: &str,
+    file_path: &str,
+    stage: &str,
+) -> DbResult<Option<PipelineStateRow>> {
+    let result = conn
+        .query_row(
+            r#"
+            SELECT branch, file_path, stage, status, input_hash, error, updated_at
+            FROM pipeline_state
+            WHERE branch = ? AND file_path = ? AND stage = ?
+            "#,
+            params![branch, file_path, stage],
+            |row| {
+                Ok(PipelineStateRow {
+                    branch: row.get(0)?,
+                    file_path: row.get(1)?,
+                    stage: row.get(2)?,
+                    status: row.get(3)?,
+                    input_hash: row.get(4)?,
+                    error: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(result)
+}
+
+pub fn get_unfinished_pipeline_files(conn: &Connection, branch: &str) -> DbResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        r#"
+        WITH known_files AS (
+            SELECT DISTINCT file_path
+            FROM pipeline_state
+            WHERE branch = ?
+
+            UNION
+
+            SELECT DISTINCT c.file_path
+            FROM branch_chunks bc
+            INNER JOIN chunks c ON c.chunk_id = bc.chunk_id
+            WHERE bc.branch = ?
+        ),
+        required_stages(stage) AS (
+            VALUES ('chunk'), ('embed'), ('index'), ('graph')
+        )
+        SELECT DISTINCT known_files.file_path
+        FROM known_files
+        CROSS JOIN required_stages
+        LEFT JOIN pipeline_state ps
+            ON ps.branch = ?
+           AND ps.file_path = known_files.file_path
+           AND ps.stage = required_stages.stage
+        WHERE ps.status IS NULL
+           OR ps.status != 'complete'
+           OR ps.input_hash IS NULL
+        ORDER BY known_files.file_path
+        "#,
+    )?;
+    let rows = stmt.query_map(params![branch, branch, branch], |row| row.get::<_, String>(0))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn get_known_pipeline_files(conn: &Connection, branch: &str) -> DbResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        r#"
+        WITH known_files AS (
+            SELECT DISTINCT file_path
+            FROM pipeline_state
+            WHERE branch = ?
+
+            UNION
+
+            SELECT DISTINCT c.file_path
+            FROM branch_chunks bc
+            INNER JOIN chunks c ON c.chunk_id = bc.chunk_id
+            WHERE bc.branch = ?
+        )
+        SELECT file_path
+        FROM known_files
+        ORDER BY file_path
+        "#,
+    )?;
+    let rows = stmt.query_map(params![branch, branch], |row| row.get::<_, String>(0))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn reset_pipeline_stage(
+    conn: &Connection,
+    branch: &str,
+    stage: &str,
+    updated_at: i64,
+) -> DbResult<usize> {
+    let count = conn.execute(
+        r#"
+        UPDATE pipeline_state
+        SET status = 'pending',
+            input_hash = NULL,
+            error = NULL,
+            updated_at = ?
+        WHERE branch = ? AND stage = ?
+        "#,
+        params![updated_at, branch, stage],
+    )?;
+    Ok(count)
+}
+
+pub fn clear_pipeline_state_for_branch(conn: &Connection, branch: &str) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM pipeline_state WHERE branch = ?",
+        params![branch],
+    )?;
+    Ok(count)
+}
+
+pub fn clear_pipeline_state_for_file(
+    conn: &Connection,
+    branch: &str,
+    file_path: &str,
+) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM pipeline_state WHERE branch = ? AND file_path = ?",
+        params![branch, file_path],
+    )?;
+    Ok(count)
+}
+
+// ============================================================================
+// Pipeline Run Operations
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct PipelineRunRow {
+    pub run_id: String,
+    pub branch: String,
+    pub run_type: String,
+    pub status: String,
+    pub config_hash: String,
+    pub started_at: i64,
+    pub completed_at: Option<i64>,
+}
+
+pub fn start_pipeline_run(
+    conn: &mut Connection,
+    run: &PipelineRunRow,
+    cancelled_at: i64,
+) -> DbResult<()> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        r#"
+        UPDATE pipeline_runs
+        SET status = 'cancelled',
+            completed_at = ?
+        WHERE branch = ? AND status = 'in_progress'
+        "#,
+        params![cancelled_at, run.branch],
+    )?;
+
+    tx.execute(
+        r#"
+        INSERT INTO pipeline_runs (run_id, branch, run_type, status, config_hash, started_at, completed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        "#,
+        params![
+            run.run_id,
+            run.branch,
+            run.run_type,
+            run.status,
+            run.config_hash,
+            run.started_at,
+            run.completed_at
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn update_pipeline_run_status(
+    conn: &Connection,
+    run_id: &str,
+    status: &str,
+    completed_at: i64,
+) -> DbResult<bool> {
+    let count = conn.execute(
+        r#"
+        UPDATE pipeline_runs
+        SET status = ?,
+            completed_at = ?
+        WHERE run_id = ?
+        "#,
+        params![status, completed_at, run_id],
+    )?;
+    Ok(count > 0)
+}
+
+pub fn get_pipeline_run(conn: &Connection, run_id: &str) -> DbResult<Option<PipelineRunRow>> {
+    let result = conn
+        .query_row(
+            r#"
+            SELECT run_id, branch, run_type, status, config_hash, started_at, completed_at
+            FROM pipeline_runs
+            WHERE run_id = ?
+            "#,
+            params![run_id],
+            |row| {
+                Ok(PipelineRunRow {
+                    run_id: row.get(0)?,
+                    branch: row.get(1)?,
+                    run_type: row.get(2)?,
+                    status: row.get(3)?,
+                    config_hash: row.get(4)?,
+                    started_at: row.get(5)?,
+                    completed_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(result)
+}
+
+pub fn cancel_active_pipeline_runs(
+    conn: &Connection,
+    branch: &str,
+    cancelled_at: i64,
+) -> DbResult<usize> {
+    let count = conn.execute(
+        r#"
+        UPDATE pipeline_runs
+        SET status = 'cancelled',
+            completed_at = ?
+        WHERE branch = ? AND status = 'in_progress'
+        "#,
+        params![cancelled_at, branch],
+    )?;
+    Ok(count)
+}
+
+pub fn get_active_pipeline_runs(conn: &Connection) -> DbResult<Vec<PipelineRunRow>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT run_id, branch, run_type, status, config_hash, started_at, completed_at
+        FROM pipeline_runs
+        WHERE status = 'in_progress'
+        ORDER BY started_at, run_id
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(PipelineRunRow {
+            run_id: row.get(0)?,
+            branch: row.get(1)?,
+            run_type: row.get(2)?,
+            status: row.get(3)?,
+            config_hash: row.get(4)?,
+            started_at: row.get(5)?,
+            completed_at: row.get(6)?,
+        })
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn prune_finished_pipeline_runs(conn: &Connection, older_than: i64) -> DbResult<usize> {
+    let count = conn.execute(
+        r#"
+        DELETE FROM pipeline_runs
+        WHERE status != 'in_progress'
+          AND completed_at IS NOT NULL
+          AND completed_at < ?
+        "#,
+        params![older_than],
+    )?;
+    Ok(count)
+}
+
+// ============================================================================
+// Config Version Operations
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct ConfigVersionRow {
+    pub config_hash: String,
+    pub embedding_model_id: String,
+    pub embedding_dimension: i64,
+    pub chunker_version: String,
+    pub graph_extractor_version: String,
+    pub active: bool,
+    pub created_at: i64,
+}
+
+pub fn get_active_config_version(conn: &Connection) -> DbResult<Option<ConfigVersionRow>> {
+    let result = conn
+        .query_row(
+            r#"
+            SELECT config_hash,
+                   embedding_model_id,
+                   embedding_dimension,
+                   chunker_version,
+                   graph_extractor_version,
+                   active,
+                   created_at
+            FROM config_versions
+            WHERE active = 1
+            ORDER BY created_at DESC, config_hash DESC
+            LIMIT 1
+            "#,
+            [],
+            |row| {
+                Ok(ConfigVersionRow {
+                    config_hash: row.get(0)?,
+                    embedding_model_id: row.get(1)?,
+                    embedding_dimension: row.get(2)?,
+                    chunker_version: row.get(3)?,
+                    graph_extractor_version: row.get(4)?,
+                    active: row.get::<_, i64>(5)? != 0,
+                    created_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(result)
+}
+
+pub fn activate_config_version(
+    conn: &mut Connection,
+    config_version: &ConfigVersionRow,
+) -> DbResult<()> {
+    let tx = conn.transaction()?;
+    tx.execute("UPDATE config_versions SET active = 0 WHERE active != 0", [])?;
+    tx.execute(
+        r#"
+        INSERT INTO config_versions (
+            config_hash,
+            embedding_model_id,
+            embedding_dimension,
+            chunker_version,
+            graph_extractor_version,
+            active,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, 1, ?)
+        ON CONFLICT(config_hash) DO UPDATE SET
+            embedding_model_id = excluded.embedding_model_id,
+            embedding_dimension = excluded.embedding_dimension,
+            chunker_version = excluded.chunker_version,
+            graph_extractor_version = excluded.graph_extractor_version,
+            active = 1
+        "#,
+        params![
+            config_version.config_hash,
+            config_version.embedding_model_id,
+            config_version.embedding_dimension,
+            config_version.chunker_version,
+            config_version.graph_extractor_version,
+            config_version.created_at
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1434,7 +1990,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "5");
+        assert_eq!(version, "6");
     }
 
     #[test]
@@ -1942,7 +2498,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "5");
+        assert_eq!(schema_version, "6");
 
         let on_delete: String = conn
             .query_row("PRAGMA foreign_key_list(call_edges)", [], |row| row.get(6))
@@ -1987,6 +2543,210 @@ mod tests {
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .unwrap();
         assert_eq!(enabled, 1);
+    }
+
+    #[test]
+    fn test_v6_schema_exists_on_fresh_db() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        let schema_version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, "6");
+
+        let pipeline_state_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pipeline_state_exists, "pipeline_state");
+
+        let pipeline_runs_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pipeline_runs_exists, "pipeline_runs");
+
+        let config_versions_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'config_versions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(config_versions_exists, "config_versions");
+
+        let mut stmt = conn.prepare("PRAGMA index_list('pipeline_state')").unwrap();
+        let pipeline_state_indexes: Vec<String> = stmt
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(pipeline_state_indexes
+            .iter()
+            .any(|name| name == "idx_pipeline_state_branch_status"));
+
+        let mut stmt = conn.prepare("PRAGMA index_list('pipeline_runs')").unwrap();
+        let pipeline_runs_indexes: Vec<String> = stmt
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(pipeline_runs_indexes
+            .iter()
+            .any(|name| name == "idx_pipeline_runs_branch_status"));
+    }
+
+    #[test]
+    fn test_migration_v6_adds_pipeline_tables_and_indexes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("migration-v5.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE embeddings (
+                    content_hash TEXT PRIMARY KEY,
+                    embedding BLOB NOT NULL,
+                    chunk_text TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE chunks (
+                    chunk_id TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    node_type TEXT,
+                    name TEXT,
+                    language TEXT NOT NULL
+                );
+                CREATE TABLE branch_chunks (
+                    branch TEXT NOT NULL,
+                    chunk_id TEXT NOT NULL,
+                    PRIMARY KEY (branch, chunk_id)
+                );
+                CREATE TABLE symbols (
+                    id TEXT PRIMARY KEY,
+                    file_path TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    start_col INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    end_col INTEGER NOT NULL,
+                    language TEXT NOT NULL
+                );
+                CREATE TABLE call_edges (
+                    id TEXT PRIMARY KEY,
+                    from_symbol_id TEXT NOT NULL,
+                    target_name TEXT NOT NULL,
+                    to_symbol_id TEXT,
+                    call_type TEXT NOT NULL,
+                    line INTEGER NOT NULL,
+                    col INTEGER NOT NULL,
+                    is_resolved INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY (from_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+                );
+                CREATE TABLE branch_symbols (
+                    branch TEXT NOT NULL,
+                    symbol_id TEXT NOT NULL,
+                    PRIMARY KEY (branch, symbol_id)
+                );
+                CREATE TABLE merkle_snapshots (
+                    branch TEXT PRIMARY KEY,
+                    root_hash TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE merkle_nodes (
+                    branch TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    parent_path TEXT,
+                    node_kind TEXT NOT NULL,
+                    node_hash TEXT NOT NULL,
+                    size_bytes INTEGER,
+                    PRIMARY KEY (branch, path),
+                    FOREIGN KEY (branch) REFERENCES merkle_snapshots(branch) ON DELETE CASCADE
+                );
+                INSERT INTO metadata (key, value) VALUES ('schema_version', '5');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let conn = init_db(&db_path).unwrap();
+
+        let schema_version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, "6");
+
+        let pipeline_state_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pipeline_state_exists, "pipeline_state");
+
+        let pipeline_runs_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pipeline_runs_exists, "pipeline_runs");
+
+        let config_versions_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'config_versions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(config_versions_exists, "config_versions");
+
+        let mut stmt = conn.prepare("PRAGMA index_list('pipeline_state')").unwrap();
+        let pipeline_state_indexes: Vec<String> = stmt
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(pipeline_state_indexes
+            .iter()
+            .any(|name| name == "idx_pipeline_state_branch_status"));
+
+        let mut stmt = conn.prepare("PRAGMA index_list('pipeline_runs')").unwrap();
+        let pipeline_runs_indexes: Vec<String> = stmt
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(pipeline_runs_indexes
+            .iter()
+            .any(|name| name == "idx_pipeline_runs_branch_status"));
     }
 
     #[test]

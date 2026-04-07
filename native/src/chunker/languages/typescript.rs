@@ -1,6 +1,6 @@
 use super::super::policy::{
-    classify_test_call, extract_name_by_fields, extract_string_literal, first_named_child_of_kind,
-    has_descendant_kind, LanguagePolicy, SemanticInfo,
+    extract_name_by_fields, extract_string_literal, first_named_child_of_kind,
+    has_descendant_kind, node_text, LanguagePolicy, SemanticInfo,
 };
 use super::super::{ChunkKind, SymbolKind};
 use tree_sitter::Node;
@@ -36,6 +36,30 @@ fn classify_export_statement(node: Node<'_>, source: &str) -> Option<SemanticInf
     for child in node.named_children(&mut cursor) {
         if child.kind() == "comment" {
             continue;
+        }
+
+        if matches!(child.kind(), "lexical_declaration" | "variable_declaration") {
+            if let Some(declarator) = first_named_child_of_kind(child, "variable_declarator") {
+                if let Some(info) = classify_variable_declarator(declarator, source) {
+                    return Some(info);
+                }
+
+                if declarator
+                    .child_by_field_name("value")
+                    .is_some_and(|value| value.kind() == "call_expression")
+                {
+                    if let Some(symbol_name) =
+                        extract_name_by_fields(declarator, source, &["name"])
+                    {
+                        return Some(SemanticInfo {
+                            symbol_name: Some(symbol_name),
+                            symbol_kind: Some(SymbolKind::Module),
+                            chunk_kind: ChunkKind::Code,
+                            coarse_eligible: false,
+                        });
+                    }
+                }
+            }
         }
 
         if let Some(info) = classify_ts_js_node(child, source) {
@@ -75,7 +99,7 @@ fn classify_test_expression(node: Node<'_>, source: &str) -> Option<SemanticInfo
         None
     }?;
 
-    if !classify_test_call(call, source, JS_TEST_CALLEES) {
+    if !is_js_test_call(call, source) {
         return None;
     }
 
@@ -96,6 +120,33 @@ fn classify_test_expression(node: Node<'_>, source: &str) -> Option<SemanticInfo
         chunk_kind: ChunkKind::Test,
         coarse_eligible: false,
     })
+}
+
+fn is_js_test_call(node: Node<'_>, source: &str) -> bool {
+    let Some(function) = node.child_by_field_name("function") else {
+        return false;
+    };
+
+    match function.kind() {
+        "identifier" | "property_identifier" => node_text(function, source)
+            .map(|value| JS_TEST_CALLEES.iter().any(|callee| value == *callee))
+            .unwrap_or(false),
+        "member_expression" => {
+            let property = function
+                .child_by_field_name("property")
+                .and_then(|child| node_text(child, source));
+            let object = function
+                .child_by_field_name("object")
+                .and_then(|child| node_text(child, source))
+                .map(str::trim);
+
+            matches!(object, Some("test"))
+                && property
+                    .map(|value| JS_TEST_CALLEES.iter().any(|callee| value == *callee))
+                    .unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 fn classify_ts_js_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
