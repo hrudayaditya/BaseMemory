@@ -1,5 +1,5 @@
 {
-  "version": "1.1.0",
+  "version": "1.1.1",
   "name": "small",
   "description": "Expanded smoke-sized golden eval set for retrieval quality checks.",
   "queries": [
@@ -35,10 +35,7 @@
       "query": "fusionStrategy hybridWeight rrfK rerankTopN",
       "queryType": "keyword-heavy",
       "expected": {
-        "acceptableFiles": [
-          "src/config/schema.ts",
-          "src/indexer/index.ts"
-        ]
+        "filePath": "src/config/schema.ts"
       }
     },
     {

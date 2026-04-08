@@ -10,6 +10,7 @@ import {
   buildChunkStageInputHash,
   buildEmbedStageInputHash,
   buildGraphStageInputHash,
+  TTI_TARGET_MS,
 } from "../src/indexer/incremental-index-orchestrator.js";
 import {
   type ConfigVersion,
@@ -18,10 +19,15 @@ import {
 } from "../src/indexer/config-version.js";
 import {
   buildMerkleSnapshot,
+  chunkFile,
   Database,
   getChunkerVersion,
   hashContent,
 } from "../src/native/index.js";
+import {
+  recordWatcherEventTimestamp,
+  resetWatcherEventTimestamps,
+} from "../src/indexer/watcher-tti.js";
 
 describe("incremental index orchestrator", () => {
   let tempDir: string;
@@ -29,6 +35,7 @@ describe("incremental index orchestrator", () => {
 
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "incremental-orchestrator-"));
+    resetWatcherEventTimestamps();
     fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy.mockImplementation(async (_url, init) => {
       const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[] };
@@ -54,6 +61,7 @@ describe("incremental index orchestrator", () => {
 
   afterEach(() => {
     fetchSpy.mockRestore();
+    resetWatcherEventTimestamps();
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
@@ -93,6 +101,78 @@ describe("incremental index orchestrator", () => {
       fileA,
       fileB,
     };
+  }
+
+  function createSingleFileRepo(): string {
+    const srcDir = path.join(tempDir, "src");
+    fs.mkdirSync(srcDir, { recursive: true });
+    const filePath = path.join(srcDir, "only.ts");
+    fs.writeFileSync(filePath, "export function only(): number { return 1; }\n", "utf-8");
+    return filePath;
+  }
+
+  function createRepoWithThreeFiles(): {
+    fileA: string;
+    fileB: string;
+    fileC: string;
+  } {
+    const srcDir = path.join(tempDir, "src");
+    fs.mkdirSync(srcDir, { recursive: true });
+    const fileA = path.join(srcDir, "alpha.ts");
+    const fileB = path.join(srcDir, "beta.ts");
+    const fileC = path.join(srcDir, "gamma.ts");
+    fs.writeFileSync(fileA, "export function alpha(): number { return 1; }\n", "utf-8");
+    fs.writeFileSync(fileB, "export function beta(): number { return 2; }\n", "utf-8");
+    fs.writeFileSync(fileC, "export function gamma(): number { return 3; }\n", "utf-8");
+
+    return { fileA, fileB, fileC };
+  }
+
+  function createMultiLanguageRepo(): Array<{
+    filePath: string;
+    language: "typescript" | "python" | "rust";
+    content: string;
+  }> {
+    const srcDir = path.join(tempDir, "src");
+    fs.mkdirSync(srcDir, { recursive: true });
+
+    const files = [
+      {
+        filePath: path.join(srcDir, "alpha.ts"),
+        language: "typescript" as const,
+        content: [
+          "export function alpha(): number {",
+          "  return 1;",
+          "}",
+          "",
+        ].join("\n"),
+      },
+      {
+        filePath: path.join(srcDir, "beta.py"),
+        language: "python" as const,
+        content: [
+          "def beta() -> int:",
+          "    return 2",
+          "",
+        ].join("\n"),
+      },
+      {
+        filePath: path.join(srcDir, "gamma.rs"),
+        language: "rust" as const,
+        content: [
+          "pub fn gamma() -> i32 {",
+          "    3",
+          "}",
+          "",
+        ].join("\n"),
+      },
+    ];
+
+    for (const file of files) {
+      fs.writeFileSync(file.filePath, file.content, "utf-8");
+    }
+
+    return files;
   }
 
   function createGraphRepo(): string {
@@ -139,6 +219,24 @@ describe("incremental index orchestrator", () => {
       "utf-8"
     );
     return filePath;
+  }
+
+  function createLargeRepo(fileCount: number): string[] {
+    const srcDir = path.join(tempDir, "src");
+    fs.mkdirSync(srcDir, { recursive: true });
+
+    const filePaths: string[] = [];
+    for (let index = 0; index < fileCount; index += 1) {
+      const filePath = path.join(srcDir, `file-${String(index).padStart(3, "0")}.ts`);
+      fs.writeFileSync(
+        filePath,
+        `export function value${index}(): number { return ${index}; }\n`,
+        "utf-8"
+      );
+      filePaths.push(filePath);
+    }
+
+    return filePaths;
   }
 
   function createZeroChunkRepo(): string {
@@ -206,6 +304,10 @@ describe("incremental index orchestrator", () => {
     return node.hash ?? null;
   }
 
+  function getFileHashCachePath(indexPath: string, branch: string): string {
+    return path.join(indexPath, "file-hashes", `${encodeURIComponent(branch || "default")}.json`);
+  }
+
   function getIndexerInternals(indexer: Indexer): {
     orchestrator: any;
     store: { save: () => void };
@@ -249,6 +351,32 @@ describe("incremental index orchestrator", () => {
     return getCurrentConfigVersion(configuredProviderInfo);
   }
 
+  function createEmptyStats(): {
+    totalFiles: number;
+    totalChunks: number;
+    indexedChunks: number;
+    failedChunks: number;
+    tokensUsed: number;
+    durationMs: number;
+    existingChunks: number;
+    removedChunks: number;
+    skippedFiles: [];
+    parseFailures: [];
+  } {
+    return {
+      totalFiles: 0,
+      totalChunks: 0,
+      indexedChunks: 0,
+      failedChunks: 0,
+      tokensUsed: 0,
+      durationMs: 0,
+      existingChunks: 0,
+      removedChunks: 0,
+      skippedFiles: [],
+      parseFailures: [],
+    };
+  }
+
   it("builds stable stage input hashes with the expected invalidation behavior", () => {
     expect(buildChunkStageInputHash("file-hash-a", "chunker-v1")).toBe(
       buildChunkStageInputHash("file-hash-a", "chunker-v1")
@@ -268,18 +396,190 @@ describe("incremental index orchestrator", () => {
     );
   });
 
-  it("completes all pipeline stages on cold start and persists a Merkle snapshot", async () => {
-    const { fileA, fileB } = createRepo();
+  it("delegates public indexing entrypoints to the orchestrator", async () => {
+    const { fileA } = createRepo();
     const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { orchestrator } = getIndexerInternals(indexer);
+    const coldStartSpy = vi.spyOn(orchestrator, "coldStart").mockResolvedValue(createEmptyStats());
+    const hotUpdateSpy = vi.spyOn(orchestrator, "hotUpdate").mockResolvedValue(createEmptyStats());
+    const branchSpy = vi.spyOn(orchestrator, "handleBranchChange").mockResolvedValue(undefined);
+
+    await indexer.index();
+    expect(coldStartSpy).toHaveBeenCalledTimes(1);
+
+    fs.writeFileSync(fileA, "export function alpha(): number { return 42; }\n", "utf-8");
+    await indexer.handleFileChanges([{ type: "change", path: fileA }]);
+    expect(hotUpdateSpy).toHaveBeenCalledTimes(1);
+
+    await indexer.indexDirtySet(
+      {
+        changedFiles: ["src/alpha.ts"],
+        addedFiles: [],
+        removedFiles: [],
+      },
+      undefined,
+      null
+    );
+    expect(hotUpdateSpy).toHaveBeenCalledTimes(2);
+    expect(hotUpdateSpy).toHaveBeenLastCalledWith(
+      {
+        changedFiles: ["src/alpha.ts"],
+        addedFiles: [],
+        removedFiles: [],
+      },
+      undefined,
+      null
+    );
+
+    await indexer.handleBranchChange("main", "feature");
+    expect(branchSpy).toHaveBeenCalledWith("main", "feature");
+
+    coldStartSpy.mockRestore();
+    hotUpdateSpy.mockRestore();
+    branchSpy.mockRestore();
+  });
+
+  it("delegates search() to searchDetailed() and keeps searchDetailed on the retrieval path", async () => {
+    createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    const { orchestrator } = getIndexerInternals(indexer);
+    const coldStartSpy = vi.spyOn(orchestrator, "coldStart");
+    const hotUpdateSpy = vi.spyOn(orchestrator, "hotUpdate");
+    const branchSpy = vi.spyOn(orchestrator, "handleBranchChange");
+
+    const detailedSpy = vi.spyOn(indexer, "searchDetailed").mockResolvedValue({
+      primaryResults: [
+        {
+          filePath: "src/alpha.ts",
+          startLine: 1,
+          endLine: 1,
+          content: "export function alpha(): number { return 1; }",
+          score: 1,
+          chunkType: "function",
+          name: "alpha",
+        },
+      ],
+      expandedContext: [],
+      taskType: "general",
+      reranker: {
+        applied: false,
+        backend: null,
+      },
+    });
+
+    await expect(indexer.search("alpha", 1, { metadataOnly: true })).resolves.toEqual([
+      {
+        filePath: "src/alpha.ts",
+        startLine: 1,
+        endLine: 1,
+        content: "export function alpha(): number { return 1; }",
+        score: 1,
+        chunkType: "function",
+        name: "alpha",
+      },
+    ]);
+    expect(detailedSpy).toHaveBeenCalledWith("alpha", 1, { metadataOnly: true });
+    detailedSpy.mockRestore();
+
+    const response = await indexer.searchDetailed("", 5);
+    expect(response).toEqual({
+      primaryResults: [],
+      expandedContext: [],
+      taskType: "general",
+      reranker: {
+        applied: false,
+        backend: null,
+      },
+    });
+    expect(coldStartSpy).not.toHaveBeenCalled();
+    expect(hotUpdateSpy).not.toHaveBeenCalled();
+    expect(branchSpy).not.toHaveBeenCalled();
+
+    coldStartSpy.mockRestore();
+    hotUpdateSpy.mockRestore();
+    branchSpy.mockRestore();
+  });
+
+  it("reuses a singleton Indexer instance for the same repo path and config", () => {
+    createRepo();
+    const config = createConfig();
+    const first = new Indexer(tempDir, config);
+    const second = new Indexer(tempDir, createConfig());
+    expect(second).toBe(first);
+  });
+
+  it("reuses the same singleton Indexer instance when construction happens concurrently", async () => {
+    createRepo();
+
+    const [first, second] = await Promise.all([
+      Promise.resolve().then(() => new Indexer(tempDir, createConfig())),
+      Promise.resolve().then(() => new Indexer(tempDir, createConfig())),
+    ]);
+
+    expect(second).toBe(first);
+  });
+
+  it("completes a cold start on an empty repo and commits a valid empty snapshot", async () => {
+    const indexer = new Indexer(tempDir, createConfig());
+    let coldStartRunId: string | null = null;
+    const originalStartPipelineRun = Database.prototype.startPipelineRun;
+    const runSpy = vi
+      .spyOn(Database.prototype, "startPipelineRun")
+      .mockImplementation(function (run, cancelledAt) {
+        if (run.runType === "cold_start" && coldStartRunId === null) {
+          coldStartRunId = run.runId;
+        }
+        return originalStartPipelineRun.call(this, run, cancelledAt);
+      });
 
     const stats = await indexer.index();
-    expect(stats.totalFiles).toBe(2);
+    runSpy.mockRestore();
+
+    expect(stats.totalFiles).toBe(0);
+    expect(coldStartRunId).toBeTruthy();
+
+    const { branch, database } = await openDatabase(indexer);
+    const snapshot = database.getMerkleSnapshot(branch);
+    expect(snapshot).toBeTruthy();
+    expect(database.getPipelineRun(coldStartRunId ?? "")?.status).toBe("complete");
+
+    const parsed = JSON.parse(snapshot ?? "{}") as {
+      branch?: string;
+      nodes?: Record<string, { kind?: string }>;
+    };
+    expect(parsed.branch).toBe(branch);
+    const fileNodes = Object.values(parsed.nodes ?? {}).filter((node) => node.kind === "file");
+    expect(fileNodes).toHaveLength(0);
+  });
+
+  it("completes cold start end to end across multiple languages and persists all durable artifacts", async () => {
+    const files = createMultiLanguageRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    let coldStartRunId: string | null = null;
+    const originalStartPipelineRun = Database.prototype.startPipelineRun;
+    const runSpy = vi
+      .spyOn(Database.prototype, "startPipelineRun")
+      .mockImplementation(function (run, cancelledAt) {
+        if (run.runType === "cold_start" && coldStartRunId === null) {
+          coldStartRunId = run.runId;
+        }
+        return originalStartPipelineRun.call(this, run, cancelledAt);
+      });
+
+    const stats = await indexer.index();
+    runSpy.mockRestore();
+    expect(stats.totalFiles).toBe(files.length);
+    expect(coldStartRunId).toBeTruthy();
 
     const status = await indexer.getStatus();
     const branch = status.currentBranch;
     const database = new Database(path.join(status.indexPath, "codebase.db"));
-    for (const filePath of [fileA, fileB]) {
-      const trackedPath = resolveTrackedPath(database, branch, filePath, tempDir);
+    const branchChunkIds = new Set(database.getBranchChunkIds(branch));
+
+    for (const file of files) {
+      const trackedPath = resolveTrackedPath(database, branch, file.filePath, tempDir);
       for (const stage of ["chunk", "embed", "index", "graph"] as const) {
         expect(database.getPipelineState(branch, trackedPath, stage)).toMatchObject({
           branch,
@@ -289,12 +589,234 @@ describe("incremental index orchestrator", () => {
         });
         expect(database.getPipelineState(branch, trackedPath, stage)?.inputHash).toBeTruthy();
       }
+
+      const branchChunksForFile = database
+        .getChunksByFile(trackedPath)
+        .filter((chunk) => branchChunkIds.has(chunk.chunkId));
+      expect(branchChunksForFile).toHaveLength(
+        chunkFile(file.filePath, file.language, file.content).length
+      );
     }
 
     expect(database.getMerkleSnapshot(branch)).toBeTruthy();
+    expect(database.getPipelineRun(coldStartRunId ?? "")?.status).toBe("complete");
+
+    const fileHashCachePath = getFileHashCachePath(status.indexPath, branch);
+    expect(fs.existsSync(fileHashCachePath)).toBe(true);
+    const persistedFileHashCache = JSON.parse(
+      fs.readFileSync(fileHashCachePath, "utf-8")
+    ) as Record<string, string>;
+    for (const file of files) {
+      expect(persistedFileHashCache[fs.realpathSync(file.filePath)]).toBe(hashContent(file.content));
+    }
   });
 
-  it("reprocesses only the changed file on hot update and leaves unchanged files untouched", async () => {
+  it("handles cold start, hot update, and branch change correctly for a single-file repo", async () => {
+    const filePath = createSingleFileRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    let { branch, database } = await openDatabase(indexer);
+    const mainTrackedPath = resolveTrackedPath(database, branch, filePath, tempDir);
+    for (const stage of ["chunk", "embed", "index", "graph"] as const) {
+      expect(database.getPipelineState(branch, mainTrackedPath, stage)?.status).toBe("complete");
+    }
+
+    const changedContent = "export function only(): number { return 2; }\n";
+    fs.writeFileSync(filePath, changedContent, "utf-8");
+    await indexer.handleFileChanges([{ type: "change", path: filePath }]);
+
+    ({ branch, database } = await openDatabase(indexer));
+    expect(
+      getSnapshotFileHash(database.getMerkleSnapshot(branch) ?? "", relativeToRepo(filePath))
+    ).toBe(hashContent(changedContent));
+
+    const { orchestrator } = getIndexerInternals(indexer);
+    const coldStartSpy = vi.spyOn(orchestrator, "coldStart");
+    const hotUpdateSpy = vi.spyOn(orchestrator, "hotUpdate");
+
+    await indexer.handleBranchChange(branch, "feature");
+
+    expect(coldStartSpy).toHaveBeenCalledTimes(1);
+    expect(hotUpdateSpy).not.toHaveBeenCalled();
+
+    const featureTrackedPath = resolveTrackedPath(database, "feature", filePath, tempDir);
+    for (const stage of ["chunk", "embed", "index", "graph"] as const) {
+      expect(database.getPipelineState("feature", featureTrackedPath, stage)?.status).toBe("complete");
+    }
+    expect(database.getMerkleSnapshot("feature")).toBeTruthy();
+
+    coldStartSpy.mockRestore();
+    hotUpdateSpy.mockRestore();
+  });
+
+  it("treats unchanged file notifications as a zero-cost hot update", async () => {
+    const { fileA, fileB } = createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedA = resolveTrackedPath(database, branch, fileA, tempDir);
+    const trackedB = resolveTrackedPath(database, branch, fileB, tempDir);
+    const beforeAChunk = database.getPipelineState(branch, trackedA, "chunk");
+    const beforeAEmbed = database.getPipelineState(branch, trackedA, "embed");
+    const beforeBChunk = database.getPipelineState(branch, trackedB, "chunk");
+    const beforeBEmbed = database.getPipelineState(branch, trackedB, "embed");
+    const beforeSnapshot = database.getMerkleSnapshot(branch);
+    const fetchCountBefore = fetchSpy.mock.calls.length;
+
+    await indexer.handleFileChanges([
+      { type: "change", path: fileA },
+      { type: "change", path: fileB },
+    ]);
+
+    expect(fetchSpy.mock.calls.length).toBe(fetchCountBefore);
+    expect(database.getPipelineState(branch, trackedA, "chunk")?.updatedAt).toBe(beforeAChunk?.updatedAt);
+    expect(database.getPipelineState(branch, trackedA, "embed")?.updatedAt).toBe(beforeAEmbed?.updatedAt);
+    expect(database.getPipelineState(branch, trackedB, "chunk")?.updatedAt).toBe(beforeBChunk?.updatedAt);
+    expect(database.getPipelineState(branch, trackedB, "embed")?.updatedAt).toBe(beforeBEmbed?.updatedAt);
+    expect(database.getMerkleSnapshot(branch)).toBe(beforeSnapshot);
+  });
+
+  it("removes files deleted since the last run during cold start", async () => {
+    const { fileA, fileB, fileC } = createRepoWithThreeFiles();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedA = resolveTrackedPath(database, branch, fileA, tempDir);
+    const trackedB = resolveTrackedPath(database, branch, fileB, tempDir);
+    const trackedC = resolveTrackedPath(database, branch, fileC, tempDir);
+    const initialBranchChunkIds = new Set(database.getBranchChunkIds(branch));
+    const deletedFileChunkIds = database
+      .getChunksByFile(trackedB)
+      .filter((chunk) => initialBranchChunkIds.has(chunk.chunkId))
+      .map((chunk) => chunk.chunkId);
+
+    expect(deletedFileChunkIds.length).toBeGreaterThan(0);
+
+    fs.unlinkSync(fileB);
+    await indexer.index();
+
+    const updatedBranchChunkIds = new Set(database.getBranchChunkIds(branch));
+    for (const chunkId of deletedFileChunkIds) {
+      expect(updatedBranchChunkIds.has(chunkId)).toBe(false);
+    }
+    expect(database.getChunksByFile(trackedB)).toHaveLength(0);
+    expect(database.getKnownPipelineFiles(branch)).not.toContain(trackedB);
+    for (const stage of ["chunk", "embed", "index", "graph"] as const) {
+      expect(database.getPipelineState(branch, trackedB, stage)).toBeNull();
+      expect(database.getPipelineState(branch, trackedA, stage)?.status).toBe("complete");
+      expect(database.getPipelineState(branch, trackedC, stage)?.status).toBe("complete");
+    }
+
+    const remainingAChunks = database
+      .getChunksByFile(trackedA)
+      .filter((chunk) => updatedBranchChunkIds.has(chunk.chunkId));
+    const remainingCChunks = database
+      .getChunksByFile(trackedC)
+      .filter((chunk) => updatedBranchChunkIds.has(chunk.chunkId));
+    expect(remainingAChunks.length).toBeGreaterThan(0);
+    expect(remainingCChunks.length).toBeGreaterThan(0);
+  });
+
+  it("preserves other-branch chunk references when cold start removes a deleted file", async () => {
+    const { fileA } = createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch: mainBranch, database } = await openDatabase(indexer);
+    const trackedPath = resolveTrackedPath(database, mainBranch, fileA, tempDir);
+    const mainBranchChunkIds = new Set(database.getBranchChunkIds(mainBranch));
+    const fileChunkIds = database
+      .getChunksByFile(trackedPath)
+      .filter((chunk) => mainBranchChunkIds.has(chunk.chunkId))
+      .map((chunk) => chunk.chunkId);
+
+    expect(fileChunkIds.length).toBeGreaterThan(0);
+
+    await indexer.handleBranchChange(mainBranch, "feature");
+    const featureBranchChunkIds = new Set(database.getBranchChunkIds("feature"));
+    for (const chunkId of fileChunkIds) {
+      expect(featureBranchChunkIds.has(chunkId)).toBe(true);
+    }
+
+    await indexer.handleBranchChange("feature", mainBranch);
+    fs.unlinkSync(fileA);
+    await indexer.index();
+
+    const updatedMainBranchChunkIds = new Set(database.getBranchChunkIds(mainBranch));
+    const updatedFeatureBranchChunkIds = new Set(database.getBranchChunkIds("feature"));
+    for (const chunkId of fileChunkIds) {
+      expect(updatedMainBranchChunkIds.has(chunkId)).toBe(false);
+      expect(updatedFeatureBranchChunkIds.has(chunkId)).toBe(true);
+    }
+    for (const stage of ["chunk", "embed", "index", "graph"] as const) {
+      expect(database.getPipelineState(mainBranch, trackedPath, stage)).toBeNull();
+      expect(database.getPipelineState("feature", trackedPath, stage)?.status).toBe("complete");
+    }
+  });
+
+  it("processes high priority jobs before remaining cold-start batches", async () => {
+    const lowFiles = createLargeRepo(60);
+    const urgentFile = path.join(tempDir, "src", "urgent.ts");
+    const indexer = new Indexer(tempDir, createConfig());
+    const { orchestrator } = getIndexerInternals(indexer);
+    const queue = orchestrator.queue as {
+      enqueue: (job: {
+        branch: string;
+        filePath: string;
+        priority: "high";
+        trigger: "watcher_event";
+        runId: string;
+      }) => string;
+    };
+
+    const processedFiles: string[] = [];
+    let injected = false;
+    let coldStartJobsSeen = 0;
+    const originalProcessJob = orchestrator.processJob.bind(orchestrator);
+    const processSpy = vi
+      .spyOn(orchestrator, "processJob")
+      .mockImplementation(async (context: any, job: any) => {
+        processedFiles.push(path.basename(job.filePath));
+        if (!injected && job.trigger === "cold_start") {
+          coldStartJobsSeen += 1;
+          if (coldStartJobsSeen === 10) {
+            fs.writeFileSync(
+              urgentFile,
+              "export function urgent(): number { return 999; }\n",
+              "utf-8"
+            );
+            queue.enqueue({
+              branch: context.branch,
+              filePath: urgentFile,
+              priority: "high",
+              trigger: "watcher_event",
+              runId: context.runId,
+            });
+            injected = true;
+          }
+        }
+        return originalProcessJob(context, job);
+      });
+
+    await indexer.index();
+    processSpy.mockRestore();
+
+    expect(injected).toBe(true);
+    expect(processedFiles.indexOf("urgent.ts")).toBeGreaterThan(-1);
+    expect(processedFiles.indexOf(path.basename(lowFiles[55] ?? ""))).toBeGreaterThan(-1);
+    expect(processedFiles.indexOf("urgent.ts")).toBeLessThan(
+      processedFiles.indexOf(path.basename(lowFiles[55] ?? ""))
+    );
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedUrgent = resolveTrackedPath(database, branch, urgentFile, tempDir);
+    expect(database.getPipelineState(branch, trackedUrgent, "index")?.status).toBe("complete");
+  });
+
+  it("wires the full hot update path end to end through handleFileChanges", async () => {
     const { fileA, fileB } = createRepo();
     const indexer = new Indexer(tempDir, createConfig());
     await indexer.index();
@@ -310,17 +832,31 @@ describe("incremental index orchestrator", () => {
     expect(beforeB?.updatedAt).toBeTypeOf("number");
 
     const initialFetchCount = fetchSpy.mock.calls.length;
+    recordWatcherEventTimestamp(fileA, Date.now() - 100);
     await new Promise((resolve) => setTimeout(resolve, 10));
-    fs.writeFileSync(fileA, "export function alpha(): number { return 11; }\n", "utf-8");
+    const changedContent = "export function alpha(): number { return 11; }\n";
+    fs.writeFileSync(fileA, changedContent, "utf-8");
     await indexer.handleFileChanges([{ type: "change", path: fileA }]);
 
     const afterAChunk = database.getPipelineState(branch, trackedA, "chunk");
     const afterAEmbed = database.getPipelineState(branch, trackedA, "embed");
+    const afterAIndex = database.getPipelineState(branch, trackedA, "index");
+    const afterAGraph = database.getPipelineState(branch, trackedA, "graph");
     const afterBChunk = database.getPipelineState(branch, trackedB, "chunk");
 
     expect(afterAChunk?.updatedAt).toBeGreaterThan(beforeA?.updatedAt ?? 0);
     expect(afterAEmbed?.status).toBe("complete");
+    expect(afterAIndex?.status).toBe("complete");
+    expect(afterAGraph?.status).toBe("complete");
     expect(afterBChunk?.updatedAt).toBe(beforeB?.updatedAt);
+    expect(
+      getSnapshotFileHash(
+        database.getMerkleSnapshot(branch) ?? "",
+        relativeToRepo(fileA)
+      )
+    ).toBe(hashContent(changedContent));
+    expect(indexer.getLogger().getMetrics().hotUpdateTtiCount).toBeGreaterThan(0);
+    expect(indexer.getLogger().getMetrics().hotUpdateTtiLastMs).toBeGreaterThan(0);
 
     const hotUpdateCalls = fetchSpy.mock.calls.slice(initialFetchCount);
     expect(hotUpdateCalls.length).toBe(1);
@@ -329,6 +865,170 @@ describe("incremental index orchestrator", () => {
     };
     expect(requestBody.input?.length).toBe(1);
     expect(requestBody.input?.[0]).toContain("alpha");
+  });
+
+  it("isolates partial failure during hot update and retries the unfinished file on the next pass", async () => {
+    const { fileA, fileB, fileC } = createRepoWithThreeFiles();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedA = resolveTrackedPath(database, branch, fileA, tempDir);
+    const trackedB = resolveTrackedPath(database, branch, fileB, tempDir);
+    const trackedC = resolveTrackedPath(database, branch, fileC, tempDir);
+    const oldSnapshot = database.getMerkleSnapshot(branch) ?? "";
+    const oldAHash = getSnapshotFileHash(oldSnapshot, relativeToRepo(fileA));
+
+    const changedA = "export function alpha(): number { return 101; }\n";
+    const changedB = "export function beta(): number { return 202; }\n";
+    fs.writeFileSync(fileA, changedA, "utf-8");
+    fs.writeFileSync(fileB, changedB, "utf-8");
+
+    fetchSpy.mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[] };
+      const texts = Array.isArray(body.input) ? body.input : [];
+      if (texts.some((text) => text.includes("alpha"))) {
+        throw new Error("forced hot update embed failure");
+      }
+      const data = texts.map(() => ({
+        embedding: Array.from({ length: 8 }, (_, idx) => idx / 8),
+      }));
+      return new Response(
+        JSON.stringify({
+          data,
+          usage: { total_tokens: Math.max(1, texts.length * 8) },
+        }),
+        { status: 200 }
+      );
+    });
+
+    await indexer.handleFileChanges([
+      { type: "change", path: fileA },
+      { type: "change", path: fileB },
+    ]);
+
+    expect(database.getPipelineState(branch, trackedA, "embed")?.status).toBe("failed");
+    expect(database.getPipelineState(branch, trackedB, "index")?.status).toBe("complete");
+    expect(database.getPipelineState(branch, trackedB, "graph")?.status).toBe("complete");
+    expect(database.getPipelineState(branch, trackedC, "chunk")?.status).toBe("complete");
+    expect(
+      getSnapshotFileHash(
+        database.getMerkleSnapshot(branch) ?? "",
+        relativeToRepo(fileA)
+      )
+    ).toBe(oldAHash);
+    expect(
+      getSnapshotFileHash(
+        database.getMerkleSnapshot(branch) ?? "",
+        relativeToRepo(fileB)
+      )
+    ).toBe(hashContent(changedB));
+    expect(database.getUnfinishedPipelineFiles(branch)).toContain(trackedA);
+    expect(database.getUnfinishedPipelineFiles(branch)).not.toContain(trackedB);
+
+    fetchSpy.mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[] };
+      const texts = Array.isArray(body.input) ? body.input : [];
+      const data = texts.map((text) => {
+        let seed = 0;
+        for (const ch of text) {
+          seed = (seed * 31 + ch.charCodeAt(0)) % 1000;
+        }
+        return {
+          embedding: Array.from({ length: 8 }, (_, idx) => ((seed + idx * 17) % 997) / 997),
+        };
+      });
+
+      return new Response(
+        JSON.stringify({
+          data,
+          usage: { total_tokens: Math.max(1, texts.length * 8) },
+        }),
+        { status: 200 }
+      );
+    });
+
+    await indexer.handleFileChanges([{ type: "change", path: fileA }]);
+
+    expect(database.getPipelineState(branch, trackedA, "embed")?.status).toBe("complete");
+    expect(database.getPipelineState(branch, trackedA, "index")?.status).toBe("complete");
+    expect(
+      getSnapshotFileHash(
+        database.getMerkleSnapshot(branch) ?? "",
+        relativeToRepo(fileA)
+      )
+    ).toBe(hashContent(changedA));
+    expect(database.getUnfinishedPipelineFiles(branch)).not.toContain(trackedA);
+  });
+
+  it("records hot update TTI from watcher event arrival to index completion", async () => {
+    const { fileA } = createRepo();
+    const config = createConfig({
+      debug: {
+        enabled: true,
+        logLevel: "debug",
+        metrics: true,
+      },
+      indexing: {
+        watchFiles: true,
+      },
+    });
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    fs.writeFileSync(fileA, "export function alpha(): number { return 77; }\n", "utf-8");
+    const { branch, database } = await openDatabase(indexer);
+    const baseSnapshot = database.getMerkleSnapshot(branch);
+    const nextSnapshot = await buildMerkleSnapshot(
+      tempDir,
+      branch,
+      getIndexerInternals(indexer).buildMerkleIgnoreRules()
+    );
+    recordWatcherEventTimestamp(fileA, Date.now() - 100);
+
+    await indexer.indexDirtySet(
+      {
+        changedFiles: [relativeToRepo(fileA)],
+        addedFiles: [],
+        removedFiles: [],
+      },
+      nextSnapshot.snapshot,
+      baseSnapshot
+    );
+
+    const metrics = indexer.getLogger().getMetrics();
+    expect(metrics.hotUpdateTtiCount).toBeGreaterThan(0);
+    expect(metrics.hotUpdateTtiLastMs).toBeGreaterThan(0);
+    expect(metrics.hotUpdateTtiLastMs).toBeLessThan(5000);
+    expect(metrics.hotUpdateTtiMaxMs).toBeGreaterThanOrEqual(metrics.hotUpdateTtiLastMs);
+    expect(metrics.hotUpdateTtiOverTargetCount).toBeLessThanOrEqual(metrics.hotUpdateTtiCount);
+    expect(TTI_TARGET_MS).toBe(2000);
+  });
+
+  it("logs a warning when hot update TTI exceeds the target", async () => {
+    const { fileA } = createRepo();
+    const config = createConfig({
+      debug: {
+        enabled: true,
+        logLevel: "debug",
+        metrics: true,
+      },
+    });
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+    indexer.getLogger().clearLogs();
+
+    fs.writeFileSync(fileA, "export function alpha(): number { return 88; }\n", "utf-8");
+    recordWatcherEventTimestamp(fileA, Date.now() - (TTI_TARGET_MS + 250));
+
+    await indexer.handleFileChanges([{ type: "change", path: fileA }]);
+
+    const ttiWarnings = indexer
+      .getLogger()
+      .getLogsByLevel("warn")
+      .filter((entry) => entry.message === "Hot update TTI exceeded target");
+    expect(ttiWarnings.length).toBeGreaterThan(0);
+    expect(ttiWarnings[0]?.data?.targetMs).toBe(TTI_TARGET_MS);
   });
 
   it("skips embedding calls on a clean rerun when stage hashes still match", async () => {
@@ -511,6 +1211,17 @@ describe("incremental index orchestrator", () => {
     }
 
     expect(database.getUnfinishedPipelineFiles(branch)).not.toContain(trackedPath);
+
+    const beforeChunk = database.getPipelineState(branch, trackedPath, "chunk")?.updatedAt;
+    const beforeEmbed = database.getPipelineState(branch, trackedPath, "embed")?.updatedAt;
+    const fetchCountBefore = fetchSpy.mock.calls.length;
+
+    await indexer.index();
+
+    expect(database.getPipelineState(branch, trackedPath, "chunk")?.updatedAt).toBe(beforeChunk);
+    expect(database.getPipelineState(branch, trackedPath, "embed")?.updatedAt).toBe(beforeEmbed);
+    expect(database.getUnfinishedPipelineFiles(branch)).not.toContain(trackedPath);
+    expect(fetchSpy.mock.calls.length).toBe(fetchCountBefore);
   });
 
   it("keeps other-branch call edges intact when reindexing a shared file", async () => {
@@ -624,16 +1335,208 @@ describe("incremental index orchestrator", () => {
     expect(database.getPipelineRun("resume-run")?.status).toBe("complete");
   });
 
-  it("handles chunker config drift by rerunning CHUNK without resetting EMBED", async () => {
+  it("re-enqueues only incomplete files at normal priority during crash resume and preserves the original run id", async () => {
+    const { fileA, fileB, fileC } = createRepoWithThreeFiles();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedA = resolveTrackedPath(database, branch, fileA, tempDir);
+    const trackedB = resolveTrackedPath(database, branch, fileB, tempDir);
+    const trackedC = resolveTrackedPath(database, branch, fileC, tempDir);
+    const currentConfig = await getCurrentRuntimeConfig(indexer);
+    const orchestrator = getIndexerInternals(indexer).orchestrator;
+    const queue = orchestrator.queue as {
+      enqueue: (job: {
+        branch: string;
+        filePath: string;
+        priority: "normal";
+        trigger: "crash_resume";
+        runId: string;
+      }) => string;
+    };
+
+    database.upsertPipelineState({
+      branch,
+      filePath: trackedC,
+      stage: "graph",
+      status: "in_progress",
+      inputHash: database.getPipelineState(branch, trackedC, "graph")?.inputHash,
+      updatedAt: Date.now(),
+    });
+    database.startPipelineRun(
+      {
+        runId: "recent-resume-run",
+        branch,
+        runType: "hot_update",
+        status: "in_progress",
+        configHash: hashConfigVersion(currentConfig),
+        startedAt: Date.now(),
+      },
+      Date.now()
+    );
+
+    const enqueueSpy = vi.spyOn(queue, "enqueue");
+    await orchestrator.resumeInterruptedRuns(branch, currentConfig, hashConfigVersion(currentConfig));
+
+    expect(enqueueSpy).toHaveBeenCalledTimes(1);
+    expect(enqueueSpy).toHaveBeenCalledWith({
+      branch,
+      filePath: trackedC,
+      priority: "normal",
+      trigger: "crash_resume",
+      runId: "recent-resume-run",
+    });
+    expect(
+      enqueueSpy.mock.calls.some((call) => (call[0] as { filePath: string }).filePath === trackedA)
+    ).toBe(false);
+    expect(
+      enqueueSpy.mock.calls.some((call) => (call[0] as { filePath: string }).filePath === trackedB)
+    ).toBe(false);
+    expect(database.getPipelineRun("recent-resume-run")?.status).toBe("complete");
+    enqueueSpy.mockRestore();
+  });
+
+  it("resumes an interrupted cold start by reprocessing only incomplete files", async () => {
+    const { fileA, fileB, fileC } = createRepoWithThreeFiles();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedA = resolveTrackedPath(database, branch, fileA, tempDir);
+    const trackedB = resolveTrackedPath(database, branch, fileB, tempDir);
+    const trackedC = resolveTrackedPath(database, branch, fileC, tempDir);
+    const beforeAChunk = database.getPipelineState(branch, trackedA, "chunk");
+    const beforeAEmbed = database.getPipelineState(branch, trackedA, "embed");
+    const beforeBChunk = database.getPipelineState(branch, trackedB, "chunk");
+    const beforeBEmbed = database.getPipelineState(branch, trackedB, "embed");
+    const beforeCChunk = database.getPipelineState(branch, trackedC, "chunk");
+    const beforeCEmbed = database.getPipelineState(branch, trackedC, "embed");
+    const currentConfig = await getCurrentRuntimeConfig(indexer);
+
+    database.upsertPipelineState({
+      branch,
+      filePath: trackedC,
+      stage: "embed",
+      status: "in_progress",
+      inputHash: beforeCEmbed?.inputHash,
+      updatedAt: Date.now(),
+    });
+    database.upsertPipelineState({
+      branch,
+      filePath: trackedC,
+      stage: "index",
+      status: "pending",
+      updatedAt: Date.now(),
+    });
+    database.upsertPipelineState({
+      branch,
+      filePath: trackedC,
+      stage: "graph",
+      status: "pending",
+      updatedAt: Date.now(),
+    });
+    database.startPipelineRun(
+      {
+        runId: "interrupted-cold-start",
+        branch,
+        runType: "cold_start",
+        status: "in_progress",
+        configHash: hashConfigVersion(currentConfig),
+        startedAt: Date.now(),
+      },
+      Date.now()
+    );
+
+    const fetchCountBeforeResume = fetchSpy.mock.calls.length;
+    const orchestrator = getIndexerInternals(indexer).orchestrator;
+    await orchestrator.resumeInterruptedRuns(branch, currentConfig, hashConfigVersion(currentConfig));
+
+    expect(database.getPipelineRun("interrupted-cold-start")?.status).toBe("complete");
+    expect(database.getPipelineState(branch, trackedC, "embed")?.status).toBe("complete");
+    expect(database.getPipelineState(branch, trackedC, "index")?.status).toBe("complete");
+    expect(database.getPipelineState(branch, trackedC, "graph")?.status).toBe("complete");
+    expect(database.getPipelineState(branch, trackedA, "chunk")?.updatedAt).toBe(beforeAChunk?.updatedAt);
+    expect(database.getPipelineState(branch, trackedA, "embed")?.updatedAt).toBe(beforeAEmbed?.updatedAt);
+    expect(database.getPipelineState(branch, trackedB, "chunk")?.updatedAt).toBe(beforeBChunk?.updatedAt);
+    expect(database.getPipelineState(branch, trackedB, "embed")?.updatedAt).toBe(beforeBEmbed?.updatedAt);
+    expect(database.getPipelineState(branch, trackedC, "chunk")?.updatedAt).toBe(beforeCChunk?.updatedAt);
+    expect(database.getPipelineState(branch, trackedC, "embed")?.updatedAt).toBeGreaterThan(
+      beforeCEmbed?.updatedAt ?? 0
+    );
+
+    const resumeCalls = fetchSpy.mock.calls.slice(fetchCountBeforeResume);
+    expect(resumeCalls.length).toBeLessThanOrEqual(1);
+    if (resumeCalls.length === 1) {
+      const requestBody = JSON.parse(String(resumeCalls[0]?.[1]?.body ?? "{}")) as {
+        input?: string[];
+      };
+      expect(requestBody.input?.length).toBeGreaterThan(0);
+      expect(requestBody.input?.every((text) => text.includes("gamma"))).toBe(true);
+    }
+  });
+
+  it("cancels stale in-progress runs older than the resume threshold instead of resuming them", async () => {
     const { fileA } = createRepo();
     const indexer = new Indexer(tempDir, createConfig());
     await indexer.index();
 
     const { branch, database } = await openDatabase(indexer);
     const trackedPath = resolveTrackedPath(database, branch, fileA, tempDir);
+    const currentConfig = await getCurrentRuntimeConfig(indexer);
+    const staleStartedAt = Date.now() - 2 * 60 * 60 * 1000 - 5_000;
+    const orchestrator = getIndexerInternals(indexer).orchestrator;
+    const queue = orchestrator.queue as {
+      enqueue: (job: {
+        branch: string;
+        filePath: string;
+        priority: "normal";
+        trigger: "crash_resume";
+        runId: string;
+      }) => string;
+    };
+
+    database.upsertPipelineState({
+      branch,
+      filePath: trackedPath,
+      stage: "index",
+      status: "in_progress",
+      updatedAt: staleStartedAt,
+    });
+    database.startPipelineRun(
+      {
+        runId: "stale-resume-run",
+        branch,
+        runType: "hot_update",
+        status: "in_progress",
+        configHash: hashConfigVersion(currentConfig),
+        startedAt: staleStartedAt,
+      },
+      staleStartedAt
+    );
+
+    const enqueueSpy = vi.spyOn(queue, "enqueue");
+    await orchestrator.resumeInterruptedRuns(branch, currentConfig, hashConfigVersion(currentConfig));
+
+    expect(database.getPipelineRun("stale-resume-run")?.status).toBe("cancelled");
+    expect(enqueueSpy).not.toHaveBeenCalled();
+    enqueueSpy.mockRestore();
+  });
+
+  it("reruns CHUNK across the branch after chunker config drift without resetting EMBED", async () => {
+    const { fileA, fileB } = createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedPath = resolveTrackedPath(database, branch, fileA, tempDir);
+    const trackedPathB = resolveTrackedPath(database, branch, fileB, tempDir);
     const beforeChunk = database.getPipelineState(branch, trackedPath, "chunk");
     const beforeEmbed = database.getPipelineState(branch, trackedPath, "embed");
+    const beforeChunkB = database.getPipelineState(branch, trackedPathB, "chunk");
+    const beforeEmbedB = database.getPipelineState(branch, trackedPathB, "embed");
     const currentConfig = await getCurrentRuntimeConfig(indexer);
+    const initialFetchCount = fetchSpy.mock.calls.length;
 
     database.activateConfigVersion({
       configHash: "stale-chunker-hash",
@@ -647,7 +1550,7 @@ describe("incremental index orchestrator", () => {
 
     const orchestrator = getIndexerInternals(indexer).orchestrator;
     orchestrator.startupComplete = false;
-    await orchestrator.ensureStartupState();
+    await indexer.index();
 
     expect(database.getPipelineState(branch, trackedPath, "chunk")?.updatedAt).toBeGreaterThan(
       beforeChunk?.updatedAt ?? 0
@@ -655,22 +1558,39 @@ describe("incremental index orchestrator", () => {
     expect(database.getPipelineState(branch, trackedPath, "embed")?.updatedAt).toBe(
       beforeEmbed?.updatedAt
     );
+    expect(database.getPipelineState(branch, trackedPathB, "chunk")?.updatedAt).toBeGreaterThan(
+      beforeChunkB?.updatedAt ?? 0
+    );
+    expect(database.getPipelineState(branch, trackedPathB, "embed")?.updatedAt).toBe(
+      beforeEmbedB?.updatedAt
+    );
+    expect(fetchSpy.mock.calls.length).toBe(initialFetchCount);
+    expect(database.getActiveConfigVersion()).toMatchObject({
+      configHash: hashConfigVersion(currentConfig),
+      active: true,
+      chunkerVersion: currentConfig.chunkerVersion,
+    });
   });
 
-  it("handles embedding config drift by rerunning EMBED without resetting CHUNK", async () => {
-    const { fileA } = createRepo();
+  it("reruns EMBED across the branch after embedding config drift without resetting CHUNK or GRAPH", async () => {
+    const { fileA, fileB } = createRepo();
     const indexer = new Indexer(tempDir, createConfig());
     await indexer.index();
 
     const { branch, database } = await openDatabase(indexer);
     const trackedPath = resolveTrackedPath(database, branch, fileA, tempDir);
+    const trackedPathB = resolveTrackedPath(database, branch, fileB, tempDir);
     const beforeChunk = database.getPipelineState(branch, trackedPath, "chunk");
     const beforeEmbed = database.getPipelineState(branch, trackedPath, "embed");
+    const beforeGraph = database.getPipelineState(branch, trackedPath, "graph");
+    const beforeChunkB = database.getPipelineState(branch, trackedPathB, "chunk");
+    const beforeEmbedB = database.getPipelineState(branch, trackedPathB, "embed");
+    const beforeGraphB = database.getPipelineState(branch, trackedPathB, "graph");
     const currentConfig = await getCurrentRuntimeConfig(indexer);
 
     database.activateConfigVersion({
       configHash: "stale-embed-hash",
-      embeddingModelId: currentConfig.embeddingModelId,
+      embeddingModelId: "stale-model-id",
       embeddingDimension: currentConfig.embeddingDimension,
       chunkerVersion: currentConfig.chunkerVersion,
       graphExtractorVersion: currentConfig.graphExtractorVersion,
@@ -688,6 +1608,360 @@ describe("incremental index orchestrator", () => {
     expect(database.getPipelineState(branch, trackedPath, "embed")?.updatedAt).toBeGreaterThan(
       beforeEmbed?.updatedAt ?? 0
     );
+    expect(database.getPipelineState(branch, trackedPath, "graph")?.updatedAt).toBe(
+      beforeGraph?.updatedAt
+    );
+    expect(database.getPipelineState(branch, trackedPathB, "chunk")?.updatedAt).toBe(
+      beforeChunkB?.updatedAt
+    );
+    expect(database.getPipelineState(branch, trackedPathB, "embed")?.updatedAt).toBeGreaterThan(
+      beforeEmbedB?.updatedAt ?? 0
+    );
+    expect(database.getPipelineState(branch, trackedPathB, "graph")?.updatedAt).toBe(
+      beforeGraphB?.updatedAt
+    );
+    expect(database.getActiveConfigVersion()).toMatchObject({
+      configHash: hashConfigVersion(currentConfig),
+      active: true,
+      embeddingModelId: currentConfig.embeddingModelId,
+    });
+  });
+
+  it("reruns GRAPH across the branch after graph extractor drift without resetting CHUNK or EMBED", async () => {
+    const { fileA, fileB } = createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedPath = resolveTrackedPath(database, branch, fileA, tempDir);
+    const trackedPathB = resolveTrackedPath(database, branch, fileB, tempDir);
+    const beforeChunk = database.getPipelineState(branch, trackedPath, "chunk");
+    const beforeEmbed = database.getPipelineState(branch, trackedPath, "embed");
+    const beforeGraph = database.getPipelineState(branch, trackedPath, "graph");
+    const beforeChunkB = database.getPipelineState(branch, trackedPathB, "chunk");
+    const beforeEmbedB = database.getPipelineState(branch, trackedPathB, "embed");
+    const beforeGraphB = database.getPipelineState(branch, trackedPathB, "graph");
+    const currentConfig = await getCurrentRuntimeConfig(indexer);
+
+    database.activateConfigVersion({
+      configHash: "stale-graph-hash",
+      embeddingModelId: currentConfig.embeddingModelId,
+      embeddingDimension: currentConfig.embeddingDimension,
+      chunkerVersion: currentConfig.chunkerVersion,
+      graphExtractorVersion: "stale-graph-version",
+      active: true,
+      createdAt: Date.now() - 1,
+    });
+
+    const orchestrator = getIndexerInternals(indexer).orchestrator;
+    orchestrator.startupComplete = false;
+    await orchestrator.ensureStartupState();
+
+    expect(database.getPipelineState(branch, trackedPath, "chunk")?.updatedAt).toBe(
+      beforeChunk?.updatedAt
+    );
+    expect(database.getPipelineState(branch, trackedPath, "embed")?.updatedAt).toBe(
+      beforeEmbed?.updatedAt
+    );
+    expect(database.getPipelineState(branch, trackedPath, "graph")?.updatedAt).toBeGreaterThan(
+      beforeGraph?.updatedAt ?? 0
+    );
+    expect(database.getPipelineState(branch, trackedPathB, "chunk")?.updatedAt).toBe(
+      beforeChunkB?.updatedAt
+    );
+    expect(database.getPipelineState(branch, trackedPathB, "embed")?.updatedAt).toBe(
+      beforeEmbedB?.updatedAt
+    );
+    expect(database.getPipelineState(branch, trackedPathB, "graph")?.updatedAt).toBeGreaterThan(
+      beforeGraphB?.updatedAt ?? 0
+    );
+  });
+
+  it("converges combined chunker and embedding config drift in a single startup pass", async () => {
+    const { fileA, fileB } = createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const internals = getIndexerInternals(indexer) as {
+      orchestrator: any;
+      configuredProviderInfo: {
+        modelInfo: {
+          model: string;
+        };
+      };
+    };
+    const originalModel = internals.configuredProviderInfo.modelInfo.model;
+    internals.configuredProviderInfo.modelInfo.model = "updated-model-id";
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedPath = resolveTrackedPath(database, branch, fileA, tempDir);
+    const trackedPathB = resolveTrackedPath(database, branch, fileB, tempDir);
+    const beforeChunk = database.getPipelineState(branch, trackedPath, "chunk");
+    const beforeEmbed = database.getPipelineState(branch, trackedPath, "embed");
+    const beforeChunkB = database.getPipelineState(branch, trackedPathB, "chunk");
+    const beforeEmbedB = database.getPipelineState(branch, trackedPathB, "embed");
+    const beforeGraph = database.getPipelineState(branch, trackedPath, "graph");
+    const beforeGraphB = database.getPipelineState(branch, trackedPathB, "graph");
+    const currentConfig = await getCurrentRuntimeConfig(indexer);
+
+    database.activateConfigVersion({
+      configHash: "stale-chunk-and-embed-hash",
+      embeddingModelId: originalModel,
+      embeddingDimension: currentConfig.embeddingDimension,
+      chunkerVersion: "stale-chunker-version",
+      graphExtractorVersion: currentConfig.graphExtractorVersion,
+      active: true,
+      createdAt: Date.now() - 1,
+    });
+
+    const fetchCountBefore = fetchSpy.mock.calls.length;
+    internals.orchestrator.startupComplete = false;
+    await internals.orchestrator.ensureStartupState();
+
+    expect(database.getPipelineState(branch, trackedPath, "chunk")?.updatedAt).toBeGreaterThan(
+      beforeChunk?.updatedAt ?? 0
+    );
+    expect(database.getPipelineState(branch, trackedPath, "embed")?.updatedAt).toBeGreaterThan(
+      beforeEmbed?.updatedAt ?? 0
+    );
+    expect(database.getPipelineState(branch, trackedPathB, "chunk")?.updatedAt).toBeGreaterThan(
+      beforeChunkB?.updatedAt ?? 0
+    );
+    expect(database.getPipelineState(branch, trackedPathB, "embed")?.updatedAt).toBeGreaterThan(
+      beforeEmbedB?.updatedAt ?? 0
+    );
+    expect(database.getPipelineState(branch, trackedPath, "graph")?.updatedAt).toBe(
+      beforeGraph?.updatedAt
+    );
+    expect(database.getPipelineState(branch, trackedPathB, "graph")?.updatedAt).toBe(
+      beforeGraphB?.updatedAt
+    );
+    expect(fetchSpy.mock.calls.length).toBeGreaterThan(fetchCountBefore);
+
+    const afterFirstChunk = database.getPipelineState(branch, trackedPath, "chunk")?.updatedAt;
+    const afterFirstEmbed = database.getPipelineState(branch, trackedPath, "embed")?.updatedAt;
+    const afterFirstChunkB = database.getPipelineState(branch, trackedPathB, "chunk")?.updatedAt;
+    const afterFirstEmbedB = database.getPipelineState(branch, trackedPathB, "embed")?.updatedAt;
+    const fetchCountAfterFirstPass = fetchSpy.mock.calls.length;
+
+    internals.orchestrator.startupComplete = false;
+    await internals.orchestrator.ensureStartupState();
+
+    expect(database.getPipelineState(branch, trackedPath, "chunk")?.updatedAt).toBe(afterFirstChunk);
+    expect(database.getPipelineState(branch, trackedPath, "embed")?.updatedAt).toBe(afterFirstEmbed);
+    expect(database.getPipelineState(branch, trackedPathB, "chunk")?.updatedAt).toBe(afterFirstChunkB);
+    expect(database.getPipelineState(branch, trackedPathB, "embed")?.updatedAt).toBe(afterFirstEmbedB);
+    expect(fetchSpy.mock.calls.length).toBe(fetchCountAfterFirstPass);
+    expect(database.getActiveConfigVersion()).toMatchObject({
+      configHash: hashConfigVersion(currentConfig),
+      active: true,
+      chunkerVersion: currentConfig.chunkerVersion,
+      embeddingModelId: currentConfig.embeddingModelId,
+    });
+  });
+
+  it("applies config drift handling before resume so files cannot skip CHUNK under a stale chunker version", async () => {
+    const { fileA } = createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedPath = resolveTrackedPath(database, branch, fileA, tempDir);
+    const beforeChunk = database.getPipelineState(branch, trackedPath, "chunk");
+    const beforeEmbed = database.getPipelineState(branch, trackedPath, "embed");
+    const currentConfig = await getCurrentRuntimeConfig(indexer);
+
+    database.activateConfigVersion({
+      configHash: "ordering-stale-chunker-hash",
+      embeddingModelId: currentConfig.embeddingModelId,
+      embeddingDimension: currentConfig.embeddingDimension,
+      chunkerVersion: "ordering-stale-chunker-version",
+      graphExtractorVersion: currentConfig.graphExtractorVersion,
+      active: true,
+      createdAt: Date.now() - 1,
+    });
+    database.upsertPipelineState({
+      branch,
+      filePath: trackedPath,
+      stage: "index",
+      status: "in_progress",
+      inputHash: database.getPipelineState(branch, trackedPath, "index")?.inputHash,
+      updatedAt: Date.now(),
+    });
+    database.startPipelineRun(
+      {
+        runId: "ordering-resume-run",
+        branch,
+        runType: "hot_update",
+        status: "in_progress",
+        configHash: "ordering-stale-chunker-hash",
+        startedAt: Date.now(),
+      },
+      Date.now()
+    );
+
+    const orchestrator = getIndexerInternals(indexer).orchestrator;
+    const callOrder: string[] = [];
+    const originalHandleConfigChange = orchestrator.handleConfigChange.bind(orchestrator);
+    const originalResumeInterruptedRuns = orchestrator.resumeInterruptedRuns.bind(orchestrator);
+    const configSpy = vi
+      .spyOn(orchestrator, "handleConfigChange")
+      .mockImplementation(async (...args: Parameters<typeof originalHandleConfigChange>) => {
+        callOrder.push("config");
+        return originalHandleConfigChange(...args);
+      });
+    const resumeSpy = vi
+      .spyOn(orchestrator, "resumeInterruptedRuns")
+      .mockImplementation(async (...args: Parameters<typeof originalResumeInterruptedRuns>) => {
+        callOrder.push("resume");
+        return originalResumeInterruptedRuns(...args);
+      });
+
+    orchestrator.startupComplete = false;
+    await orchestrator.ensureStartupState();
+
+    expect(callOrder[0]).toBe("config");
+    expect(callOrder[1]).toBe("resume");
+    expect(database.getPipelineState(branch, trackedPath, "chunk")?.updatedAt).toBeGreaterThan(
+      beforeChunk?.updatedAt ?? 0
+    );
+    expect(database.getPipelineState(branch, trackedPath, "embed")?.updatedAt).toBe(
+      beforeEmbed?.updatedAt
+    );
+    expect(database.getPipelineRun("ordering-resume-run")?.status).toBe("cancelled");
+    configSpy.mockRestore();
+    resumeSpy.mockRestore();
+  });
+
+  it("prunes old finished pipeline runs during cold start without deleting active run history", async () => {
+    createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    const status = await indexer.getStatus();
+    const branch = status.currentBranch;
+    const database = new Database(path.join(status.indexPath, "codebase.db"));
+    const now = Date.now();
+    const oldCompletedAt = now - 8 * 24 * 60 * 60 * 1000;
+
+    database.startPipelineRun(
+      {
+        runId: "old-complete-run",
+        branch,
+        runType: "cold_start",
+        status: "complete",
+        configHash: "old-complete-hash",
+        startedAt: oldCompletedAt - 1000,
+        completedAt: oldCompletedAt,
+      },
+      oldCompletedAt
+    );
+    database.startPipelineRun(
+      {
+        runId: "old-cancelled-run",
+        branch,
+        runType: "hot_update",
+        status: "cancelled",
+        configHash: "old-cancelled-hash",
+        startedAt: oldCompletedAt - 2000,
+        completedAt: oldCompletedAt,
+      },
+      oldCompletedAt
+    );
+    database.startPipelineRun(
+      {
+        runId: "old-in-progress-run",
+        branch,
+        runType: "resume",
+        status: "in_progress",
+        configHash: "old-active-hash",
+        startedAt: now - 8 * 24 * 60 * 60 * 1000,
+      },
+      now - 8 * 24 * 60 * 60 * 1000
+    );
+
+    const orchestrator = getIndexerInternals(indexer).orchestrator;
+    orchestrator.startupComplete = false;
+    await indexer.index();
+
+    expect(database.getPipelineRun("old-complete-run")).toBeNull();
+    expect(database.getPipelineRun("old-cancelled-run")).toBeNull();
+    expect(database.getPipelineRun("old-in-progress-run")).not.toBeNull();
+    expect(database.getPipelineRun("old-in-progress-run")?.status).not.toBe("in_progress");
+  });
+
+  it("detects a stale lock, invalidates snapshots and caches, cancels in-progress runs, and forces cold start instead of resume", async () => {
+    const { fileA } = createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const status = await indexer.getStatus();
+    const branch = status.currentBranch;
+    const indexPath = status.indexPath;
+    const database = new Database(path.join(indexPath, "codebase.db"));
+    const trackedPath = resolveTrackedPath(database, branch, fileA, tempDir);
+    const previousSnapshot = database.getMerkleSnapshot(branch);
+    expect(previousSnapshot).toBeTruthy();
+
+    const fileHashCachePath = getFileHashCachePath(indexPath, branch);
+    expect(fs.existsSync(fileHashCachePath)).toBe(true);
+
+    database.upsertPipelineState({
+      branch,
+      filePath: trackedPath,
+      stage: "index",
+      status: "in_progress",
+      updatedAt: Date.now(),
+    });
+    database.startPipelineRun(
+      {
+        runId: "stale-lock-run",
+        branch,
+        runType: "hot_update",
+        status: "in_progress",
+        configHash: "stale-lock-config",
+        startedAt: Date.now(),
+      },
+      Date.now()
+    );
+
+    fs.writeFileSync(
+      path.join(indexPath, "indexing.lock"),
+      JSON.stringify({
+        pid: 999_999_999,
+        startedAt: new Date().toISOString(),
+      }),
+      "utf-8"
+    );
+
+    const orchestrator = getIndexerInternals(indexer).orchestrator;
+    const resumeSpy = vi.spyOn(orchestrator as any, "resumeInterruptedRuns");
+    const indexerInternal = indexer as unknown as {
+      store: unknown;
+      invertedIndex: unknown;
+      database: unknown;
+      provider: unknown;
+      configuredProviderInfo: unknown;
+      ensureInitialized: () => Promise<void>;
+    };
+    indexerInternal.store = null;
+    indexerInternal.invertedIndex = null;
+    indexerInternal.database = null;
+    indexerInternal.provider = null;
+    indexerInternal.configuredProviderInfo = null;
+
+    await indexerInternal.ensureInitialized();
+
+    const recoveredDatabase = new Database(path.join(indexPath, "codebase.db"));
+    expect(recoveredDatabase.getMerkleSnapshot(branch)).toBeNull();
+    expect(fs.existsSync(fileHashCachePath)).toBe(false);
+
+    orchestrator.startupComplete = false;
+    await indexer.index();
+
+    expect(resumeSpy).not.toHaveBeenCalled();
+    expect(recoveredDatabase.getPipelineRun("stale-lock-run")?.status).toBe("cancelled");
+    expect(recoveredDatabase.getMerkleSnapshot(branch)).toBeTruthy();
+    expect(fs.existsSync(fileHashCachePath)).toBe(true);
+    resumeSpy.mockRestore();
   });
 
   it("isolates single-file embed failures and still completes the rest of the run", async () => {
@@ -722,29 +1996,39 @@ describe("incremental index orchestrator", () => {
     expect(database.getPipelineState(branch, trackedB, "graph")?.status).toBe("complete");
   });
 
-  it("purges pending old-branch jobs and cancels active runs when the branch changes", async () => {
-    const { fileA } = createRepo();
+  it("purges old-branch hot-update jobs and starts the new branch without leaking old state", async () => {
+    const { fileA, fileB } = createRepo();
     const indexer = new Indexer(tempDir, createConfig());
     await indexer.index();
 
     const { branch, database } = await openDatabase(indexer);
+    const oldBranchChunkIds = new Set(database.getBranchChunkIds(branch));
     const orchestrator = getIndexerInternals(indexer).orchestrator;
     const queue = orchestrator.queue as {
       enqueue: (job: {
         branch: string;
         filePath: string;
         priority: "low";
-        trigger: "cold_start";
+        trigger: "cold_start" | "hot_update";
         runId: string;
       }) => void;
       getStats: () => { pendingCount: number };
     };
 
+    fs.unlinkSync(fileA);
+    fs.unlinkSync(fileB);
+    const featureFile = path.join(tempDir, "src", "feature-only.ts");
+    fs.writeFileSync(
+      featureFile,
+      "export function featureOnly(): number { return 999; }\n",
+      "utf-8"
+    );
+
     database.startPipelineRun(
       {
         runId: "branch-change-run",
         branch,
-        runType: "cold_start",
+        runType: "hot_update",
         status: "in_progress",
         configHash: "branch-change-hash",
         startedAt: Date.now(),
@@ -755,7 +2039,14 @@ describe("incremental index orchestrator", () => {
       branch,
       filePath: fileA,
       priority: "low",
-      trigger: "cold_start",
+      trigger: "hot_update",
+      runId: "branch-change-run",
+    });
+    queue.enqueue({
+      branch,
+      filePath: fileB,
+      priority: "low",
+      trigger: "hot_update",
       runId: "branch-change-run",
     });
     expect(queue.getStats().pendingCount).toBeGreaterThan(0);
@@ -765,5 +2056,79 @@ describe("incremental index orchestrator", () => {
     expect(database.getPipelineRun("branch-change-run")?.status).toBe("cancelled");
     expect(queue.getStats().pendingCount).toBe(0);
     expect(database.getMerkleSnapshot("feature")).toBeTruthy();
+    const featureChunkIds = new Set(database.getBranchChunkIds("feature"));
+    expect(featureChunkIds.size).toBeGreaterThan(0);
+    for (const chunkId of oldBranchChunkIds) {
+      expect(featureChunkIds.has(chunkId)).toBe(false);
+    }
+  });
+
+  it("uses cold start instead of hot update when switching to a branch with no prior snapshot", async () => {
+    createSingleFileRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const orchestrator = getIndexerInternals(indexer).orchestrator;
+    const coldStartSpy = vi.spyOn(orchestrator, "coldStart");
+    const hotUpdateSpy = vi.spyOn(orchestrator, "hotUpdate");
+
+    await indexer.handleBranchChange(branch, "brand-new-branch");
+
+    expect(coldStartSpy).toHaveBeenCalledTimes(1);
+    expect(hotUpdateSpy).not.toHaveBeenCalled();
+    expect(database.getMerkleSnapshot("brand-new-branch")).toBeTruthy();
+
+    coldStartSpy.mockRestore();
+    hotUpdateSpy.mockRestore();
+  });
+
+  it("removes deleted files from the active branch, keeps cross-branch references, and clears pipeline state", async () => {
+    const { fileA } = createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedPath = resolveTrackedPath(database, branch, fileA, tempDir);
+    const mainBranchChunkIds = new Set(database.getBranchChunkIds(branch));
+    const fileChunkIds = database
+      .getChunksByFile(trackedPath)
+      .filter((chunk) => mainBranchChunkIds.has(chunk.chunkId))
+      .map((chunk) => chunk.chunkId);
+    database.addChunksToBranchBatch("feature", fileChunkIds);
+
+    const removeChunkSpy = vi.spyOn(
+      indexer as unknown as {
+        removeChunkFromRetrievalIfUnreferenced: (
+          database: Database,
+          store: unknown,
+          invertedIndex: unknown,
+          chunkId: string
+        ) => boolean;
+      },
+      "removeChunkFromRetrievalIfUnreferenced"
+    );
+
+    fs.unlinkSync(fileA);
+    await indexer.handleFileChanges([{ type: "unlink", path: fileA }]);
+
+    const updatedMainChunkIds = new Set(database.getBranchChunkIds(branch));
+    const featureChunkIds = new Set(database.getBranchChunkIds("feature"));
+    for (const chunkId of fileChunkIds) {
+      expect(updatedMainChunkIds.has(chunkId)).toBe(false);
+      expect(featureChunkIds.has(chunkId)).toBe(true);
+    }
+    expect(removeChunkSpy.mock.calls.length).toBeGreaterThan(0);
+    const checkedChunkIds = new Set(
+      removeChunkSpy.mock.calls.map((call) => call[3] as string)
+    );
+    for (const chunkId of fileChunkIds) {
+      expect(checkedChunkIds.has(chunkId)).toBe(true);
+    }
+    removeChunkSpy.mockRestore();
+
+    for (const stage of ["chunk", "embed", "index", "graph"] as const) {
+      expect(database.getPipelineState(branch, trackedPath, stage)).toBeNull();
+    }
   });
 });

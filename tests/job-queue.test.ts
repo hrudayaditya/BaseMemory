@@ -280,6 +280,31 @@ describe("JobQueue", () => {
     });
   });
 
+  it("promotes all starved low-priority jobs before processing under real queue load", async () => {
+    let nowMs = 0;
+    const queue = new JobQueue({
+      now: () => nowMs,
+    });
+    const processed: IndexJob[] = [];
+
+    for (let index = 0; index < 10; index += 1) {
+      queue.enqueue(createJob(`src/low-${index}.ts`, "low"));
+    }
+
+    nowMs = LOW_PRIORITY_STARVATION_THRESHOLD_MS + 1;
+    expect(queue.getStats().stalledLowPriorityCount).toBe(10);
+
+    await queue.drain(async (job) => {
+      processed.push(job);
+    });
+
+    expect(processed).toHaveLength(10);
+    expect(processed.every((job) => job.priority === "normal")).toBe(true);
+    expect(processed.map((job) => job.filePath)).toEqual(
+      Array.from({ length: 10 }, (_, index) => `src/low-${index}.ts`)
+    );
+  });
+
   it("returns immediately when drain is called on an empty queue", async () => {
     const queue = new JobQueue();
     const processed = await queue.drain(async () => {

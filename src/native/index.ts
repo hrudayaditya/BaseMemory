@@ -837,6 +837,10 @@ export class Database {
     return this.inner.getMissingEmbeddings(contentHashes);
   }
 
+  getMissingEmbeddingsForModel(contentHashes: string[], model: string): string[] {
+    return this.inner.getMissingEmbeddingsForModel(contentHashes, model);
+  }
+
   upsertChunk(chunk: ChunkData): void {
     this.inner.upsertChunk(chunk);
   }

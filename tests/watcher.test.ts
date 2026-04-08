@@ -12,6 +12,23 @@ import {
 } from "../src/watcher/index.js";
 import { ParsedCodebaseIndexConfig } from "../src/config/schema.js";
 
+async function waitForCondition(
+  predicate: () => boolean,
+  timeoutMs: number = 3000,
+  intervalMs: number = 25
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+
+  throw new Error("Timed out waiting for watcher condition");
+}
+
 const createTestConfig = (overrides: Partial<ParsedCodebaseIndexConfig> = {}): ParsedCodebaseIndexConfig => ({
   embeddingProvider: "auto",
   embeddingModel: undefined,
@@ -124,12 +141,15 @@ describe("FileWatcher", () => {
       fs.writeFileSync(path.join(tempDir, "src", "test.ts"), "const x = 1;");
       fs.writeFileSync(path.join(tempDir, "src", "test.md"), "# README");
 
-      await new Promise((r) => setTimeout(r, 1500));
+      await waitForCondition(
+        () => changes.some((change) => change.path.endsWith(".ts")),
+        4000
+      );
 
       const tsChanges = changes.filter((c) => c.path.endsWith(".ts"));
       const mdChanges = changes.filter((c) => c.path.endsWith(".md"));
 
-      expect(tsChanges.length).toBeGreaterThanOrEqual(0);
+      expect(tsChanges.length).toBeGreaterThan(0);
       expect(mdChanges.length).toBe(0);
     });
   });
@@ -236,13 +256,11 @@ describe("GitHeadWatcher", () => {
 
       fs.writeFileSync(path.join(tempDir, ".git", "HEAD"), "ref: refs/heads/feature\n");
 
-      await new Promise((r) => setTimeout(r, 500));
+      await waitForCondition(() => branchChanges.length > 0, 3000);
 
-      expect(branchChanges.length).toBeGreaterThanOrEqual(0);
-      if (branchChanges.length > 0) {
-        expect(branchChanges[0].old).toBe("main");
-        expect(branchChanges[0].new).toBe("feature");
-      }
+      expect(branchChanges.length).toBeGreaterThan(0);
+      expect(branchChanges[0].old).toBe("main");
+      expect(branchChanges[0].new).toBe("feature");
     });
   });
 });

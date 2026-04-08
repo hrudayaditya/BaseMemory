@@ -115,6 +115,37 @@ export async function handleEvalCommand(): Promise<void> {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+  it("returns no results on an empty index without making embedding calls", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    const fetchCountBefore = fetchSpy.mock.calls.length;
+
+    await expect(indexer.search("where is rankHybridResults implementation", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+    })).resolves.toEqual([]);
+
+    expect(fetchSpy.mock.calls.length).toBe(fetchCountBefore);
+  });
+
   it("returns implementation definitions before fixture/benchmark noise for implementation-intent query", async () => {
     const config = parseConfig({
       embeddingProvider: "custom",

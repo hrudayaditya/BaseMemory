@@ -3,6 +3,7 @@ import chokidar, { FSWatcher } from "chokidar";
 import * as path from "path";
 
 import { CodebaseIndexConfig } from "../config/schema.js";
+import { recordWatcherEventTimestamp } from "../indexer/watcher-tti.js";
 import { createIgnoreFilter, matchesExcludePattern, shouldIncludeFile } from "../utils/files.js";
 import { Indexer } from "../indexer/index.js";
 import { isGitRepo, getHeadPath, getCurrentBranch } from "../git/index.js";
@@ -82,6 +83,7 @@ export class FileWatcher {
       return;
     }
 
+    recordWatcherEventTimestamp(filePath);
     this.pendingChanges.set(filePath, type);
     this.scheduleFlush();
   }

@@ -194,6 +194,17 @@ describe("Logger", () => {
       expect(metrics.gcEmbeddingsRemoved).toBe(3);
     });
 
+    it("should track hot update TTI metrics", () => {
+      logger.recordHotUpdateTti(1200, false);
+      logger.recordHotUpdateTti(2400, true);
+
+      const metrics = logger.getMetrics();
+      expect(metrics.hotUpdateTtiCount).toBe(2);
+      expect(metrics.hotUpdateTtiLastMs).toBe(2400);
+      expect(metrics.hotUpdateTtiMaxMs).toBe(2400);
+      expect(metrics.hotUpdateTtiOverTargetCount).toBe(1);
+    });
+
     it("should format metrics as readable string", () => {
       logger.recordCacheHit();
       logger.recordCacheHit();
@@ -201,11 +212,13 @@ describe("Logger", () => {
       logger.recordFilesScanned(5);
       logger.recordFilesParsed(5);
       logger.recordChunksEmbedded(50);
+      logger.recordHotUpdateTti(1500, false);
       
       const formatted = logger.formatMetrics();
       expect(formatted).toContain("Hits: 2");
       expect(formatted).toContain("Misses: 1");
       expect(formatted).toContain("Files scanned: 5");
+      expect(formatted).toContain("Hot Update TTI:");
     });
 
     it("should not collect metrics when disabled", () => {

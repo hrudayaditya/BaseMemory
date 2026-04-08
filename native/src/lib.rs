@@ -711,6 +711,20 @@ impl Database {
     }
 
     #[napi]
+    pub fn get_missing_embeddings_for_model(
+        &self,
+        content_hashes: Vec<String>,
+        model: String,
+    ) -> Result<Vec<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        db::get_missing_embeddings_for_model(&conn, &content_hashes, &model)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
     pub fn upsert_chunk(&self, chunk: ChunkData) -> Result<()> {
         let conn = self
             .conn

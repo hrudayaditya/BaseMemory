@@ -1,9 +1,9 @@
 {
-  "generatedAt": "2026-04-07T18:48:05.550Z",
+  "generatedAt": "2026-04-07T22:21:50.238Z",
   "projectRoot": "/Users/aady/Desktop/OpenSourceContributions/BaseMemory",
   "datasetPath": "/Users/aady/Desktop/OpenSourceContributions/BaseMemory/benchmarks/golden/small.json",
   "datasetName": "small",
-  "datasetVersion": "1.1.0",
+  "datasetVersion": "1.1.1",
   "queryCount": 10,
   "topK": 10,
   "searchConfig": {
@@ -22,18 +22,18 @@
     "hitAt5": 1,
     "hitAt10": 1,
     "mrrAt10": 1,
-    "ndcgAt10": 0.9831554629583621,
+    "ndcgAt10": 1,
     "latencyMs": {
-      "p50": 2.4032914999997956,
-      "p95": 5.296877050000235,
-      "p99": 6.823741810000339
+      "p50": 1.9462915000003704,
+      "p95": 3.8367025999994415,
+      "p99": 4.620707719998936
     },
     "tokenEstimate": {
       "queryTokens": 116,
-      "embeddingTokensUsed": 17184
+      "embeddingTokensUsed": 17592
     },
     "embedding": {
-      "callCount": 165,
+      "callCount": 168,
       "estimatedCostUsd": 0,
       "costPer1MTokensUsd": 0
     },
@@ -47,7 +47,7 @@
       "appliedCount": 0,
       "failureCount": 0,
       "backendUsage": {},
-      "lastMs": 0.0018749999999272404
+      "lastMs": 0.0020000000004074536
     }
   }
 }

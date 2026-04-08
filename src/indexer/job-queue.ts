@@ -32,6 +32,11 @@ export interface JobQueueStats {
   isShutdown: boolean;
 }
 
+export interface JobQueueDrainOptions {
+  maxCountedJobs?: number;
+  countJob?: (job: IndexJob) => boolean;
+}
+
 export type JobQueueEnqueueResult =
   | "enqueued"
   | "replaced"
@@ -145,8 +150,12 @@ export class JobQueue {
     return "enqueued";
   }
 
-  async drain(executor: IndexJobExecutor): Promise<number> {
+  async drain(
+    executor: IndexJobExecutor,
+    options: JobQueueDrainOptions = {}
+  ): Promise<number> {
     let processed = 0;
+    let counted = 0;
 
     while (true) {
       this.promoteStarvedLowPriorityJobs();
@@ -156,11 +165,21 @@ export class JobQueue {
         return processed;
       }
 
+      const publicJob = this.toPublicJob(nextJob);
       try {
-        await executor(this.toPublicJob(nextJob));
+        await executor(publicJob);
       } finally {
         this.finishJob(nextJob);
         processed += 1;
+        if ((options.countJob?.(publicJob) ?? true)) {
+          counted += 1;
+        }
+        if (
+          options.maxCountedJobs !== undefined &&
+          counted >= options.maxCountedJobs
+        ) {
+          return processed;
+        }
       }
     }
   }
@@ -186,6 +205,14 @@ export class JobQueue {
     }
 
     return removed;
+  }
+
+  hasPendingAtOrAbove(priority: IndexJobPriority): boolean {
+    return PRIORITY_ORDER.some(
+      (candidate) =>
+        PRIORITY_RANK[candidate] <= PRIORITY_RANK[priority] &&
+        this.pendingByPriority[candidate].length > 0
+    );
   }
 
   getStats(): JobQueueStats {

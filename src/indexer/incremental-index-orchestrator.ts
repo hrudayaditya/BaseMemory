@@ -42,8 +42,13 @@ import {
   JobQueue,
   type IndexJob,
   LOW_PRIORITY_STARVATION_THRESHOLD_MS,
+  type JobQueueDrainOptions,
 } from "./job-queue.js";
 import type { IndexStats, ProgressCallback } from "./index.js";
+import {
+  clearWatcherEventTimestamp,
+  consumeWatcherEventTimestamp,
+} from "./watcher-tti.js";
 
 export interface OrchestratorParsedChunk {
   content: string;
@@ -218,6 +223,7 @@ interface RunContext {
 }
 
 const COLD_START_BATCH_SIZE = 50;
+export const TTI_TARGET_MS = 2_000;
 const RESUME_STALENESS_THRESHOLD_MS = 2 * 60 * 60 * 1000;
 const FINISHED_RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -553,6 +559,7 @@ function createEmptyStats(): IndexStats {
     removedChunks: 0,
     skippedFiles: [],
     parseFailures: [],
+    ttiMeasurements: [],
   };
 }
 
@@ -608,17 +615,6 @@ export class IncrementalIndexOrchestrator {
         totalChunks: 0,
       });
 
-      for (const filePath of fileHashes.keys()) {
-        this.checkpoints.ensureTrackedFile(branch, filePath);
-        this.queue.enqueue({
-          branch,
-          filePath,
-          priority: "low",
-          trigger: "cold_start",
-          runId: run.runId,
-        });
-      }
-
       const context = this.createRunContext({
         ...resources,
         branch,
@@ -630,7 +626,55 @@ export class IncrementalIndexOrchestrator {
         fileHashes,
       });
 
+      const trackedDeletedFiles = Array.from(
+        new Set(
+          this.checkpoints
+            .getKnownFiles(branch)
+            .map((filePath) => toAbsolutePath(this.host.getProjectRoot(), filePath))
+            .filter((filePath) => !fileHashes.has(filePath))
+        )
+      ).sort((left, right) => left.localeCompare(right));
+
+      for (const filePath of trackedDeletedFiles) {
+        this.processRemovedFile(context, filePath);
+      }
+
       context.stats.totalFiles = fileHashes.size;
+      const coldStartFilePaths = Array.from(fileHashes.keys());
+      for (
+        let batchStart = 0;
+        batchStart < coldStartFilePaths.length;
+        batchStart += COLD_START_BATCH_SIZE
+      ) {
+        const batch = coldStartFilePaths.slice(
+          batchStart,
+          batchStart + COLD_START_BATCH_SIZE
+        );
+
+        for (const filePath of batch) {
+          this.checkpoints.ensureTrackedFile(branch, filePath);
+          this.queue.enqueue({
+            branch,
+            filePath,
+            priority: "low",
+            trigger: "cold_start",
+            runId: run.runId,
+          });
+        }
+
+        await this.drainRunContext(context, {
+          maxCountedJobs: batch.length,
+          countJob: (job) =>
+            job.branch === context.branch &&
+            job.runId === context.runId &&
+            job.trigger === "cold_start",
+        });
+
+        while (this.queue.hasPendingAtOrAbove("high")) {
+          await this.drainRunContext(context);
+        }
+      }
+
       await this.drainRunContext(context);
       return this.finalizeRunContext(context, onProgress);
     });
@@ -757,9 +801,8 @@ export class IncrementalIndexOrchestrator {
     const chunkChanged = oldConfig?.chunkerVersion !== newConfig.chunkerVersion;
     const graphChanged = oldConfig?.graphExtractorVersion !== newConfig.graphExtractorVersion;
     const embedChanged = oldConfig
-      ? oldConfig.configHash !== newConfigHash &&
-        !chunkChanged &&
-        !graphChanged
+      ? oldConfig.embeddingModelId !== newConfig.embeddingModelId ||
+        oldConfig.embeddingDimension !== newConfig.embeddingDimension
       : false;
 
     if (!chunkChanged && !embedChanged && !graphChanged) {
@@ -1021,7 +1064,10 @@ export class IncrementalIndexOrchestrator {
     };
   }
 
-  private async drainRunContext(context: RunContext): Promise<void> {
+  private async drainRunContext(
+    context: RunContext,
+    options: JobQueueDrainOptions = {}
+  ): Promise<void> {
     await this.queue.drain(async (job) => {
       if (job.branch !== context.branch || job.runId !== context.runId) {
         return;
@@ -1039,7 +1085,7 @@ export class IncrementalIndexOrchestrator {
           error: getErrorMessage(error),
         });
       }
-    });
+    }, options);
   }
 
   private async processJob(context: RunContext, job: IndexJob): Promise<void> {
@@ -1178,8 +1224,14 @@ export class IncrementalIndexOrchestrator {
     const currentChunkHashes = currentChunks.map((chunk) => chunk.chunkHash);
     const embedStageInputHash = buildEmbedStageInputHash(currentChunkHashes, embedConfigHash);
     const indexStageInputHash = buildIndexStageInputHash(currentChunkHashes, embedConfigHash);
+    const embedStageIsStale = this.checkpoints.isStageStale(
+      context.branch,
+      filePath,
+      "embed",
+      embedStageInputHash
+    );
 
-    if (!chunkRan && this.checkpoints.isStageStale(context.branch, filePath, "embed", embedStageInputHash)) {
+    if (!chunkRan && embedStageIsStale) {
       const reparsed = this.host.parseFilesForIndexing([
         {
           path: absolutePath,
@@ -1195,6 +1247,9 @@ export class IncrementalIndexOrchestrator {
         throw new Error(error);
       }
       currentChunks = this.buildChunkRecords(absolutePath, parsedFile);
+      dirtyChunks = currentChunks.map((chunk) => this.toEmbeddingWorkChunk(chunk));
+      indexNeedsUpdate = dirtyChunks.length > 0 || removedChunkIds.size > 0;
+    } else if (chunkRan && embedStageIsStale && dirtyChunks.length === 0) {
       dirtyChunks = currentChunks.map((chunk) => this.toEmbeddingWorkChunk(chunk));
       indexNeedsUpdate = dirtyChunks.length > 0 || removedChunkIds.size > 0;
     }
@@ -1264,7 +1319,10 @@ export class IncrementalIndexOrchestrator {
     const { store, invertedIndex, database, provider } = context;
     const model = context.configuredProviderInfo.modelInfo.model;
     const missingEmbeddings = new Set(
-      database.getMissingEmbeddings(plan.dirtyChunks.map((chunk) => chunk.contentHash))
+      database.getMissingEmbeddingsForModel(
+        plan.dirtyChunks.map((chunk) => chunk.contentHash),
+        model
+      )
     );
     const embeddingQueue = new PQueue(this.host.getProviderRateLimits(context.configuredProviderInfo.provider));
 
@@ -1491,6 +1549,7 @@ export class IncrementalIndexOrchestrator {
     context.existingChunksByFile.delete(filePath);
     context.removedAbsolutePaths.add(filePath);
     context.removedRelativePaths.add(toRelativePath(this.host.getProjectRoot(), filePath));
+    clearWatcherEventTimestamp(filePath);
     this.checkpoints.clearFileState(context.branch, filePath);
   }
 
@@ -1690,6 +1749,15 @@ export class IncrementalIndexOrchestrator {
     context.database.addChunksToBranchBatch(context.branch, Array.from(context.currentChunkIds));
     context.database.clearBranchSymbols(context.branch);
     context.database.addSymbolsToBranchBatch(context.branch, Array.from(context.allSymbolIds));
+
+    if (staleChunkIds.length > 0) {
+      // Branch membership is now authoritative for this run, so orphan GC can
+      // safely remove chunk rows and embeddings that no branch references
+      // anymore, including files deleted before a cold start begins.
+      context.database.gcOrphanChunks();
+      context.database.gcOrphanEmbeddings();
+    }
+
     context.store.save();
     context.invertedIndex.save();
 
@@ -1704,6 +1772,36 @@ export class IncrementalIndexOrchestrator {
         completion.inputHash
       );
       context.successfulFileHashes.set(filePath, completion.fileContentHash);
+
+      if (context.runType === "hot_update") {
+        const watcherTimestamp = consumeWatcherEventTimestamp(filePath);
+        if (watcherTimestamp !== undefined) {
+          const ttiMs = Date.now() - watcherTimestamp;
+          const exceededTarget = ttiMs > TTI_TARGET_MS;
+          context.stats.ttiMeasurements?.push({
+            filePath,
+            durationMs: ttiMs,
+            exceededTarget,
+          });
+          this.host.logger.recordHotUpdateTti(ttiMs, exceededTarget);
+          this.host.logger.branch("debug", "Recorded hot update TTI", {
+            branch: context.branch,
+            filePath,
+            runId: context.runId,
+            ttiMs,
+            targetMs: TTI_TARGET_MS,
+          });
+          if (exceededTarget) {
+            this.host.logger.warn("Hot update TTI exceeded target", {
+              branch: context.branch,
+              filePath,
+              runId: context.runId,
+              ttiMs,
+              targetMs: TTI_TARGET_MS,
+            });
+          }
+        }
+      }
     }
 
     this.host.commitFileHashChanges(context.successfulFileHashes, context.removedAbsolutePaths);

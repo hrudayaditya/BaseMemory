@@ -33,6 +33,10 @@ export interface Metrics {
   rerankerAppliedCount: number;
   rerankerFailureCount: number;
   rerankerBackendCounts: Record<string, number>;
+  hotUpdateTtiCount: number;
+  hotUpdateTtiLastMs: number;
+  hotUpdateTtiMaxMs: number;
+  hotUpdateTtiOverTargetCount: number;
   
   cacheHits: number;
   cacheMisses: number;
@@ -79,6 +83,10 @@ function createEmptyMetrics(): Metrics {
     rerankerAppliedCount: 0,
     rerankerFailureCount: 0,
     rerankerBackendCounts: {},
+    hotUpdateTtiCount: 0,
+    hotUpdateTtiLastMs: 0,
+    hotUpdateTtiMaxMs: 0,
+    hotUpdateTtiOverTargetCount: 0,
     cacheHits: 0,
     cacheMisses: 0,
     queryCacheHits: 0,
@@ -261,6 +269,17 @@ export class Logger {
     }
   }
 
+  recordHotUpdateTti(durationMs: number, exceededTarget: boolean): void {
+    if (!this.config.metrics) return;
+
+    this.metrics.hotUpdateTtiCount++;
+    this.metrics.hotUpdateTtiLastMs = durationMs;
+    this.metrics.hotUpdateTtiMaxMs = Math.max(this.metrics.hotUpdateTtiMaxMs, durationMs);
+    if (exceededTarget) {
+      this.metrics.hotUpdateTtiOverTargetCount++;
+    }
+  }
+
   recordCacheHit(): void {
     if (!this.config.metrics) return;
     this.metrics.cacheHits++;
@@ -374,6 +393,15 @@ export class Logger {
       if (Object.keys(m.rerankerBackendCounts).length > 0) {
         lines.push(`  Reranker backends: ${JSON.stringify(m.rerankerBackendCounts)}`);
       }
+    }
+
+    if (m.hotUpdateTtiCount > 0) {
+      lines.push("");
+      lines.push("Hot Update TTI:");
+      lines.push(`  Measurements: ${m.hotUpdateTtiCount}`);
+      lines.push(`  Last TTI: ${m.hotUpdateTtiLastMs.toFixed(2)}ms`);
+      lines.push(`  Max TTI: ${m.hotUpdateTtiMaxMs.toFixed(2)}ms`);
+      lines.push(`  Over target: ${m.hotUpdateTtiOverTargetCount}`);
     }
     
     const totalCacheOps = m.cacheHits + m.cacheMisses;

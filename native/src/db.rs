@@ -447,6 +447,43 @@ pub fn get_missing_embeddings(
         .collect())
 }
 
+/// Get content hashes that don't have embeddings for the requested model yet
+pub fn get_missing_embeddings_for_model(
+    conn: &Connection,
+    content_hashes: &[String],
+    model: &str,
+) -> DbResult<Vec<String>> {
+    if content_hashes.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut existing = std::collections::HashSet::new();
+    for chunk in content_hashes.chunks(SQL_BIND_PARAM_BATCH_SIZE) {
+        let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT content_hash FROM embeddings WHERE model = ? AND content_hash IN ({})",
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 1);
+        params.push(&model);
+        params.extend(chunk.iter().map(|s| s as &dyn rusqlite::ToSql));
+
+        let batch_existing: std::collections::HashSet<String> = stmt
+            .query_map(params.as_slice(), |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        existing.extend(batch_existing);
+    }
+
+    Ok(content_hashes
+        .iter()
+        .filter(|h| !existing.contains(*h))
+        .cloned()
+        .collect())
+}
+
 // ============================================================================
 // Chunk Operations
 // ============================================================================
