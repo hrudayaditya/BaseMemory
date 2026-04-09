@@ -100,12 +100,18 @@ describe("eval cli", () => {
         hybridWeight: 0.4,
         rrfK: 60,
         rerankTopN: 20,
+        useQueryTypes: false,
+        effectiveTaskType: "general",
+        effectiveFinalRerankTopN: 10,
+        effectiveGraphDepth: 0,
       },
       metrics: {
         hitAt1: 1,
         hitAt3: 1,
         hitAt5: 1,
         hitAt10: 1,
+        combinedRecallAt10: 1,
+        expansionHitRate: 0,
         mrrAt10: 1,
         ndcgAt10: 1,
         latencyMs: { p50: 1, p95: 2, p99: 3 },
@@ -129,5 +135,64 @@ describe("eval cli", () => {
     );
 
     expect(exitCode).toBe(0);
+  });
+
+  it("returns non-zero for eval gate when the budget gate fails", async () => {
+    runEvaluationMock.mockResolvedValue({
+      outputDir: path.join(tempDir, "out"),
+      summary: {
+        generatedAt: new Date().toISOString(),
+        projectRoot: tempDir,
+        datasetPath: "benchmarks/golden/small.json",
+        datasetName: "small",
+        datasetVersion: "1.0.0",
+        queryCount: 1,
+        topK: 10,
+        searchConfig: {
+          fusionStrategy: "rrf",
+          hybridWeight: 0.4,
+          rrfK: 60,
+          rerankTopN: 20,
+          useQueryTypes: false,
+          effectiveTaskType: "general",
+          effectiveFinalRerankTopN: 10,
+          effectiveGraphDepth: 0,
+        },
+        metrics: {
+          hitAt1: 1,
+          hitAt3: 1,
+          hitAt5: 1,
+          hitAt10: 1,
+          combinedRecallAt10: 1,
+          expansionHitRate: 0,
+          mrrAt10: 1,
+          ndcgAt10: 1,
+          latencyMs: { p50: 1, p95: 2, p99: 3 },
+          tokenEstimate: { queryTokens: 10, embeddingTokensUsed: 20 },
+          embedding: { callCount: 1, estimatedCostUsd: 0, costPer1MTokensUsd: 0 },
+          failureBuckets: {
+            "wrong-file": 0,
+            "wrong-symbol": 0,
+            "docs-tests-outranking-source": 0,
+            "no-relevant-hit-top-k": 0,
+          },
+        },
+      },
+      gate: {
+        passed: false,
+        budgetName: "default",
+        violations: [{ metric: "combinedRecallAt10", message: "bad" }],
+        regressions: [{
+          metric: "combinedRecallAt10",
+          baseline: 1,
+          current: 0.8,
+          delta: -0.2,
+          threshold: 0.05,
+        }],
+      },
+    });
+
+    const exitCode = await handleEvalCommand(["gate"], tempDir);
+    expect(exitCode).toBe(1);
   });
 });

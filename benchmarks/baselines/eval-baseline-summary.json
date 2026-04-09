@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-04-07T22:21:50.238Z",
+  "generatedAt": "2026-04-09T05:10:09.594Z",
   "projectRoot": "/Users/aady/Desktop/OpenSourceContributions/BaseMemory",
   "datasetPath": "/Users/aady/Desktop/OpenSourceContributions/BaseMemory/benchmarks/golden/small.json",
   "datasetName": "small",
@@ -8,46 +8,51 @@
   "topK": 10,
   "searchConfig": {
     "fusionStrategy": "rrf",
-    "hybridWeight": 0.4,
+    "hybridWeight": 0.5,
     "rrfK": 60,
     "rerankTopN": 20,
-    "useQueryTypes": false,
-    "effectiveTaskType": "general",
-    "effectiveFinalRerankTopN": 0,
-    "effectiveGraphDepth": 0
+    "useQueryTypes": true,
+    "recipeOverrides": {},
+    "effectiveTaskType": "mixed",
+    "effectiveFinalRerankTopN": -1,
+    "effectiveGraphDepth": -1
   },
   "metrics": {
-    "hitAt1": 1,
-    "hitAt3": 1,
-    "hitAt5": 1,
-    "hitAt10": 1,
-    "mrrAt10": 1,
-    "ndcgAt10": 1,
+    "hitAt1": 0.6,
+    "hitAt3": 0.7,
+    "hitAt5": 0.7,
+    "hitAt10": 0.7,
+    "combinedRecallAt10": 0.7,
+    "expansionHitRate": 0.6,
+    "mrrAt10": 0.6333333333333334,
+    "ndcgAt10": 0.65,
     "latencyMs": {
-      "p50": 1.9462915000003704,
-      "p95": 3.8367025999994415,
-      "p99": 4.620707719998936
+      "p50": 395.6371459999998,
+      "p95": 878.0273268999996,
+      "p99": 1010.4099317800001
     },
     "tokenEstimate": {
       "queryTokens": 116,
-      "embeddingTokensUsed": 17592
+      "embeddingTokensUsed": 18056
     },
     "embedding": {
-      "callCount": 168,
+      "callCount": 172,
       "estimatedCostUsd": 0,
       "costPer1MTokensUsd": 0
     },
     "failureBuckets": {
-      "wrong-file": 0,
-      "wrong-symbol": 0,
+      "wrong-file": 1,
+      "wrong-symbol": 1,
       "docs-tests-outranking-source": 0,
-      "no-relevant-hit-top-k": 0
+      "no-relevant-hit-top-k": 3
     },
     "reranker": {
-      "appliedCount": 0,
+      "appliedCount": 7,
       "failureCount": 0,
-      "backendUsage": {},
-      "lastMs": 0.0020000000004074536
+      "backendUsage": {
+        "transformers-cross-encoder": 7
+      },
+      "lastMs": 553.284208
     }
   }
 }

@@ -30,6 +30,8 @@ function chunk(chunkId: string, name: string, filePath: string): ChunkData {
     language: "typescript",
     name,
     nodeType: "function",
+    chunkKind: "Code",
+    symbolKind: "Function",
   };
 }
 

@@ -12,7 +12,12 @@ import { collectFiles, SkippedFile } from "../utils/files.js";
 import { createCostEstimate, CostEstimate } from "../utils/cost.js";
 import { Logger, initializeLogger } from "../utils/logger.js";
 import { IncrementalIndexOrchestrator } from "./incremental-index-orchestrator.js";
-import { expandGraphContext, type GraphExpansionEntry, type GraphExpansionSeed } from "./graph-expansion.js";
+import {
+  expandGraphContext,
+  type GraphExpansionEntry,
+  type GraphExpansionMetadata,
+  type GraphExpansionSeed,
+} from "./graph-expansion.js";
 import { SearchReranker, type RerankerCandidate } from "./reranker.js";
 import { ensureWatcherEventTimestamp } from "./watcher-tti.js";
 import {
@@ -33,7 +38,7 @@ import {
   type MerkleDiff,
   type MerkleIgnoreRules,
 } from "../native/index.js";
-import type { SymbolData, CallEdgeData } from "../native/index.js";
+import type { SymbolData, CallEdgeData, ChunkKind, ChunkSymbolKind } from "../native/index.js";
 import { getBranchOrDefault, getBaseBranch, isGitRepo } from "../git/index.js";
 
 const CALL_GRAPH_LANGUAGES = new Set(["typescript", "tsx", "javascript", "jsx", "python", "go", "rust", "php"]);
@@ -153,7 +158,10 @@ export interface SearchResult {
   endLine: number;
   content: string;
   score: number;
+  reranked?: boolean;
   chunkType: string;
+  chunkKind?: ChunkKind;
+  symbolKind?: ChunkSymbolKind;
   name?: string;
 }
 
@@ -175,6 +183,10 @@ export interface SearchResponse {
 
 export interface SearchOptions {
   hybridWeight?: number;
+  bm25Weight?: number;
+  denseWeight?: number;
+  identifierBoost?: number;
+  finalRerankTopN?: number;
   fileType?: string;
   directory?: string;
   chunkType?: string;
@@ -233,6 +245,8 @@ interface ParsedChunkCandidate {
   endByte: number;
   chunkType: ChunkMetadata["chunkType"];
   name?: string;
+  chunkKind?: string;
+  symbolKind?: string;
   language: string;
   chunkHash: string;
 }
@@ -244,9 +258,11 @@ interface ParsedFileCandidate {
   chunks: ParsedChunkCandidate[];
 }
 
+type GraphEdgeData = Omit<CallEdgeData, "branch">;
+
 interface FileGraphData {
   symbols: SymbolData[];
-  edges: CallEdgeData[];
+  edges: GraphEdgeData[];
 }
 
 interface FailedBatch {
@@ -256,7 +272,17 @@ interface FailedBatch {
   lastAttempt: string;
 }
 
-type RankedCandidate = { id: string; score: number; metadata: ChunkMetadata };
+type RetrievalChunkMetadata = GraphExpansionMetadata;
+
+type RankedCandidate = {
+  id: string;
+  score: number;
+  metadata: RetrievalChunkMetadata;
+  relation?: "caller" | "callee";
+  chunkKind?: ChunkKind;
+  symbolKind?: ChunkSymbolKind;
+  reranked?: boolean;
+};
 
 interface HybridRankOptions {
   fusionStrategy: "weighted" | "rrf";
@@ -264,7 +290,14 @@ interface HybridRankOptions {
   rerankTopN: number;
   limit: number;
   hybridWeight: number;
+  bm25Weight?: number;
+  denseWeight?: number;
   pathPreference?: SearchPathPreference;
+}
+
+interface FusionWeights {
+  bm25Weight: number;
+  denseWeight: number;
 }
 
 interface SemanticRankOptions {
@@ -519,6 +552,18 @@ function isTestOrDocPath(filePath: string): boolean {
   return TEST_PATH_SEGMENTS.some((segment) => filePath.includes(segment));
 }
 
+function isLikelyTestPath(filePath: string): boolean {
+  const lowered = filePath.toLowerCase();
+  return (
+    lowered.includes("tests/") ||
+    lowered.includes("__tests__/") ||
+    lowered.includes("/test/") ||
+    lowered.includes(".spec.") ||
+    lowered.includes(".test.") ||
+    lowered.includes("fixtures/")
+  );
+}
+
 function isLikelyImplementationPath(filePath: string): boolean {
   const lowered = filePath.toLowerCase();
   if (IMPLEMENTATION_EXCLUDE_PATH_SEGMENTS.some((segment) => lowered.includes(segment))) {
@@ -573,6 +618,31 @@ function classifyQueryIntentRaw(query: string): "source" | "doc_test" {
 
   const queryTokens = Array.from(tokenizeTextForRanking(query));
   return classifyQueryIntent(queryTokens);
+}
+
+function normalizeFusionWeights(
+  bm25Weight?: number,
+  denseWeight?: number,
+  hybridWeight?: number | null
+): FusionWeights {
+  if (bm25Weight !== undefined || denseWeight !== undefined) {
+    const normalizedBm25 = Math.max(0, bm25Weight ?? 0);
+    const normalizedDense = Math.max(0, denseWeight ?? 0);
+    const total = normalizedBm25 + normalizedDense;
+
+    if (total > 0) {
+      return {
+        bm25Weight: normalizedBm25 / total,
+        denseWeight: normalizedDense / total,
+      };
+    }
+  }
+
+  const keywordWeight = Math.min(1, Math.max(0, hybridWeight ?? 0.5));
+  return {
+    bm25Weight: keywordWeight,
+    denseWeight: 1 - keywordWeight,
+  };
 }
 
 function classifyDocIntent(tokens: string[]): "docs" | "test" | "mixed" | "none" {
@@ -787,10 +857,11 @@ function buildDeterministicIdentifierPass(
 export function fuseResultsWeighted(
   semanticResults: RankedCandidate[],
   keywordResults: RankedCandidate[],
-  keywordWeight: number,
+  weights: FusionWeights,
   limit: number
 ): RankedCandidate[] {
-  const semanticWeight = 1 - keywordWeight;
+  const semanticWeight = weights.denseWeight;
+  const keywordWeight = weights.bm25Weight;
   const fusedScores = new Map<string, { score: number; metadata: ChunkMetadata }>();
 
   for (const r of semanticResults) {
@@ -825,10 +896,11 @@ export function fuseResultsWeighted(
 export function fuseResultsRrf(
   semanticResults: RankedCandidate[],
   keywordResults: RankedCandidate[],
+  weights: FusionWeights,
   rrfK: number,
   limit: number
 ): RankedCandidate[] {
-  const maxPossibleRaw = 2 / (rrfK + 1);
+  const maxPossibleRaw = (weights.denseWeight + weights.bm25Weight) / (rrfK + 1);
   const rankByIdSemantic = new Map<string, number>();
   const rankByIdKeyword = new Map<string, number>();
   const metadataById = new Map<string, ChunkMetadata>();
@@ -852,8 +924,8 @@ export function fuseResultsRrf(
     const semanticRank = rankByIdSemantic.get(id);
     const keywordRank = rankByIdKeyword.get(id);
 
-    const semanticScore = semanticRank ? 1 / (rrfK + semanticRank) : 0;
-    const keywordScore = keywordRank ? 1 / (rrfK + keywordRank) : 0;
+    const semanticScore = semanticRank ? weights.denseWeight / (rrfK + semanticRank) : 0;
+    const keywordScore = keywordRank ? weights.bm25Weight / (rrfK + keywordRank) : 0;
 
     const metadata = metadataById.get(id);
     if (!metadata) continue;
@@ -1025,9 +1097,14 @@ export function rankHybridResults(
   options: HybridRankOptions & { prioritizeSourcePaths?: boolean }
 ): RankedCandidate[] {
   const overfetchLimit = Math.max(options.limit * 4, options.limit);
+  const fusionWeights = normalizeFusionWeights(
+    options.bm25Weight,
+    options.denseWeight,
+    options.hybridWeight
+  );
   const fused = options.fusionStrategy === "rrf"
-    ? fuseResultsRrf(semanticResults, keywordResults, options.rrfK, overfetchLimit)
-    : fuseResultsWeighted(semanticResults, keywordResults, options.hybridWeight, overfetchLimit);
+    ? fuseResultsRrf(semanticResults, keywordResults, fusionWeights, options.rrfK, overfetchLimit)
+    : fuseResultsWeighted(semanticResults, keywordResults, fusionWeights, overfetchLimit);
 
   const rerankPoolLimit = Math.max(overfetchLimit, options.rerankTopN * 3, options.limit * 6);
   const rerankPool = fused.slice(0, rerankPoolLimit);
@@ -1052,6 +1129,35 @@ export function rankSemanticOnlyResults(
   });
 }
 
+function resolveIdentifierPromotionPathPreference(
+  query: string,
+  pathPreference: SearchPathPreference
+): "source" | "test" | "auto" {
+  if (pathPreference === "source" || pathPreference === "test") {
+    return pathPreference;
+  }
+
+  return classifyQueryIntentRaw(query) === "source" ? "source" : "auto";
+}
+
+function matchesIdentifierPromotionTarget(
+  filePath: string,
+  chunkType: string,
+  chunkKind: string | null | undefined,
+  symbolKind: string | null | undefined,
+  pathPreference: "source" | "test" | "auto"
+): boolean {
+  if (pathPreference === "test") {
+    return chunkKind === "Test" || symbolKind === "Test" || isLikelyTestPath(filePath);
+  }
+
+  if (pathPreference === "source") {
+    return isImplementationChunkType(chunkType) && isLikelyImplementationPath(filePath);
+  }
+
+  return false;
+}
+
 function promoteIdentifierMatches(
   query: string,
   combined: RankedCandidate[],
@@ -1059,13 +1165,15 @@ function promoteIdentifierMatches(
   keywordCandidates: RankedCandidate[],
   database?: Database,
   allowedChunkIds?: Set<string> | null,
-  prioritizeSourcePaths: boolean = classifyQueryIntentRaw(query) === "source"
+  pathPreference: SearchPathPreference = classifyQueryIntentRaw(query) === "source" ? "source" : "auto",
+  identifierBoost: number = 1
 ): RankedCandidate[] {
   if (combined.length === 0) {
     return combined;
   }
 
-  if (!prioritizeSourcePaths) {
+  const effectivePathPreference = resolveIdentifierPromotionPathPreference(query, pathPreference);
+  if (effectivePathPreference === "auto") {
     return combined;
   }
 
@@ -1096,11 +1204,13 @@ function promoteIdentifierMatches(
           }
 
           const chunkType = ((chunk.nodeType ?? "other") as ChunkMetadata["chunkType"]);
-          if (!isImplementationChunkType(chunkType)) {
-            continue;
-          }
-
-          if (!isLikelyImplementationPath(chunk.filePath)) {
+          if (!matchesIdentifierPromotionTarget(
+            chunk.filePath,
+            chunkType,
+            chunk.chunkKind,
+            chunk.symbolKind,
+            effectivePathPreference
+          )) {
             continue;
           }
 
@@ -1109,11 +1219,13 @@ function promoteIdentifierMatches(
           }
 
           const existing = combinedById.get(chunk.chunkId) ?? candidateUnion.get(chunk.chunkId);
-          const metadata: ChunkMetadata = existing?.metadata ?? {
+          const metadata: RetrievalChunkMetadata = existing?.metadata ?? {
             filePath: chunk.filePath,
             startLine: chunk.startLine,
             endLine: chunk.endLine,
             chunkType,
+            chunkKind: chunk.chunkKind as ChunkKind | undefined,
+            symbolKind: chunk.symbolKind as ChunkSymbolKind | undefined,
             name: chunk.name ?? undefined,
             language: chunk.language,
             hash: chunk.contentHash,
@@ -1122,8 +1234,10 @@ function promoteIdentifierMatches(
           const baselineScore = existing?.score ?? 0.5;
           candidateUnion.set(chunk.chunkId, {
             id: chunk.chunkId,
-            score: Math.min(1, baselineScore + 0.5),
+            score: Math.min(1, baselineScore + 0.5 * Math.max(0, identifierBoost)),
             metadata,
+            chunkKind: (chunk.chunkKind as ChunkKind | undefined) ?? existing?.chunkKind ?? metadata.chunkKind,
+            symbolKind: (chunk.symbolKind as ChunkSymbolKind | undefined) ?? existing?.symbolKind ?? metadata.symbolKind,
           });
         }
       }
@@ -1144,21 +1258,25 @@ function promoteIdentifierMatches(
       continue;
     }
 
-    if (!isImplementationChunkType(candidate.metadata.chunkType)) {
-      continue;
-    }
-
-    if (!isLikelyImplementationPath(candidate.metadata.filePath)) {
+    if (!matchesIdentifierPromotionTarget(
+      candidate.metadata.filePath,
+      candidate.metadata.chunkType,
+      candidate.chunkKind ?? candidate.metadata.chunkKind,
+      candidate.symbolKind ?? candidate.metadata.symbolKind,
+      effectivePathPreference
+    )) {
       continue;
     }
 
     const existing = combinedById.get(candidate.id) ?? candidate;
-    const rescueBoost = exactIdentifierMatch ? 0.45 : 0.25;
+    const rescueBoost = (exactIdentifierMatch ? 0.45 : 0.25) * Math.max(0, identifierBoost);
     const boostedScore = Math.min(1, Math.max(existing.score, candidate.score) + rescueBoost);
     promoted.push({
       id: existing.id,
       score: boostedScore,
       metadata: existing.metadata,
+      chunkKind: existing.chunkKind ?? candidate.chunkKind ?? existing.metadata.chunkKind,
+      symbolKind: existing.symbolKind ?? candidate.symbolKind ?? existing.metadata.symbolKind,
     });
   }
 
@@ -1964,6 +2082,8 @@ export class Indexer {
         endLine: metadata.endLine,
         nodeType: metadata.chunkType,
         name: metadata.name,
+        chunkKind: undefined,
+        symbolKind: undefined,
         language: metadata.language,
       };
       chunkDataBatch.push(chunkData);
@@ -2166,6 +2286,8 @@ export class Indexer {
             endByte: chunk.endByte,
             chunkType: mapSemanticChunkType(chunk.symbolKind),
             name: chunk.symbolName,
+            chunkKind: chunk.chunkKind,
+            symbolKind: chunk.symbolKind,
             language: chunk.language,
             chunkHash: chunk.chunkHash,
           }));
@@ -2241,7 +2363,7 @@ export class Indexer {
       }
 
       const lineStartBytes = buildLineStartByteOffsets(parsed.content);
-      const edges: CallEdgeData[] = [];
+      const edges: GraphEdgeData[] = [];
       for (const site of callSites) {
         const siteByteOffset = lineColumnToByteOffset(lineStartBytes, site.line, site.column);
         if (siteByteOffset === null) {
@@ -2271,16 +2393,19 @@ export class Indexer {
 
         const edgeId = `edge_${hashContent(enclosingSymbol.id + ":" + site.calleeName + ":" + site.line + ":" + site.column).slice(0, 16)}`;
         const candidates = symbolsByName.get(site.calleeName);
-        const resolvedId = candidates && candidates.length === 1 ? candidates[0].id : undefined;
+        const resolvedSymbol = candidates && candidates.length === 1 ? candidates[0] : undefined;
         edges.push({
           id: edgeId,
           fromSymbolId: enclosingSymbol.id,
+          callerFilePath: parsed.path,
           targetName: site.calleeName,
-          toSymbolId: resolvedId,
+          targetFilePath: resolvedSymbol?.filePath,
+          targetKind: resolvedSymbol?.kind,
+          toSymbolId: resolvedSymbol?.id,
           callType: site.callType,
           line: site.line,
           col: site.column,
-          isResolved: resolvedId !== undefined,
+          isResolved: resolvedSymbol !== undefined,
         });
       }
 
@@ -2310,6 +2435,7 @@ export class Indexer {
 
   private clearCallEdgesForSymbolIfUnreferenced(database: Database, symbolId: string): boolean {
     if (database.symbolExistsOnOtherBranches(this.currentBranch, symbolId)) {
+      database.deleteCallEdgesBySymbolForBranch(symbolId, this.currentBranch);
       return false;
     }
 
@@ -2319,6 +2445,7 @@ export class Indexer {
 
   private removeSymbolFromGraphIfUnreferenced(database: Database, symbolId: string): boolean {
     if (database.symbolExistsOnOtherBranches(this.currentBranch, symbolId)) {
+      database.deleteCallEdgesBySymbolForBranch(symbolId, this.currentBranch);
       return false;
     }
 
@@ -2630,9 +2757,33 @@ export class Indexer {
           id: candidate.id,
           baseScore: candidate.score,
           metadata: candidate.metadata,
+          chunkKind: candidate.chunkKind ?? candidate.metadata.chunkKind,
+          symbolKind: candidate.symbolKind ?? candidate.metadata.symbolKind,
+          relation: candidate.relation,
           content,
         };
       })
+    );
+  }
+
+  private async batchFetchChunkKinds(
+    chunkIds: string[]
+  ): Promise<Map<string, { chunkKind?: ChunkKind; symbolKind?: ChunkSymbolKind }>> {
+    const uniqueChunkIds = Array.from(new Set(chunkIds));
+    if (uniqueChunkIds.length === 0) {
+      return new Map();
+    }
+
+    const { database } = await this.ensureInitialized();
+    const rows = database.getChunkKindsBatch(uniqueChunkIds);
+    return new Map(
+      rows.map((row) => [
+        row.chunkId,
+        {
+          chunkKind: row.chunkKind,
+          symbolKind: row.symbolKind,
+        },
+      ])
     );
   }
 
@@ -2665,7 +2816,10 @@ export class Indexer {
           endLine,
           content,
           score: candidate.score,
+          reranked: candidate.reranked,
           chunkType: candidate.metadata.chunkType,
+          chunkKind: candidate.chunkKind ?? candidate.metadata.chunkKind,
+          symbolKind: candidate.symbolKind ?? candidate.metadata.symbolKind,
           name: candidate.metadata.name,
         };
       })
@@ -2684,6 +2838,7 @@ export class Indexer {
             id: entry.id,
             score: 0,
             metadata: entry.metadata,
+            relation: entry.relation,
           }],
           options,
           fileContentCache
@@ -2739,11 +2894,29 @@ export class Indexer {
 
     const headById = new Map(head.map((candidate) => [candidate.id, candidate]));
     const orderedHead = reranked.candidates
-      .map((candidate) => headById.get(candidate.id))
-      .filter((candidate): candidate is RankedCandidate => candidate !== undefined);
+      .map<RankedCandidate | undefined>((candidate) => {
+        const original = headById.get(candidate.id);
+        if (!original) {
+          return undefined;
+        }
+
+        return {
+          ...original,
+          score: candidate.baseScore,
+          chunkKind: candidate.chunkKind ?? original.chunkKind ?? original.metadata.chunkKind,
+          symbolKind: candidate.symbolKind ?? original.symbolKind ?? original.metadata.symbolKind,
+          relation: candidate.relation ?? original.relation,
+          reranked: true,
+        };
+      });
+    const promotedHead: RankedCandidate[] = orderedHead.filter((candidate): candidate is RankedCandidate => candidate !== undefined);
+    const orderedTail = tail.map((candidate) => ({
+      ...candidate,
+      reranked: false,
+    }));
 
     return {
-      ordered: [...orderedHead, ...tail],
+      ordered: [...promotedHead, ...orderedTail],
       applied: true,
       backend: reranked.backend,
       failedBackend: reranked.failedBackend,
@@ -2806,6 +2979,11 @@ export class Indexer {
     const recipe = getSearchRecipe(taskType);
     const queryIntent = classifyQueryIntentRaw(query);
     const hybridWeight = options?.hybridWeight ?? recipe.hybridWeight ?? this.config.search.hybridWeight;
+    const fusionWeights = normalizeFusionWeights(
+      options?.bm25Weight ?? recipe.bm25Weight,
+      options?.denseWeight ?? recipe.denseWeight,
+      hybridWeight
+    );
     const fusionStrategy = this.config.search.fusionStrategy;
     const rrfK = this.config.search.rrfK;
     const rerankTopN = this.config.search.rerankTopN;
@@ -2813,10 +2991,13 @@ export class Indexer {
     const sourceIntent = options?.definitionIntent === true ||
       recipe.forceDefinitionIntent ||
       queryIntent === "source";
+    const identifierBoost = options?.identifierBoost ?? recipe.identifierBoost ?? 1.0;
     const finalRerankTopN =
-      taskType === "general" && queryIntent === "doc_test" && options?.definitionIntent !== true
-        ? 0
-        : recipe.finalRerankTopN;
+      options?.finalRerankTopN !== undefined
+        ? options.finalRerankTopN
+        : taskType === "general" && queryIntent === "doc_test" && options?.definitionIntent !== true
+          ? 0
+          : recipe.finalRerankTopN;
     const prefilterStartTime = performance.now();
     const allowedChunkIds = this.buildAllowedChunkIds(store, database, {
       filterByBranch,
@@ -2849,10 +3030,15 @@ export class Indexer {
       query,
       maxResults,
       hybridWeight,
+      bm25Weight: fusionWeights.bm25Weight,
+      denseWeight: fusionWeights.denseWeight,
       fusionStrategy,
       rrfK,
-      rerankTopN: finalRerankTopN,
+      rerankTopN,
+      finalRerankTopN,
+      identifierBoost,
       filterByBranch,
+      taskType,
     });
 
     const embeddingStartTime = performance.now();
@@ -2880,6 +3066,8 @@ export class Indexer {
       rerankTopN,
       limit: maxResults,
       hybridWeight,
+      bm25Weight: fusionWeights.bm25Weight,
+      denseWeight: fusionWeights.denseWeight,
       prioritizeSourcePaths: sourceIntent,
       pathPreference: recipe.pathPreference,
     });
@@ -2893,7 +3081,8 @@ export class Indexer {
           keywordCandidates,
           database,
           allowedChunkIds,
-          sourceIntent
+          recipe.pathPreference,
+          identifierBoost
         )
       : combined;
 
@@ -2940,10 +3129,21 @@ export class Indexer {
       isImplementationChunkType(r.metadata.chunkType)
     );
 
+    const candidatePoolLimit = Math.max(maxResults, finalRerankTopN);
     const filtered = ((recipe.implementationOnlyOnCodeHints && sourceIntent && hasCodeHints && implementationOnly.length > 0)
       ? implementationOnly
       : baseFiltered
-    ).slice(0, maxResults);
+    ).slice(0, candidatePoolLimit);
+
+    const chunkKindMap = await this.batchFetchChunkKinds(filtered.map((candidate) => candidate.id));
+    for (const candidate of filtered) {
+      const enrichment = chunkKindMap.get(candidate.id);
+      if (!enrichment) {
+        continue;
+      }
+      candidate.chunkKind = enrichment.chunkKind;
+      candidate.symbolKind = enrichment.symbolKind;
+    }
 
     const fileContentCache = new Map<string, string | null>();
     const rerankStartTime = performance.now();
@@ -2967,7 +3167,8 @@ export class Indexer {
     });
     this.logger.search("info", "Search complete", {
       query,
-      results: filtered.length,
+      results: Math.min(maxResults, reranked.ordered.length),
+      candidatePool: filtered.length,
       totalMs: Math.round(totalSearchMs * 100) / 100,
       embeddingMs: Math.round(embeddingMs * 100) / 100,
       vectorMs: Math.round(vectorMs * 100) / 100,
@@ -2981,16 +3182,17 @@ export class Indexer {
 
     const metadataOnly = options?.metadataOnly ?? false;
     const contextLines = options?.contextLines ?? this.config.search.contextLines;
+    const visiblePrimaryCandidates = reranked.ordered.slice(0, maxResults);
     const primaryResults = await this.materializeRankedResults(
-      reranked.ordered,
+      visiblePrimaryCandidates,
       { metadataOnly, contextLines },
       fileContentCache
     );
 
     let expandedContext: GraphContextResult[] = [];
-    const graphDepth = Math.max(0, Math.min(2, options?.graphDepth ?? 0));
+    const graphDepth = Math.max(0, Math.min(2, options?.graphDepth ?? recipe.graphDepth ?? 0));
     if (graphDepth > 0) {
-      const graphSeeds: GraphExpansionSeed[] = reranked.ordered.map((candidate) => ({
+      const graphSeeds: GraphExpansionSeed[] = visiblePrimaryCandidates.map((candidate) => ({
         id: candidate.id,
         metadata: candidate.metadata,
       }));

@@ -12,6 +12,10 @@ export type SearchPathPreference = "auto" | "source" | "test" | "balanced";
 export interface SearchRecipe {
   taskType: SearchTaskType;
   hybridWeight: number | null;
+  graphDepth?: number;
+  bm25Weight?: number;
+  denseWeight?: number;
+  identifierBoost?: number;
   forceDefinitionIntent: boolean;
   pathPreference: SearchPathPreference;
   enableIdentifierPromotion: boolean;
@@ -23,11 +27,15 @@ export interface SearchRecipe {
 }
 
 export const DEFAULT_FINAL_RERANK_TOP_N = 20;
+export const GENERAL_FINAL_RERANK_TOP_N = 10;
 
 const RECIPE_BY_TASK_TYPE: Record<SearchTaskType, SearchRecipe> = {
   general: {
     taskType: "general",
-    hybridWeight: null,
+    hybridWeight: 0.3,
+    bm25Weight: 0.3,
+    denseWeight: 0.7,
+    identifierBoost: 1.0,
     forceDefinitionIntent: false,
     pathPreference: "auto",
     enableIdentifierPromotion: true,
@@ -35,14 +43,15 @@ const RECIPE_BY_TASK_TYPE: Record<SearchTaskType, SearchRecipe> = {
     enableIdentifierDefinitionLane: true,
     enableSymbolDefinitionLane: true,
     implementationOnlyOnCodeHints: true,
-    // The real cross-encoder backend is implemented, but leaving it on for the
-    // default recipe regressed the golden eval set. Keep general on the proven
-    // baseline order until the backend/model is strong enough to clear the gate.
-    finalRerankTopN: 0,
+    finalRerankTopN: GENERAL_FINAL_RERANK_TOP_N,
   },
   definition: {
     taskType: "definition",
-    hybridWeight: 0.6,
+    hybridWeight: 0.7,
+    graphDepth: 1,
+    bm25Weight: 0.7,
+    denseWeight: 0.3,
+    identifierBoost: 2.0,
     forceDefinitionIntent: true,
     pathPreference: "source",
     enableIdentifierPromotion: true,
@@ -54,10 +63,14 @@ const RECIPE_BY_TASK_TYPE: Record<SearchTaskType, SearchRecipe> = {
   },
   test_debug: {
     taskType: "test_debug",
-    hybridWeight: 0.45,
+    hybridWeight: 0.5,
+    graphDepth: 1,
+    bm25Weight: 0.5,
+    denseWeight: 0.5,
+    identifierBoost: 1.5,
     forceDefinitionIntent: false,
     pathPreference: "test",
-    enableIdentifierPromotion: false,
+    enableIdentifierPromotion: true,
     enableDeterministicIdentifierLane: false,
     enableIdentifierDefinitionLane: false,
     enableSymbolDefinitionLane: false,
@@ -66,7 +79,10 @@ const RECIPE_BY_TASK_TYPE: Record<SearchTaskType, SearchRecipe> = {
   },
   semantic: {
     taskType: "semantic",
-    hybridWeight: 0.25,
+    hybridWeight: 0.2,
+    bm25Weight: 0.2,
+    denseWeight: 0.8,
+    identifierBoost: 1.0,
     forceDefinitionIntent: false,
     pathPreference: "balanced",
     enableIdentifierPromotion: false,
@@ -74,7 +90,7 @@ const RECIPE_BY_TASK_TYPE: Record<SearchTaskType, SearchRecipe> = {
     enableIdentifierDefinitionLane: false,
     enableSymbolDefinitionLane: false,
     implementationOnlyOnCodeHints: false,
-    finalRerankTopN: DEFAULT_FINAL_RERANK_TOP_N,
+    finalRerankTopN: 0,
   },
 };
 

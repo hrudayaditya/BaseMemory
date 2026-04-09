@@ -1,13 +1,18 @@
-import type { ChunkMetadata, Database, SymbolData } from "../native/index.js";
+import type { ChunkKind, ChunkMetadata, ChunkSymbolKind, Database, SymbolData } from "../native/index.js";
+
+export interface GraphExpansionMetadata extends ChunkMetadata {
+  chunkKind?: ChunkKind;
+  symbolKind?: ChunkSymbolKind;
+}
 
 export interface GraphExpansionSeed {
   id: string;
-  metadata: ChunkMetadata;
+  metadata: GraphExpansionMetadata;
 }
 
 export interface GraphExpansionEntry {
   id: string;
-  metadata: ChunkMetadata;
+  metadata: GraphExpansionMetadata;
   relation: "caller" | "callee";
   depth: number;
   viaSymbol?: string;
@@ -104,6 +109,8 @@ function resolveChunkForSymbol(
       startLine: bestChunk.startLine,
       endLine: bestChunk.endLine,
       chunkType: (bestChunk.nodeType ?? "other") as ChunkMetadata["chunkType"],
+      chunkKind: bestChunk.chunkKind as ChunkKind | undefined,
+      symbolKind: bestChunk.symbolKind as ChunkSymbolKind | undefined,
       name: bestChunk.name ?? undefined,
       language: bestChunk.language,
       hash: bestChunk.contentHash,

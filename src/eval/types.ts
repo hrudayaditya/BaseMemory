@@ -1,4 +1,5 @@
 import type { SearchConfig } from "../config/schema.js";
+import type { SearchTaskType } from "../indexer/search-recipes.js";
 
 export type GoldenQueryType =
   | "definition"
@@ -17,6 +18,7 @@ export interface GoldenQuery {
   id: string;
   query: string;
   queryType?: GoldenQueryType;
+  taskType?: SearchTaskType;
   expected: GoldenExpected;
 }
 
@@ -34,11 +36,21 @@ export interface EvalBudget {
   thresholds: {
     hitAt5MaxDrop?: number;
     mrrAt10MaxDrop?: number;
+    combinedRecallAt10MaxDrop?: number;
+    expansionHitRateMaxDrop?: number;
     p95LatencyMaxMultiplier?: number;
     p95LatencyMaxAbsoluteMs?: number;
     minHitAt5?: number;
     minMrrAt10?: number;
   };
+}
+
+export interface EvalRecipeOverrides {
+  bm25Weight?: number;
+  denseWeight?: number;
+  identifierBoost?: number;
+  graphDepth?: number;
+  finalRerankTopN?: number;
 }
 
 export interface EvalSearchResult {
@@ -68,6 +80,9 @@ export interface PerQueryEvalResult {
   hitAt3: boolean;
   hitAt5: boolean;
   hitAt10: boolean;
+  expandedHit?: boolean;
+  expandedRecallAtK?: number;
+  expandedRelations?: string[];
   reciprocalRankAt10: number;
   ndcgAt10: number;
   failureBucket?: FailureBucket;
@@ -79,6 +94,8 @@ export interface EvalMetrics {
   hitAt3: number;
   hitAt5: number;
   hitAt10: number;
+  combinedRecallAt10: number;
+  expansionHitRate: number;
   mrrAt10: number;
   ndcgAt10: number;
   latencyMs: {
@@ -107,6 +124,7 @@ export interface EvalMetrics {
 export interface EvalSearchConfig
   extends Pick<SearchConfig, "fusionStrategy" | "hybridWeight" | "rrfK" | "rerankTopN"> {
   useQueryTypes: boolean;
+  recipeOverrides?: EvalRecipeOverrides;
   effectiveTaskType: string;
   effectiveFinalRerankTopN: number;
   effectiveGraphDepth: number;
@@ -138,6 +156,8 @@ export interface EvalComparison {
     hitAt3: MetricDelta;
     hitAt5: MetricDelta;
     hitAt10: MetricDelta;
+    combinedRecallAt10: MetricDelta;
+    expansionHitRate: MetricDelta;
     mrrAt10: MetricDelta;
     ndcgAt10: MetricDelta;
     latencyP50Ms: MetricDelta;
@@ -153,10 +173,27 @@ export interface EvalGateViolation {
   message: string;
 }
 
+export interface EvalGateRegression {
+  metric: string;
+  baseline: number;
+  current: number;
+  delta: number;
+  threshold: number;
+}
+
 export interface EvalGateResult {
   passed: boolean;
   budgetName?: string;
   violations: EvalGateViolation[];
+  regressions: EvalGateRegression[];
+}
+
+export interface EvalRecipeOverrideSweep {
+  bm25Weight?: number[];
+  denseWeight?: number[];
+  identifierBoost?: number[];
+  graphDepth?: number[];
+  finalRerankTopN?: number[];
 }
 
 export interface SweepDefinition {
@@ -164,6 +201,7 @@ export interface SweepDefinition {
   hybridWeight?: number[];
   rrfK?: number[];
   rerankTopN?: number[];
+  recipeOverrides?: EvalRecipeOverrideSweep;
 }
 
 export interface SweepRunSummary {
@@ -195,4 +233,5 @@ export interface EvalRunOptions {
   budgetPath?: string;
   reindex: boolean;
   searchOverrides?: Partial<Pick<SearchConfig, "fusionStrategy" | "hybridWeight" | "rrfK" | "rerankTopN">>;
+  recipeOverrides?: EvalRecipeOverrides;
 }

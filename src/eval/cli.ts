@@ -19,6 +19,11 @@ interface ParsedArgs {
   hybridWeight?: number;
   rrfK?: number;
   rerankTopN?: number;
+  bm25Weight?: number;
+  denseWeight?: number;
+  identifierBoost?: number;
+  graphDepth?: number;
+  finalRerankTopN?: number;
   sweep: SweepDefinition;
 }
 
@@ -31,6 +36,7 @@ function printUsage(): void {
   console.log(`
 Usage:
   opencode-codebase-index-mcp eval run [options]
+  opencode-codebase-index-mcp eval gate [options]
   opencode-codebase-index-mcp eval compare --against <summary.json> [options]
   opencode-codebase-index-mcp eval diff --current <summary.json> --against <summary.json> [options]
 
@@ -50,12 +56,22 @@ Search overrides:
   --hybridWeight <0-1>
   --rrfK <number>
   --rerankTopN <number>
+  --bm25Weight <0-1>
+  --denseWeight <0-1>
+  --identifierBoost <number>
+  --graphDepth <number>
+  --finalRerankTopN <number>
 
 Sweep options (comma-separated values):
   --sweepFusionStrategy <rrf,weighted>
   --sweepHybridWeight <0.3,0.5,0.7>
   --sweepRrfK <30,60,90>
   --sweepRerankTopN <10,20,40>
+  --sweepBm25Weight <0.3,0.5,0.7>
+  --sweepDenseWeight <0.3,0.5,0.7>
+  --sweepIdentifierBoost <1,1.5,2>
+  --sweepGraphDepth <0,1,2>
+  --sweepFinalRerankTopN <0,10,20>
 `);
 }
 
@@ -96,7 +112,12 @@ function hasSweepOptions(sweep: SweepDefinition): boolean {
     (sweep.fusionStrategy && sweep.fusionStrategy.length > 0) ||
       (sweep.hybridWeight && sweep.hybridWeight.length > 0) ||
       (sweep.rrfK && sweep.rrfK.length > 0) ||
-      (sweep.rerankTopN && sweep.rerankTopN.length > 0)
+      (sweep.rerankTopN && sweep.rerankTopN.length > 0) ||
+      (sweep.recipeOverrides?.bm25Weight && sweep.recipeOverrides.bm25Weight.length > 0) ||
+      (sweep.recipeOverrides?.denseWeight && sweep.recipeOverrides.denseWeight.length > 0) ||
+      (sweep.recipeOverrides?.identifierBoost && sweep.recipeOverrides.identifierBoost.length > 0) ||
+      (sweep.recipeOverrides?.graphDepth && sweep.recipeOverrides.graphDepth.length > 0) ||
+      (sweep.recipeOverrides?.finalRerankTopN && sweep.recipeOverrides.finalRerankTopN.length > 0)
   );
 }
 
@@ -181,6 +202,31 @@ function parseEvalArgs(argv: string[], cwd: string): ParsedArgs {
       i += 1;
       continue;
     }
+    if (arg === "--bm25Weight" && next) {
+      parsed.bm25Weight = parseNumber(next, "--bm25Weight");
+      i += 1;
+      continue;
+    }
+    if (arg === "--denseWeight" && next) {
+      parsed.denseWeight = parseNumber(next, "--denseWeight");
+      i += 1;
+      continue;
+    }
+    if (arg === "--identifierBoost" && next) {
+      parsed.identifierBoost = parseNumber(next, "--identifierBoost");
+      i += 1;
+      continue;
+    }
+    if (arg === "--graphDepth" && next) {
+      parsed.graphDepth = parseNumber(next, "--graphDepth");
+      i += 1;
+      continue;
+    }
+    if (arg === "--finalRerankTopN" && next) {
+      parsed.finalRerankTopN = parseNumber(next, "--finalRerankTopN");
+      i += 1;
+      continue;
+    }
     if (arg === "--sweepFusionStrategy" && next) {
       parsed.sweep.fusionStrategy = parseCsvFusion(next);
       i += 1;
@@ -198,6 +244,46 @@ function parseEvalArgs(argv: string[], cwd: string): ParsedArgs {
     }
     if (arg === "--sweepRerankTopN" && next) {
       parsed.sweep.rerankTopN = parseCsvNumbers(next, "--sweepRerankTopN");
+      i += 1;
+      continue;
+    }
+    if (arg === "--sweepBm25Weight" && next) {
+      parsed.sweep.recipeOverrides = {
+        ...parsed.sweep.recipeOverrides,
+        bm25Weight: parseCsvNumbers(next, "--sweepBm25Weight"),
+      };
+      i += 1;
+      continue;
+    }
+    if (arg === "--sweepDenseWeight" && next) {
+      parsed.sweep.recipeOverrides = {
+        ...parsed.sweep.recipeOverrides,
+        denseWeight: parseCsvNumbers(next, "--sweepDenseWeight"),
+      };
+      i += 1;
+      continue;
+    }
+    if (arg === "--sweepIdentifierBoost" && next) {
+      parsed.sweep.recipeOverrides = {
+        ...parsed.sweep.recipeOverrides,
+        identifierBoost: parseCsvNumbers(next, "--sweepIdentifierBoost"),
+      };
+      i += 1;
+      continue;
+    }
+    if (arg === "--sweepGraphDepth" && next) {
+      parsed.sweep.recipeOverrides = {
+        ...parsed.sweep.recipeOverrides,
+        graphDepth: parseCsvNumbers(next, "--sweepGraphDepth"),
+      };
+      i += 1;
+      continue;
+    }
+    if (arg === "--sweepFinalRerankTopN" && next) {
+      parsed.sweep.recipeOverrides = {
+        ...parsed.sweep.recipeOverrides,
+        finalRerankTopN: parseCsvNumbers(next, "--sweepFinalRerankTopN"),
+      };
       i += 1;
       continue;
     }
@@ -245,6 +331,13 @@ function toRunOptions(parsed: ParsedArgs): EvalRunOptions {
       ...(parsed.rrfK !== undefined ? { rrfK: parsed.rrfK } : {}),
       ...(parsed.rerankTopN !== undefined ? { rerankTopN: parsed.rerankTopN } : {}),
     },
+    recipeOverrides: {
+      ...(parsed.bm25Weight !== undefined ? { bm25Weight: parsed.bm25Weight } : {}),
+      ...(parsed.denseWeight !== undefined ? { denseWeight: parsed.denseWeight } : {}),
+      ...(parsed.identifierBoost !== undefined ? { identifierBoost: parsed.identifierBoost } : {}),
+      ...(parsed.graphDepth !== undefined ? { graphDepth: parsed.graphDepth } : {}),
+      ...(parsed.finalRerankTopN !== undefined ? { finalRerankTopN: parsed.finalRerankTopN } : {}),
+    },
   };
 }
 
@@ -289,6 +382,28 @@ export async function handleEvalCommand(args: string[], cwd: string): Promise<nu
       return 1;
     }
 
+    return 0;
+  }
+
+  if (subcommand === "gate") {
+    const { parsed, explicitAgainst } = parseEvalSubcommandOptions(args.slice(1), cwd);
+    if (explicitAgainst) {
+      parsed.againstPath = explicitAgainst;
+    }
+    parsed.ciMode = true;
+    const result = await runEvaluation(toRunOptions(parsed));
+    console.log(`Eval gate complete. Artifacts: ${result.outputDir}`);
+    if (result.gate && !result.gate.passed) {
+      for (const regression of result.gate.regressions) {
+        console.error(
+          `[CI-GATE] ${regression.metric}: baseline=${regression.baseline.toFixed(4)} current=${regression.current.toFixed(4)} delta=${regression.delta.toFixed(4)} threshold=${regression.threshold.toFixed(4)}`
+        );
+      }
+      for (const violation of result.gate.violations) {
+        console.error(`[CI-GATE] ${violation.metric}: ${violation.message}`);
+      }
+      return 1;
+    }
     return 0;
   }
 

@@ -481,10 +481,14 @@ pub struct SymbolData {
 #[napi(object)]
 pub struct CallEdgeData {
     pub id: String,
+    pub branch: String,
     pub from_symbol_id: String,
     pub from_symbol_name: Option<String>,
     pub from_symbol_file_path: Option<String>,
+    pub caller_file_path: Option<String>,
     pub target_name: String,
+    pub target_file_path: Option<String>,
+    pub target_kind: Option<String>,
     pub to_symbol_id: Option<String>,
     pub call_type: String,
     pub line: u32,
@@ -593,7 +597,16 @@ pub struct ChunkData {
     pub end_line: u32,
     pub node_type: Option<String>,
     pub name: Option<String>,
+    pub chunk_kind: Option<String>,
+    pub symbol_kind: Option<String>,
     pub language: String,
+}
+
+#[napi(object)]
+pub struct ChunkKindEnrichmentData {
+    pub chunk_id: String,
+    pub chunk_kind: Option<String>,
+    pub symbol_kind: Option<String>,
 }
 
 #[napi(object)]
@@ -739,6 +752,8 @@ impl Database {
             chunk.end_line,
             chunk.node_type.as_deref(),
             chunk.name.as_deref(),
+            chunk.chunk_kind.as_deref(),
+            chunk.symbol_kind.as_deref(),
             &chunk.language,
         )
         .map_err(|e| Error::from_reason(e.to_string()))
@@ -760,6 +775,8 @@ impl Database {
             end_line: row.end_line,
             node_type: row.node_type,
             name: row.name,
+            chunk_kind: row.chunk_kind,
+            symbol_kind: row.symbol_kind,
             language: row.language,
         }))
     }
@@ -782,6 +799,8 @@ impl Database {
                 end_line: row.end_line,
                 node_type: row.node_type,
                 name: row.name,
+                chunk_kind: row.chunk_kind,
+                symbol_kind: row.symbol_kind,
                 language: row.language,
             })
             .collect())
@@ -805,6 +824,8 @@ impl Database {
                 end_line: row.end_line,
                 node_type: row.node_type,
                 name: row.name,
+                chunk_kind: row.chunk_kind,
+                symbol_kind: row.symbol_kind,
                 language: row.language,
             })
             .collect())
@@ -828,7 +849,30 @@ impl Database {
                 end_line: row.end_line,
                 node_type: row.node_type,
                 name: row.name,
+                chunk_kind: row.chunk_kind,
+                symbol_kind: row.symbol_kind,
                 language: row.language,
+            })
+            .collect())
+    }
+
+    #[napi]
+    pub fn get_chunk_kinds_batch(
+        &self,
+        chunk_ids: Vec<String>,
+    ) -> Result<Vec<ChunkKindEnrichmentData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows = db::get_chunk_kinds_batch(&conn, &chunk_ids)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ChunkKindEnrichmentData {
+                chunk_id: row.chunk_id,
+                chunk_kind: row.chunk_kind,
+                symbol_kind: row.symbol_kind,
             })
             .collect())
     }
@@ -891,6 +935,8 @@ impl Database {
                 end_line: c.end_line,
                 node_type: c.node_type,
                 name: c.name,
+                chunk_kind: c.chunk_kind,
+                symbol_kind: c.symbol_kind,
                 language: c.language,
             })
             .collect();
@@ -1540,8 +1586,12 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let row = db::CallEdgeRow {
             id: edge.id,
+            branch: edge.branch,
             from_symbol_id: edge.from_symbol_id,
+            caller_file_path: edge.caller_file_path.or(edge.from_symbol_file_path),
             target_name: edge.target_name,
+            target_file_path: edge.target_file_path,
+            target_kind: edge.target_kind,
             to_symbol_id: edge.to_symbol_id,
             call_type: edge.call_type,
             line: edge.line,
@@ -1561,8 +1611,12 @@ impl Database {
             .into_iter()
             .map(|e| db::CallEdgeRow {
                 id: e.id,
+                branch: e.branch,
                 from_symbol_id: e.from_symbol_id,
+                caller_file_path: e.caller_file_path.or(e.from_symbol_file_path),
                 target_name: e.target_name,
+                target_file_path: e.target_file_path,
+                target_kind: e.target_kind,
                 to_symbol_id: e.to_symbol_id,
                 call_type: e.call_type,
                 line: e.line,
@@ -1585,10 +1639,14 @@ impl Database {
             .into_iter()
             .map(|r| CallEdgeData {
                 id: r.id,
+                branch: r.branch,
                 from_symbol_id: r.from_symbol_id,
                 from_symbol_name: None,
                 from_symbol_file_path: None,
+                caller_file_path: r.caller_file_path,
                 target_name: r.target_name,
+                target_file_path: r.target_file_path,
+                target_kind: r.target_kind,
                 to_symbol_id: r.to_symbol_id,
                 call_type: r.call_type,
                 line: r.line,
@@ -1610,10 +1668,14 @@ impl Database {
             .into_iter()
             .map(|r| CallEdgeData {
                 id: r.id,
+                branch: r.branch,
                 from_symbol_id: r.from_symbol_id,
                 from_symbol_name: None,
                 from_symbol_file_path: None,
+                caller_file_path: r.caller_file_path,
                 target_name: r.target_name,
+                target_file_path: r.target_file_path,
+                target_kind: r.target_kind,
                 to_symbol_id: r.to_symbol_id,
                 call_type: r.call_type,
                 line: r.line,
@@ -1637,18 +1699,24 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(rows
             .into_iter()
-            .map(|r| CallEdgeData {
+            .map(|r| {
+                let from_symbol_file_path = r.from_symbol_file_path;
+                CallEdgeData {
                 id: r.id,
+                branch: branch.clone(),
                 from_symbol_id: r.from_symbol_id,
                 from_symbol_name: Some(r.from_symbol_name),
-                from_symbol_file_path: Some(r.from_symbol_file_path),
+                from_symbol_file_path: Some(from_symbol_file_path.clone()),
+                caller_file_path: Some(from_symbol_file_path),
                 target_name: r.target_name,
+                target_file_path: r.target_file_path,
+                target_kind: r.target_kind,
                 to_symbol_id: r.to_symbol_id,
                 call_type: r.call_type,
                 line: r.line,
                 col: r.col,
                 is_resolved: r.is_resolved,
-            })
+            }})
             .collect())
     }
 
@@ -1666,28 +1734,34 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(rows
             .into_iter()
-            .map(|r| CallEdgeData {
+            .map(|r| {
+                let from_symbol_file_path = r.from_symbol_file_path;
+                CallEdgeData {
                 id: r.id,
+                branch: branch.clone(),
                 from_symbol_id: r.from_symbol_id,
                 from_symbol_name: Some(r.from_symbol_name),
-                from_symbol_file_path: Some(r.from_symbol_file_path),
+                from_symbol_file_path: Some(from_symbol_file_path.clone()),
+                caller_file_path: Some(from_symbol_file_path),
                 target_name: r.target_name,
+                target_file_path: r.target_file_path,
+                target_kind: r.target_kind,
                 to_symbol_id: r.to_symbol_id,
                 call_type: r.call_type,
                 line: r.line,
                 col: r.col,
                 is_resolved: r.is_resolved,
-            })
+            }})
             .collect())
     }
 
     #[napi]
-    pub fn delete_call_edges_by_file(&self, file_path: String) -> Result<u32> {
+    pub fn delete_call_edges_by_file(&self, file_path: String, branch: String) -> Result<u32> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        let count = db::delete_call_edges_by_file(&conn, &file_path)
+        let count = db::delete_call_edges_by_file(&conn, &file_path, &branch)
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(count as u32)
     }
@@ -1704,12 +1778,41 @@ impl Database {
     }
 
     #[napi]
-    pub fn resolve_call_edge(&self, edge_id: String, to_symbol_id: String) -> Result<()> {
+    pub fn delete_call_edges_by_symbol_for_branch(
+        &self,
+        symbol_id: String,
+        branch: String,
+    ) -> Result<u32> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        db::resolve_call_edge(&conn, &edge_id, &to_symbol_id)
+        let count = db::delete_call_edges_by_symbol_for_branch(&conn, &symbol_id, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    #[napi]
+    pub fn resolve_call_edge(
+        &self,
+        edge_id: String,
+        branch: String,
+        to_symbol_id: String,
+        target_file_path: Option<String>,
+        target_kind: Option<String>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        db::resolve_call_edge(
+            &conn,
+            &edge_id,
+            &branch,
+            &to_symbol_id,
+            target_file_path.as_deref(),
+            target_kind.as_deref(),
+        )
             .map_err(|e| Error::from_reason(e.to_string()))
     }
 

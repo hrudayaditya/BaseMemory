@@ -1,5 +1,7 @@
 import { readFileSync } from "fs";
 
+import { isSearchTaskType } from "../indexer/search-recipes.js";
+
 import type {
   EvalBudget,
   GoldenDataset,
@@ -40,6 +42,13 @@ function parseQueryType(value: unknown, path: string): GoldenQueryType {
   throw new Error(
     `${path} must be one of: definition, implementation-intent, similarity, keyword-heavy`
   );
+}
+
+function parseTaskType(value: unknown, path: string) {
+  if (typeof value === "string" && isSearchTaskType(value)) {
+    return value;
+  }
+  throw new Error(`${path} must be a valid search task type`);
 }
 
 function parseExpected(input: unknown, path: string): GoldenExpected {
@@ -88,6 +97,7 @@ function parseQuery(input: unknown, index: number): GoldenQuery {
   const id = input.id;
   const query = input.query;
   const queryType = input.queryType;
+  const taskType = input.taskType ?? input.type;
   const expected = input.expected;
 
   if (typeof id !== "string" || id.trim().length === 0) {
@@ -103,6 +113,8 @@ function parseQuery(input: unknown, index: number): GoldenQuery {
     query,
     queryType:
       queryType === undefined ? undefined : parseQueryType(queryType, `${path}.queryType`),
+    taskType:
+      taskType === undefined ? undefined : parseTaskType(taskType, `${path}.taskType`),
     expected: parseExpected(expected, `${path}.expected`),
   };
 }
@@ -196,6 +208,20 @@ export function parseBudget(raw: unknown, sourceLabel: string): EvalBudget {
         thresholds.mrrAt10MaxDrop === undefined
           ? undefined
           : asPositiveNumber(thresholds.mrrAt10MaxDrop, `${sourceLabel}.thresholds.mrrAt10MaxDrop`),
+      combinedRecallAt10MaxDrop:
+        thresholds.combinedRecallAt10MaxDrop === undefined && thresholds.combinedRecallAt10 === undefined
+          ? undefined
+          : asPositiveNumber(
+              thresholds.combinedRecallAt10MaxDrop ?? thresholds.combinedRecallAt10,
+              `${sourceLabel}.thresholds.combinedRecallAt10`
+            ),
+      expansionHitRateMaxDrop:
+        thresholds.expansionHitRateMaxDrop === undefined && thresholds.expansionHitRate === undefined
+          ? undefined
+          : asPositiveNumber(
+              thresholds.expansionHitRateMaxDrop ?? thresholds.expansionHitRate,
+              `${sourceLabel}.thresholds.expansionHitRate`
+            ),
       p95LatencyMaxMultiplier:
         thresholds.p95LatencyMaxMultiplier === undefined
           ? undefined

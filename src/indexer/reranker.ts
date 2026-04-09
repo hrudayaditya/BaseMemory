@@ -1,4 +1,4 @@
-import type { ChunkMetadata } from "../native/index.js";
+import type { ChunkKind, ChunkMetadata, ChunkSymbolKind } from "../native/index.js";
 
 import type { SearchTaskType } from "./search-recipes.js";
 
@@ -11,6 +11,9 @@ export interface RerankerCandidate {
   id: string;
   baseScore: number;
   metadata: ChunkMetadata;
+  chunkKind?: ChunkKind;
+  symbolKind?: ChunkSymbolKind;
+  relation?: "caller" | "callee";
   content: string;
 }
 
@@ -90,6 +93,52 @@ export interface SearchRerankerBackend {
   rerank(query: string, candidates: RerankerCandidate[], taskType: SearchTaskType): Promise<RerankerCandidate[]>;
 }
 
+function stableSigmoid(logit: number): number {
+  if (!Number.isFinite(logit)) {
+    return logit > 0 ? 1 : 0;
+  }
+
+  if (logit >= 0) {
+    const scaled = Math.exp(-logit);
+    return 1 / (1 + scaled);
+  }
+
+  const scaled = Math.exp(logit);
+  return scaled / (1 + scaled);
+}
+
+function buildCrossEncoderDocument(candidate: RerankerCandidate): string {
+  const prefixParts: string[] = [];
+
+  if (candidate.metadata.name) {
+    prefixParts.push(`[name: ${candidate.metadata.name}]`);
+  }
+
+  if (candidate.chunkKind) {
+    prefixParts.push(`[kind: ${candidate.chunkKind}]`);
+  }
+
+  // Symbol kind is more semantically precise than chunk role, so surface it
+  // separately instead of overloading the chunk-kind slot.
+  if (candidate.symbolKind) {
+    prefixParts.push(`[symbol: ${candidate.symbolKind}]`);
+  }
+
+  if (candidate.relation) {
+    prefixParts.push(`[relation: ${candidate.relation}]`);
+  }
+
+  if (prefixParts.length === 0) {
+    return candidate.content;
+  }
+
+  if (candidate.content.length === 0) {
+    return prefixParts.join(" ");
+  }
+
+  return `${prefixParts.join(" ")} ${candidate.content}`;
+}
+
 function tokenize(text: string): Set<string> {
   return new Set(
     text
@@ -112,6 +161,13 @@ function splitPath(filePath: string): Set<string> {
 function looksLikeTestPath(filePath: string): boolean {
   const lowered = filePath.toLowerCase();
   return lowered.includes("test") || lowered.includes("__tests__") || lowered.includes("spec");
+}
+
+function isTestCandidate(candidate: RerankerCandidate): boolean {
+  if (candidate.chunkKind !== undefined) {
+    return candidate.chunkKind === "Test";
+  }
+  return looksLikeTestPath(candidate.metadata.filePath);
 }
 
 function overlapCount(left: Set<string>, right: Set<string>): number {
@@ -238,7 +294,7 @@ function computeHeuristicJointScore(
   const contentOverlap = overlapCount(queryTokens, contentTokens);
   const exactNameBoost = normalizedName.length > 0 && normalizedQuery.includes(normalizedName) ? 0.4 : 0;
   const contentPhraseBoost = normalizedContent.includes(normalizedQuery) ? 0.25 : 0;
-  const isTestPath = looksLikeTestPath(candidate.metadata.filePath);
+  const isTest = isTestCandidate(candidate);
 
   let taskBias = 0;
   if (taskType === "definition") {
@@ -246,7 +302,7 @@ function computeHeuristicJointScore(
   } else if (taskType === "semantic") {
     taskBias += contentOverlap * 0.1 + contentPhraseBoost;
   } else if (taskType === "test_debug") {
-    taskBias += isTestPath ? 0.18 : -0.04;
+    taskBias += isTest ? 0.18 : -0.04;
     taskBias += contentOverlap * 0.08 + pathOverlap * 0.05;
   }
 
@@ -288,7 +344,10 @@ export class HeuristicLocalRerankerBackend implements SearchRerankerBackend {
       return left.candidate.id.localeCompare(right.candidate.id);
     });
 
-    return scored.map((entry) => entry.candidate);
+    return scored.map((entry) => ({
+      ...entry.candidate,
+      baseScore: entry.score,
+    }));
   }
 }
 
@@ -311,13 +370,13 @@ export class TransformersCrossEncoderBackend implements SearchRerankerBackend {
     const scores = await scorer(
       candidates.map((candidate) => ({
         text: query,
-        textPair: candidate.content,
+        textPair: buildCrossEncoderDocument(candidate),
       }))
     );
 
     const scored: ScoredCandidate[] = candidates.map((candidate, index) => ({
       candidate,
-      score: Number(scores[index] ?? Number.NEGATIVE_INFINITY),
+      score: stableSigmoid(Number(scores[index] ?? Number.NEGATIVE_INFINITY)),
       originalIndex: index,
     }));
 
@@ -331,7 +390,10 @@ export class TransformersCrossEncoderBackend implements SearchRerankerBackend {
       return left.originalIndex - right.originalIndex;
     });
 
-    return scored.map((entry) => entry.candidate);
+    return scored.map((entry) => ({
+      ...entry.candidate,
+      baseScore: entry.score,
+    }));
   }
 
   private async getScorer(): Promise<CrossEncoderScorer | null> {

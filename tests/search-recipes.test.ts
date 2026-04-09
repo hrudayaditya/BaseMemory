@@ -7,23 +7,49 @@ import type { GoldenQueryType } from "../src/eval/types.js";
 import { getSearchRecipe, mapEvalQueryTypeToTaskType } from "../src/indexer/search-recipes.js";
 
 describe("search recipes", () => {
-  it("keeps general behavior on the non-reranked baseline", () => {
+  it("assigns the expected general-search retrieval profile", () => {
     const general = getSearchRecipe("general");
 
-    expect(general.finalRerankTopN).toBe(0);
+    expect(general.finalRerankTopN).toBe(10);
+    expect(general.graphDepth ?? 0).toBe(0);
+    expect(general.bm25Weight).toBe(0.3);
+    expect(general.denseWeight).toBe(0.7);
+    expect(general.identifierBoost).toBe(1.0);
     expect(general.enableIdentifierPromotion).toBe(true);
     expect(general.enableSymbolDefinitionLane).toBe(true);
     expect(general.pathPreference).toBe("auto");
   });
 
-  it("weights definition retrieval differently than general", () => {
-    const general = getSearchRecipe("general");
+  it("assigns the expected definition-search retrieval profile", () => {
     const definition = getSearchRecipe("definition");
 
     expect(definition.forceDefinitionIntent).toBe(true);
     expect(definition.pathPreference).toBe("source");
-    expect(definition.finalRerankTopN).toBeGreaterThan(general.finalRerankTopN);
-    expect(definition.hybridWeight).not.toBe(general.hybridWeight);
+    expect(definition.graphDepth).toBe(1);
+    expect(definition.finalRerankTopN).toBe(20);
+    expect(definition.bm25Weight).toBe(0.7);
+    expect(definition.denseWeight).toBe(0.3);
+    expect(definition.identifierBoost).toBe(2.0);
+  });
+
+  it("assigns the expected test-debug retrieval profile", () => {
+    const recipe = getSearchRecipe("test_debug");
+
+    expect(recipe.graphDepth).toBe(1);
+    expect(recipe.finalRerankTopN).toBe(20);
+    expect(recipe.bm25Weight).toBe(0.5);
+    expect(recipe.denseWeight).toBe(0.5);
+    expect(recipe.identifierBoost).toBe(1.5);
+  });
+
+  it("assigns the expected semantic retrieval profile", () => {
+    const recipe = getSearchRecipe("semantic");
+
+    expect(recipe.finalRerankTopN).toBe(0);
+    expect(recipe.graphDepth ?? 0).toBe(0);
+    expect(recipe.bm25Weight).toBe(0.2);
+    expect(recipe.denseWeight).toBe(0.8);
+    expect(recipe.identifierBoost).toBe(1.0);
   });
 
   it("maps eval query types into explicit task recipes", () => {

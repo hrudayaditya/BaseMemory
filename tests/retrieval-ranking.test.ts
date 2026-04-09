@@ -14,6 +14,7 @@ import {
 } from "../src/indexer/index.js";
 
 type Candidate = { id: string; score: number; metadata: ChunkMetadata };
+const EQUAL_FUSION_WEIGHTS = { denseWeight: 0.5, bm25Weight: 0.5 } as const;
 
 function meta(overrides: Partial<ChunkMetadata>): ChunkMetadata {
   return {
@@ -40,7 +41,7 @@ describe("retrieval ranking", () => {
       { id: "a", score: 1, metadata: meta({ filePath: "/repo/src/auth.ts", name: "validateAuth", chunkType: "function" }) },
     ];
 
-    const fused = fuseResultsRrf(semantic, keyword, 60, 10);
+    const fused = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 60, 10);
     expect(fused.map(r => r.id).slice(0, 3)).toEqual(["a", "c", "d"]);
     expect(fused[0]?.score ?? 0).toBeLessThanOrEqual(1);
     expect(fused[0]?.score ?? 0).toBeGreaterThan(0);
@@ -56,7 +57,7 @@ describe("retrieval ranking", () => {
       { id: "both", score: 1, metadata: meta({ filePath: "/repo/src/both.ts", name: "bothCandidate", chunkType: "function" }) },
     ];
 
-    const fused = fuseResultsRrf(semantic, keyword, 60, 5);
+    const fused = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 60, 5);
     const top3 = fused.map(r => r.id).slice(0, 3);
     expect(top3[0]).toBe("both");
     expect(top3).toContain("semanticOnly");
@@ -75,7 +76,7 @@ describe("retrieval ranking", () => {
       { id: "keywordOnly", score: 100, metadata: meta({ filePath: "/repo/src/keyword.ts", name: "keywordBest", chunkType: "function" }) },
     ];
 
-    const fused = fuseResultsRrf(semantic, keyword, 60, 10);
+    const fused = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 60, 10);
 
     expect(fused).toHaveLength(2);
     expect(fused.map((result) => result.id)).toEqual(["keywordOnly", "semanticOnly"]);
@@ -90,7 +91,7 @@ describe("retrieval ranking", () => {
       { id: "both", score: 3, metadata: meta({ filePath: "/repo/src/both.ts", name: "both", chunkType: "function" }) },
     ];
 
-    const fused = fuseResultsRrf(semantic, keyword, 60, 10);
+    const fused = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 60, 10);
 
     expect(fused[0]?.id).toBe("both");
     expect(fused[1]?.id).toBe("semanticOnly");
@@ -106,7 +107,7 @@ describe("retrieval ranking", () => {
       { id: "c", score: 1, metadata: meta({ filePath: "/repo/src/c.ts", name: "c", chunkType: "function" }) },
     ];
 
-    const fused = fuseResultsRrf(semantic, keyword, 60, 10);
+    const fused = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 60, 10);
 
     for (let i = 1; i < fused.length; i += 1) {
       expect(fused[i - 1]!.score).toBeGreaterThanOrEqual(fused[i]!.score);
@@ -123,8 +124,8 @@ describe("retrieval ranking", () => {
       { id: "b", score: 2, metadata: meta({ filePath: "/repo/src/b.ts", name: "b", chunkType: "function" }) },
     ];
 
-    const lowK = fuseResultsRrf(semantic, keyword, 10, 10);
-    const highK = fuseResultsRrf(semantic, keyword, 100, 10);
+    const lowK = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 10, 10);
+    const highK = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 100, 10);
 
     expect(lowK[0]?.id).toBe("a");
     expect(highK[0]?.id).toBe("a");
@@ -201,7 +202,7 @@ describe("retrieval ranking", () => {
       { id: "x", score: 79, metadata: meta({ filePath: "/repo/src/x.ts", name: "x", chunkType: "function" }) },
     ];
 
-    const preRerank = fuseResultsRrf(semantic, keyword, 60, 10);
+    const preRerank = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 60, 10);
     const ranked = rankHybridResults("query", semantic, keyword, {
       fusionStrategy: "rrf",
       rrfK: 60,
@@ -223,7 +224,7 @@ describe("retrieval ranking", () => {
       { id: "c", score: 3.0, metadata: meta({ filePath: "/repo/src/c.ts", name: "c", chunkType: "function" }) },
     ];
 
-    const weighted = fuseResultsWeighted(semantic, keyword, 0.5, 10);
+    const weighted = fuseResultsWeighted(semantic, keyword, EQUAL_FUSION_WEIGHTS, 10);
     expect(weighted.map(r => r.id).slice(0, 2)).toEqual(["b", "c"]);
   });
 
@@ -235,12 +236,12 @@ describe("retrieval ranking", () => {
       { id: "k1", score: 2.5, metadata: meta({ filePath: "/repo/src/k1.ts", name: "k1", chunkType: "function" }) },
     ];
 
-    const disjoint = fuseResultsRrf(semantic, keyword, 60, 10);
+    const disjoint = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 60, 10);
     expect(disjoint).toHaveLength(2);
     expect(disjoint.map(r => r.id)).toContain("s1");
     expect(disjoint.map(r => r.id)).toContain("k1");
 
-    expect(fuseResultsRrf([], [], 60, 10)).toEqual([]);
+    expect(fuseResultsRrf([], [], EQUAL_FUSION_WEIGHTS, 60, 10)).toEqual([]);
     expect(rankSemanticOnlyResults("q", [], { rerankTopN: 10, limit: 5 })).toEqual([]);
   });
 

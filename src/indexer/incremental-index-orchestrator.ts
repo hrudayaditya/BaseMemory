@@ -58,6 +58,8 @@ export interface OrchestratorParsedChunk {
   endByte: number;
   chunkType: ChunkMetadata["chunkType"];
   name?: string;
+  chunkKind?: string;
+  symbolKind?: string;
   language: string;
   chunkHash: string;
 }
@@ -69,9 +71,11 @@ export interface OrchestratorParsedFile {
   chunks: OrchestratorParsedChunk[];
 }
 
+type OrchestratorGraphEdgeData = Omit<CallEdgeData, "branch">;
+
 export interface OrchestratorFileGraphData {
   symbols: SymbolData[];
-  edges: CallEdgeData[];
+  edges: OrchestratorGraphEdgeData[];
 }
 
 export interface InitializationResources {
@@ -177,6 +181,8 @@ interface ChunkRecord {
   endLine: number;
   nodeType?: string;
   name?: string;
+  chunkKind?: string;
+  symbolKind?: string;
   language: string;
   text: string;
   chunkHash: string;
@@ -1211,6 +1217,8 @@ export class IncrementalIndexOrchestrator {
         endLine: chunk.endLine,
         nodeType: chunk.nodeType,
         name: chunk.name,
+        chunkKind: chunk.chunkKind,
+        symbolKind: chunk.symbolKind,
         language: chunk.language,
       }));
       context.database.upsertChunksBatch(chunkRows);
@@ -1507,7 +1515,14 @@ export class IncrementalIndexOrchestrator {
           context.database.upsertSymbolsBatch(graph.symbols);
         }
         if (graph.edges.length > 0) {
-          context.database.upsertCallEdgesBatch(graph.edges);
+          const edgesToPersist: CallEdgeData[] = graph.edges.map((edge) => ({
+            ...edge,
+            branch: context.branch,
+            callerFilePath: edge.callerFilePath ?? filePath,
+            targetFilePath: edge.targetFilePath,
+            targetKind: edge.targetKind,
+          }));
+          context.database.upsertCallEdgesBatch(edgesToPersist);
         }
         for (const symbol of graph.symbols) {
           plan.newSymbolIds.add(symbol.id);
@@ -1573,6 +1588,8 @@ export class IncrementalIndexOrchestrator {
       endLine: chunk.endLine,
       nodeType: chunk.chunkType,
       name: chunk.name,
+      chunkKind: chunk.chunkKind,
+      symbolKind: chunk.symbolKind,
       language: chunk.language,
       text: chunk.content,
       chunkHash: chunk.chunkHash,

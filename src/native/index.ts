@@ -157,10 +157,14 @@ export interface SymbolData {
 
 export interface CallEdgeData {
   id: string;
+  branch: string;
   fromSymbolId: string;
   fromSymbolName?: string;
   fromSymbolFilePath?: string;
+  callerFilePath?: string;
   targetName: string;
+  targetFilePath?: string;
+  targetKind?: string;
   toSymbolId?: string;
   callType: string;
   line: number;
@@ -750,7 +754,15 @@ export interface ChunkData {
   endLine: number;
   nodeType?: string;
   name?: string;
+  chunkKind?: string;
+  symbolKind?: string;
   language: string;
+}
+
+export interface ChunkKindEnrichment {
+  chunkId: string;
+  chunkKind?: ChunkKind;
+  symbolKind?: ChunkSymbolKind;
 }
 
 export interface BranchDelta {
@@ -864,6 +876,11 @@ export class Database {
 
   getChunksByNameCi(name: string): ChunkData[] {
     return this.inner.getChunksByNameCi(name);
+  }
+
+  getChunkKindsBatch(chunkIds: string[]): ChunkKindEnrichment[] {
+    if (chunkIds.length === 0) return [];
+    return this.inner.getChunkKindsBatch(chunkIds);
   }
 
   deleteChunksByFile(filePath: string): number {
@@ -1146,16 +1163,26 @@ export class Database {
     return this.inner.getCallees(symbolId, branch);
   }
 
-  deleteCallEdgesByFile(filePath: string): number {
-    return this.inner.deleteCallEdgesByFile(filePath);
+  deleteCallEdgesByFile(filePath: string, branch: string): number {
+    return this.inner.deleteCallEdgesByFile(filePath, branch);
   }
 
   deleteCallEdgesBySymbol(symbolId: string): number {
     return this.inner.deleteCallEdgesBySymbol(symbolId);
   }
 
-  resolveCallEdge(edgeId: string, toSymbolId: string): void {
-    this.inner.resolveCallEdge(edgeId, toSymbolId);
+  deleteCallEdgesBySymbolForBranch(symbolId: string, branch: string): number {
+    return this.inner.deleteCallEdgesBySymbolForBranch(symbolId, branch);
+  }
+
+  resolveCallEdge(
+    edgeId: string,
+    branch: string,
+    toSymbolId: string,
+    targetFilePath?: string,
+    targetKind?: string
+  ): void {
+    this.inner.resolveCallEdge(edgeId, branch, toSymbolId, targetFilePath, targetKind);
   }
 
   // ── Branch Symbol methods ────────────────────────────────────────

@@ -7,7 +7,30 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { parseConfig } from "../src/config/schema.js";
 import { Indexer } from "../src/indexer/index.js";
+import { SearchReranker, type RerankerCandidate, type SearchRerankerBackend } from "../src/indexer/reranker.js";
 import { Database } from "../src/native/index.js";
+
+class FixedScoreBackend implements SearchRerankerBackend {
+  readonly name = "fixed-score";
+
+  async rerank(
+    _query: string,
+    candidates: RerankerCandidate[],
+    _taskType: "general" | "definition" | "test_debug" | "semantic"
+  ): Promise<RerankerCandidate[]> {
+    return [...candidates]
+      .map((candidate) => ({
+        ...candidate,
+        baseScore: candidate.metadata.filePath.includes("/app/indexer/index.ts") ? 0.97 : 0.23,
+      }))
+      .sort((left, right) => {
+        if (right.baseScore !== left.baseScore) {
+          return right.baseScore - left.baseScore;
+        }
+        return left.id.localeCompare(right.id);
+      });
+  }
+}
 
 describe("search integration", () => {
   let tempDir: string;
@@ -179,6 +202,55 @@ export async function handleEvalCommand(): Promise<void> {
     expect(topPaths[0]).toContain("/app/indexer/index.ts");
     expect(topPaths).not.toContain("/tests/fixtures/call-graph/same-file-refs.ts");
     expect(topPaths).not.toContain("/benchmarks/run.ts");
+    expect(results[0]?.chunkKind).toBe("Code");
+    expect(results[0]?.symbolKind).toBe("Function");
+  });
+
+  it("rewrites definition-search scores through the reranker promoted block and preserves chunk metadata", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const internals = indexer as unknown as { searchReranker: SearchReranker };
+    internals.searchReranker = new SearchReranker([]);
+    const baseline = await indexer.searchDetailed("where is rankHybridResults implementation", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+      taskType: "definition",
+    });
+
+    internals.searchReranker = new SearchReranker([new FixedScoreBackend()]);
+    const reranked = await indexer.searchDetailed("where is rankHybridResults implementation", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+      taskType: "definition",
+    });
+
+    expect(baseline.reranker.applied).toBe(false);
+    expect(reranked.reranker.applied).toBe(true);
+    expect(reranked.reranker.backend).toBe("fixed-score");
+    expect(reranked.primaryResults[0]?.score).toBe(0.97);
+    expect(reranked.primaryResults[0]?.score).not.toBe(baseline.primaryResults[0]?.score);
+    expect(reranked.primaryResults[0]?.reranked).toBe(true);
+    expect(reranked.primaryResults[0]?.chunkKind).toBe("Code");
   });
 
   it("prefers documentation paths for doc-intent phrasing with 'where is'", async () => {
@@ -244,6 +316,62 @@ export async function handleEvalCommand(): Promise<void> {
     expect(results.length).toBeGreaterThan(0);
     const topPaths = results.slice(0, 3).map((r) => r.filePath);
     expect(topPaths[0]).toContain("/app/indexer/index.ts");
+  });
+
+  it("uses different runtime fusion weights for definition and general search", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const loggerSpy = vi.spyOn((indexer as unknown as { logger: { search: (...args: unknown[]) => void } }).logger, "search");
+
+    await indexer.searchDetailed("rankHybridResults", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+      taskType: "definition",
+    });
+    await indexer.searchDetailed("rankHybridResults", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+      taskType: "general",
+    });
+
+    const startCalls = loggerSpy.mock.calls.filter((call) => call[1] === "Starting search");
+    const definitionPayload = startCalls.find((call) => (call[2] as { taskType?: string }).taskType === "definition")?.[2] as {
+      bm25Weight: number;
+      denseWeight: number;
+      finalRerankTopN: number;
+    };
+    const generalPayload = startCalls.find((call) => (call[2] as { taskType?: string }).taskType === "general")?.[2] as {
+      bm25Weight: number;
+      denseWeight: number;
+      finalRerankTopN: number;
+    };
+
+    expect(definitionPayload.bm25Weight).toBe(0.7);
+    expect(definitionPayload.denseWeight).toBe(0.3);
+    expect(definitionPayload.finalRerankTopN).toBe(20);
+    expect(generalPayload.bm25Weight).toBe(0.3);
+    expect(generalPayload.denseWeight).toBe(0.7);
+    expect(generalPayload.finalRerankTopN).toBe(10);
   });
 
   it("forces definition lanes for doc-leaning queries when definitionIntent is true", async () => {
@@ -507,10 +635,14 @@ export async function handleEvalCommand(): Promise<void> {
     database.upsertCallEdgesBatch([
       {
         id: "edge-rerank-rank",
+        branch: "main",
         fromSymbolId: "sym-rerankResults",
         fromSymbolName: "rerankResults",
         fromSymbolFilePath: filePath,
+        callerFilePath: filePath,
         targetName: "rankHybridResults",
+        targetFilePath: filePath,
+        targetKind: "Function",
         toSymbolId: "sym-rankHybridResults",
         callType: "Call",
         line: 2,
@@ -519,10 +651,14 @@ export async function handleEvalCommand(): Promise<void> {
       },
       {
         id: "edge-entry-rerank",
+        branch: "main",
         fromSymbolId: "sym-searchEntry",
         fromSymbolName: "searchEntry",
         fromSymbolFilePath: filePath,
+        callerFilePath: filePath,
         targetName: "rerankResults",
+        targetFilePath: filePath,
+        targetKind: "Function",
         toSymbolId: "sym-rerankResults",
         callType: "Call",
         line: 3,
@@ -538,13 +674,14 @@ export async function handleEvalCommand(): Promise<void> {
       metadataOnly: true,
       filterByBranch: false,
       taskType: "definition",
-      graphDepth: 1,
     });
 
     expect(response.primaryResults[0]?.name).toBe("rerankResults");
+    expect(response.expandedContext.length).toBeGreaterThan(0);
     const expandedNames = response.expandedContext.map((entry) => entry.name);
     expect(expandedNames).toContain("rankHybridResults");
     expect(expandedNames).toContain("searchEntry");
     expect(new Set(response.expandedContext.map((entry) => entry.relation))).toEqual(new Set(["caller", "callee"]));
+    expect(response.expandedContext.every((entry) => entry.chunkKind === "Code")).toBe(true);
   });
 });

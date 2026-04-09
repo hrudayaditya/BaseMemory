@@ -143,7 +143,7 @@ function getDefaultDebugConfig(): DebugConfig {
 
 function getDefaultEvalConfig(): EvalConfig {
   return {
-    useQueryTypes: false,
+    useQueryTypes: true,
   };
 }
 

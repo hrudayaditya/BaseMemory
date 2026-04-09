@@ -25,13 +25,25 @@ function formatEffectiveFinalRerankTopN(value: number): string {
   return value < 0 ? "mixed per-query" : String(value);
 }
 
+function formatEffectiveGraphDepth(value: number): string {
+  return value < 0 ? "mixed per-query" : String(value);
+}
+
 function formatRawSearchConfig(config: EvalSummary["searchConfig"]): string {
   const fusionMode = config.fusionStrategy;
   const hybridBlend = config.hybridWeight;
   const reciprocalRankWindow = config.rrfK;
   const earlyRerankLimit = config.rerankTopN;
+  const recipeOverrideParts = config.recipeOverrides
+    ? Object.entries(config.recipeOverrides)
+      .filter(([, value]) => value !== undefined)
+      .map(([key, value]) => `${key}=${value}`)
+    : [];
 
-  return `fusion=${fusionMode}, hybrid weight=${hybridBlend}, RRF k=${reciprocalRankWindow}, early rerank top-N=${earlyRerankLimit}`;
+  const base = `fusion=${fusionMode}, hybrid weight=${hybridBlend}, RRF k=${reciprocalRankWindow}, early rerank top-N=${earlyRerankLimit}`;
+  return recipeOverrideParts.length > 0
+    ? `${base}, recipe overrides={${recipeOverrideParts.join(", ")}}`
+    : base;
 }
 
 function signed(value: number, digits = 4): string {
@@ -86,7 +98,7 @@ export function createSummaryMarkdown(
   lines.push(
     `- Final rerank top-N: ${formatEffectiveFinalRerankTopN(effectiveFinalRerankTopN)}`
   );
-  lines.push(`- Graph depth: ${effectiveGraphDepth}`);
+  lines.push(`- Graph depth: ${formatEffectiveGraphDepth(effectiveGraphDepth)}`);
   lines.push("");
 
   lines.push("## Metrics");
@@ -97,6 +109,8 @@ export function createSummaryMarkdown(
   lines.push(`| Hit@3 | ${formatPct(summary.metrics.hitAt3)} |`);
   lines.push(`| Hit@5 | ${formatPct(summary.metrics.hitAt5)} |`);
   lines.push(`| Hit@10 | ${formatPct(summary.metrics.hitAt10)} |`);
+  lines.push(`| Combined Recall@10 | ${formatPct(summary.metrics.combinedRecallAt10)} |`);
+  lines.push(`| Expansion Hit Rate | ${formatPct(summary.metrics.expansionHitRate)} |`);
   lines.push(`| MRR@10 | ${summary.metrics.mrrAt10.toFixed(4)} |`);
   lines.push(`| nDCG@10 | ${summary.metrics.ndcgAt10.toFixed(4)} |`);
   lines.push(`| Latency p50 | ${formatMs(summary.metrics.latencyMs.p50)} |`);
@@ -150,6 +164,12 @@ export function createSummaryMarkdown(
       `| Hit@5 | ${formatPct(comparison.deltas.hitAt5.baseline)} | ${formatPct(comparison.deltas.hitAt5.current)} | ${signed(comparison.deltas.hitAt5.absolute)} |`
     );
     lines.push(
+      `| Combined Recall@10 | ${formatPct(comparison.deltas.combinedRecallAt10.baseline)} | ${formatPct(comparison.deltas.combinedRecallAt10.current)} | ${signed(comparison.deltas.combinedRecallAt10.absolute)} |`
+    );
+    lines.push(
+      `| Expansion Hit Rate | ${formatPct(comparison.deltas.expansionHitRate.baseline)} | ${formatPct(comparison.deltas.expansionHitRate.current)} | ${signed(comparison.deltas.expansionHitRate.absolute)} |`
+    );
+    lines.push(
       `| MRR@10 | ${comparison.deltas.mrrAt10.baseline.toFixed(4)} | ${comparison.deltas.mrrAt10.current.toFixed(4)} | ${signed(comparison.deltas.mrrAt10.absolute)} |`
     );
     lines.push(
@@ -165,6 +185,14 @@ export function createSummaryMarkdown(
     lines.push("## CI Gate");
     lines.push("");
     lines.push(`- Result: ${gate.passed ? "PASS ✅" : "FAIL ❌"}`);
+    if (gate.regressions.length > 0) {
+      lines.push("- Regressions:");
+      for (const regression of gate.regressions) {
+        lines.push(
+          `  - ${regression.metric}: baseline=${regression.baseline.toFixed(4)} current=${regression.current.toFixed(4)} delta=${regression.delta.toFixed(4)} threshold=${regression.threshold.toFixed(4)}`
+        );
+      }
+    }
     if (gate.violations.length > 0) {
       lines.push("- Violations:");
       for (const violation of gate.violations) {

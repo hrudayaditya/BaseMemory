@@ -35,7 +35,7 @@ function candidate(
 class ThrowingBackend implements SearchRerankerBackend {
   readonly name = "throwing";
 
-  async rerank(): Promise<RerankerCandidate[]> {
+  async rerank(_query: string, _candidates: RerankerCandidate[], _taskType: "general" | "definition" | "test_debug" | "semantic"): Promise<RerankerCandidate[]> {
     throw new Error("boom");
   }
 }
@@ -43,7 +43,11 @@ class ThrowingBackend implements SearchRerankerBackend {
 class ReverseBackend implements SearchRerankerBackend {
   readonly name = "reverse";
 
-  async rerank(_query: string, candidates: RerankerCandidate[]): Promise<RerankerCandidate[]> {
+  async rerank(
+    _query: string,
+    candidates: RerankerCandidate[],
+    _taskType: "general" | "definition" | "test_debug" | "semantic"
+  ): Promise<RerankerCandidate[]> {
     return [...candidates].reverse();
   }
 }
@@ -81,6 +85,72 @@ describe("search reranker", () => {
     expect(reranked[0]?.id).toBe("target");
   });
 
+  it("prefers stored Test chunkKind over a non-test file path", async () => {
+    const backend = new HeuristicLocalRerankerBackend();
+    const reranked = await backend.rerank("debug failing checkout test", [
+      candidate("prod-helper", {
+        metadata: {
+          filePath: "/repo/src/checkout/runner.ts",
+          startLine: 1,
+          endLine: 10,
+          chunkType: "function",
+          language: "typescript",
+          hash: "prod-helper",
+          name: "runner",
+        },
+        chunkKind: "Code",
+        content: "export function runner() { return false; }",
+      }),
+      candidate("stored-test", {
+        metadata: {
+          filePath: "/repo/src/checkout/scenarios.ts",
+          startLine: 1,
+          endLine: 10,
+          chunkType: "function",
+          language: "typescript",
+          hash: "stored-test",
+          name: "checkoutScenario",
+        },
+        chunkKind: "Test",
+        content: "export function checkoutScenario() { return false; }",
+      }),
+    ], "test_debug");
+
+    expect(reranked[0]?.id).toBe("stored-test");
+  });
+
+  it("falls back to test-path heuristics when chunkKind is undefined", async () => {
+    const backend = new HeuristicLocalRerankerBackend();
+    const reranked = await backend.rerank("debug failing checkout test", [
+      candidate("plain-source", {
+        metadata: {
+          filePath: "/repo/src/checkout/runner.ts",
+          startLine: 1,
+          endLine: 10,
+          chunkType: "function",
+          language: "typescript",
+          hash: "plain-source",
+          name: "runner",
+        },
+        content: "export function runner() { return false; }",
+      }),
+      candidate("path-test", {
+        metadata: {
+          filePath: "/repo/tests/checkout/runner.spec.ts",
+          startLine: 1,
+          endLine: 10,
+          chunkType: "function",
+          language: "typescript",
+          hash: "path-test",
+          name: "runnerSpec",
+        },
+        content: "export function runnerSpec() { return false; }",
+      }),
+    ], "test_debug");
+
+    expect(reranked[0]?.id).toBe("path-test");
+  });
+
   it("falls back without reranking when fewer than two candidates exist", async () => {
     const reranker = new SearchReranker([new ReverseBackend()]);
     const result = await reranker.rerank("query", [candidate("only")], "semantic");
@@ -99,6 +169,21 @@ describe("search reranker", () => {
     expect(result.candidates.map((item) => item.id)).toEqual(["second", "first"]);
   });
 
+  it("rewrites candidate scores with sigmoid-normalized cross-encoder output", async () => {
+    const backend = new TransformersCrossEncoderBackend(async () =>
+      async () => [10, -5]
+    );
+
+    const reranked = await backend.rerank("find target implementation", [
+      candidate("high", { content: "target implementation body" }),
+      candidate("low", { content: "generic helper function" }),
+    ], "definition");
+
+    expect(reranked.map((item) => item.id)).toEqual(["high", "low"]);
+    expect(reranked[0]?.baseScore).toBeCloseTo(1 / (1 + Math.exp(-10)), 6);
+    expect(reranked[1]?.baseScore).toBeCloseTo(1 / (1 + Math.exp(5)), 6);
+  });
+
   it("passes structured query-document pairs into the transformers backend", async () => {
     const seen: Array<{ text: string; textPair: string }> = [];
     const backend = new TransformersCrossEncoderBackend(async () =>
@@ -109,14 +194,60 @@ describe("search reranker", () => {
     );
 
     const reranked = await backend.rerank("find target implementation", [
-      candidate("generic", { content: "generic helper function" }),
-      candidate("target", { content: "target implementation body" }),
+      candidate("generic", {
+        metadata: {
+          filePath: "/repo/src/generic.ts",
+          startLine: 1,
+          endLine: 20,
+          chunkType: "function",
+          language: "typescript",
+          hash: "generic",
+        },
+        content: "generic helper function",
+        chunkKind: "Code",
+        symbolKind: "Function",
+      }),
+      candidate("target", {
+        metadata: {
+          filePath: "/repo/src/target.ts",
+          startLine: 1,
+          endLine: 20,
+          chunkType: "function",
+          language: "typescript",
+          hash: "target",
+        },
+        content: "target implementation body",
+        chunkKind: "Test",
+        relation: "callee",
+      }),
     ], "definition");
 
     expect(seen).toEqual([
-      { text: "find target implementation", textPair: "generic helper function" },
-      { text: "find target implementation", textPair: "target implementation body" },
+      {
+        text: "find target implementation",
+        textPair: "[kind: Code] [symbol: Function] generic helper function",
+      },
+      {
+        text: "find target implementation",
+        textPair: "[kind: Test] [relation: callee] target implementation body",
+      },
     ]);
     expect(reranked.map((item) => item.id)).toEqual(["target", "generic"]);
+  });
+
+  it("does not inject structured prefixes into the heuristic backend content", async () => {
+    const backend = new HeuristicLocalRerankerBackend();
+    const reranked = await backend.rerank("debug checkout test", [
+      candidate("test-case", {
+        chunkKind: "Test",
+        relation: "callee",
+        content: "it should process checkout retries",
+      }),
+      candidate("helper", {
+        content: "helper implementation",
+      }),
+    ], "test_debug");
+
+    expect(reranked.find((item) => item.id === "test-case")?.content).toBe("it should process checkout retries");
   });
 });

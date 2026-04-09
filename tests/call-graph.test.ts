@@ -264,6 +264,7 @@ describe("call-graph", () => {
       const edges: CallEdgeData[] = [
         {
           id: "edge_001",
+          branch: "test",
           fromSymbolId: "sym_a",
           targetName: "callee",
           callType: "Call",
@@ -304,6 +305,7 @@ describe("call-graph", () => {
       const edges: CallEdgeData[] = [
         {
           id: "edge_br1",
+          branch: "main",
           fromSymbolId: "sym_br1",
           targetName: "branchFunc",
           callType: "Call",
@@ -375,10 +377,14 @@ describe("call-graph", () => {
       const edges: CallEdgeData[] = [
         {
           id: "edge_a",
+          branch: "main",
           fromSymbolId: "sym_caller_a",
           fromSymbolName: "callA",
           fromSymbolFilePath: "/src/caller-a.ts",
+          callerFilePath: "/src/caller-a.ts",
           targetName: "execute",
+          targetFilePath: "/src/a.ts",
+          targetKind: "method",
           toSymbolId: "sym_execute_a",
           callType: "Call",
           line: 3,
@@ -387,10 +393,14 @@ describe("call-graph", () => {
         },
         {
           id: "edge_b",
+          branch: "main",
           fromSymbolId: "sym_caller_b",
           fromSymbolName: "callB",
           fromSymbolFilePath: "/src/caller-b.ts",
+          callerFilePath: "/src/caller-b.ts",
           targetName: "execute",
+          targetFilePath: "/src/b.ts",
+          targetKind: "method",
           toSymbolId: "sym_execute_b",
           callType: "Call",
           line: 3,
@@ -439,6 +449,7 @@ describe("call-graph", () => {
       const edges: CallEdgeData[] = [
         {
           id: "edge_resolve",
+          branch: "test",
           fromSymbolId: "sym_caller",
           targetName: "target",
           callType: "Call",
@@ -450,7 +461,7 @@ describe("call-graph", () => {
       db.upsertCallEdgesBatch(edges);
 
       // Resolve the edge
-      db.resolveCallEdge("edge_resolve", "sym_target");
+      db.resolveCallEdge("edge_resolve", "test", "sym_target", "/src/file.ts", "function");
 
       // Verify resolution
       db.addSymbolsToBranchBatch("test", ["sym_caller", "sym_target"]);
@@ -481,6 +492,7 @@ describe("call-graph", () => {
       const edges: CallEdgeData[] = [
         {
           id: "edge_cross",
+          branch: "test",
           fromSymbolId: "sym_local",
           targetName: "externalFunc",
           callType: "Import",
@@ -542,6 +554,7 @@ describe("call-graph", () => {
       const edges: CallEdgeData[] = [
         {
           id: "edge_multi",
+          branch: "test",
           fromSymbolId: "sym_caller_m",
           targetName: "helper",
           callType: "Call",
@@ -553,7 +566,7 @@ describe("call-graph", () => {
       db.upsertCallEdgesBatch(edges);
 
       // Resolve to only one of the targets
-      db.resolveCallEdge("edge_multi", "sym_helper_a");
+      db.resolveCallEdge("edge_multi", "test", "sym_helper_a", "/src/a.ts", "function");
 
       db.addSymbolsToBranchBatch("test", ["sym_caller_m", "sym_helper_a", "sym_helper_b"]);
       const callees = db.getCallees("sym_caller_m", "test");
@@ -605,6 +618,7 @@ describe("call-graph", () => {
       const edges: CallEdgeData[] = [
         {
           id: "edge_ambiguous",
+          branch: "test",
           fromSymbolId: "sym_caller_amb",
           targetName: "dup",
           callType: "Call",
@@ -660,6 +674,7 @@ describe("call-graph", () => {
       const edges: CallEdgeData[] = [
         {
           id: "edge_main_1",
+          branch: "main",
           fromSymbolId: "sym_main_1",
           targetName: "mainFunc",
           callType: "Call",
@@ -669,6 +684,7 @@ describe("call-graph", () => {
         },
         {
           id: "edge_feat_1",
+          branch: "feature",
           fromSymbolId: "sym_feat_1",
           targetName: "featFunc",
           callType: "Call",
@@ -724,6 +740,7 @@ describe("call-graph", () => {
       const edges: CallEdgeData[] = [
         {
           id: "edge_ba",
+          branch: "main",
           fromSymbolId: "sym_br_a",
           targetName: "sharedTarget",
           callType: "Call",
@@ -733,6 +750,7 @@ describe("call-graph", () => {
         },
         {
           id: "edge_bb",
+          branch: "other",
           fromSymbolId: "sym_br_b",
           targetName: "sharedTarget",
           callType: "Call",
@@ -783,7 +801,7 @@ export const outer: ToolDefinition = tool({
       const internals = indexer as unknown as {
         buildFileGraphData: (
           parsedFiles: unknown[]
-        ) => Map<string, { symbols: SymbolData[]; edges: CallEdgeData[] }>;
+        ) => Map<string, { symbols: SymbolData[]; edges: Array<Omit<CallEdgeData, "branch">> }>;
       };
 
       const parsedFiles = [
@@ -889,6 +907,7 @@ export const outer: ToolDefinition = tool({
         const edgeId = `edge_${hashContent(enclosing.id + ":" + site.calleeName + ":" + site.line + ":" + site.column).slice(0, 16)}`;
         edges.push({
           id: edgeId,
+          branch: "main",
           fromSymbolId: enclosing.id,
           targetName: site.calleeName,
           callType: site.callType,
@@ -905,7 +924,7 @@ export const outer: ToolDefinition = tool({
       for (const edge of edges) {
         const matchingSymbol = symbols.find((sym) => sym.name === edge.targetName);
         if (matchingSymbol) {
-          db.resolveCallEdge(edge.id, matchingSymbol.id);
+          db.resolveCallEdge(edge.id, "main", matchingSymbol.id, matchingSymbol.filePath, matchingSymbol.kind);
         }
       }
 

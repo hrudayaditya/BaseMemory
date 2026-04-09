@@ -1,5 +1,105 @@
 import type { EvalBudget, EvalComparison, EvalGateResult, EvalSummary } from "./types.js";
 
+function buildMaxDropRegression(
+  metric: string,
+  baseline: number,
+  current: number,
+  threshold: number
+) {
+  return {
+    metric,
+    baseline,
+    current,
+    delta: current - baseline,
+    threshold,
+  };
+}
+
+export function checkGate(
+  current: EvalSummary,
+  baseline: EvalSummary,
+  budget: EvalBudget
+): EvalGateResult {
+  const comparisonLike = {
+    hitAt5: current.metrics.hitAt5 - baseline.metrics.hitAt5,
+    mrrAt10: current.metrics.mrrAt10 - baseline.metrics.mrrAt10,
+    combinedRecallAt10: current.metrics.combinedRecallAt10 - baseline.metrics.combinedRecallAt10,
+    expansionHitRate: current.metrics.expansionHitRate - baseline.metrics.expansionHitRate,
+  };
+  const violations: EvalGateResult["violations"] = [];
+  const regressions: EvalGateResult["regressions"] = [];
+
+  if (
+    budget.thresholds.hitAt5MaxDrop !== undefined &&
+    comparisonLike.hitAt5 < -budget.thresholds.hitAt5MaxDrop
+  ) {
+    regressions.push(
+      buildMaxDropRegression(
+        "hitAt5",
+        baseline.metrics.hitAt5,
+        current.metrics.hitAt5,
+        budget.thresholds.hitAt5MaxDrop
+      )
+    );
+  }
+
+  if (
+    budget.thresholds.mrrAt10MaxDrop !== undefined &&
+    comparisonLike.mrrAt10 < -budget.thresholds.mrrAt10MaxDrop
+  ) {
+    regressions.push(
+      buildMaxDropRegression(
+        "mrrAt10",
+        baseline.metrics.mrrAt10,
+        current.metrics.mrrAt10,
+        budget.thresholds.mrrAt10MaxDrop
+      )
+    );
+  }
+
+  if (
+    budget.thresholds.combinedRecallAt10MaxDrop !== undefined &&
+    comparisonLike.combinedRecallAt10 < -budget.thresholds.combinedRecallAt10MaxDrop
+  ) {
+    regressions.push(
+      buildMaxDropRegression(
+        "combinedRecallAt10",
+        baseline.metrics.combinedRecallAt10,
+        current.metrics.combinedRecallAt10,
+        budget.thresholds.combinedRecallAt10MaxDrop
+      )
+    );
+  }
+
+  if (
+    budget.thresholds.expansionHitRateMaxDrop !== undefined &&
+    comparisonLike.expansionHitRate < -budget.thresholds.expansionHitRateMaxDrop
+  ) {
+    regressions.push(
+      buildMaxDropRegression(
+        "expansionHitRate",
+        baseline.metrics.expansionHitRate,
+        current.metrics.expansionHitRate,
+        budget.thresholds.expansionHitRateMaxDrop
+      )
+    );
+  }
+
+  for (const regression of regressions) {
+    violations.push({
+      metric: regression.metric,
+      message: `${regression.metric} regressed by ${regression.delta.toFixed(4)} against baseline ${regression.baseline.toFixed(4)} (threshold -${regression.threshold.toFixed(4)})`,
+    });
+  }
+
+  return {
+    passed: regressions.length === 0,
+    budgetName: budget.name,
+    violations,
+    regressions,
+  };
+}
+
 export function evaluateBudgetGate(
   budget: EvalBudget,
   summary: EvalSummary,
@@ -7,6 +107,7 @@ export function evaluateBudgetGate(
 ): EvalGateResult {
   const BASELINE_P95_EPSILON_MS = 0.001;
   const violations: EvalGateResult["violations"] = [];
+  const regressions: EvalGateResult["regressions"] = [];
 
   const { thresholds } = budget;
 
@@ -29,20 +130,56 @@ export function evaluateBudgetGate(
       thresholds.hitAt5MaxDrop !== undefined &&
       comparison.deltas.hitAt5.absolute < -thresholds.hitAt5MaxDrop
     ) {
-      violations.push({
-        metric: "hitAt5MaxDrop",
-        message: `Hit@5 drop ${comparison.deltas.hitAt5.absolute.toFixed(4)} exceeds allowed -${thresholds.hitAt5MaxDrop.toFixed(4)}`,
-      });
+      regressions.push(
+        buildMaxDropRegression(
+          "hitAt5",
+          comparison.deltas.hitAt5.baseline,
+          comparison.deltas.hitAt5.current,
+          thresholds.hitAt5MaxDrop
+        )
+      );
     }
 
     if (
       thresholds.mrrAt10MaxDrop !== undefined &&
       comparison.deltas.mrrAt10.absolute < -thresholds.mrrAt10MaxDrop
     ) {
-      violations.push({
-        metric: "mrrAt10MaxDrop",
-        message: `MRR@10 drop ${comparison.deltas.mrrAt10.absolute.toFixed(4)} exceeds allowed -${thresholds.mrrAt10MaxDrop.toFixed(4)}`,
-      });
+      regressions.push(
+        buildMaxDropRegression(
+          "mrrAt10",
+          comparison.deltas.mrrAt10.baseline,
+          comparison.deltas.mrrAt10.current,
+          thresholds.mrrAt10MaxDrop
+        )
+      );
+    }
+
+    if (
+      thresholds.combinedRecallAt10MaxDrop !== undefined &&
+      comparison.deltas.combinedRecallAt10.absolute < -thresholds.combinedRecallAt10MaxDrop
+    ) {
+      regressions.push(
+        buildMaxDropRegression(
+          "combinedRecallAt10",
+          comparison.deltas.combinedRecallAt10.baseline,
+          comparison.deltas.combinedRecallAt10.current,
+          thresholds.combinedRecallAt10MaxDrop
+        )
+      );
+    }
+
+    if (
+      thresholds.expansionHitRateMaxDrop !== undefined &&
+      comparison.deltas.expansionHitRate.absolute < -thresholds.expansionHitRateMaxDrop
+    ) {
+      regressions.push(
+        buildMaxDropRegression(
+          "expansionHitRate",
+          comparison.deltas.expansionHitRate.baseline,
+          comparison.deltas.expansionHitRate.current,
+          thresholds.expansionHitRateMaxDrop
+        )
+      );
     }
 
     if (thresholds.p95LatencyMaxMultiplier !== undefined) {
@@ -59,6 +196,13 @@ export function evaluateBudgetGate(
     }
   }
 
+  for (const regression of regressions) {
+    violations.push({
+      metric: regression.metric,
+      message: `${regression.metric} regressed by ${regression.delta.toFixed(4)} against baseline ${regression.baseline.toFixed(4)} (threshold -${regression.threshold.toFixed(4)})`,
+    });
+  }
+
   if (
     thresholds.p95LatencyMaxAbsoluteMs !== undefined &&
     summary.metrics.latencyMs.p95 > thresholds.p95LatencyMaxAbsoluteMs
@@ -73,5 +217,6 @@ export function evaluateBudgetGate(
     passed: violations.length === 0,
     budgetName: budget.name,
     violations,
+    regressions,
   };
 }

@@ -39,6 +39,25 @@ function uniqueResultsByPath(results: PerQueryEvalResult["results"]): PerQueryEv
   return unique;
 }
 
+function mergeUniqueResultsByPath(
+  primaryResults: PerQueryEvalResult["results"],
+  expandedResults: PerQueryEvalResult["results"]
+): PerQueryEvalResult["results"] {
+  const merged: PerQueryEvalResult["results"] = [];
+  const seen = new Set<string>();
+
+  for (const result of [...primaryResults, ...expandedResults]) {
+    const normalized = normalizePath(result.filePath);
+    if (seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    merged.push(result);
+  }
+
+  return merged;
+}
+
 export function pathMatchesExpected(actualPath: string, expectedPath: string): boolean {
   const actual = normalizePath(actualPath);
   const expected = normalizePath(expectedPath);
@@ -54,6 +73,23 @@ export function getRelevantPaths(query: GoldenQuery): string[] {
 
 function isRelevantResult(filePath: string, relevantPaths: string[]): boolean {
   return relevantPaths.some((expected) => pathMatchesExpected(filePath, expected));
+}
+
+function combinedRecallAtK(
+  primaryResults: PerQueryEvalResult["results"],
+  expandedResults: PerQueryEvalResult["results"],
+  relevantPaths: string[],
+  k: number
+): number {
+  if (relevantPaths.length === 0) {
+    return 0;
+  }
+
+  const combined = mergeUniqueResultsByPath(primaryResults, expandedResults).slice(0, k);
+  const matchedRelevantPaths = relevantPaths.filter((expectedPath) =>
+    combined.some((result) => pathMatchesExpected(result.filePath, expectedPath))
+  );
+  return matchedRelevantPaths.length / relevantPaths.length;
 }
 
 function reciprocalRankAtK(results: PerQueryEvalResult["results"], relevantPaths: string[], k: number): number {
@@ -134,12 +170,16 @@ export function buildPerQueryResult(
   effective?: Pick<
     PerQueryEvalResult,
     "effectiveTaskType" | "effectiveFinalRerankTopN" | "effectiveGraphDepth"
-  >
+  >,
+  expandedResults: PerQueryEvalResult["results"] = [],
+  expandedRelations: string[] = []
 ): PerQueryEvalResult {
   const relevantPaths = getRelevantPaths(query);
   const deduped = uniqueResultsByPath(results);
+  const dedupedExpanded = uniqueResultsByPath(expandedResults);
   const hitAt = (cutoff: number): boolean =>
     deduped.slice(0, cutoff).some((result) => isRelevantResult(result.filePath, relevantPaths));
+  const expandedHit = dedupedExpanded.some((result) => isRelevantResult(result.filePath, relevantPaths));
 
   const perQuery: PerQueryEvalResult = {
     id: query.id,
@@ -153,6 +193,9 @@ export function buildPerQueryResult(
     hitAt3: hitAt(3),
     hitAt5: hitAt(5),
     hitAt10: hitAt(10),
+    expandedHit,
+    expandedRecallAtK: combinedRecallAtK(deduped, dedupedExpanded, relevantPaths, k),
+    expandedRelations: expandedRelations.length > 0 ? Array.from(new Set(expandedRelations)).sort() : undefined,
     reciprocalRankAt10: reciprocalRankAtK(deduped, relevantPaths, 10),
     ndcgAt10: ndcgAtK(deduped, relevantPaths, 10),
     failureBucket: classifyFailureBucket(query, results, k),
@@ -177,6 +220,8 @@ export function computeEvalMetrics(
     hitAt3: 0,
     hitAt5: 0,
     hitAt10: 0,
+    combinedRecallAt10: 0,
+    expansionHitRate: 0,
     mrrAt10: 0,
     ndcgAt10: 0,
   };
@@ -195,6 +240,8 @@ export function computeEvalMetrics(
     if (query.hitAt3) sum.hitAt3 += 1;
     if (query.hitAt5) sum.hitAt5 += 1;
     if (query.hitAt10) sum.hitAt10 += 1;
+    sum.combinedRecallAt10 += query.expandedRecallAtK ?? 0;
+    if (query.expandedHit) sum.expansionHitRate += 1;
     sum.mrrAt10 += query.reciprocalRankAt10;
     sum.ndcgAt10 += query.ndcgAt10;
     if (query.failureBucket) {
@@ -209,6 +256,8 @@ export function computeEvalMetrics(
     hitAt3: safeDiv(sum.hitAt3),
     hitAt5: safeDiv(sum.hitAt5),
     hitAt10: safeDiv(sum.hitAt10),
+    combinedRecallAt10: safeDiv(sum.combinedRecallAt10),
+    expansionHitRate: safeDiv(sum.expansionHitRate),
     mrrAt10: safeDiv(sum.mrrAt10),
     ndcgAt10: safeDiv(sum.ndcgAt10),
     latencyMs: {

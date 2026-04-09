@@ -123,6 +123,7 @@ describe("eval runner", () => {
 
   afterEach(() => {
     fetchSpy.mockRestore();
+    vi.restoreAllMocks();
     rmSync(tempDir, { recursive: true, force: true });
   });
 
@@ -137,7 +138,7 @@ describe("eval runner", () => {
 
     expect(result.summary.queryCount).toBe(1);
     expect(result.summary.searchConfig.effectiveTaskType).toBe("general");
-    expect(result.summary.searchConfig.effectiveFinalRerankTopN).toBe(0);
+    expect(result.summary.searchConfig.effectiveFinalRerankTopN).toBe(10);
     expect(result.summary.searchConfig.effectiveGraphDepth).toBe(0);
     expect(readFileSync(path.join(result.outputDir, "summary.json"), "utf-8")).toContain("\"metrics\"");
     expect(readFileSync(path.join(result.outputDir, "summary.md"), "utf-8")).toContain("# Evaluation Summary");
@@ -190,7 +191,7 @@ describe("eval runner", () => {
     expect(taskTypes).toEqual(["general", "general"]);
     expect(result.summary.searchConfig.useQueryTypes).toBe(false);
     expect(result.summary.searchConfig.effectiveTaskType).toBe("general");
-    expect(result.summary.searchConfig.effectiveFinalRerankTopN).toBe(0);
+    expect(result.summary.searchConfig.effectiveFinalRerankTopN).toBe(10);
 
     searchDetailedSpy.mockRestore();
   });
@@ -271,6 +272,7 @@ describe("eval runner", () => {
     expect(result.summary.searchConfig.useQueryTypes).toBe(true);
     expect(result.summary.searchConfig.effectiveTaskType).toBe("mixed");
     expect(result.summary.searchConfig.effectiveFinalRerankTopN).toBe(-1);
+    expect(result.summary.searchConfig.effectiveGraphDepth).toBe(-1);
 
     searchDetailedSpy.mockRestore();
   });
@@ -320,10 +322,56 @@ describe("eval runner", () => {
 
     expect(result.summary.searchConfig.effectiveTaskType).toBe("definition");
     expect(result.summary.searchConfig.effectiveFinalRerankTopN).toBeGreaterThan(0);
-    expect(result.summary.searchConfig.effectiveGraphDepth).toBe(0);
+    expect(result.summary.searchConfig.effectiveGraphDepth).toBe(1);
     expect(summaryJson.searchConfig.effectiveTaskType).toBe("definition");
     expect(summaryJson.searchConfig.effectiveFinalRerankTopN).toBeGreaterThan(0);
-    expect(summaryJson.searchConfig.effectiveGraphDepth).toBe(0);
+    expect(summaryJson.searchConfig.effectiveGraphDepth).toBe(1);
+  });
+
+  it("passes recipe graph depth through to searchDetailed during eval execution", async () => {
+    const searchDetailedSpy = vi.spyOn(Indexer.prototype, "searchDetailed");
+
+    writeFileSync(
+      path.join(tempDir, ".opencode", "codebase-index.json"),
+      JSON.stringify(
+        {
+          embeddingProvider: "custom",
+          customProvider: {
+            baseUrl: "http://localhost:11434/v1",
+            model: "mock-embedding-model",
+            dimensions: 8,
+          },
+          indexing: {
+            watchFiles: false,
+          },
+          eval: {
+            useQueryTypes: true,
+          },
+          search: {
+            maxResults: 10,
+            minScore: 0,
+            fusionStrategy: "rrf",
+            rrfK: 60,
+            rerankTopN: 20,
+          },
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+
+    await runEvaluation({
+      projectRoot: tempDir,
+      datasetPath: "benchmarks/golden/small.json",
+      outputRoot: "benchmarks/results",
+      ciMode: false,
+      reindex: false,
+    });
+
+    expect(searchDetailedSpy.mock.calls[0]?.[2]?.taskType).toBe("definition");
+    expect(searchDetailedSpy.mock.calls[0]?.[2]?.graphDepth).toBe(1);
+    expect(searchDetailedSpy.mock.calls[0]?.[2]?.finalRerankTopN).toBe(20);
   });
 
   it("compares against baseline and writes compare artifact", async () => {

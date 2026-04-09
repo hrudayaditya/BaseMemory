@@ -19,6 +19,14 @@ export function compareSummaries(current: EvalSummary, baseline: EvalSummary, ag
       hitAt3: metricDelta(current.metrics.hitAt3, baseline.metrics.hitAt3),
       hitAt5: metricDelta(current.metrics.hitAt5, baseline.metrics.hitAt5),
       hitAt10: metricDelta(current.metrics.hitAt10, baseline.metrics.hitAt10),
+      combinedRecallAt10: metricDelta(
+        current.metrics.combinedRecallAt10,
+        baseline.metrics.combinedRecallAt10
+      ),
+      expansionHitRate: metricDelta(
+        current.metrics.expansionHitRate,
+        baseline.metrics.expansionHitRate
+      ),
       mrrAt10: metricDelta(current.metrics.mrrAt10, baseline.metrics.mrrAt10),
       ndcgAt10: metricDelta(current.metrics.ndcgAt10, baseline.metrics.ndcgAt10),
       latencyP50Ms: metricDelta(current.metrics.latencyMs.p50, baseline.metrics.latencyMs.p50),

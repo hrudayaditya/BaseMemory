@@ -45,6 +45,7 @@ const DEFAULT_EVAL_TASK_TYPE: SearchTaskType = "general";
 const DEFAULT_EVAL_GRAPH_DEPTH = 0;
 const MIXED_EFFECTIVE_TASK_TYPE = "mixed";
 const MIXED_EFFECTIVE_FINAL_RERANK_TOP_N = -1;
+const MIXED_EFFECTIVE_GRAPH_DEPTH = -1;
 
 function buildMockEmbedding(text: string): number[] {
   let seed = 0;
@@ -320,32 +321,43 @@ interface EvalQueryPlan {
   taskType: SearchTaskType;
   finalRerankTopN: number;
   graphDepth: number;
+  bm25Weight?: number;
+  denseWeight?: number;
+  identifierBoost?: number;
   filterByBranch: boolean;
 }
 
 function resolveEvalTaskType(
   effectiveConfig: ReturnType<typeof resolveSearchConfig>,
-  queryType: PerQueryEvalResult["queryType"]
+  query: Pick<PerQueryEvalResult, "queryType"> & { taskType?: SearchTaskType }
 ): SearchTaskType {
-  if (!effectiveConfig.eval.useQueryTypes || !queryType) {
+  if (query.taskType) {
+    return query.taskType;
+  }
+
+  if (!effectiveConfig.eval.useQueryTypes || !query.queryType) {
     return DEFAULT_EVAL_TASK_TYPE;
   }
 
-  return mapEvalQueryTypeToTaskType(queryType);
+  return mapEvalQueryTypeToTaskType(query.queryType);
 }
 
 function resolveEvalQueryPlan(
   effectiveConfig: ReturnType<typeof resolveSearchConfig>,
-  queryType: PerQueryEvalResult["queryType"],
+  query: Pick<PerQueryEvalResult, "queryType"> & { taskType?: SearchTaskType },
+  recipeOverrides: EvalRunOptions["recipeOverrides"],
   expectedBranch?: string
 ): EvalQueryPlan {
-  const taskType = resolveEvalTaskType(effectiveConfig, queryType);
+  const taskType = resolveEvalTaskType(effectiveConfig, query);
   const recipe = getSearchRecipe(taskType);
 
   return {
     taskType,
-    finalRerankTopN: recipe.finalRerankTopN,
-    graphDepth: DEFAULT_EVAL_GRAPH_DEPTH,
+    finalRerankTopN: recipeOverrides?.finalRerankTopN ?? recipe.finalRerankTopN,
+    graphDepth: recipeOverrides?.graphDepth ?? recipe.graphDepth ?? DEFAULT_EVAL_GRAPH_DEPTH,
+    bm25Weight: recipeOverrides?.bm25Weight,
+    denseWeight: recipeOverrides?.denseWeight,
+    identifierBoost: recipeOverrides?.identifierBoost,
     filterByBranch: expectedBranch ? true : false,
   };
 }
@@ -374,7 +386,7 @@ function summarizeEffectiveEvalConfig(plans: EvalQueryPlan[]): Pick<
     effectiveFinalRerankTopN: sameFinalRerankTopN
       ? firstPlan.finalRerankTopN
       : MIXED_EFFECTIVE_FINAL_RERANK_TOP_N,
-    effectiveGraphDepth: sameGraphDepth ? firstPlan.graphDepth : DEFAULT_EVAL_GRAPH_DEPTH,
+    effectiveGraphDepth: sameGraphDepth ? firstPlan.graphDepth : MIXED_EFFECTIVE_GRAPH_DEPTH,
   };
 }
 
@@ -403,7 +415,8 @@ async function finalizeEvaluationRun(
 
     const queryPlan = resolveEvalQueryPlan(
       effectiveConfig,
-      query.queryType,
+      query,
+      options.recipeOverrides,
       query.expected.branch
     );
     effectivePlans.push(queryPlan);
@@ -414,10 +427,22 @@ async function finalizeEvaluationRun(
       filterByBranch: queryPlan.filterByBranch,
       taskType: queryPlan.taskType,
       graphDepth: queryPlan.graphDepth,
+      finalRerankTopN: queryPlan.finalRerankTopN,
+      bm25Weight: queryPlan.bm25Weight,
+      denseWeight: queryPlan.denseWeight,
+      identifierBoost: queryPlan.identifierBoost,
     });
     const elapsed = performance.now() - start;
 
     const materialized = searchResponse.primaryResults.map((item) => ({
+      filePath: item.filePath,
+      startLine: item.startLine,
+      endLine: item.endLine,
+      score: item.score,
+      chunkType: item.chunkType,
+      name: item.name,
+    }));
+    const expandedMaterialized = searchResponse.expandedContext.map((item) => ({
       filePath: item.filePath,
       startLine: item.startLine,
       endLine: item.endLine,
@@ -431,7 +456,7 @@ async function finalizeEvaluationRun(
         effectiveTaskType: queryPlan.taskType,
         effectiveFinalRerankTopN: queryPlan.finalRerankTopN,
         effectiveGraphDepth: queryPlan.graphDepth,
-      })
+      }, expandedMaterialized, searchResponse.expandedContext.map((entry) => entry.relation))
     );
   }
 
@@ -458,6 +483,7 @@ async function finalizeEvaluationRun(
       rrfK: effectiveConfig.search.rrfK,
       rerankTopN: effectiveConfig.search.rerankTopN,
       useQueryTypes: effectiveConfig.eval.useQueryTypes,
+      recipeOverrides: options.recipeOverrides,
       effectiveTaskType: effectiveSearchConfig.effectiveTaskType,
       effectiveFinalRerankTopN: effectiveSearchConfig.effectiveFinalRerankTopN,
       effectiveGraphDepth: effectiveSearchConfig.effectiveGraphDepth,
@@ -577,6 +603,26 @@ export async function runSweep(
     sweep.rrfK && sweep.rrfK.length > 0 ? [...sweep.rrfK] : [undefined];
   const rerankValues: Array<number | undefined> =
     sweep.rerankTopN && sweep.rerankTopN.length > 0 ? [...sweep.rerankTopN] : [undefined];
+  const recipeBm25Values: Array<number | undefined> =
+    sweep.recipeOverrides?.bm25Weight && sweep.recipeOverrides.bm25Weight.length > 0
+      ? [...sweep.recipeOverrides.bm25Weight]
+      : [options.recipeOverrides?.bm25Weight];
+  const recipeDenseValues: Array<number | undefined> =
+    sweep.recipeOverrides?.denseWeight && sweep.recipeOverrides.denseWeight.length > 0
+      ? [...sweep.recipeOverrides.denseWeight]
+      : [options.recipeOverrides?.denseWeight];
+  const recipeIdentifierBoostValues: Array<number | undefined> =
+    sweep.recipeOverrides?.identifierBoost && sweep.recipeOverrides.identifierBoost.length > 0
+      ? [...sweep.recipeOverrides.identifierBoost]
+      : [options.recipeOverrides?.identifierBoost];
+  const recipeGraphDepthValues: Array<number | undefined> =
+    sweep.recipeOverrides?.graphDepth && sweep.recipeOverrides.graphDepth.length > 0
+      ? [...sweep.recipeOverrides.graphDepth]
+      : [options.recipeOverrides?.graphDepth];
+  const recipeFinalRerankValues: Array<number | undefined> =
+    sweep.recipeOverrides?.finalRerankTopN && sweep.recipeOverrides.finalRerankTopN.length > 0
+      ? [...sweep.recipeOverrides.finalRerankTopN]
+      : [options.recipeOverrides?.finalRerankTopN];
 
   const runs: SweepRunSummary[] = [];
   let sweepIndexer: Indexer | null = null;
@@ -586,41 +632,61 @@ export async function runSweep(
       for (const hybridWeight of weightValues) {
         for (const rrfK of rrfValues) {
           for (const rerankTopN of rerankValues) {
-            const effectiveConfig = resolveSearchConfig(parsedConfig, {
-              ...(fusion !== undefined ? { fusionStrategy: fusion } : {}),
-              ...(hybridWeight !== undefined ? { hybridWeight } : {}),
-              ...(rrfK !== undefined ? { rrfK } : {}),
-              ...(rerankTopN !== undefined ? { rerankTopN } : {}),
-            });
+            for (const recipeBm25Weight of recipeBm25Values) {
+              for (const recipeDenseWeight of recipeDenseValues) {
+                for (const recipeIdentifierBoost of recipeIdentifierBoostValues) {
+                  for (const recipeGraphDepth of recipeGraphDepthValues) {
+                    for (const recipeFinalRerankTopN of recipeFinalRerankValues) {
+                      const effectiveConfig = resolveSearchConfig(parsedConfig, {
+                        ...(fusion !== undefined ? { fusionStrategy: fusion } : {}),
+                        ...(hybridWeight !== undefined ? { hybridWeight } : {}),
+                        ...(rrfK !== undefined ? { rrfK } : {}),
+                        ...(rerankTopN !== undefined ? { rerankTopN } : {}),
+                      });
+                      const effectiveRunOptions: EvalRunOptions = {
+                        ...options,
+                        recipeOverrides: {
+                          ...(recipeBm25Weight !== undefined ? { bm25Weight: recipeBm25Weight } : {}),
+                          ...(recipeDenseWeight !== undefined ? { denseWeight: recipeDenseWeight } : {}),
+                          ...(recipeIdentifierBoost !== undefined ? { identifierBoost: recipeIdentifierBoost } : {}),
+                          ...(recipeGraphDepth !== undefined ? { graphDepth: recipeGraphDepth } : {}),
+                          ...(recipeFinalRerankTopN !== undefined ? { finalRerankTopN: recipeFinalRerankTopN } : {}),
+                        },
+                      };
 
-            if (!sweepIndexer) {
-              if (options.reindex) {
-                clearIndexRoot(options.projectRoot, effectiveConfig.scope);
+                      if (!sweepIndexer) {
+                        if (options.reindex) {
+                          clearIndexRoot(options.projectRoot, effectiveConfig.scope);
+                        }
+                        sweepIndexer = new Indexer(options.projectRoot, effectiveConfig);
+                        const indexStats = await sweepIndexer.index();
+                        await assertSearchableEvalCorpus(sweepIndexer, indexStats);
+                      } else {
+                        // Search-parameter sweeps do not change indexed artifacts, so reuse
+                        // the same indexer instance and swap only the search config.
+                        applySearchConfigToIndexer(sweepIndexer, effectiveConfig);
+                      }
+
+                      const run = await finalizeEvaluationRun(
+                        effectiveRunOptions,
+                        sweepIndexer,
+                        effectiveConfig,
+                        datasetPath,
+                        againstPath,
+                        budgetPath
+                      );
+
+                      runs.push({
+                        searchConfig: run.summary.searchConfig,
+                        summary: run.summary,
+                        comparison: run.comparison,
+                        gate: run.gate,
+                      });
+                    }
+                  }
+                }
               }
-              sweepIndexer = new Indexer(options.projectRoot, effectiveConfig);
-              const indexStats = await sweepIndexer.index();
-              await assertSearchableEvalCorpus(sweepIndexer, indexStats);
-            } else {
-              // Search-parameter sweeps do not change indexed artifacts, so reuse
-              // the same indexer instance and swap only the search config.
-              applySearchConfigToIndexer(sweepIndexer, effectiveConfig);
             }
-
-            const run = await finalizeEvaluationRun(
-              options,
-              sweepIndexer,
-              effectiveConfig,
-              datasetPath,
-              againstPath,
-              budgetPath
-            );
-
-            runs.push({
-              searchConfig: run.summary.searchConfig,
-              summary: run.summary,
-              comparison: run.comparison,
-              gate: run.gate,
-            });
           }
         }
       }

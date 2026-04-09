@@ -49,6 +49,28 @@ describe("eval schema", () => {
     expect(dataset.queries[0].queryType).toBeUndefined();
   });
 
+  it("accepts an explicit taskType alias on golden queries", () => {
+    const dataset = parseGoldenDataset(
+      {
+        version: "1.0.0",
+        name: "small",
+        queries: [
+          {
+            id: "q1",
+            query: "find similar code",
+            taskType: "semantic",
+            expected: {
+              filePath: "src/indexer/index.ts",
+            },
+          },
+        ],
+      },
+      "dataset.json"
+    );
+
+    expect(dataset.queries[0].taskType).toBe("semantic");
+  });
+
   it("rejects dataset with missing expected path", () => {
     expect(() =>
       parseGoldenDataset(
@@ -104,6 +126,8 @@ describe("eval schema", () => {
         thresholds: {
           hitAt5MaxDrop: 0.05,
           mrrAt10MaxDrop: 0.02,
+          combinedRecallAt10: 0.05,
+          expansionHitRate: 0.1,
           p95LatencyMaxMultiplier: 1.5,
         },
       },
@@ -111,6 +135,8 @@ describe("eval schema", () => {
     );
 
     expect(budget.thresholds.hitAt5MaxDrop).toBe(0.05);
+    expect(budget.thresholds.combinedRecallAt10MaxDrop).toBe(0.05);
+    expect(budget.thresholds.expansionHitRateMaxDrop).toBe(0.1);
     expect(budget.failOnMissingBaseline).toBe(true);
   });
 

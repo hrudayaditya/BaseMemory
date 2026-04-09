@@ -621,6 +621,9 @@ describe("incremental index orchestrator", () => {
     for (const stage of ["chunk", "embed", "index", "graph"] as const) {
       expect(database.getPipelineState(branch, mainTrackedPath, stage)?.status).toBe("complete");
     }
+    const initialChunks = database.getChunksByFile(mainTrackedPath);
+    expect(initialChunks.some((chunk) => chunk.chunkKind !== undefined)).toBe(true);
+    expect(initialChunks.some((chunk) => chunk.symbolKind !== undefined)).toBe(true);
 
     const changedContent = "export function only(): number { return 2; }\n";
     fs.writeFileSync(filePath, changedContent, "utf-8");
@@ -1232,8 +1235,16 @@ describe("incremental index orchestrator", () => {
     const { branch, database } = await openDatabase(indexer);
     const callersBefore = database.getCallers("callee", branch);
     expect(callersBefore.length).toBeGreaterThan(0);
+    expect(callersBefore.every((edge) => edge.branch === branch)).toBe(true);
 
     database.addSymbolsToBranchBatch("feature", database.getBranchSymbolIds(branch));
+    database.upsertCallEdgesBatch(
+      callersBefore.map((edge) => ({
+        ...edge,
+        branch: "feature",
+      }))
+    );
+    expect(database.getCallers("callee", "feature")).toHaveLength(callersBefore.length);
 
     fs.writeFileSync(
       filePath,

@@ -159,10 +159,129 @@ describe("eval metrics", () => {
 
     expect(metrics.hitAt1).toBe(0.5);
     expect(metrics.hitAt3).toBe(1);
+    expect(metrics.combinedRecallAt10).toBe(1);
+    expect(metrics.expansionHitRate).toBe(0);
     expect(metrics.mrrAt10).toBeCloseTo(0.75, 5);
     expect(metrics.latencyMs.p50).toBeGreaterThan(0);
     expect(metrics.embedding.callCount).toBe(20);
     expect(metrics.embedding.estimatedCostUsd).toBeCloseTo(0.00002, 8);
+  });
+
+  it("counts combined recall hits when the relevant file appears only in expanded context", () => {
+    const q = query();
+    const per = buildPerQueryResult(
+      q,
+      [
+        {
+          filePath: "/repo/src/tools/index.ts",
+          startLine: 1,
+          endLine: 10,
+          score: 0.95,
+          chunkType: "function",
+          name: "codebase_search",
+        },
+      ],
+      12,
+      10,
+      undefined,
+      [
+        {
+          filePath: "/repo/src/indexer/index.ts",
+          startLine: 100,
+          endLine: 120,
+          score: 0.51,
+          chunkType: "function",
+          name: "rankHybridResults",
+        },
+      ],
+      ["caller"]
+    );
+
+    expect(per.hitAt10).toBe(false);
+    expect(per.expandedHit).toBe(true);
+    expect(per.expandedRecallAtK).toBe(1);
+    expect(per.expandedRelations).toEqual(["caller"]);
+  });
+
+  it("computes expansion hit rate across queries", () => {
+    const queries: GoldenQuery[] = [query({ id: "q1" }), query({ id: "q2" })];
+    const perQuery = [
+      buildPerQueryResult(
+        queries[0],
+        [
+          {
+            filePath: "/repo/src/tools/index.ts",
+            startLine: 1,
+            endLine: 2,
+            score: 1,
+            chunkType: "function",
+            name: "tool",
+          },
+        ],
+        10,
+        10,
+        undefined,
+        [
+          {
+            filePath: "/repo/src/indexer/index.ts",
+            startLine: 1,
+            endLine: 2,
+            score: 0.6,
+            chunkType: "function",
+            name: "rankHybridResults",
+          },
+        ],
+        ["callee"]
+      ),
+      buildPerQueryResult(
+        queries[1],
+        [
+          {
+            filePath: "/repo/src/indexer/index.ts",
+            startLine: 1,
+            endLine: 2,
+            score: 1,
+            chunkType: "function",
+            name: "rankHybridResults",
+          },
+        ],
+        12,
+        10,
+        undefined,
+        [],
+        []
+      ),
+    ];
+
+    const metrics = computeEvalMetrics(queries, perQuery, 0, 0, 0);
+    expect(metrics.expansionHitRate).toBe(0.5);
+  });
+
+  it("reports expansion hit rate as 1.0 when every query hits in expanded context", () => {
+    const queries: GoldenQuery[] = [query({ id: "q1" }), query({ id: "q2" })];
+    const perQuery = queries.map((currentQuery, index) =>
+      buildPerQueryResult(
+        currentQuery,
+        [],
+        5 + index,
+        10,
+        undefined,
+        [
+          {
+            filePath: "/repo/src/indexer/index.ts",
+            startLine: 1,
+            endLine: 2,
+            score: 0.7,
+            chunkType: "function",
+            name: "rankHybridResults",
+          },
+        ],
+        ["callee"]
+      )
+    );
+
+    const metrics = computeEvalMetrics(queries, perQuery, 0, 0, 0);
+    expect(metrics.expansionHitRate).toBe(1);
   });
 
   it("uses deterministic percentile behavior for tiny samples", () => {
