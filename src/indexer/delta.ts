@@ -20,7 +20,8 @@ export async function buildDeltaIndexes(
   indexPath: string,
   branch: string,
   baseBranch: string,
-  dimensions: number
+  dimensions: number,
+  modelId: string
 ): Promise<DeltaInfo> {
   const delta = database.getBranchDelta(branch, baseBranch);
   
@@ -37,7 +38,7 @@ export async function buildDeltaIndexes(
     const chunk = database.getChunk(chunkId);
     if (!chunk) continue;
 
-    const embedding = database.getEmbedding(chunk.contentHash);
+    const embedding = database.getEmbeddingForModel(chunk.contentHash, modelId);
     if (!embedding) continue;
 
     const vector = bufferToFloat32Array(embedding);
@@ -76,9 +77,8 @@ export function loadDeltaIndexes(
   const deltaPath = path.join(indexPath, `delta-${sanitizeBranchName(branch)}`);
   
   const vectorStorePath = path.join(deltaPath, "vectors");
-  const vectorIndexPath = path.join(deltaPath, "vectors.usearch");
   
-  if (!existsSync(vectorIndexPath)) {
+  if (!existsSync(vectorStorePath)) {
     return null;
   }
 

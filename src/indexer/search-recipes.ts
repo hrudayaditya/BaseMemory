@@ -1,6 +1,7 @@
 export const SEARCH_TASK_TYPES = [
   "general",
   "definition",
+  "bug",
   "test_debug",
   "semantic",
 ] as const;
@@ -15,6 +16,7 @@ export interface SearchRecipe {
   graphDepth?: number;
   bm25Weight?: number;
   denseWeight?: number;
+  voyageWeight?: number;
   identifierBoost?: number;
   forceDefinitionIntent: boolean;
   pathPreference: SearchPathPreference;
@@ -33,8 +35,9 @@ const RECIPE_BY_TASK_TYPE: Record<SearchTaskType, SearchRecipe> = {
   general: {
     taskType: "general",
     hybridWeight: 0.3,
-    bm25Weight: 0.3,
-    denseWeight: 0.7,
+    bm25Weight: 0.2,
+    denseWeight: 0.6,
+    voyageWeight: 0.2,
     identifierBoost: 1.0,
     forceDefinitionIntent: false,
     pathPreference: "auto",
@@ -47,10 +50,11 @@ const RECIPE_BY_TASK_TYPE: Record<SearchTaskType, SearchRecipe> = {
   },
   definition: {
     taskType: "definition",
-    hybridWeight: 0.7,
+    hybridWeight: 0.5,
     graphDepth: 1,
-    bm25Weight: 0.7,
-    denseWeight: 0.3,
+    bm25Weight: 0.5,
+    denseWeight: 0.2,
+    voyageWeight: 0.3,
     identifierBoost: 2.0,
     forceDefinitionIntent: true,
     pathPreference: "source",
@@ -61,12 +65,30 @@ const RECIPE_BY_TASK_TYPE: Record<SearchTaskType, SearchRecipe> = {
     implementationOnlyOnCodeHints: true,
     finalRerankTopN: DEFAULT_FINAL_RERANK_TOP_N,
   },
+  bug: {
+    taskType: "bug",
+    hybridWeight: 0.4,
+    graphDepth: 1,
+    bm25Weight: 0.4,
+    denseWeight: 0.2,
+    voyageWeight: 0.4,
+    identifierBoost: 1.8,
+    forceDefinitionIntent: false,
+    pathPreference: "source",
+    enableIdentifierPromotion: true,
+    enableDeterministicIdentifierLane: true,
+    enableIdentifierDefinitionLane: true,
+    enableSymbolDefinitionLane: true,
+    implementationOnlyOnCodeHints: true,
+    finalRerankTopN: DEFAULT_FINAL_RERANK_TOP_N,
+  },
   test_debug: {
     taskType: "test_debug",
-    hybridWeight: 0.5,
+    hybridWeight: 0.4,
     graphDepth: 1,
-    bm25Weight: 0.5,
-    denseWeight: 0.5,
+    bm25Weight: 0.4,
+    denseWeight: 0.2,
+    voyageWeight: 0.4,
     identifierBoost: 1.5,
     forceDefinitionIntent: false,
     pathPreference: "test",
@@ -79,9 +101,10 @@ const RECIPE_BY_TASK_TYPE: Record<SearchTaskType, SearchRecipe> = {
   },
   semantic: {
     taskType: "semantic",
-    hybridWeight: 0.2,
-    bm25Weight: 0.2,
-    denseWeight: 0.8,
+    hybridWeight: 0.1,
+    bm25Weight: 0.1,
+    denseWeight: 0.7,
+    voyageWeight: 0.2,
     identifierBoost: 1.0,
     forceDefinitionIntent: false,
     pathPreference: "balanced",

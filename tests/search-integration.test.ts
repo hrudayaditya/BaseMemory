@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { parseConfig } from "../src/config/schema.js";
 import { Indexer } from "../src/indexer/index.js";
+import type { SearchTaskType } from "../src/indexer/search-recipes.js";
 import { SearchReranker, type RerankerCandidate, type SearchRerankerBackend } from "../src/indexer/reranker.js";
 import { Database } from "../src/native/index.js";
 
@@ -16,7 +17,7 @@ class FixedScoreBackend implements SearchRerankerBackend {
   async rerank(
     _query: string,
     candidates: RerankerCandidate[],
-    _taskType: "general" | "definition" | "test_debug" | "semantic"
+    _taskType: SearchTaskType
   ): Promise<RerankerCandidate[]> {
     return [...candidates]
       .map((candidate) => ({
@@ -39,15 +40,17 @@ describe("search integration", () => {
   beforeEach(() => {
     fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy.mockImplementation(async (_url, init) => {
-      const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[] };
+      const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[]; model?: string };
       const texts = Array.isArray(body.input) ? body.input : [];
+      const url = String(_url);
+      const dimensions = url.includes("api.voyageai.com") || body.model === "voyage-code-2" ? 1536 : 8;
 
       const data = texts.map((text) => {
         let seed = 0;
         for (const ch of text) {
           seed = (seed * 31 + ch.charCodeAt(0)) % 1000;
         }
-        const embedding = Array.from({ length: 8 }, (_, idx) => ((seed + idx * 17) % 997) / 997);
+        const embedding = Array.from({ length: dimensions }, (_, idx) => ((seed + idx * 17) % 997) / 997);
         return { embedding };
       });
 
@@ -146,6 +149,8 @@ export async function handleEvalCommand(): Promise<void> {
         model: "mock-embedding-model",
         dimensions: 8,
       },
+      voyageApiKey: "voyage-test-key",
+      voyageModelId: "voyage-code-2",
       indexing: {
         watchFiles: false,
       },
@@ -177,6 +182,8 @@ export async function handleEvalCommand(): Promise<void> {
         model: "mock-embedding-model",
         dimensions: 8,
       },
+      voyageApiKey: "voyage-test-key",
+      voyageModelId: "voyage-code-2",
       indexing: {
         watchFiles: false,
       },
@@ -326,6 +333,8 @@ export async function handleEvalCommand(): Promise<void> {
         model: "mock-embedding-model",
         dimensions: 8,
       },
+      voyageApiKey: "voyage-test-key",
+      voyageModelId: "voyage-code-2",
       indexing: {
         watchFiles: false,
       },
@@ -358,20 +367,329 @@ export async function handleEvalCommand(): Promise<void> {
     const definitionPayload = startCalls.find((call) => (call[2] as { taskType?: string }).taskType === "definition")?.[2] as {
       bm25Weight: number;
       denseWeight: number;
+      voyageWeight: number;
       finalRerankTopN: number;
     };
     const generalPayload = startCalls.find((call) => (call[2] as { taskType?: string }).taskType === "general")?.[2] as {
       bm25Weight: number;
       denseWeight: number;
+      voyageWeight: number;
       finalRerankTopN: number;
     };
 
-    expect(definitionPayload.bm25Weight).toBe(0.7);
-    expect(definitionPayload.denseWeight).toBe(0.3);
+    expect(definitionPayload.bm25Weight).toBe(0.5);
+    expect(definitionPayload.denseWeight).toBe(0.2);
+    expect(definitionPayload.voyageWeight).toBe(0.3);
     expect(definitionPayload.finalRerankTopN).toBe(20);
-    expect(generalPayload.bm25Weight).toBe(0.3);
-    expect(generalPayload.denseWeight).toBe(0.7);
+    expect(generalPayload.bm25Weight).toBe(0.2);
+    expect(generalPayload.denseWeight).toBe(0.6);
+    expect(generalPayload.voyageWeight).toBe(0.2);
     expect(generalPayload.finalRerankTopN).toBe(10);
+  });
+
+  it("redistributes Voyage fusion weight to Arctic when the Voyage query lane is unavailable", async () => {
+    fetchSpy.mockImplementation(async (url, init) => {
+      if (String(url).includes("api.voyageai.com")) {
+        return new Response("temporarily unavailable", { status: 503 });
+      }
+
+      const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[] };
+      const texts = Array.isArray(body.input) ? body.input : [];
+      const data = texts.map((text) => {
+        let seed = 0;
+        for (const ch of text) {
+          seed = (seed * 31 + ch.charCodeAt(0)) % 1000;
+        }
+        return { embedding: Array.from({ length: 8 }, (_, idx) => ((seed + idx * 17) % 997) / 997) };
+      });
+
+      return new Response(JSON.stringify({
+        data,
+        usage: { total_tokens: Math.max(1, texts.length * 8) },
+      }), { status: 200 });
+    });
+
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      voyageApiKey: "voyage-test-key",
+      voyageModelId: "voyage-code-2",
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const loggerSpy = vi.spyOn((indexer as unknown as { logger: { search: (...args: unknown[]) => void } }).logger, "search");
+
+    await indexer.searchDetailed("where is rankHybridResults implementation", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+      taskType: "general",
+    });
+
+    const startPayload = loggerSpy.mock.calls.find(
+      (call) => call[1] === "Starting search" && (call[2] as { taskType?: string }).taskType === "general"
+    )?.[2] as {
+      bm25Weight: number;
+      denseWeight: number;
+      voyageWeight: number;
+      voyageLaneConfigured: boolean;
+      voyageLaneAvailable: boolean;
+    };
+
+    expect(startPayload.voyageLaneConfigured).toBe(true);
+    expect(startPayload.voyageLaneAvailable).toBe(false);
+    expect(startPayload.bm25Weight).toBe(0.2);
+    expect(startPayload.denseWeight).toBe(0.8);
+    expect(startPayload.voyageWeight).toBe(0);
+  });
+
+  it("uses the Voyage lane to lift code results for bug-report queries", async () => {
+    fs.mkdirSync(path.join(tempDir, "src", "runtime"), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, "docs"), { recursive: true });
+
+    fs.writeFileSync(
+      path.join(tempDir, "src", "runtime", "abort-controller.ts"),
+      `export function runRefinements(options: { abort?: boolean }, values: string[]) {
+  for (const value of values) {
+    if (!value.startsWith("ok")) {
+      if (options.abort) {
+        return { success: false, aborted: true };
+      }
+    }
+  }
+  return { success: true, aborted: false };
+}
+`,
+      "utf-8"
+    );
+
+    fs.writeFileSync(
+      path.join(tempDir, "docs", "abort-behavior.md"),
+      `Expected behavior: abort: true should stop after first failing refine.
+Actual behavior: continues validating.
+steps to reproduce:
+1. set abort: true
+2. continue validating
+3. observe continues validating
+`,
+      "utf-8"
+    );
+
+    fs.writeFileSync(
+      path.join(tempDir, "src", "runtime", "continue-validating.ts"),
+      `export function continueValidating() {
+  return "Expected behavior abort: true should stop after first failing refine but actual behavior continues validating";
+}
+`,
+      "utf-8"
+    );
+
+    fetchSpy.mockImplementation(async (url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[]; model?: string };
+      const texts = Array.isArray(body.input) ? body.input : [];
+      const requestUrl = String(url);
+      const isVoyage = requestUrl.includes("api.voyageai.com") || body.model === "voyage-code-2";
+      const dimensions = isVoyage ? 1536 : 8;
+
+      const data = texts.map((text) => {
+        const lower = String(text).toLowerCase();
+        const bugQuery = lower.includes("expected behavior") || lower.includes("actual behavior");
+        const abortImplementation = lower.includes("if (options.abort)") || lower.includes("aborted: true");
+        const misleadingImplementation = lower.includes("continuevalidating()");
+        const abortDocs = lower.includes("steps to reproduce");
+        let embedding: number[];
+
+        if (isVoyage) {
+          embedding = Array.from({ length: dimensions }, (_, idx) => {
+            if (idx === 0) return bugQuery || abortImplementation ? 1 : 0;
+            if (idx === 1) return misleadingImplementation || abortDocs ? 1 : 0;
+            return 0;
+          });
+        } else {
+          embedding = Array.from({ length: dimensions }, (_, idx) => {
+            if (idx === 0) return bugQuery || misleadingImplementation ? 1 : 0;
+            if (idx === 1) return abortImplementation ? 1 : 0;
+            return 0;
+          });
+        }
+
+        return { embedding };
+      });
+
+      return new Response(JSON.stringify({
+        data,
+        usage: { total_tokens: Math.max(1, texts.length * 8) },
+      }), { status: 200 });
+    });
+
+    const voyageDir = fs.mkdtempSync(path.join(os.tmpdir(), "search-voyage-"));
+    const arcticOnlyDir = fs.mkdtempSync(path.join(os.tmpdir(), "search-arctic-"));
+    fs.cpSync(tempDir, voyageDir, { recursive: true });
+    fs.cpSync(tempDir, arcticOnlyDir, { recursive: true });
+
+    try {
+      const configWithVoyage = parseConfig({
+        embeddingProvider: "custom",
+        customProvider: {
+          baseUrl: "http://localhost:11434/v1",
+          model: "mock-embedding-model",
+          dimensions: 8,
+        },
+        voyageApiKey: "voyage-test-key",
+        voyageModelId: "voyage-code-2",
+        indexing: {
+          watchFiles: false,
+        },
+        search: {
+          maxResults: 10,
+          minScore: 0,
+          fusionStrategy: "rrf",
+          rrfK: 60,
+          rerankTopN: 20,
+        },
+      });
+      const configWithoutVoyage = parseConfig({
+        embeddingProvider: "custom",
+        customProvider: {
+          baseUrl: "http://localhost:11434/v1",
+          model: "mock-embedding-model",
+          dimensions: 8,
+        },
+        indexing: {
+          watchFiles: false,
+        },
+        search: {
+          maxResults: 10,
+          minScore: 0,
+          fusionStrategy: "rrf",
+          rrfK: 60,
+          rerankTopN: 20,
+        },
+      });
+
+      const voyageIndexer = new Indexer(voyageDir, configWithVoyage);
+      await voyageIndexer.index();
+      const voyageResult = await voyageIndexer.searchDetailed(
+        "Expected behavior: abort: true should stop after first failing refine. Actual behavior: continues validating.",
+        5,
+        {
+          metadataOnly: true,
+          filterByBranch: false,
+          taskType: "semantic",
+          bm25Weight: 0.01,
+          denseWeight: 0.01,
+          voyageWeight: 0.98,
+          finalRerankTopN: 0,
+        }
+      );
+
+      const arcticOnlyIndexer = new Indexer(arcticOnlyDir, configWithoutVoyage);
+      await arcticOnlyIndexer.index();
+      const arcticOnlyResult = await arcticOnlyIndexer.searchDetailed(
+        "Expected behavior: abort: true should stop after first failing refine. Actual behavior: continues validating.",
+        5,
+        {
+          metadataOnly: true,
+          filterByBranch: false,
+          taskType: "semantic",
+          bm25Weight: 0.01,
+          denseWeight: 0.01,
+          voyageWeight: 0.98,
+          finalRerankTopN: 0,
+        }
+      );
+
+      const voyageTarget = voyageResult.primaryResults.find((result) =>
+        result.filePath.includes("/src/runtime/abort-controller.ts")
+      );
+      const arcticTarget = arcticOnlyResult.primaryResults.find((result) =>
+        result.filePath.includes("/src/runtime/abort-controller.ts")
+      );
+
+      expect(voyageResult.taskType).toBe("semantic");
+      expect(voyageResult.primaryResults[0]?.filePath).toContain("/src/runtime/abort-controller.ts");
+      expect(voyageTarget).toBeDefined();
+      expect(arcticTarget).toBeDefined();
+      expect((voyageTarget?.score ?? 0)).toBeGreaterThan(arcticTarget?.score ?? 0);
+    } finally {
+      fs.rmSync(voyageDir, { recursive: true, force: true });
+      fs.rmSync(arcticOnlyDir, { recursive: true, force: true });
+    }
+  });
+
+  it("degrades gracefully when the Voyage query lane is unavailable", async () => {
+    fetchSpy.mockImplementation(async (url, init) => {
+      if (String(url).includes("api.voyageai.com")) {
+        return new Response("temporarily unavailable", { status: 503 });
+      }
+
+      const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[] };
+      const texts = Array.isArray(body.input) ? body.input : [];
+      const data = texts.map((text) => {
+        let seed = 0;
+        for (const ch of text) {
+          seed = (seed * 31 + ch.charCodeAt(0)) % 1000;
+        }
+        return { embedding: Array.from({ length: 8 }, (_, idx) => ((seed + idx * 17) % 997) / 997) };
+      });
+
+      return new Response(JSON.stringify({
+        data,
+        usage: { total_tokens: Math.max(1, texts.length * 8) },
+      }), { status: 200 });
+    });
+
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      voyageApiKey: "voyage-test-key",
+      voyageModelId: "voyage-code-2",
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    await expect(indexer.searchDetailed("where is rankHybridResults implementation", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+      taskType: "definition",
+    })).resolves.toMatchObject({
+      primaryResults: expect.arrayContaining([
+        expect.objectContaining({
+          filePath: expect.stringContaining("/app/indexer/index.ts"),
+        }),
+      ]),
+      taskType: "definition",
+    });
   });
 
   it("forces definition lanes for doc-leaning queries when definitionIntent is true", async () => {

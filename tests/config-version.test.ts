@@ -70,6 +70,7 @@ describe("config-version", () => {
       embeddingProvider: "openai",
       endpointBaseUrl: "https://api.openai.com/v1",
       documentTaskType: "",
+      voyageModelId: null,
       chunkerVersion: "chunker-v1",
       graphExtractorVersion: "1.0.0",
     };
@@ -82,6 +83,7 @@ describe("config-version", () => {
       chunkerVersion: "chunker-v1",
       embeddingDimension: 1536,
       embeddingModelId: "text-embedding-3-small",
+      voyageModelId: null,
     } as ConfigVersion;
 
     expect(hashConfigVersion(base)).toBe(hashConfigVersion(base));
@@ -95,6 +97,7 @@ describe("config-version", () => {
       embeddingProvider: "openai",
       endpointBaseUrl: "https://api.openai.com/v1",
       documentTaskType: "",
+      voyageModelId: null,
       chunkerVersion: "chunker-v1",
       graphExtractorVersion: "1.0.0",
     };
@@ -126,6 +129,10 @@ describe("config-version", () => {
     expect(hashConfigVersion(base)).not.toBe(hashConfigVersion({
       ...base,
       graphExtractorVersion: "2.0.0",
+    }));
+    expect(hashConfigVersion(base)).not.toBe(hashConfigVersion({
+      ...base,
+      voyageModelId: "voyage-code-2",
     }));
   });
 
@@ -162,6 +169,21 @@ describe("config-version", () => {
     expect(hashEmbedConfig(taskAwareProvider)).not.toBe(hashEmbedConfig(defaultTaskProvider));
   });
 
+  it("hashEmbedConfig changes when voyage model identity changes", () => {
+    const providerInfo = createCustomProviderInfo({
+      baseUrl: "http://localhost:11434/v1",
+      model: "nomic-embed-text",
+      dimensions: 768,
+    });
+
+    expect(hashEmbedConfig(providerInfo, null)).not.toBe(
+      hashEmbedConfig(providerInfo, "voyage-code-2")
+    );
+    expect(hashEmbedConfig(providerInfo, "voyage-code-2")).not.toBe(
+      hashEmbedConfig(providerInfo, "voyage-code-3")
+    );
+  });
+
   it("hashConfigVersion changes when provider identity changes for the same model and dimension", async () => {
     const openAiProvider = createOpenAiProvider();
     const gitHubProvider = createGitHubCopilotProvider();
@@ -195,8 +217,21 @@ describe("config-version", () => {
       embeddingProvider: "custom",
       endpointBaseUrl: "http://localhost:11434/v1",
       documentTaskType: "",
+      voyageModelId: null,
       chunkerVersion: getChunkerVersion(),
       graphExtractorVersion: "1.0.0",
     });
+  });
+
+  it("includes voyage model id in the runtime config version when provided", async () => {
+    const providerInfo = createCustomProviderInfo({
+      baseUrl: "http://localhost:11434/v1",
+      model: "nomic-embed-text",
+      dimensions: 768,
+    });
+
+    const configVersion = await getCurrentConfigVersion(providerInfo, "voyage-code-2");
+
+    expect(configVersion.voyageModelId).toBe("voyage-code-2");
   });
 });

@@ -79,6 +79,8 @@ export interface CodebaseIndexConfig {
   embeddingModel?: EmbeddingModelName;
   /** Configuration for custom OpenAI-compatible embedding providers (required when embeddingProvider is 'custom') */
   customProvider?: CustomProviderConfig;
+  voyageApiKey?: string;
+  voyageModelId?: string;
   scope: IndexScope;
   indexing?: Partial<IndexingConfig>;
   search?: Partial<SearchConfig>;
@@ -192,6 +194,8 @@ function isValidLogLevel(value: unknown): value is LogLevel {
 export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
   const input = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   const embeddingProviderValue = getResolvedString(input.embeddingProvider, "$root.embeddingProvider");
+  const voyageApiKeyValue = getResolvedString(input.voyageApiKey, "$root.voyageApiKey");
+  const voyageModelIdValue = getResolvedString(input.voyageModelId, "$root.voyageModelId");
   const scopeValue = getResolvedString(input.scope, "$root.scope");
   const includeValue = getResolvedStringArray(input.include, "$root.include");
   const excludeValue = getResolvedStringArray(input.exclude, "$root.exclude");
@@ -308,6 +312,8 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
     embeddingProvider,
     embeddingModel,
     customProvider,
+    voyageApiKey: voyageApiKeyValue?.trim() || undefined,
+    voyageModelId: voyageModelIdValue?.trim() || "voyage-code-2",
     scope: isValidScope(scopeValue) ? scopeValue : "project",
     include: includeValue ?? DEFAULT_INCLUDE,
     exclude: excludeValue ?? DEFAULT_EXCLUDE,

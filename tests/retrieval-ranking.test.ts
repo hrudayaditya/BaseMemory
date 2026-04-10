@@ -5,6 +5,7 @@ import {
   extractFilePathHint,
   fuseResultsRrf,
   fuseResultsWeighted,
+  inferTaskType,
   matchesHardRetrievalFilters,
   rankSemanticOnlyResults,
   mergeTieredResults,
@@ -14,7 +15,30 @@ import {
 } from "../src/indexer/index.js";
 
 type Candidate = { id: string; score: number; metadata: ChunkMetadata };
-const EQUAL_FUSION_WEIGHTS = { denseWeight: 0.5, bm25Weight: 0.5 } as const;
+const EQUAL_FUSION_WEIGHTS = { denseWeight: 0.5, bm25Weight: 0.5, voyageWeight: 0 } as const;
+
+function fuseTwoLaneRrf(
+  semantic: Candidate[],
+  keyword: Candidate[],
+  rrfK: number,
+  limit: number
+): Candidate[] {
+  return fuseResultsRrf([
+    { results: semantic, weight: EQUAL_FUSION_WEIGHTS.denseWeight },
+    { results: keyword, weight: EQUAL_FUSION_WEIGHTS.bm25Weight },
+  ], rrfK, limit);
+}
+
+function fuseTwoLaneWeighted(
+  semantic: Candidate[],
+  keyword: Candidate[],
+  limit: number
+): Candidate[] {
+  return fuseResultsWeighted([
+    { results: semantic, weight: EQUAL_FUSION_WEIGHTS.denseWeight },
+    { results: keyword, weight: EQUAL_FUSION_WEIGHTS.bm25Weight },
+  ], limit);
+}
 
 function meta(overrides: Partial<ChunkMetadata>): ChunkMetadata {
   return {
@@ -41,7 +65,7 @@ describe("retrieval ranking", () => {
       { id: "a", score: 1, metadata: meta({ filePath: "/repo/src/auth.ts", name: "validateAuth", chunkType: "function" }) },
     ];
 
-    const fused = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 60, 10);
+    const fused = fuseTwoLaneRrf(semantic, keyword, 60, 10);
     expect(fused.map(r => r.id).slice(0, 3)).toEqual(["a", "c", "d"]);
     expect(fused[0]?.score ?? 0).toBeLessThanOrEqual(1);
     expect(fused[0]?.score ?? 0).toBeGreaterThan(0);
@@ -57,7 +81,7 @@ describe("retrieval ranking", () => {
       { id: "both", score: 1, metadata: meta({ filePath: "/repo/src/both.ts", name: "bothCandidate", chunkType: "function" }) },
     ];
 
-    const fused = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 60, 5);
+    const fused = fuseTwoLaneRrf(semantic, keyword, 60, 5);
     const top3 = fused.map(r => r.id).slice(0, 3);
     expect(top3[0]).toBe("both");
     expect(top3).toContain("semanticOnly");
@@ -76,7 +100,7 @@ describe("retrieval ranking", () => {
       { id: "keywordOnly", score: 100, metadata: meta({ filePath: "/repo/src/keyword.ts", name: "keywordBest", chunkType: "function" }) },
     ];
 
-    const fused = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 60, 10);
+    const fused = fuseTwoLaneRrf(semantic, keyword, 60, 10);
 
     expect(fused).toHaveLength(2);
     expect(fused.map((result) => result.id)).toEqual(["keywordOnly", "semanticOnly"]);
@@ -91,7 +115,7 @@ describe("retrieval ranking", () => {
       { id: "both", score: 3, metadata: meta({ filePath: "/repo/src/both.ts", name: "both", chunkType: "function" }) },
     ];
 
-    const fused = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 60, 10);
+    const fused = fuseTwoLaneRrf(semantic, keyword, 60, 10);
 
     expect(fused[0]?.id).toBe("both");
     expect(fused[1]?.id).toBe("semanticOnly");
@@ -107,7 +131,7 @@ describe("retrieval ranking", () => {
       { id: "c", score: 1, metadata: meta({ filePath: "/repo/src/c.ts", name: "c", chunkType: "function" }) },
     ];
 
-    const fused = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 60, 10);
+    const fused = fuseTwoLaneRrf(semantic, keyword, 60, 10);
 
     for (let i = 1; i < fused.length; i += 1) {
       expect(fused[i - 1]!.score).toBeGreaterThanOrEqual(fused[i]!.score);
@@ -124,14 +148,58 @@ describe("retrieval ranking", () => {
       { id: "b", score: 2, metadata: meta({ filePath: "/repo/src/b.ts", name: "b", chunkType: "function" }) },
     ];
 
-    const lowK = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 10, 10);
-    const highK = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 100, 10);
+    const lowK = fuseTwoLaneRrf(semantic, keyword, 10, 10);
+    const highK = fuseTwoLaneRrf(semantic, keyword, 100, 10);
 
     expect(lowK[0]?.id).toBe("a");
     expect(highK[0]?.id).toBe("a");
     expect(lowK[1]?.id).toBe("b");
     expect(highK[1]?.id).toBe("b");
     expect(lowK[1]?.score).not.toBe(highK[1]?.score);
+  });
+
+  it("fuses three weighted lanes and normalizes scores into [0, 1]", () => {
+    const semantic: Candidate[] = [
+      { id: "shared", score: 0.9, metadata: meta({ filePath: "/repo/src/shared.ts", name: "shared", chunkType: "function" }) },
+      { id: "semanticOnly", score: 0.85, metadata: meta({ filePath: "/repo/src/semantic.ts", name: "semanticOnly", chunkType: "function" }) },
+    ];
+    const voyage: Candidate[] = [
+      { id: "voyageTop", score: 0.95, metadata: meta({ filePath: "/repo/src/voyage.ts", name: "voyageTop", chunkType: "function" }) },
+      { id: "shared", score: 0.88, metadata: meta({ filePath: "/repo/src/shared.ts", name: "shared", chunkType: "function" }) },
+    ];
+    const keyword: Candidate[] = [
+      { id: "shared", score: 12, metadata: meta({ filePath: "/repo/src/shared.ts", name: "shared", chunkType: "function" }) },
+      { id: "keywordOnly", score: 9, metadata: meta({ filePath: "/repo/src/keyword.ts", name: "keywordOnly", chunkType: "function" }) },
+    ];
+
+    const fused = fuseResultsRrf([
+      { results: semantic, weight: 0.2 },
+      { results: voyage, weight: 0.4 },
+      { results: keyword, weight: 0.4 },
+    ], 60, 10);
+
+    expect(fused[0]?.id).toBe("shared");
+    expect(fused.map((result) => result.id)).toContain("voyageTop");
+    expect(fused.map((result) => result.id)).toContain("keywordOnly");
+    expect(fused.every((result) => result.score >= 0 && result.score <= 1)).toBe(true);
+  });
+
+  it("keeps two-lane RRF scores normalized when Voyage is absent", () => {
+    const semantic: Candidate[] = [
+      { id: "semanticOnly", score: 0.95, metadata: meta({ filePath: "/repo/src/semantic.ts", name: "semanticOnly", chunkType: "function" }) },
+    ];
+    const keyword: Candidate[] = [
+      { id: "keywordOnly", score: 8, metadata: meta({ filePath: "/repo/src/keyword.ts", name: "keywordOnly", chunkType: "function" }) },
+    ];
+
+    const fused = fuseResultsRrf([
+      { results: semantic, weight: 0.6 },
+      { results: [], weight: 0.2 },
+      { results: keyword, weight: 0.2 },
+    ], 60, 10);
+
+    expect(fused).toHaveLength(2);
+    expect(fused.every((result) => result.score >= 0 && result.score <= 1)).toBe(true);
   });
 
   it("applies hard retrieval filters consistently", () => {
@@ -202,7 +270,7 @@ describe("retrieval ranking", () => {
       { id: "x", score: 79, metadata: meta({ filePath: "/repo/src/x.ts", name: "x", chunkType: "function" }) },
     ];
 
-    const preRerank = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 60, 10);
+    const preRerank = fuseTwoLaneRrf(semantic, keyword, 60, 10);
     const ranked = rankHybridResults("query", semantic, keyword, {
       fusionStrategy: "rrf",
       rrfK: 60,
@@ -224,7 +292,7 @@ describe("retrieval ranking", () => {
       { id: "c", score: 3.0, metadata: meta({ filePath: "/repo/src/c.ts", name: "c", chunkType: "function" }) },
     ];
 
-    const weighted = fuseResultsWeighted(semantic, keyword, EQUAL_FUSION_WEIGHTS, 10);
+    const weighted = fuseTwoLaneWeighted(semantic, keyword, 10);
     expect(weighted.map(r => r.id).slice(0, 2)).toEqual(["b", "c"]);
   });
 
@@ -236,12 +304,12 @@ describe("retrieval ranking", () => {
       { id: "k1", score: 2.5, metadata: meta({ filePath: "/repo/src/k1.ts", name: "k1", chunkType: "function" }) },
     ];
 
-    const disjoint = fuseResultsRrf(semantic, keyword, EQUAL_FUSION_WEIGHTS, 60, 10);
+    const disjoint = fuseTwoLaneRrf(semantic, keyword, 60, 10);
     expect(disjoint).toHaveLength(2);
     expect(disjoint.map(r => r.id)).toContain("s1");
     expect(disjoint.map(r => r.id)).toContain("k1");
 
-    expect(fuseResultsRrf([], [], EQUAL_FUSION_WEIGHTS, 60, 10)).toEqual([]);
+    expect(fuseTwoLaneRrf([], [], 60, 10)).toEqual([]);
     expect(rankSemanticOnlyResults("q", [], { rerankTopN: 10, limit: 5 })).toEqual([]);
   });
 
@@ -418,5 +486,22 @@ describe("retrieval ranking", () => {
   it("strips file path suffix from embedding query text", () => {
     const query = "where is createSystem implementation in packages/react/src/styled-system/system.ts";
     expect(stripFilePathHint(query)).toBe("where is createSystem implementation");
+  });
+
+  it("infers bug task type from expected/actual bug report phrasing", () => {
+    expect(inferTaskType(
+      "Expected behavior: abort: true should stop. Actual behavior: it continues validating."
+    )).toBe("bug");
+  });
+
+  it("does not override an explicitly provided task type during inference", () => {
+    expect(inferTaskType(
+      "Expected behavior: abort: true should stop. Actual behavior: it continues validating.",
+      "definition"
+    )).toBe("definition");
+  });
+
+  it("avoids false-positive bug inference for ordinary definition lookup queries", () => {
+    expect(inferTaskType("where is rankHybridResults implementation")).toBe("general");
   });
 });

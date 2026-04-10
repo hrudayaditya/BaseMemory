@@ -12,8 +12,9 @@ describe("search recipes", () => {
 
     expect(general.finalRerankTopN).toBe(10);
     expect(general.graphDepth ?? 0).toBe(0);
-    expect(general.bm25Weight).toBe(0.3);
-    expect(general.denseWeight).toBe(0.7);
+    expect(general.bm25Weight).toBe(0.2);
+    expect(general.denseWeight).toBe(0.6);
+    expect(general.voyageWeight).toBe(0.2);
     expect(general.identifierBoost).toBe(1.0);
     expect(general.enableIdentifierPromotion).toBe(true);
     expect(general.enableSymbolDefinitionLane).toBe(true);
@@ -27,9 +28,22 @@ describe("search recipes", () => {
     expect(definition.pathPreference).toBe("source");
     expect(definition.graphDepth).toBe(1);
     expect(definition.finalRerankTopN).toBe(20);
-    expect(definition.bm25Weight).toBe(0.7);
-    expect(definition.denseWeight).toBe(0.3);
+    expect(definition.bm25Weight).toBe(0.5);
+    expect(definition.denseWeight).toBe(0.2);
+    expect(definition.voyageWeight).toBe(0.3);
     expect(definition.identifierBoost).toBe(2.0);
+  });
+
+  it("assigns the expected bug-search retrieval profile", () => {
+    const recipe = getSearchRecipe("bug");
+
+    expect(recipe.graphDepth).toBe(1);
+    expect(recipe.finalRerankTopN).toBe(20);
+    expect(recipe.bm25Weight).toBe(0.4);
+    expect(recipe.denseWeight).toBe(0.2);
+    expect(recipe.voyageWeight).toBe(0.4);
+    expect(recipe.identifierBoost).toBe(1.8);
+    expect(recipe.pathPreference).toBe("source");
   });
 
   it("assigns the expected test-debug retrieval profile", () => {
@@ -37,8 +51,9 @@ describe("search recipes", () => {
 
     expect(recipe.graphDepth).toBe(1);
     expect(recipe.finalRerankTopN).toBe(20);
-    expect(recipe.bm25Weight).toBe(0.5);
-    expect(recipe.denseWeight).toBe(0.5);
+    expect(recipe.bm25Weight).toBe(0.4);
+    expect(recipe.denseWeight).toBe(0.2);
+    expect(recipe.voyageWeight).toBe(0.4);
     expect(recipe.identifierBoost).toBe(1.5);
   });
 
@@ -47,8 +62,9 @@ describe("search recipes", () => {
 
     expect(recipe.finalRerankTopN).toBe(0);
     expect(recipe.graphDepth ?? 0).toBe(0);
-    expect(recipe.bm25Weight).toBe(0.2);
-    expect(recipe.denseWeight).toBe(0.8);
+    expect(recipe.bm25Weight).toBe(0.1);
+    expect(recipe.denseWeight).toBe(0.7);
+    expect(recipe.voyageWeight).toBe(0.2);
     expect(recipe.identifierBoost).toBe(1.0);
   });
 

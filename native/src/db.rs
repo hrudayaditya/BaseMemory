@@ -13,7 +13,7 @@ pub enum DbError {
 pub type DbResult<T> = Result<T, DbError>;
 
 /// Schema version for migrations
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 /// Maximum number of SQL bind parameters per query.
 /// SQLite defaults to 999 (SQLITE_MAX_VARIABLE_NUMBER). We use 900 to stay safely under.
@@ -352,6 +352,82 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> DbResult<()> {
         )?;
     }
 
+    if from_version < 8 {
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = OFF;
+
+            BEGIN;
+
+            ALTER TABLE embeddings RENAME TO embeddings_old;
+
+            CREATE TABLE embeddings (
+                content_hash TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                chunk_text TEXT NOT NULL,
+                model TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (content_hash, model)
+            );
+
+            INSERT INTO embeddings (content_hash, embedding, chunk_text, model, created_at)
+            SELECT content_hash, embedding, chunk_text, model, created_at
+            FROM embeddings_old;
+
+            DROP TABLE embeddings_old;
+
+            CREATE INDEX IF NOT EXISTS idx_embeddings_model_content_hash
+                ON embeddings(model, content_hash);
+
+            ALTER TABLE config_versions RENAME TO config_versions_old;
+
+            CREATE TABLE config_versions (
+                config_hash TEXT NOT NULL,
+                embedding_model_id TEXT NOT NULL,
+                embedding_dimension INTEGER NOT NULL,
+                voyage_model_id TEXT,
+                chunker_version TEXT NOT NULL,
+                graph_extractor_version TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (config_hash)
+            );
+
+            INSERT INTO config_versions (
+                config_hash,
+                embedding_model_id,
+                embedding_dimension,
+                voyage_model_id,
+                chunker_version,
+                graph_extractor_version,
+                active,
+                created_at
+            )
+            SELECT
+                config_hash,
+                embedding_model_id,
+                embedding_dimension,
+                NULL,
+                chunker_version,
+                graph_extractor_version,
+                active,
+                created_at
+            FROM config_versions_old;
+
+            DROP TABLE config_versions_old;
+
+            COMMIT;
+
+            PRAGMA foreign_keys = ON;
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -381,6 +457,22 @@ pub fn get_embedding(conn: &Connection, content_hash: &str) -> DbResult<Option<V
     Ok(result)
 }
 
+/// Get embedding for a content hash and model
+pub fn get_embedding_for_model(
+    conn: &Connection,
+    content_hash: &str,
+    model: &str,
+) -> DbResult<Option<Vec<u8>>> {
+    let result = conn
+        .query_row(
+            "SELECT embedding FROM embeddings WHERE content_hash = ? AND model = ?",
+            params![content_hash, model],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(result)
+}
+
 /// Insert or update an embedding
 pub fn upsert_embedding(
     conn: &Connection,
@@ -393,9 +485,9 @@ pub fn upsert_embedding(
         r#"
         INSERT INTO embeddings (content_hash, embedding, chunk_text, model, created_at)
         VALUES (?, ?, ?, ?, strftime('%s', 'now'))
-        ON CONFLICT(content_hash) DO UPDATE SET
+        ON CONFLICT(content_hash, model) DO UPDATE SET
             embedding = excluded.embedding,
-            model = excluded.model
+            chunk_text = excluded.chunk_text
         "#,
         params![content_hash, embedding, chunk_text, model],
     )?;
@@ -417,9 +509,9 @@ pub fn upsert_embeddings_batch(
             r#"
             INSERT INTO embeddings (content_hash, embedding, chunk_text, model, created_at)
             VALUES (?, ?, ?, ?, strftime('%s', 'now'))
-            ON CONFLICT(content_hash) DO UPDATE SET
+            ON CONFLICT(content_hash, model) DO UPDATE SET
                 embedding = excluded.embedding,
-                model = excluded.model
+                chunk_text = excluded.chunk_text
             "#,
         )?;
 
@@ -429,6 +521,41 @@ pub fn upsert_embeddings_batch(
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Get multiple embeddings by content hashes for a specific model
+pub fn get_embeddings_for_model_batch(
+    conn: &Connection,
+    content_hashes: &[String],
+    model: &str,
+) -> DbResult<Vec<(String, Vec<u8>)>> {
+    if content_hashes.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    for chunk in content_hashes.chunks(SQL_BIND_PARAM_BATCH_SIZE) {
+        let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT content_hash, embedding FROM embeddings WHERE model = ? AND content_hash IN ({})",
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 1);
+        params.push(&model);
+        params.extend(chunk.iter().map(|s| s as &dyn rusqlite::ToSql));
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    Ok(results)
 }
 
 /// Get multiple embeddings by content hashes
@@ -2177,6 +2304,7 @@ pub struct ConfigVersionRow {
     pub config_hash: String,
     pub embedding_model_id: String,
     pub embedding_dimension: i64,
+    pub voyage_model_id: Option<String>,
     pub chunker_version: String,
     pub graph_extractor_version: String,
     pub active: bool,
@@ -2190,6 +2318,7 @@ pub fn get_active_config_version(conn: &Connection) -> DbResult<Option<ConfigVer
             SELECT config_hash,
                    embedding_model_id,
                    embedding_dimension,
+                   voyage_model_id,
                    chunker_version,
                    graph_extractor_version,
                    active,
@@ -2205,10 +2334,11 @@ pub fn get_active_config_version(conn: &Connection) -> DbResult<Option<ConfigVer
                     config_hash: row.get(0)?,
                     embedding_model_id: row.get(1)?,
                     embedding_dimension: row.get(2)?,
-                    chunker_version: row.get(3)?,
-                    graph_extractor_version: row.get(4)?,
-                    active: row.get::<_, i64>(5)? != 0,
-                    created_at: row.get(6)?,
+                    voyage_model_id: row.get(3)?,
+                    chunker_version: row.get(4)?,
+                    graph_extractor_version: row.get(5)?,
+                    active: row.get::<_, i64>(6)? != 0,
+                    created_at: row.get(7)?,
                 })
             },
         )
@@ -2228,15 +2358,17 @@ pub fn activate_config_version(
             config_hash,
             embedding_model_id,
             embedding_dimension,
+            voyage_model_id,
             chunker_version,
             graph_extractor_version,
             active,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, 1, ?)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?)
         ON CONFLICT(config_hash) DO UPDATE SET
             embedding_model_id = excluded.embedding_model_id,
             embedding_dimension = excluded.embedding_dimension,
+            voyage_model_id = excluded.voyage_model_id,
             chunker_version = excluded.chunker_version,
             graph_extractor_version = excluded.graph_extractor_version,
             active = 1
@@ -2245,6 +2377,7 @@ pub fn activate_config_version(
             config_version.config_hash,
             config_version.embedding_model_id,
             config_version.embedding_dimension,
+            config_version.voyage_model_id,
             config_version.chunker_version,
             config_version.graph_extractor_version,
             config_version.created_at
@@ -2294,25 +2427,38 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "7");
+        assert_eq!(version, "8");
     }
 
     #[test]
     fn test_embedding_operations() {
         let (_temp_dir, conn) = setup_test_db();
 
-        // Insert embedding
         let hash = "abc123";
         let embedding = vec![1u8, 2, 3, 4];
+        let voyage_embedding = vec![5u8, 6, 7, 8];
         upsert_embedding(&conn, hash, &embedding, "test content", "test-model").unwrap();
+        upsert_embedding(&conn, hash, &voyage_embedding, "test content", "voyage-model").unwrap();
 
-        // Check exists
         assert!(embedding_exists(&conn, hash).unwrap());
         assert!(!embedding_exists(&conn, "nonexistent").unwrap());
 
-        // Get embedding
-        let retrieved = get_embedding(&conn, hash).unwrap().unwrap();
+        let retrieved = get_embedding_for_model(&conn, hash, "test-model").unwrap().unwrap();
         assert_eq!(retrieved, embedding);
+        let retrieved_voyage = get_embedding_for_model(&conn, hash, "voyage-model")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retrieved_voyage, voyage_embedding);
+
+        let batch_rows = get_embeddings_for_model_batch(
+            &conn,
+            &[hash.to_string()],
+            "voyage-model",
+        )
+        .unwrap();
+        assert_eq!(batch_rows.len(), 1);
+        assert_eq!(batch_rows[0].0, hash);
+        assert_eq!(batch_rows[0].1, voyage_embedding);
     }
 
     #[test]
@@ -2837,7 +2983,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "7");
+        assert_eq!(schema_version, "8");
 
         let on_delete: String = conn
             .query_row("PRAGMA foreign_key_list(call_edges)", [], |row| row.get(6))
@@ -2885,7 +3031,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v7_schema_exists_on_fresh_db() {
+    fn test_v8_schema_exists_on_fresh_db() {
         let (_temp_dir, conn) = setup_test_db();
 
         let schema_version: String = conn
@@ -2895,7 +3041,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "7");
+        assert_eq!(schema_version, "8");
 
         let pipeline_state_exists: String = conn
             .query_row(
@@ -2923,6 +3069,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(config_versions_exists, "config_versions");
+
+        let config_version_columns = table_columns(&conn, "config_versions");
+        assert!(config_version_columns
+            .iter()
+            .any(|name| name == "voyage_model_id"));
+
+        let embedding_indexes = index_names(&conn, "embeddings");
+        assert!(embedding_indexes
+            .iter()
+            .any(|name| name == "idx_embeddings_model_content_hash"));
 
         let chunk_columns = table_columns(&conn, "chunks");
         assert!(chunk_columns.iter().any(|name| name == "chunk_kind"));
@@ -3052,7 +3208,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "7");
+        assert_eq!(schema_version, "8");
 
         let pipeline_state_exists: String = conn
             .query_row(
@@ -3561,7 +3717,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "7");
+        assert_eq!(schema_version, "8");
 
         let call_edge_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM call_edges", [], |row| row.get(0))
@@ -3601,5 +3757,190 @@ mod tests {
         assert_eq!(fk_table, "symbols");
         assert_eq!(fk_from, "from_symbol_id");
         assert_eq!(fk_on_delete.to_uppercase(), "CASCADE");
+    }
+
+    #[test]
+    fn test_v8_migration_from_v7_adds_model_scoped_embeddings_and_voyage_model_id() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("migration-v7.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE embeddings (
+                    content_hash TEXT PRIMARY KEY,
+                    embedding BLOB NOT NULL,
+                    chunk_text TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE chunks (
+                    chunk_id TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    node_type TEXT,
+                    name TEXT,
+                    language TEXT NOT NULL,
+                    chunk_kind TEXT,
+                    symbol_kind TEXT
+                );
+                CREATE TABLE branch_chunks (
+                    branch TEXT NOT NULL,
+                    chunk_id TEXT NOT NULL,
+                    PRIMARY KEY (branch, chunk_id)
+                );
+                CREATE TABLE symbols (
+                    id TEXT PRIMARY KEY,
+                    file_path TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    start_col INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    end_col INTEGER NOT NULL,
+                    language TEXT NOT NULL
+                );
+                CREATE TABLE call_edges (
+                    id TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    from_symbol_id TEXT NOT NULL,
+                    caller_file_path TEXT,
+                    target_name TEXT NOT NULL,
+                    target_file_path TEXT,
+                    target_kind TEXT,
+                    to_symbol_id TEXT,
+                    call_type TEXT NOT NULL,
+                    line INTEGER NOT NULL,
+                    col INTEGER NOT NULL,
+                    is_resolved INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (id, branch),
+                    FOREIGN KEY (from_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+                );
+                CREATE INDEX idx_call_edges_from ON call_edges(from_symbol_id);
+                CREATE INDEX idx_call_edges_to ON call_edges(to_symbol_id);
+                CREATE INDEX idx_call_edges_target_name ON call_edges(target_name);
+                CREATE INDEX idx_call_edges_branch_from ON call_edges(branch, from_symbol_id);
+                CREATE INDEX idx_call_edges_branch_target_name ON call_edges(branch, target_name);
+                CREATE INDEX idx_call_edges_branch_to ON call_edges(branch, to_symbol_id);
+                CREATE TABLE branch_symbols (
+                    branch TEXT NOT NULL,
+                    symbol_id TEXT NOT NULL,
+                    PRIMARY KEY (branch, symbol_id)
+                );
+                CREATE TABLE merkle_snapshots (
+                    branch TEXT PRIMARY KEY,
+                    root_hash TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE merkle_nodes (
+                    branch TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    parent_path TEXT,
+                    node_kind TEXT NOT NULL,
+                    node_hash TEXT NOT NULL,
+                    size_bytes INTEGER,
+                    PRIMARY KEY (branch, path),
+                    FOREIGN KEY (branch) REFERENCES merkle_snapshots(branch) ON DELETE CASCADE
+                );
+                CREATE TABLE pipeline_state (
+                    branch TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    input_hash TEXT,
+                    error TEXT,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (branch, file_path, stage)
+                );
+                CREATE TABLE pipeline_runs (
+                    run_id TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    run_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    config_hash TEXT NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    completed_at INTEGER,
+                    PRIMARY KEY (run_id)
+                );
+                CREATE TABLE config_versions (
+                    config_hash TEXT NOT NULL,
+                    embedding_model_id TEXT NOT NULL,
+                    embedding_dimension INTEGER NOT NULL,
+                    chunker_version TEXT NOT NULL,
+                    graph_extractor_version TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (config_hash)
+                );
+                INSERT INTO embeddings (content_hash, embedding, chunk_text, model, created_at)
+                VALUES ('shared_hash', X'01020304', 'chunk', 'mock-embedding-model', 1);
+                INSERT INTO config_versions (
+                    config_hash,
+                    embedding_model_id,
+                    embedding_dimension,
+                    chunker_version,
+                    graph_extractor_version,
+                    active,
+                    created_at
+                ) VALUES ('cfg-v7', 'mock-embedding-model', 8, 'chunker-v1', '1.0.0', 1, 1);
+                INSERT INTO metadata (key, value) VALUES ('schema_version', '7');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let conn = init_db(&db_path).unwrap();
+
+        let schema_version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, "8");
+
+        let config_columns = table_columns(&conn, "config_versions");
+        assert!(config_columns.iter().any(|name| name == "voyage_model_id"));
+
+        let active_config = get_active_config_version(&conn).unwrap().unwrap();
+        assert_eq!(active_config.voyage_model_id, None);
+
+        let embedding = get_embedding_for_model(&conn, "shared_hash", "mock-embedding-model")
+            .unwrap()
+            .unwrap();
+        assert_eq!(embedding, vec![1u8, 2, 3, 4]);
+
+        upsert_embedding(
+            &conn,
+            "shared_hash",
+            &[5u8, 6, 7, 8],
+            "chunk",
+            "voyage-code-2",
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings WHERE content_hash = 'shared_hash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let embedding_indexes = index_names(&conn, "embeddings");
+        assert!(embedding_indexes
+            .iter()
+            .any(|name| name == "idx_embeddings_model_content_hash"));
     }
 }

@@ -10,7 +10,7 @@ const __dirname = path.dirname(__filename);
 
 const BASE_MEMORY_ROOT = path.resolve(__dirname, "..");
 const CONFIG_PATH = path.join(BASE_MEMORY_ROOT, ".opencode", "codebase-index.json");
-const TARGET_REPO = "/Users/aady/Desktop/OpenSourceContributions/zod";
+const TARGET_REPO = "/Users/aady/Documents/Get Decimal AI Projects/mirror-site-builder";
 const RESULT_LIMIT = 5;
 const SNIPPET_LENGTH = 240;
 
@@ -53,6 +53,7 @@ async function main(): Promise<void> {
 
   console.log("");
   console.log(`Task type: ${response.taskType}`);
+  console.log(`Voyage lane: configured=${response.retrieval.voyageLaneConfigured} used=${response.retrieval.voyageLaneUsed}`);
   console.log(`Final reranker applied: ${response.reranker.applied}`);
   console.log(`Final reranker backend: ${response.reranker.backend ?? "none"}`);
   console.log("");

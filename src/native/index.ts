@@ -803,6 +803,7 @@ export interface StoredConfigVersionData {
   configHash: string;
   embeddingModelId: string;
   embeddingDimension: number;
+  voyageModelId?: string | null;
   chunkerVersion: string;
   graphExtractorVersion: string;
   active: boolean;
@@ -822,6 +823,25 @@ export class Database {
 
   getEmbedding(contentHash: string): Buffer | null {
     return this.inner.getEmbedding(contentHash) ?? null;
+  }
+
+  getEmbeddingForModel(contentHash: string, model: string): Buffer | null {
+    return this.inner.getEmbeddingForModel(contentHash, model) ?? null;
+  }
+
+  getEmbeddingsForModelBatch(contentHashes: string[], model: string): Map<string, Buffer> {
+    const results = this.inner.getEmbeddingsForModelBatch(contentHashes, model);
+    const map = new Map<string, Buffer>();
+    for (const item of results as Array<{
+      contentHash?: string;
+      content_hash?: string;
+      embedding: Buffer;
+    }>) {
+      const contentHash = item.contentHash ?? item.content_hash;
+      if (!contentHash) continue;
+      map.set(contentHash, item.embedding);
+    }
+    return map;
   }
 
   upsertEmbedding(
@@ -1074,6 +1094,7 @@ export class Database {
       configHash: result.configHash ?? result.config_hash,
       embeddingModelId: result.embeddingModelId ?? result.embedding_model_id,
       embeddingDimension: result.embeddingDimension ?? result.embedding_dimension,
+      voyageModelId: result.voyageModelId ?? result.voyage_model_id ?? null,
       chunkerVersion: result.chunkerVersion ?? result.chunker_version,
       graphExtractorVersion: result.graphExtractorVersion ?? result.graph_extractor_version,
       active: result.active,
@@ -1082,7 +1103,7 @@ export class Database {
   }
 
   activateConfigVersion(configVersion: StoredConfigVersionData): void {
-    this.inner.activateConfigVersion({
+    const payload = {
       configHash: configVersion.configHash,
       embeddingModelId: configVersion.embeddingModelId,
       embeddingDimension: configVersion.embeddingDimension,
@@ -1090,7 +1111,11 @@ export class Database {
       graphExtractorVersion: configVersion.graphExtractorVersion,
       active: configVersion.active,
       createdAt: configVersion.createdAt,
-    });
+      ...(configVersion.voyageModelId != null
+        ? { voyageModelId: configVersion.voyageModelId }
+        : {}),
+    };
+    this.inner.activateConfigVersion(payload);
   }
 
   // ── Symbol methods ──────────────────────────────────────────────

@@ -43,11 +43,16 @@ describe("CustomEmbeddingProvider", () => {
     fetchSpy.mockRestore();
   });
 
-  function createProvider(overrides?: { apiKey?: string; baseUrl?: string }) {
+  function createProvider(overrides?: {
+    apiKey?: string;
+    baseUrl?: string;
+    model?: string;
+    dimensions?: number;
+  }) {
     const info = createCustomProviderInfo({
       baseUrl: overrides?.baseUrl ?? "http://localhost:11434/v1",
-      model: "nomic-embed-text",
-      dimensions: 768,
+      model: overrides?.model ?? "nomic-embed-text",
+      dimensions: overrides?.dimensions ?? 768,
       apiKey: overrides?.apiKey,
     });
     return createEmbeddingProvider(info);
@@ -198,6 +203,42 @@ describe("CustomEmbeddingProvider", () => {
 
     const [url] = fetchSpy.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("http://localhost:11434/v1/embeddings");
+  });
+
+  it("prepends the Arctic query prefix for snowflake-arctic-embed2 queries", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({
+      data: [{ embedding: new Array(1024).fill(0) }],
+      usage: { total_tokens: 5 },
+    }), { status: 200 }));
+
+    const provider = createProvider({
+      model: "snowflake-arctic-embed2",
+      dimensions: 1024,
+    });
+    await provider.embedQuery("find ranking logic");
+
+    const [, options] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(options.body as string);
+    expect(body.input).toEqual([
+      "Represent this sentence for searching relevant passages: find ranking logic",
+    ]);
+  });
+
+  it("does not prepend the Arctic query prefix for snowflake-arctic-embed2 documents", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({
+      data: [{ embedding: new Array(1024).fill(0) }],
+      usage: { total_tokens: 5 },
+    }), { status: 200 }));
+
+    const provider = createProvider({
+      model: "snowflake-arctic-embed2",
+      dimensions: 1024,
+    });
+    await provider.embedDocument("function rankHybridResults() {}");
+
+    const [, options] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(options.body as string);
+    expect(body.input).toEqual(["function rankHybridResults() {}"]);
   });
 
   it("should return correct model info", () => {

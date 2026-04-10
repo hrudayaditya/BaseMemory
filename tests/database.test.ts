@@ -37,6 +37,34 @@ describe("Database", () => {
       expect(floats[2]).toBeCloseTo(3.0);
     });
 
+    it("should store distinct embeddings per model for the same content hash", () => {
+      const arcticEmbedding = Buffer.from(new Float32Array([1.0, 2.0, 3.0]).buffer);
+      const voyageEmbedding = Buffer.from(new Float32Array([4.0, 5.0, 6.0]).buffer);
+
+      db.upsertEmbedding("hash123", arcticEmbedding, "test chunk text", "arctic-model");
+      db.upsertEmbedding("hash123", voyageEmbedding, "test chunk text", "voyage-model");
+
+      const retrievedArctic = db.getEmbeddingForModel("hash123", "arctic-model");
+      const retrievedVoyage = db.getEmbeddingForModel("hash123", "voyage-model");
+
+      expect(retrievedArctic).not.toBeNull();
+      expect(retrievedVoyage).not.toBeNull();
+
+      const arcticFloats = new Float32Array(
+        retrievedArctic!.buffer,
+        retrievedArctic!.byteOffset,
+        retrievedArctic!.byteLength / 4
+      );
+      const voyageFloats = new Float32Array(
+        retrievedVoyage!.buffer,
+        retrievedVoyage!.byteOffset,
+        retrievedVoyage!.byteLength / 4
+      );
+
+      expect(arcticFloats[0]).toBeCloseTo(1.0);
+      expect(voyageFloats[0]).toBeCloseTo(4.0);
+    });
+
     it("should return null for non-existent embedding", () => {
       expect(db.getEmbedding("nonexistent")).toBeNull();
     });
@@ -50,6 +78,17 @@ describe("Database", () => {
       expect(missing).toContain("missing1");
       expect(missing).toContain("missing2");
       expect(missing).not.toContain("exists");
+    });
+
+    it("should get missing embeddings for a specific model", () => {
+      const embedding = Buffer.from(new Float32Array([1.0]).buffer);
+      db.upsertEmbedding("shared", embedding, "text", "arctic-model");
+
+      const missingVoyage = db.getMissingEmbeddingsForModel(["shared", "missing"], "voyage-model");
+      const missingArctic = db.getMissingEmbeddingsForModel(["shared", "missing"], "arctic-model");
+
+      expect(missingVoyage).toEqual(["shared", "missing"]);
+      expect(missingArctic).toEqual(["missing"]);
     });
   });
 
@@ -368,6 +407,30 @@ describe("Database", () => {
       const floats = new Float32Array(retrieved!.buffer, retrieved!.byteOffset, retrieved!.byteLength / 4);
       expect(floats[0]).toBeCloseTo(3.0);
       expect(floats[1]).toBeCloseTo(4.0);
+    });
+
+    it("should retrieve embeddings in batch for a specific model", () => {
+      db.upsertEmbeddingsBatch([
+        {
+          contentHash: "shared-hash",
+          embedding: Buffer.from(new Float32Array([1.0, 2.0]).buffer),
+          chunkText: "text1",
+          model: "arctic-model",
+        },
+        {
+          contentHash: "shared-hash",
+          embedding: Buffer.from(new Float32Array([3.0, 4.0]).buffer),
+          chunkText: "text1",
+          model: "voyage-model",
+        },
+      ]);
+
+      const arcticEmbeddings = db.getEmbeddingsForModelBatch(["shared-hash"], "arctic-model");
+      const voyageEmbeddings = db.getEmbeddingsForModelBatch(["shared-hash"], "voyage-model");
+
+      expect(arcticEmbeddings.get("shared-hash")).toBeTruthy();
+      expect(voyageEmbeddings.get("shared-hash")).toBeTruthy();
+      expect(arcticEmbeddings.get("shared-hash")).not.toEqual(voyageEmbeddings.get("shared-hash"));
     });
 
     it("should handle empty embeddings batch", () => {

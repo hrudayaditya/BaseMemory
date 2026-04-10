@@ -738,6 +738,37 @@ describe("config schema", () => {
         expect(config.customProvider!.timeoutMs).toBe(1000);
       });
     });
+
+    describe("voyage provider config", () => {
+      it("defaults voyageModelId to voyage-code-2", () => {
+        const config = parseConfig({});
+        expect(config.voyageModelId).toBe("voyage-code-2");
+        expect(config.voyageApiKey).toBeUndefined();
+      });
+
+      it("parses explicit voyage config values", () => {
+        const config = parseConfig({
+          voyageApiKey: "voyage-test-key",
+          voyageModelId: "voyage-code-3",
+        });
+
+        expect(config.voyageApiKey).toBe("voyage-test-key");
+        expect(config.voyageModelId).toBe("voyage-code-3");
+      });
+
+      it("accepts env-substituted voyage credentials", () => {
+        vi.stubEnv("VOYAGE_API_KEY", "voyage-env-key");
+
+        const config = parseConfig(substituteEnvReferences({
+          voyageApiKey: "{env:VOYAGE_API_KEY}",
+        }));
+
+        expect(config.voyageApiKey).toBe("voyage-env-key");
+        expect(config.voyageModelId).toBe("voyage-code-2");
+
+        vi.unstubAllEnvs();
+      });
+    });
   });
 
   describe("getDefaultModelForProvider", () => {

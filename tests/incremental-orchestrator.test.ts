@@ -33,30 +33,57 @@ describe("incremental index orchestrator", () => {
   let tempDir: string;
   let fetchSpy: ReturnType<typeof vi.spyOn>;
 
+  function getMockEmbeddingDimensions(model: string | undefined): number {
+    switch (model) {
+      case "voyage-code-2":
+        return 1536;
+      case "voyage-code-3":
+        return 1024;
+      default:
+        return 8;
+    }
+  }
+
+  function createMockEmbeddingResponse(
+    init: RequestInit | undefined,
+    overrides: {
+      failIf?: (body: { input?: string[]; model?: string }) => Error | null;
+    } = {}
+  ): Response {
+    const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[]; model?: string };
+    const failure = overrides.failIf?.(body);
+    if (failure) {
+      throw failure;
+    }
+
+    const texts = Array.isArray(body.input) ? body.input : [];
+    const dimensions = getMockEmbeddingDimensions(body.model);
+    const data = texts.map((text) => {
+      let seed = 0;
+      for (const ch of text) {
+        seed = (seed * 31 + ch.charCodeAt(0)) % 1000;
+      }
+      const embedding = Array.from(
+        { length: dimensions },
+        (_, idx) => ((seed + idx * 17) % 997) / 997
+      );
+      return { embedding };
+    });
+
+    return new Response(
+      JSON.stringify({
+        data,
+        usage: { total_tokens: Math.max(1, texts.length * 8) },
+      }),
+      { status: 200 }
+    );
+  }
+
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "incremental-orchestrator-"));
     resetWatcherEventTimestamps();
     fetchSpy = vi.spyOn(globalThis, "fetch");
-    fetchSpy.mockImplementation(async (_url, init) => {
-      const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[] };
-      const texts = Array.isArray(body.input) ? body.input : [];
-      const data = texts.map((text) => {
-        let seed = 0;
-        for (const ch of text) {
-          seed = (seed * 31 + ch.charCodeAt(0)) % 1000;
-        }
-        const embedding = Array.from({ length: 8 }, (_, idx) => ((seed + idx * 17) % 997) / 997);
-        return { embedding };
-      });
-
-      return new Response(
-        JSON.stringify({
-          data,
-          usage: { total_tokens: Math.max(1, texts.length * 8) },
-        }),
-        { status: 200 }
-      );
-    });
+    fetchSpy.mockImplementation(async (_url, init) => createMockEmbeddingResponse(init));
   });
 
   afterEach(() => {
@@ -310,7 +337,10 @@ describe("incremental index orchestrator", () => {
 
   function getIndexerInternals(indexer: Indexer): {
     orchestrator: any;
-    store: { save: () => void };
+    stores: Map<string, { save: () => void }>;
+    primaryStoreModelId?: string | null;
+    config: { voyageModelId?: string | null; voyageApiKey?: string | null };
+    voyageProvider?: { getModelInfo: () => { model: string } } | null;
     configuredProviderInfo: any;
     buildMerkleIgnoreRules: () => {
       include: string[];
@@ -328,7 +358,10 @@ describe("incremental index orchestrator", () => {
   } {
     return indexer as unknown as {
       orchestrator: any;
-      store: { save: () => void };
+      stores: Map<string, { save: () => void }>;
+      primaryStoreModelId?: string | null;
+      config: { voyageModelId?: string | null; voyageApiKey?: string | null };
+      voyageProvider?: { getModelInfo: () => { model: string } } | null;
       configuredProviderInfo: any;
       buildMerkleIgnoreRules: () => {
         include: string[];
@@ -346,9 +379,22 @@ describe("incremental index orchestrator", () => {
     };
   }
 
+  function getPrimaryStore(indexer: Indexer): { save: () => void } {
+    const internals = getIndexerInternals(indexer);
+    const modelId = internals.primaryStoreModelId ?? internals.configuredProviderInfo.modelInfo.model;
+    const store = internals.stores.get(modelId);
+    if (!store) {
+      throw new Error(`Missing primary store for model ${modelId}`);
+    }
+    return store;
+  }
+
   async function getCurrentRuntimeConfig(indexer: Indexer): Promise<ConfigVersion> {
-    const { configuredProviderInfo } = getIndexerInternals(indexer);
-    return getCurrentConfigVersion(configuredProviderInfo);
+    const { configuredProviderInfo, voyageProvider } = getIndexerInternals(indexer);
+    return getCurrentConfigVersion(
+      configuredProviderInfo,
+      voyageProvider?.getModelInfo().model ?? null
+    );
   }
 
   function createEmptyStats(): {
@@ -1281,7 +1327,7 @@ describe("incremental index orchestrator", () => {
       getIndexerInternals(indexer).buildMerkleIgnoreRules()
     );
     const saveSpy = vi
-      .spyOn(getIndexerInternals(indexer).store, "save")
+      .spyOn(getPrimaryStore(indexer), "save")
       .mockImplementationOnce(() => {
         throw new Error("simulated finalization crash");
       });
@@ -1638,6 +1684,202 @@ describe("incremental index orchestrator", () => {
     });
   });
 
+  it("writes Arctic and Voyage embeddings on cold start when Voyage is available", async () => {
+    createRepo();
+    const indexer = new Indexer(
+      tempDir,
+      createConfig({
+        voyageApiKey: "voyage-test-key",
+      })
+    );
+
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const chunkIds = database.getBranchChunkIds(branch);
+    expect(chunkIds.length).toBeGreaterThan(0);
+
+    const internals = getIndexerInternals(indexer);
+    const arcticStore = internals.stores.get("mock-embedding-model");
+    const voyageStore = internals.stores.get("voyage-code-2");
+    expect(arcticStore?.count()).toBe(chunkIds.length);
+    expect(voyageStore?.count()).toBe(chunkIds.length);
+
+    for (const chunkId of chunkIds) {
+      const chunk = database.getChunk(chunkId);
+      expect(chunk).not.toBeNull();
+      expect(database.getEmbeddingForModel(chunk!.contentHash, "mock-embedding-model")).not.toBeNull();
+      expect(database.getEmbeddingForModel(chunk!.contentHash, "voyage-code-2")).not.toBeNull();
+    }
+  });
+
+  it("treats Voyage batch nulls as non-blocking and still completes Arctic indexing", async () => {
+    const { fileA, fileB } = createRepo();
+    const indexer = new Indexer(
+      tempDir,
+      createConfig({
+        voyageApiKey: "voyage-test-key",
+      })
+    );
+    await indexer.initialize();
+
+    const voyageProvider = getIndexerInternals(indexer).voyageProvider;
+    expect(voyageProvider).toBeTruthy();
+    vi.spyOn(voyageProvider!, "embedBatch").mockResolvedValue(null);
+
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedA = resolveTrackedPath(database, branch, fileA, tempDir);
+    const trackedB = resolveTrackedPath(database, branch, fileB, tempDir);
+    expect(database.getPipelineState(branch, trackedA, "embed")?.status).toBe("complete");
+    expect(database.getPipelineState(branch, trackedB, "embed")?.status).toBe("complete");
+
+    const chunkIds = database.getBranchChunkIds(branch);
+    const voyageStore = getIndexerInternals(indexer).stores.get("voyage-code-2");
+    expect(voyageStore?.count() ?? 0).toBe(0);
+    for (const chunkId of chunkIds) {
+      const chunk = database.getChunk(chunkId);
+      expect(chunk).not.toBeNull();
+      expect(database.getEmbeddingForModel(chunk!.contentHash, "mock-embedding-model")).not.toBeNull();
+      expect(database.getEmbeddingForModel(chunk!.contentHash, "voyage-code-2")).toBeNull();
+    }
+  });
+
+  it("reuses both model caches on unchanged cold start runs", async () => {
+    createRepo();
+    const indexer = new Indexer(
+      tempDir,
+      createConfig({
+        voyageApiKey: "voyage-test-key",
+      })
+    );
+
+    await indexer.index();
+    fetchSpy.mockClear();
+
+    await indexer.index();
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("calls Voyage only when Arctic is cached and Voyage is newly enabled", async () => {
+    createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    fetchSpy.mockClear();
+    const internals = getIndexerInternals(indexer);
+    internals.config.voyageApiKey = "voyage-test-key";
+    internals.orchestrator.startupComplete = false;
+    await indexer.index();
+
+    const models = fetchSpy.mock.calls.map(([, init]) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string };
+      return body.model;
+    });
+    expect(models.length).toBeGreaterThan(0);
+    expect(models.every((model) => model === "voyage-code-2")).toBe(true);
+  });
+
+  it("reruns Voyage-only embedding work when voyageModelId changes without touching CHUNK or GRAPH", async () => {
+    const { fileA, fileB } = createRepo();
+    const indexer = new Indexer(
+      tempDir,
+      createConfig({
+        voyageApiKey: "voyage-test-key",
+      })
+    );
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedPath = resolveTrackedPath(database, branch, fileA, tempDir);
+    const trackedPathB = resolveTrackedPath(database, branch, fileB, tempDir);
+    const beforeChunk = database.getPipelineState(branch, trackedPath, "chunk");
+    const beforeEmbed = database.getPipelineState(branch, trackedPath, "embed");
+    const beforeGraph = database.getPipelineState(branch, trackedPath, "graph");
+    const beforeChunkB = database.getPipelineState(branch, trackedPathB, "chunk");
+    const beforeEmbedB = database.getPipelineState(branch, trackedPathB, "embed");
+    const beforeGraphB = database.getPipelineState(branch, trackedPathB, "graph");
+
+    const internals = getIndexerInternals(indexer);
+    internals.config.voyageModelId = "voyage-code-3";
+    fetchSpy.mockClear();
+    internals.orchestrator.startupComplete = false;
+    await internals.orchestrator.ensureStartupState();
+
+    expect(database.getPipelineState(branch, trackedPath, "chunk")?.updatedAt).toBe(
+      beforeChunk?.updatedAt
+    );
+    expect(database.getPipelineState(branch, trackedPath, "embed")?.updatedAt).toBeGreaterThan(
+      beforeEmbed?.updatedAt ?? 0
+    );
+    expect(database.getPipelineState(branch, trackedPath, "graph")?.updatedAt).toBe(
+      beforeGraph?.updatedAt
+    );
+    expect(database.getPipelineState(branch, trackedPathB, "chunk")?.updatedAt).toBe(
+      beforeChunkB?.updatedAt
+    );
+    expect(database.getPipelineState(branch, trackedPathB, "embed")?.updatedAt).toBeGreaterThan(
+      beforeEmbedB?.updatedAt ?? 0
+    );
+    expect(database.getPipelineState(branch, trackedPathB, "graph")?.updatedAt).toBe(
+      beforeGraphB?.updatedAt
+    );
+
+    const models = fetchSpy.mock.calls.map(([, init]) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string };
+      return body.model;
+    });
+    expect(models.length).toBeGreaterThan(0);
+    expect(models.every((model) => model === "voyage-code-3")).toBe(true);
+    expect(database.getActiveConfigVersion()).toMatchObject({
+      active: true,
+      voyageModelId: "voyage-code-3",
+    });
+  });
+
+  it("issues Arctic and Voyage embedding requests in parallel for the same batch", async () => {
+    createSingleFileRepo();
+    const callTimeline: Array<{ model: string; event: "start" | "end"; at: number }> = [];
+    fetchSpy.mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string };
+      const model = body.model ?? "unknown";
+      callTimeline.push({ model, event: "start", at: Date.now() });
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      callTimeline.push({ model, event: "end", at: Date.now() });
+      return createMockEmbeddingResponse(init);
+    });
+
+    const indexer = new Indexer(
+      tempDir,
+      createConfig({
+        voyageApiKey: "voyage-test-key",
+      })
+    );
+    await indexer.index();
+
+    const arcticStart = callTimeline.find(
+      (entry) => entry.model === "mock-embedding-model" && entry.event === "start"
+    );
+    const arcticEnd = callTimeline.find(
+      (entry) => entry.model === "mock-embedding-model" && entry.event === "end"
+    );
+    const voyageStart = callTimeline.find(
+      (entry) => entry.model === "voyage-code-2" && entry.event === "start"
+    );
+    const voyageEnd = callTimeline.find(
+      (entry) => entry.model === "voyage-code-2" && entry.event === "end"
+    );
+
+    expect(arcticStart).toBeTruthy();
+    expect(arcticEnd).toBeTruthy();
+    expect(voyageStart).toBeTruthy();
+    expect(voyageEnd).toBeTruthy();
+    expect(voyageStart!.at).toBeLessThan(arcticEnd!.at);
+    expect(arcticStart!.at).toBeLessThan(voyageEnd!.at);
+  });
+
   it("reruns GRAPH across the branch after graph extractor drift without resetting CHUNK or EMBED", async () => {
     const { fileA, fileB } = createRepo();
     const indexer = new Indexer(tempDir, createConfig());
@@ -1727,6 +1969,7 @@ describe("incremental index orchestrator", () => {
 
     const fetchCountBefore = fetchSpy.mock.calls.length;
     internals.orchestrator.startupComplete = false;
+    await new Promise((resolve) => setTimeout(resolve, 2));
     await internals.orchestrator.ensureStartupState();
 
     expect(database.getPipelineState(branch, trackedPath, "chunk")?.updatedAt).toBeGreaterThan(
@@ -1946,14 +2189,14 @@ describe("incremental index orchestrator", () => {
     const orchestrator = getIndexerInternals(indexer).orchestrator;
     const resumeSpy = vi.spyOn(orchestrator as any, "resumeInterruptedRuns");
     const indexerInternal = indexer as unknown as {
-      store: unknown;
+      stores: Map<string, unknown>;
       invertedIndex: unknown;
       database: unknown;
       provider: unknown;
       configuredProviderInfo: unknown;
       ensureInitialized: () => Promise<void>;
     };
-    indexerInternal.store = null;
+    indexerInternal.stores = new Map();
     indexerInternal.invertedIndex = null;
     indexerInternal.database = null;
     indexerInternal.provider = null;
@@ -2112,7 +2355,6 @@ describe("incremental index orchestrator", () => {
       indexer as unknown as {
         removeChunkFromRetrievalIfUnreferenced: (
           database: Database,
-          store: unknown,
           invertedIndex: unknown,
           chunkId: string
         ) => boolean;
@@ -2131,7 +2373,7 @@ describe("incremental index orchestrator", () => {
     }
     expect(removeChunkSpy.mock.calls.length).toBeGreaterThan(0);
     const checkedChunkIds = new Set(
-      removeChunkSpy.mock.calls.map((call) => call[3] as string)
+      removeChunkSpy.mock.calls.map((call) => call[2] as string)
     );
     for (const chunkId of fileChunkIds) {
       expect(checkedChunkIds.has(chunkId)).toBe(true);

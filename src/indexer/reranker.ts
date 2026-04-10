@@ -299,6 +299,15 @@ function computeHeuristicJointScore(
   let taskBias = 0;
   if (taskType === "definition") {
     taskBias += exactNameBoost + nameOverlap * 0.16 + pathOverlap * 0.05;
+  } else if (taskType === "bug") {
+    const errorTraceBoost =
+      /\b(?:error|exception|stack|trace|abort)\b/.test(normalizedQuery) &&
+      /\b(?:error|exception|throw|abort|fail)\b/.test(normalizedContent)
+        ? 0.14
+        : 0;
+    taskBias += contentOverlap * 0.12 + pathOverlap * 0.06 + nameOverlap * 0.05;
+    taskBias += contentPhraseBoost + exactNameBoost * 0.5 + errorTraceBoost;
+    taskBias += isTest ? 0.04 : 0;
   } else if (taskType === "semantic") {
     taskBias += contentOverlap * 0.1 + contentPhraseBoost;
   } else if (taskType === "test_debug") {

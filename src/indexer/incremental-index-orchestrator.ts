@@ -27,6 +27,7 @@ import type { Logger } from "../utils/logger.js";
 import {
   CustomProviderNonRetryableError,
   type EmbeddingProviderInterface,
+  type VoyageEmbeddingProvider,
 } from "../embeddings/provider.js";
 import {
   type ConfigVersion,
@@ -81,6 +82,9 @@ export interface OrchestratorFileGraphData {
 export interface InitializationResources {
   store: VectorStore;
   provider: EmbeddingProviderInterface;
+  voyageProvider: VoyageEmbeddingProvider | null;
+  voyageStore: VectorStore | null;
+  voyageModelId: string | null;
   invertedIndex: InvertedIndex;
   configuredProviderInfo: ConfiguredProviderInfo;
   database: Database;
@@ -109,7 +113,6 @@ export interface IncrementalIndexOrchestratorHost {
   buildMerkleIgnoreRules(): MerkleIgnoreRules;
   normalizeDirtyPaths(paths: string[]): string[];
   buildBranchStoreChunkMaps(
-    store: VectorStore,
     branchChunkIds: Set<string>
   ): {
     existingChunks: Map<string, string>;
@@ -125,7 +128,6 @@ export interface IncrementalIndexOrchestratorHost {
   buildFileGraphData(parsedFiles: OrchestratorParsedFile[]): Map<string, OrchestratorFileGraphData>;
   removeChunkFromRetrievalIfUnreferenced(
     database: Database,
-    store: VectorStore,
     invertedIndex: InvertedIndex,
     chunkId: string
   ): boolean;
@@ -205,6 +207,9 @@ interface RunContext {
   configHash: string;
   store: VectorStore;
   provider: EmbeddingProviderInterface;
+  voyageProvider: VoyageEmbeddingProvider | null;
+  voyageStore: VectorStore | null;
+  voyageModelId: string | null;
   invertedIndex: InvertedIndex;
   database: Database;
   configuredProviderInfo: ConfiguredProviderInfo;
@@ -603,7 +608,10 @@ export class IncrementalIndexOrchestrator {
       const resources = await this.prepareRun();
       const branch = this.host.getCurrentBranch();
       this.consumePendingHotUpdatePaths(branch);
-      const configVersion = await getCurrentConfigVersion(resources.configuredProviderInfo);
+      const configVersion = await getCurrentConfigVersion(
+        resources.configuredProviderInfo,
+        resources.voyageModelId
+      );
       const configHash = hashConfigVersion(configVersion);
       const snapshot = await buildMerkleSnapshot(
         this.host.getProjectRoot(),
@@ -701,7 +709,10 @@ export class IncrementalIndexOrchestrator {
     return this.host.runWithCrashMarker(async () => {
       const resources = await this.prepareRun();
       const branch = this.host.getCurrentBranch();
-      const configVersion = await getCurrentConfigVersion(resources.configuredProviderInfo);
+      const configVersion = await getCurrentConfigVersion(
+        resources.configuredProviderInfo,
+        resources.voyageModelId
+      );
       const configHash = hashConfigVersion(configVersion);
       const preparedHotUpdate = await this.prepareHotUpdateInputs(
         resources.database,
@@ -808,7 +819,8 @@ export class IncrementalIndexOrchestrator {
     const graphChanged = oldConfig?.graphExtractorVersion !== newConfig.graphExtractorVersion;
     const embedChanged = oldConfig
       ? oldConfig.embeddingModelId !== newConfig.embeddingModelId ||
-        oldConfig.embeddingDimension !== newConfig.embeddingDimension
+        oldConfig.embeddingDimension !== newConfig.embeddingDimension ||
+        (oldConfig.voyageModelId ?? null) !== newConfig.voyageModelId
       : false;
 
     if (!chunkChanged && !embedChanged && !graphChanged) {
@@ -869,7 +881,10 @@ export class IncrementalIndexOrchestrator {
 
     const resources = await this.prepareRun();
     const branch = this.host.getCurrentBranch();
-    const currentConfig = await getCurrentConfigVersion(resources.configuredProviderInfo);
+    const currentConfig = await getCurrentConfigVersion(
+      resources.configuredProviderInfo,
+      resources.voyageModelId
+    );
     const currentConfigHash = hashConfigVersion(currentConfig);
     const activeConfig = this.checkpoints.getActiveConfigVersion();
 
@@ -973,7 +988,6 @@ export class IncrementalIndexOrchestrator {
   } & InitializationResources): RunContext {
     const branchChunkIds = new Set(args.database.getBranchChunkIds(args.branch));
     const { existingChunks, existingChunksByFile } = this.host.buildBranchStoreChunkMaps(
-      args.store,
       branchChunkIds
     );
     const branchSymbolIds = new Set(args.database.getBranchSymbolIds(args.branch));
@@ -990,6 +1004,9 @@ export class IncrementalIndexOrchestrator {
       configHash: args.configHash,
       store: args.store,
       provider: args.provider,
+      voyageProvider: args.voyageProvider,
+      voyageStore: args.voyageStore,
+      voyageModelId: args.voyageModelId,
       invertedIndex: args.invertedIndex,
       database: args.database,
       configuredProviderInfo: args.configuredProviderInfo,
@@ -1228,7 +1245,10 @@ export class IncrementalIndexOrchestrator {
       currentChunks = this.loadCurrentBranchChunkRecords(context, filePath);
     }
 
-    const embedConfigHash = hashEmbedConfig(context.configuredProviderInfo);
+    const embedConfigHash = hashEmbedConfig(
+      context.configuredProviderInfo,
+      context.voyageModelId
+    );
     const currentChunkHashes = currentChunks.map((chunk) => chunk.chunkHash);
     const embedStageInputHash = buildEmbedStageInputHash(currentChunkHashes, embedConfigHash);
     const indexStageInputHash = buildIndexStageInputHash(currentChunkHashes, embedConfigHash);
@@ -1325,20 +1345,52 @@ export class IncrementalIndexOrchestrator {
     );
 
     const { store, invertedIndex, database, provider } = context;
-    const model = context.configuredProviderInfo.modelInfo.model;
-    const missingEmbeddings = new Set(
+    const arcticModelId = context.configuredProviderInfo.modelInfo.model;
+    const voyageProvider = context.voyageProvider;
+    const voyageStore = context.voyageStore;
+    const voyageModelId = context.voyageModelId;
+    const voyageEnabled = Boolean(voyageProvider && voyageStore && voyageModelId);
+    const contentHashes = plan.dirtyChunks.map((chunk) => chunk.contentHash);
+    const missingArcticEmbeddings = new Set(
       database.getMissingEmbeddingsForModel(
-        plan.dirtyChunks.map((chunk) => chunk.contentHash),
-        model
+        contentHashes,
+        arcticModelId
       )
     );
+    const missingVoyageEmbeddings = voyageEnabled && voyageModelId
+      ? new Set(database.getMissingEmbeddingsForModel(contentHashes, voyageModelId))
+      : new Set<string>();
     const embeddingQueue = new PQueue(this.host.getProviderRateLimits(context.configuredProviderInfo.provider));
 
+    const cachedArcticHashes = Array.from(
+      new Set(
+        plan.dirtyChunks
+          .filter((chunk) => !missingArcticEmbeddings.has(chunk.contentHash))
+          .map((chunk) => chunk.contentHash)
+      )
+    );
+    const cachedArcticEmbeddings = database.getEmbeddingsForModelBatch(
+      cachedArcticHashes,
+      arcticModelId
+    );
+    const cachedVoyageHashes = voyageEnabled && voyageModelId
+      ? Array.from(
+          new Set(
+            plan.dirtyChunks
+              .filter((chunk) => !missingVoyageEmbeddings.has(chunk.contentHash))
+              .map((chunk) => chunk.contentHash)
+          )
+        )
+      : [];
+    const cachedVoyageEmbeddings = voyageEnabled && voyageModelId
+      ? database.getEmbeddingsForModelBatch(cachedVoyageHashes, voyageModelId)
+      : new Map<string, Buffer>();
+
     for (const chunk of plan.dirtyChunks) {
-      if (!missingEmbeddings.has(chunk.contentHash)) {
-        const embeddingBuffer = database.getEmbedding(chunk.contentHash);
+      if (!missingArcticEmbeddings.has(chunk.contentHash)) {
+        const embeddingBuffer = cachedArcticEmbeddings.get(chunk.contentHash);
         if (!embeddingBuffer) {
-          const error = `Missing cached embedding for ${chunk.contentHash}`;
+          const error = `Missing cached ${arcticModelId} embedding for ${chunk.contentHash}`;
           this.checkpoints.markStageFailed(
             context.branch,
             filePath,
@@ -1362,62 +1414,154 @@ export class IncrementalIndexOrchestrator {
         context.stats.existingChunks += 1;
         context.stats.indexedChunks += 1;
       }
+
+      if (voyageEnabled && voyageStore && !missingVoyageEmbeddings.has(chunk.contentHash)) {
+        const embeddingBuffer = cachedVoyageEmbeddings.get(chunk.contentHash);
+        if (!embeddingBuffer) {
+          this.host.logger.warn("Voyage cached embedding missing; scheduling re-embed for batch", {
+            chunkId: chunk.id,
+            filePath,
+            model: voyageModelId,
+          });
+          missingVoyageEmbeddings.add(chunk.contentHash);
+          continue;
+        }
+
+        const vector = Array.from(
+          new Float32Array(
+            embeddingBuffer.buffer,
+            embeddingBuffer.byteOffset,
+            embeddingBuffer.byteLength / 4
+          )
+        );
+        voyageStore.add(chunk.id, vector, chunk.metadata);
+        plan.materializedChunkIds.add(chunk.id);
+      }
     }
 
     const batches = createDynamicBatches(
       plan.dirtyChunks
-        .filter((chunk) => missingEmbeddings.has(chunk.contentHash))
-        .map((chunk) => chunk)
+        .filter(
+          (chunk) =>
+            missingArcticEmbeddings.has(chunk.contentHash) ||
+            (voyageEnabled && missingVoyageEmbeddings.has(chunk.contentHash))
+        )
     );
 
     for (const batch of batches) {
       await embeddingQueue.add(async () => {
-        try {
-          const embeddingResult = await pRetry(
-            async () => {
-              const texts = batch.map((chunk) => chunk.text);
-              return provider.embedBatch(texts);
-            },
-            {
-              retries: 3,
-              onFailedAttempt: (error) => {
-                if (error instanceof CustomProviderNonRetryableError) {
-                  throw error;
-                }
-              },
-            }
-          );
-          const vectors = embeddingResult.embeddings;
+        const arcticBatch = batch.filter((chunk) =>
+          missingArcticEmbeddings.has(chunk.contentHash)
+        );
+        const voyageBatch = voyageEnabled
+          ? batch.filter((chunk) => missingVoyageEmbeddings.has(chunk.contentHash))
+          : [];
 
-          const items = batch.map((chunk, index) => {
-            const vector = vectors[index];
-            if (!vector) {
-              throw new Error(`Missing embedding vector for ${chunk.id}`);
+        try {
+          const [arcticResult, voyageResult] = await Promise.all([
+            arcticBatch.length > 0
+              ? pRetry(
+                  async () => provider.embedBatch(arcticBatch.map((chunk) => chunk.text)),
+                  {
+                    retries: 3,
+                    onFailedAttempt: (error) => {
+                      if (error instanceof CustomProviderNonRetryableError) {
+                        throw error;
+                      }
+                    },
+                  }
+                )
+              : Promise.resolve(null),
+            voyageEnabled && voyageProvider && voyageBatch.length > 0
+              ? voyageProvider
+                  .embedBatch(voyageBatch.map((chunk) => chunk.text))
+                  .catch((error: unknown) => {
+                    this.host.logger.warn(
+                      "Voyage embedding batch threw unexpectedly; continuing with Arctic only",
+                      {
+                        batchSize: voyageBatch.length,
+                        error: getErrorMessage(error),
+                        filePath,
+                        model: voyageModelId,
+                      }
+                    );
+                    return null;
+                  })
+              : Promise.resolve(null),
+          ]);
+
+          if (arcticBatch.length > 0) {
+            const arcticVectors = arcticResult?.embeddings ?? [];
+            const arcticItems = arcticBatch.map((chunk, index) => {
+              const vector = arcticVectors[index];
+              if (!vector) {
+                throw new Error(`Missing embedding vector for ${chunk.id}`);
+              }
+              return {
+                id: chunk.id,
+                vector,
+                metadata: chunk.metadata,
+              };
+            });
+            store.addBatch(arcticItems);
+            database.upsertEmbeddingsBatch(
+              arcticBatch.map((chunk, index) => ({
+                contentHash: chunk.contentHash,
+                embedding: Buffer.from(new Float32Array(arcticVectors[index] ?? []).buffer),
+                chunkText: chunk.content,
+                model: arcticModelId,
+              }))
+            );
+            for (const chunk of arcticBatch) {
+              invertedIndex.removeChunk(chunk.id);
+              invertedIndex.addChunk(chunk.id, chunk.content);
+              plan.materializedChunkIds.add(chunk.id);
             }
-            return {
-              id: chunk.id,
-              vector,
-              metadata: chunk.metadata,
-            };
-          });
-          store.addBatch(items);
-          database.upsertEmbeddingsBatch(
-            batch.map((chunk, index) => ({
-              contentHash: chunk.contentHash,
-              embedding: Buffer.from(new Float32Array(vectors[index] ?? []).buffer),
-              chunkText: chunk.content,
-              model,
-            }))
-          );
-          for (const chunk of batch) {
-            invertedIndex.removeChunk(chunk.id);
-            invertedIndex.addChunk(chunk.id, chunk.content);
-            plan.materializedChunkIds.add(chunk.id);
+            context.stats.indexedChunks += arcticBatch.length;
+            context.stats.tokensUsed += arcticResult?.totalTokensUsed ?? 0;
+            this.host.logger.recordChunksEmbedded(arcticBatch.length);
+            this.host.logger.recordEmbeddingApiCall(arcticResult?.totalTokensUsed ?? 0);
           }
-          context.stats.indexedChunks += batch.length;
-          context.stats.tokensUsed += embeddingResult.totalTokensUsed;
-          this.host.logger.recordChunksEmbedded(batch.length);
-          this.host.logger.recordEmbeddingApiCall(embeddingResult.totalTokensUsed);
+
+          if (voyageEnabled && voyageStore && voyageModelId && voyageBatch.length > 0) {
+            if (!voyageResult) {
+              this.host.logger.warn(
+                "Voyage embeddings unavailable for batch; continuing with Arctic-only indexing",
+                {
+                  batchSize: voyageBatch.length,
+                  filePath,
+                  model: voyageModelId,
+                }
+              );
+            } else {
+              const voyageVectors = voyageResult.embeddings;
+              const voyageItems = voyageBatch.map((chunk, index) => {
+                const vector = voyageVectors[index];
+                if (!vector) {
+                  throw new Error(`Missing Voyage embedding vector for ${chunk.id}`);
+                }
+                return {
+                  id: chunk.id,
+                  vector,
+                  metadata: chunk.metadata,
+                };
+              });
+              voyageStore.addBatch(voyageItems);
+              database.upsertEmbeddingsBatch(
+                voyageBatch.map((chunk, index) => ({
+                  contentHash: chunk.contentHash,
+                  embedding: Buffer.from(new Float32Array(voyageVectors[index] ?? []).buffer),
+                  chunkText: chunk.content,
+                  model: voyageModelId,
+                }))
+              );
+              for (const chunk of voyageBatch) {
+                plan.materializedChunkIds.add(chunk.id);
+              }
+              context.stats.tokensUsed += voyageResult.totalTokensUsed;
+              this.host.logger.recordEmbeddingApiCall(voyageResult.totalTokensUsed);
+            }
+          }
         } catch (error) {
           this.host.logger.recordEmbeddingError();
           this.host.addFailedBatch(batch, getErrorMessage(error));
@@ -1728,7 +1872,6 @@ export class IncrementalIndexOrchestrator {
     for (const chunkId of plan.materializedChunkIds) {
       this.host.removeChunkFromRetrievalIfUnreferenced(
         context.database,
-        context.store,
         context.invertedIndex,
         chunkId
       );
@@ -1746,7 +1889,6 @@ export class IncrementalIndexOrchestrator {
       if (
         this.host.removeChunkFromRetrievalIfUnreferenced(
           context.database,
-          context.store,
           context.invertedIndex,
           chunkId
         )
@@ -1776,6 +1918,7 @@ export class IncrementalIndexOrchestrator {
     }
 
     context.store.save();
+    context.voyageStore?.save();
     context.invertedIndex.save();
 
     // This codebase persists branch membership and on-disk retrieval artifacts in

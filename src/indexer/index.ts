@@ -7,6 +7,9 @@ import { detectEmbeddingProvider, ConfiguredProviderInfo, tryDetectProvider, cre
 import {
   createEmbeddingProvider,
   EmbeddingProviderInterface,
+  createVoyageEmbeddingProvider,
+  type EmbeddingResult,
+  type VoyageEmbeddingProvider,
 } from "../embeddings/provider.js";
 import { collectFiles, SkippedFile } from "../utils/files.js";
 import { createCostEstimate, CostEstimate } from "../utils/cost.js";
@@ -175,6 +178,10 @@ export interface SearchResponse {
   primaryResults: SearchResult[];
   expandedContext: GraphContextResult[];
   taskType: SearchTaskType;
+  retrieval: {
+    voyageLaneConfigured: boolean;
+    voyageLaneUsed: boolean;
+  };
   reranker: {
     applied: boolean;
     backend: string | null;
@@ -185,6 +192,7 @@ export interface SearchOptions {
   hybridWeight?: number;
   bm25Weight?: number;
   denseWeight?: number;
+  voyageWeight?: number;
   identifierBoost?: number;
   finalRerankTopN?: number;
   fileType?: string;
@@ -292,12 +300,27 @@ interface HybridRankOptions {
   hybridWeight: number;
   bm25Weight?: number;
   denseWeight?: number;
+  voyageWeight?: number;
+  voyageResults?: RankedCandidate[];
   pathPreference?: SearchPathPreference;
 }
 
 interface FusionWeights {
   bm25Weight: number;
   denseWeight: number;
+  voyageWeight: number;
+}
+
+interface FusionLane {
+  results: RankedCandidate[];
+  weight: number;
+}
+
+interface QueryEmbeddingCacheEntry {
+  query: string;
+  modelId: string;
+  embedding: number[];
+  timestamp: number;
 }
 
 interface SemanticRankOptions {
@@ -620,20 +643,78 @@ function classifyQueryIntentRaw(query: string): "source" | "doc_test" {
   return classifyQueryIntent(queryTokens);
 }
 
+function containsBugStyleErrorMarkers(query: string): boolean {
+  const lines = query.split(/\r?\n/);
+  return lines.some((line) => {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) {
+      return false;
+    }
+
+    return (
+      /^at\s+\S+/.test(trimmed) ||
+      /^(error|err|e)\w*\d{2,}/i.test(trimmed) ||
+      /\b(?:TypeError|ReferenceError|SyntaxError|RangeError|AssertionError|RuntimeError|\w+Exception)\b/.test(trimmed)
+    );
+  });
+}
+
+function hasWeakShouldButBugSignal(query: string): boolean {
+  const lower = query.toLowerCase();
+  const shouldIndex = lower.indexOf("should");
+  if (shouldIndex < 0) {
+    return false;
+  }
+
+  const butIndex = lower.indexOf("but", shouldIndex + "should".length);
+  if (butIndex < 0) {
+    return false;
+  }
+
+  return (butIndex - shouldIndex) <= 80;
+}
+
+export function inferTaskType(query: string, explicit?: SearchTaskType): SearchTaskType {
+  if (explicit) {
+    return explicit;
+  }
+
+  if (/\bexpected behavior\b/i.test(query) || /\bactual behavior\b/i.test(query)) {
+    return "bug";
+  }
+
+  if (/\bsteps to reproduce\b/i.test(query) || /\breproduction\b/i.test(query)) {
+    return "bug";
+  }
+
+  if (containsBugStyleErrorMarkers(query)) {
+    return "bug";
+  }
+
+  if (hasWeakShouldButBugSignal(query)) {
+    return "bug";
+  }
+
+  return "general";
+}
+
 function normalizeFusionWeights(
   bm25Weight?: number,
   denseWeight?: number,
+  voyageWeight?: number,
   hybridWeight?: number | null
 ): FusionWeights {
-  if (bm25Weight !== undefined || denseWeight !== undefined) {
+  if (bm25Weight !== undefined || denseWeight !== undefined || voyageWeight !== undefined) {
     const normalizedBm25 = Math.max(0, bm25Weight ?? 0);
     const normalizedDense = Math.max(0, denseWeight ?? 0);
-    const total = normalizedBm25 + normalizedDense;
+    const normalizedVoyage = Math.max(0, voyageWeight ?? 0);
+    const total = normalizedBm25 + normalizedDense + normalizedVoyage;
 
     if (total > 0) {
       return {
         bm25Weight: normalizedBm25 / total,
         denseWeight: normalizedDense / total,
+        voyageWeight: normalizedVoyage / total,
       };
     }
   }
@@ -642,6 +723,7 @@ function normalizeFusionWeights(
   return {
     bm25Weight: keywordWeight,
     denseWeight: 1 - keywordWeight,
+    voyageWeight: 0,
   };
 }
 
@@ -855,31 +937,26 @@ function buildDeterministicIdentifierPass(
 }
 
 export function fuseResultsWeighted(
-  semanticResults: RankedCandidate[],
-  keywordResults: RankedCandidate[],
-  weights: FusionWeights,
+  lanes: FusionLane[],
   limit: number
 ): RankedCandidate[] {
-  const semanticWeight = weights.denseWeight;
-  const keywordWeight = weights.bm25Weight;
-  const fusedScores = new Map<string, { score: number; metadata: ChunkMetadata }>();
+  const fusedScores = new Map<string, { score: number; metadata: RetrievalChunkMetadata }>();
 
-  for (const r of semanticResults) {
-    fusedScores.set(r.id, {
-      score: r.score * semanticWeight,
-      metadata: r.metadata,
-    });
-  }
+  for (const lane of lanes) {
+    if (lane.weight <= 0 || lane.results.length === 0) {
+      continue;
+    }
 
-  for (const r of keywordResults) {
-    const existing = fusedScores.get(r.id);
-    if (existing) {
-      existing.score += r.score * keywordWeight;
-    } else {
-      fusedScores.set(r.id, {
-        score: r.score * keywordWeight,
-        metadata: r.metadata,
-      });
+    for (const result of lane.results) {
+      const existing = fusedScores.get(result.id);
+      if (existing) {
+        existing.score += result.score * lane.weight;
+      } else {
+        fusedScores.set(result.id, {
+          score: result.score * lane.weight,
+          metadata: result.metadata,
+        });
+      }
     }
   }
 
@@ -894,45 +971,50 @@ export function fuseResultsWeighted(
 }
 
 export function fuseResultsRrf(
-  semanticResults: RankedCandidate[],
-  keywordResults: RankedCandidate[],
-  weights: FusionWeights,
+  lanes: FusionLane[],
   rrfK: number,
   limit: number
 ): RankedCandidate[] {
-  const maxPossibleRaw = (weights.denseWeight + weights.bm25Weight) / (rrfK + 1);
-  const rankByIdSemantic = new Map<string, number>();
-  const rankByIdKeyword = new Map<string, number>();
-  const metadataById = new Map<string, ChunkMetadata>();
+  const activeLanes = lanes.filter((lane) => lane.weight > 0 && lane.results.length > 0);
+  if (activeLanes.length === 0) {
+    return [];
+  }
 
-  semanticResults.forEach((result, index) => {
-    rankByIdSemantic.set(result.id, index + 1);
-    metadataById.set(result.id, result.metadata);
+  const maxPossibleRaw = activeLanes.reduce((sum, lane) => sum + lane.weight, 0) / (rrfK + 1);
+  const metadataById = new Map<string, RetrievalChunkMetadata>();
+  const allIds = new Set<string>();
+  const rankMaps = activeLanes.map((lane) => {
+    const rankById = new Map<string, number>();
+    lane.results.forEach((result, index) => {
+      rankById.set(result.id, index + 1);
+      allIds.add(result.id);
+      if (!metadataById.has(result.id)) {
+        metadataById.set(result.id, result.metadata);
+      }
+    });
+    return {
+      weight: lane.weight,
+      rankById,
+    };
   });
-
-  keywordResults.forEach((result, index) => {
-    rankByIdKeyword.set(result.id, index + 1);
-    if (!metadataById.has(result.id)) {
-      metadataById.set(result.id, result.metadata);
-    }
-  });
-
-  const allIds = new Set<string>([...rankByIdSemantic.keys(), ...rankByIdKeyword.keys()]);
   const fused: RankedCandidate[] = [];
 
   for (const id of allIds) {
-    const semanticRank = rankByIdSemantic.get(id);
-    const keywordRank = rankByIdKeyword.get(id);
-
-    const semanticScore = semanticRank ? weights.denseWeight / (rrfK + semanticRank) : 0;
-    const keywordScore = keywordRank ? weights.bm25Weight / (rrfK + keywordRank) : 0;
-
     const metadata = metadataById.get(id);
     if (!metadata) continue;
 
+    let rawScore = 0;
+    for (const lane of rankMaps) {
+      const rank = lane.rankById.get(id);
+      if (!rank) {
+        continue;
+      }
+      rawScore += lane.weight / (rrfK + rank);
+    }
+
     fused.push({
       id,
-      score: maxPossibleRaw > 0 ? (semanticScore + keywordScore) / maxPossibleRaw : 0,
+      score: maxPossibleRaw > 0 ? rawScore / maxPossibleRaw : 0,
       metadata,
     });
   }
@@ -1100,11 +1182,17 @@ export function rankHybridResults(
   const fusionWeights = normalizeFusionWeights(
     options.bm25Weight,
     options.denseWeight,
+    options.voyageWeight,
     options.hybridWeight
   );
+  const lanes: FusionLane[] = [
+    { results: semanticResults, weight: fusionWeights.denseWeight },
+    { results: options.voyageResults ?? [], weight: fusionWeights.voyageWeight },
+    { results: keywordResults, weight: fusionWeights.bm25Weight },
+  ];
   const fused = options.fusionStrategy === "rrf"
-    ? fuseResultsRrf(semanticResults, keywordResults, fusionWeights, options.rrfK, overfetchLimit)
-    : fuseResultsWeighted(semanticResults, keywordResults, fusionWeights, overfetchLimit);
+    ? fuseResultsRrf(lanes, options.rrfK, overfetchLimit)
+    : fuseResultsWeighted(lanes, overfetchLimit);
 
   const rerankPoolLimit = Math.max(overfetchLimit, options.rerankTopN * 3, options.limit * 6);
   const rerankPool = fused.slice(0, rerankPoolLimit);
@@ -1161,8 +1249,7 @@ function matchesIdentifierPromotionTarget(
 function promoteIdentifierMatches(
   query: string,
   combined: RankedCandidate[],
-  semanticCandidates: RankedCandidate[],
-  keywordCandidates: RankedCandidate[],
+  retrievalCandidateSets: RankedCandidate[][],
   database?: Database,
   allowedChunkIds?: Set<string> | null,
   pathPreference: SearchPathPreference = classifyQueryIntentRaw(query) === "source" ? "source" : "auto",
@@ -1184,12 +1271,12 @@ function promoteIdentifierMatches(
 
   const combinedById = new Map(combined.map((candidate) => [candidate.id, candidate]));
   const candidateUnion = new Map<string, RankedCandidate>();
-  for (const candidate of semanticCandidates) {
-    candidateUnion.set(candidate.id, candidate);
-  }
-  for (const candidate of keywordCandidates) {
-    if (!candidateUnion.has(candidate.id)) {
-      candidateUnion.set(candidate.id, candidate);
+  for (const candidateSet of retrievalCandidateSets) {
+    for (const candidate of candidateSet) {
+      const existing = candidateUnion.get(candidate.id);
+      if (!existing || candidate.score > existing.score) {
+        candidateUnion.set(candidate.id, candidate);
+      }
     }
   }
 
@@ -1567,18 +1654,14 @@ export function mergeTieredResults(
   return out;
 }
 
-function unionCandidates(
-  semanticCandidates: RankedCandidate[],
-  keywordCandidates: RankedCandidate[]
-): RankedCandidate[] {
+function unionCandidates(...candidateSets: RankedCandidate[][]): RankedCandidate[] {
   const byId = new Map<string, RankedCandidate>();
-  for (const candidate of semanticCandidates) {
-    byId.set(candidate.id, candidate);
-  }
-  for (const candidate of keywordCandidates) {
-    const existing = byId.get(candidate.id);
-    if (!existing || candidate.score > existing.score) {
-      byId.set(candidate.id, candidate);
+  for (const candidateSet of candidateSets) {
+    for (const candidate of candidateSet) {
+      const existing = byId.get(candidate.id);
+      if (!existing || candidate.score > existing.score) {
+        byId.set(candidate.id, candidate);
+      }
     }
   }
   return Array.from(byId.values());
@@ -1601,18 +1684,20 @@ export class Indexer {
   private config!: ParsedCodebaseIndexConfig;
   private projectRoot!: string;
   private indexPath!: string;
-  private store: VectorStore | null = null;
+  private stores: Map<string, VectorStore> = new Map();
   private invertedIndex: InvertedIndex | null = null;
   private database: Database | null = null;
   private provider: EmbeddingProviderInterface | null = null;
+  private voyageProvider: VoyageEmbeddingProvider | null = null;
   private configuredProviderInfo: ConfiguredProviderInfo | null = null;
+  private primaryStoreModelId: string | null = null;
   private fileHashCache: Map<string, string> = new Map();
   private fileHashCacheDir: string = "";
   private failedBatchesPath: string = "";
   private currentBranch: string = "default";
   private baseBranch: string = "main";
   private logger!: Logger;
-  private queryEmbeddingCache: Map<string, { embedding: number[]; timestamp: number }> = new Map();
+  private queryEmbeddingCache: Map<string, QueryEmbeddingCacheEntry> = new Map();
   private readonly maxQueryCacheSize = 100;
   private readonly queryCacheTtlMs = 5 * 60 * 1000;
   private readonly querySimilarityThreshold = 0.85;
@@ -1664,12 +1749,12 @@ export class Indexer {
         this.buildCommittedMerkleSnapshot(baseSnapshot, committedRelativePaths),
       buildMerkleIgnoreRules: () => this.buildMerkleIgnoreRules(),
       normalizeDirtyPaths: (paths) => this.normalizeDirtyPaths(paths),
-      buildBranchStoreChunkMaps: (store, branchChunkIds) =>
-        this.buildBranchStoreChunkMaps(store, branchChunkIds),
+      buildBranchStoreChunkMaps: (branchChunkIds) =>
+        this.buildBranchStoreChunkMaps(branchChunkIds),
       parseFilesForIndexing: (files) => this.parseFilesForIndexing(files),
       buildFileGraphData: (parsedFiles) => this.buildFileGraphData(parsedFiles),
-      removeChunkFromRetrievalIfUnreferenced: (database, store, invertedIndex, chunkId) =>
-        this.removeChunkFromRetrievalIfUnreferenced(database, store, invertedIndex, chunkId),
+      removeChunkFromRetrievalIfUnreferenced: (database, invertedIndex, chunkId) =>
+        this.removeChunkFromRetrievalIfUnreferenced(database, invertedIndex, chunkId),
       clearCallEdgesForSymbolIfUnreferenced: (database, symbolId) =>
         this.clearCallEdgesForSymbolIfUnreferenced(database, symbolId),
       removeSymbolFromGraphIfUnreferenced: (database, symbolId) =>
@@ -1703,6 +1788,118 @@ export class Indexer {
       return path.join(homeDir, ".opencode", "global-index");
     }
     return path.join(this.projectRoot, ".opencode", "index");
+  }
+
+  private storePathForModel(modelId: string): string {
+    const safeModelId = modelId.replace(/[^a-zA-Z0-9_-]/g, "-");
+    return path.join(this.indexPath, `vectors-${safeModelId}`);
+  }
+
+  private getStore(modelId: string): VectorStore {
+    const store = this.stores.get(modelId);
+    if (!store) {
+      throw new Error(`Vector store for model "${modelId}" has not been initialized.`);
+    }
+    return store;
+  }
+
+  private hasStore(modelId: string): boolean {
+    return this.stores.has(modelId);
+  }
+
+  private getPrimaryModelId(): string {
+    if (!this.primaryStoreModelId) {
+      throw new Error("Primary embedding model is not available before initialization.");
+    }
+    return this.primaryStoreModelId;
+  }
+
+  private getPrimaryStore(): VectorStore {
+    return this.getStore(this.getPrimaryModelId());
+  }
+
+  private getStoreIndexFilePath(modelId: string): string {
+    return this.storePathForModel(modelId);
+  }
+
+  private getStoreMetadataFilePath(modelId: string): string {
+    return `${this.storePathForModel(modelId)}.meta.json`;
+  }
+
+  private migrateLegacyVectorStore(primaryModelId: string): void {
+    const legacyStoreBase = path.join(this.indexPath, "vectors");
+    const legacyIndexFile = legacyStoreBase;
+    const legacyMetadataFile = `${legacyStoreBase}.meta.json`;
+    const newIndexFile = this.getStoreIndexFilePath(primaryModelId);
+    const newMetadataFile = this.getStoreMetadataFilePath(primaryModelId);
+
+    if (!existsSync(legacyIndexFile) || existsSync(newIndexFile)) {
+      return;
+    }
+
+    renameSync(legacyIndexFile, newIndexFile);
+    if (existsSync(legacyMetadataFile) && !existsSync(newMetadataFile)) {
+      renameSync(legacyMetadataFile, newMetadataFile);
+    }
+  }
+
+  private initializeStore(modelId: string, dimensions: number): VectorStore {
+    const store = new VectorStore(this.storePathForModel(modelId), dimensions);
+    this.stores.set(modelId, store);
+    return store;
+  }
+
+  private loadAllStores(): void {
+    for (const store of this.stores.values()) {
+      store.load();
+    }
+  }
+
+  private saveAllStores(): void {
+    for (const store of this.stores.values()) {
+      store.save();
+    }
+  }
+
+  private clearAllStores(): void {
+    for (const store of this.stores.values()) {
+      store.clear();
+    }
+  }
+
+  private totalVectorCount(): number {
+    let count = 0;
+    for (const store of this.stores.values()) {
+      count += store.count();
+    }
+    return count;
+  }
+
+  private getActiveVoyageModelId(): string | null {
+    return this.voyageProvider?.getModelInfo().model ?? null;
+  }
+
+  private syncVoyageRuntime(): void {
+    const voyageApiKey = this.config.voyageApiKey?.trim();
+    if (!voyageApiKey) {
+      this.voyageProvider = null;
+      return;
+    }
+
+    const requestedModelId = this.config.voyageModelId?.trim() || "voyage-code-2";
+    const currentModelId = this.voyageProvider?.getModelInfo().model;
+    if (!this.voyageProvider || currentModelId !== requestedModelId) {
+      this.voyageProvider = createVoyageEmbeddingProvider({
+        voyageApiKey,
+        voyageModelId: requestedModelId,
+      });
+    }
+
+    const voyageModelInfo = this.voyageProvider.getModelInfo();
+    if (!this.hasStore(voyageModelInfo.model)) {
+      this.initializeStore(voyageModelInfo.model, voyageModelInfo.dimensions);
+      this.getStore(voyageModelInfo.model).load();
+    }
   }
 
   private getFileHashCachePath(branch: string = this.currentBranch): string {
@@ -1960,6 +2157,9 @@ export class Indexer {
     });
 
     this.provider = createEmbeddingProvider(this.configuredProviderInfo);
+    this.voyageProvider = null;
+    this.primaryStoreModelId = null;
+    this.stores.clear();
 
     await fsPromises.mkdir(this.indexPath, { recursive: true });
 
@@ -1968,14 +2168,25 @@ export class Indexer {
     // would cause infinite recursion: recovery → healthCheck → ensureInitialized
     // → initialize (store not yet set) → recovery → ...
 
-    const dimensions = this.configuredProviderInfo.modelInfo.dimensions;
-    const storePath = path.join(this.indexPath, "vectors");
-    this.store = new VectorStore(storePath, dimensions);
+    const primaryModelId = this.configuredProviderInfo.modelInfo.model;
+    this.primaryStoreModelId = primaryModelId;
+    this.migrateLegacyVectorStore(primaryModelId);
+    const primaryStore = this.initializeStore(
+      primaryModelId,
+      this.configuredProviderInfo.modelInfo.dimensions
+    );
 
-    const indexFilePath = path.join(this.indexPath, "vectors.usearch");
-    if (existsSync(indexFilePath)) {
-      this.store.load();
+    try {
+      this.syncVoyageRuntime();
+    } catch (error) {
+      this.voyageProvider = null;
+      this.logger.warn("Failed to initialize Voyage embedding provider", {
+        model: this.config.voyageModelId,
+        error: getErrorMessage(error),
+      });
     }
+
+    this.loadAllStores();
 
     const invertedIndexPath = path.join(this.indexPath, "inverted-index.json");
     this.invertedIndex = new InvertedIndex(invertedIndexPath);
@@ -2023,7 +2234,7 @@ export class Indexer {
       await this.recoverFromInterruptedIndexing(existingLock);
     }
 
-    if (dbIsNew && this.store.count() > 0) {
+    if (dbIsNew && primaryStore.count() > 0) {
       this.migrateFromLegacyIndex();
     }
 
@@ -2067,9 +2278,9 @@ export class Indexer {
   }
 
   private migrateFromLegacyIndex(): void {
-    if (!this.store || !this.database) return;
+    if (!this.database || !this.primaryStoreModelId || !this.hasStore(this.primaryStoreModelId)) return;
 
-    const allMetadata = this.store.getAllMetadata();
+    const allMetadata = this.getPrimaryStore().getAllMetadata();
     const chunkIds: string[] = [];
     const chunkDataBatch: ChunkData[] = [];
 
@@ -2194,16 +2405,32 @@ export class Indexer {
   private async ensureInitialized(): Promise<{
     store: VectorStore;
     provider: EmbeddingProviderInterface;
+    voyageProvider: VoyageEmbeddingProvider | null;
+    voyageStore: VectorStore | null;
+    voyageModelId: string | null;
     invertedIndex: InvertedIndex;
     configuredProviderInfo: ConfiguredProviderInfo;
     database: Database;
   }> {
-    if (!this.store || !this.provider || !this.invertedIndex || !this.configuredProviderInfo || !this.database) {
+    if (
+      !this.provider ||
+      !this.invertedIndex ||
+      !this.configuredProviderInfo ||
+      !this.database ||
+      !this.primaryStoreModelId ||
+      !this.hasStore(this.primaryStoreModelId)
+    ) {
       await this.initialize();
     }
+
+    this.syncVoyageRuntime();
+    const voyageModelId = this.getActiveVoyageModelId();
     return {
-      store: this.store!,
+      store: this.getPrimaryStore(),
       provider: this.provider!,
+      voyageProvider: this.voyageProvider,
+      voyageStore: voyageModelId ? this.getStore(voyageModelId) : null,
+      voyageModelId,
       invertedIndex: this.invertedIndex!,
       configuredProviderInfo: this.configuredProviderInfo!,
       database: this.database!,
@@ -2225,7 +2452,6 @@ export class Indexer {
   // helpers below remain on Indexer because the orchestrator calls back into
   // them for parsing, graph extraction, and branch-aware retrieval cleanup.
   private buildBranchStoreChunkMaps(
-    store: VectorStore,
     branchChunkIds: Set<string>
   ): {
     existingChunks: Map<string, string>;
@@ -2234,13 +2460,15 @@ export class Indexer {
     const existingChunks = new Map<string, string>();
     const existingChunksByFile = new Map<string, Set<string>>();
 
-    for (const { key, metadata } of store.getAllMetadata()) {
-      if (!branchChunkIds.has(key)) {
-        continue;
-      }
+    for (const store of this.stores.values()) {
+      for (const { key, metadata } of store.getAllMetadata()) {
+        if (!branchChunkIds.has(key) || existingChunks.has(key)) {
+          continue;
+        }
 
-      existingChunks.set(key, metadata.hash);
-      this.getOrCreateSet(existingChunksByFile, metadata.filePath).add(key);
+        existingChunks.set(key, metadata.hash);
+        this.getOrCreateSet(existingChunksByFile, metadata.filePath).add(key);
+      }
     }
 
     return {
@@ -2420,7 +2648,6 @@ export class Indexer {
 
   private removeChunkFromRetrievalIfUnreferenced(
     database: Database,
-    store: VectorStore,
     invertedIndex: InvertedIndex,
     chunkId: string
   ): boolean {
@@ -2428,7 +2655,9 @@ export class Indexer {
       return false;
     }
 
-    store.remove(chunkId);
+    for (const store of this.stores.values()) {
+      store.remove(chunkId);
+    }
     invertedIndex.removeChunk(chunkId);
     return true;
   }
@@ -2632,30 +2861,52 @@ export class Indexer {
     return this.runSerializedIndexOperation(() => this.orchestrator.coldStart(onProgress));
   }
 
-  private async getQueryEmbedding(query: string, provider: EmbeddingProviderInterface): Promise<number[]> {
+  private getQueryEmbeddingCacheKey(modelId: string, query: string): string {
+    return `${modelId}\u0000${query}`;
+  }
+
+  private async getQueryEmbedding(
+    query: string,
+    provider: Pick<EmbeddingProviderInterface, "getModelInfo"> & {
+      embedQuery(query: string): Promise<EmbeddingResult | null>;
+    }
+  ): Promise<number[] | null> {
     const now = Date.now();
-    const cached = this.queryEmbeddingCache.get(query);
+    const modelId = provider.getModelInfo().model;
+    const cacheKey = this.getQueryEmbeddingCacheKey(modelId, query);
+    const cached = this.queryEmbeddingCache.get(cacheKey);
 
     if (cached && (now - cached.timestamp) < this.queryCacheTtlMs) {
-      this.logger.cache("debug", "Query embedding cache hit (exact)", { query: query.slice(0, 50) });
+      this.logger.cache("debug", "Query embedding cache hit (exact)", {
+        query: query.slice(0, 50),
+        modelId,
+      });
       this.logger.recordQueryCacheHit();
       return cached.embedding;
     }
 
-    const similarMatch = this.findSimilarCachedQuery(query, now);
+    const similarMatch = this.findSimilarCachedQuery(query, now, modelId);
     if (similarMatch) {
       this.logger.cache("debug", "Query embedding cache hit (similar)", {
         query: query.slice(0, 50),
         similarTo: similarMatch.key.slice(0, 50),
         similarity: similarMatch.similarity.toFixed(3),
+        modelId,
       });
       this.logger.recordQueryCacheSimilarHit();
       return similarMatch.embedding;
     }
 
-    this.logger.cache("debug", "Query embedding cache miss", { query: query.slice(0, 50) });
+    this.logger.cache("debug", "Query embedding cache miss", {
+      query: query.slice(0, 50),
+      modelId,
+    });
     this.logger.recordQueryCacheMiss();
-    const { embedding, tokensUsed } = await provider.embedQuery(query);
+    const result = await provider.embedQuery(query);
+    if (!result) {
+      return null;
+    }
+    const { embedding, tokensUsed } = result;
     this.logger.recordEmbeddingApiCall(tokensUsed);
 
     if (this.queryEmbeddingCache.size >= this.maxQueryCacheSize) {
@@ -2665,20 +2916,27 @@ export class Indexer {
       }
     }
 
-    this.queryEmbeddingCache.set(query, { embedding, timestamp: now });
+    this.queryEmbeddingCache.set(cacheKey, {
+      query,
+      modelId,
+      embedding,
+      timestamp: now,
+    });
     return embedding;
   }
 
   private findSimilarCachedQuery(
     query: string,
-    now: number
+    now: number,
+    modelId: string
   ): { key: string; embedding: number[]; similarity: number } | null {
     const queryTokens = this.tokenize(query);
     if (queryTokens.size === 0) return null;
 
     let bestMatch: { key: string; embedding: number[]; similarity: number } | null = null;
 
-    for (const [cachedQuery, { embedding, timestamp }] of this.queryEmbeddingCache) {
+    for (const { query: cachedQuery, modelId: cachedModelId, embedding, timestamp } of this.queryEmbeddingCache.values()) {
+      if (cachedModelId !== modelId) continue;
       if ((now - timestamp) >= this.queryCacheTtlMs) continue;
 
       const cachedTokens = this.tokenize(cachedQuery);
@@ -2937,13 +3195,26 @@ export class Indexer {
     limit?: number,
     options?: SearchOptions
   ): Promise<SearchResponse> {
-    const { store, provider, database } = await this.ensureInitialized();
+    const {
+      store,
+      provider,
+      voyageProvider,
+      voyageStore,
+      voyageModelId,
+      database,
+    } = await this.ensureInitialized();
+    const taskType = inferTaskType(query, options?.taskType);
+    const voyageLaneConfigured = Boolean(voyageProvider && voyageStore && voyageModelId);
 
     if (query.trim().length === 0) {
       return {
         primaryResults: [],
         expandedContext: [],
-        taskType: options?.taskType ?? "general",
+        taskType,
+        retrieval: {
+          voyageLaneConfigured,
+          voyageLaneUsed: false,
+        },
         reranker: {
           applied: false,
           backend: null,
@@ -2966,7 +3237,11 @@ export class Indexer {
       return {
         primaryResults: [],
         expandedContext: [],
-        taskType: options?.taskType ?? "general",
+        taskType,
+        retrieval: {
+          voyageLaneConfigured,
+          voyageLaneUsed: false,
+        },
         reranker: {
           applied: false,
           backend: null,
@@ -2975,21 +3250,19 @@ export class Indexer {
     }
 
     const maxResults = limit ?? this.config.search.maxResults;
-    const taskType = options?.taskType ?? "general";
     const recipe = getSearchRecipe(taskType);
     const queryIntent = classifyQueryIntentRaw(query);
     const hybridWeight = options?.hybridWeight ?? recipe.hybridWeight ?? this.config.search.hybridWeight;
-    const fusionWeights = normalizeFusionWeights(
-      options?.bm25Weight ?? recipe.bm25Weight,
-      options?.denseWeight ?? recipe.denseWeight,
-      hybridWeight
-    );
+    const configuredBm25Weight = options?.bm25Weight ?? recipe.bm25Weight;
+    const configuredDenseWeight = options?.denseWeight ?? recipe.denseWeight;
+    const configuredVoyageWeight = options?.voyageWeight ?? recipe.voyageWeight;
     const fusionStrategy = this.config.search.fusionStrategy;
     const rrfK = this.config.search.rrfK;
     const rerankTopN = this.config.search.rerankTopN;
     const filterByBranch = options?.filterByBranch ?? true;
     const sourceIntent = options?.definitionIntent === true ||
       recipe.forceDefinitionIntent ||
+      taskType === "bug" ||
       queryIntent === "source";
     const identifierBoost = options?.identifierBoost ?? recipe.identifierBoost ?? 1.0;
     const finalRerankTopN =
@@ -3016,6 +3289,10 @@ export class Indexer {
         primaryResults: [],
         expandedContext: [],
         taskType,
+        retrieval: {
+          voyageLaneConfigured,
+          voyageLaneUsed: false,
+        },
         reranker: {
           applied: false,
           backend: null,
@@ -3026,12 +3303,48 @@ export class Indexer {
     const allowedChunkIdList = allowedChunkIds ? Array.from(allowedChunkIds) : null;
     const retrievalLimit = resolveRetrievalCandidateLimit(maxResults);
 
+    const embeddingStartTime = performance.now();
+    const embeddingQuery = stripFilePathHint(query);
+    const [arcticQueryVector, rawVoyageQueryVector] = await Promise.all([
+      this.getQueryEmbedding(embeddingQuery, provider).catch((error) => {
+        this.logger.search("warn", "Primary query embedding failed; continuing without Arctic dense lane", {
+          taskType,
+          model: provider.getModelInfo().model,
+          error: getErrorMessage(error),
+        });
+        return null;
+      }),
+      voyageProvider
+        ? this.getQueryEmbedding(embeddingQuery, voyageProvider).catch((error) => {
+            this.logger.search("warn", "Voyage query embedding failed; continuing without Voyage dense lane", {
+              taskType,
+              model: voyageProvider.getModelInfo().model,
+              error: getErrorMessage(error),
+            });
+            return null;
+          })
+        : Promise.resolve(null),
+    ]);
+    const embeddingMs = performance.now() - embeddingStartTime;
+    const voyageLaneAvailable = Boolean(voyageLaneConfigured && rawVoyageQueryVector);
+    const fusionWeights = normalizeFusionWeights(
+      configuredBm25Weight,
+      voyageLaneAvailable
+        ? configuredDenseWeight
+        : (configuredDenseWeight ?? 0) + (configuredVoyageWeight ?? 0),
+      voyageLaneAvailable ? configuredVoyageWeight : 0,
+      hybridWeight
+    );
+
     this.logger.search("debug", "Starting search", {
       query,
       maxResults,
       hybridWeight,
       bm25Weight: fusionWeights.bm25Weight,
       denseWeight: fusionWeights.denseWeight,
+      voyageWeight: fusionWeights.voyageWeight,
+      voyageLaneConfigured,
+      voyageLaneAvailable,
       fusionStrategy,
       rrfK,
       rerankTopN,
@@ -3041,23 +3354,73 @@ export class Indexer {
       taskType,
     });
 
-    const embeddingStartTime = performance.now();
-    const embeddingQuery = stripFilePathHint(query);
-    const embedding = await this.getQueryEmbedding(embeddingQuery, provider);
-    const embeddingMs = performance.now() - embeddingStartTime;
+    if (voyageLaneConfigured && !voyageLaneAvailable) {
+      this.logger.search("info", "Voyage dense lane unavailable for this query; redistributing its fusion weight to Arctic", {
+        taskType,
+        model: voyageModelId,
+      });
+    }
 
-    // Native vector and BM25 lookups are synchronous NAPI calls today, so these
-    // execute sequentially. Keeping them behind filtered-search helpers makes
-    // worker-thread parallelism straightforward without changing ranking logic.
     const vectorStartTime = performance.now();
-    const semanticCandidates = allowedChunkIdList
-      ? store.searchFiltered(embedding, allowedChunkIdList, retrievalLimit)
-      : store.search(embedding, retrievalLimit);
-    const vectorMs = performance.now() - vectorStartTime;
+    // These lanes are orchestrated together, but the native VectorStore/BM25
+    // calls are still synchronous NAPI boundaries today. Promise.all keeps the
+    // control flow uniform and isolates lane failures, but it does not provide
+    // true CPU parallelism until the native search APIs become asynchronous or
+    // move onto dedicated worker threads.
+    const [semanticLane, voyageLane, keywordLane] = await Promise.all([
+      Promise.resolve().then(() => {
+        const started = performance.now();
+        if (!arcticQueryVector) {
+          return { results: [] as RankedCandidate[], ms: performance.now() - started };
+        }
 
-    const keywordStartTime = performance.now();
-    const keywordCandidates = await this.keywordSearch(query, retrievalLimit, allowedChunkIdList);
-    const keywordMs = performance.now() - keywordStartTime;
+        const results = allowedChunkIdList
+          ? store.searchFiltered(arcticQueryVector, allowedChunkIdList, retrievalLimit)
+          : store.search(arcticQueryVector, retrievalLimit);
+        return { results, ms: performance.now() - started };
+      }).catch((error) => {
+        this.logger.search("warn", "Arctic dense search failed; continuing without primary dense lane", {
+          taskType,
+          model: provider.getModelInfo().model,
+          error: getErrorMessage(error),
+        });
+        return { results: [] as RankedCandidate[], ms: 0 };
+      }),
+      Promise.resolve().then(() => {
+        const started = performance.now();
+        if (!rawVoyageQueryVector || !voyageStore || !voyageLaneAvailable) {
+          return { results: [] as RankedCandidate[], ms: performance.now() - started };
+        }
+
+        const results = allowedChunkIdList
+          ? voyageStore.searchFiltered(rawVoyageQueryVector, allowedChunkIdList, retrievalLimit)
+          : voyageStore.search(rawVoyageQueryVector, retrievalLimit);
+        return { results, ms: performance.now() - started };
+      }).catch((error) => {
+        this.logger.search("warn", "Voyage dense search failed; continuing without Voyage lane", {
+          taskType,
+          model: voyageModelId,
+          error: getErrorMessage(error),
+        });
+        return { results: [] as RankedCandidate[], ms: 0 };
+      }),
+      Promise.resolve().then(async () => {
+        const started = performance.now();
+        const results = await this.keywordSearch(query, retrievalLimit, allowedChunkIdList);
+        return { results, ms: performance.now() - started };
+      }).catch((error) => {
+        this.logger.search("warn", "BM25 search failed; continuing with dense lanes only", {
+          taskType,
+          error: getErrorMessage(error),
+        });
+        return { results: [] as RankedCandidate[], ms: 0 };
+      }),
+    ]);
+    const vectorMs = performance.now() - vectorStartTime;
+    const semanticCandidates = semanticLane.results;
+    const voyageCandidates = voyageLane.results;
+    const keywordCandidates = keywordLane.results;
+    const keywordMs = keywordLane.ms;
 
     const fusionStartTime = performance.now();
     const combined = rankHybridResults(query, semanticCandidates, keywordCandidates, {
@@ -3068,6 +3431,8 @@ export class Indexer {
       hybridWeight,
       bm25Weight: fusionWeights.bm25Weight,
       denseWeight: fusionWeights.denseWeight,
+      voyageWeight: fusionWeights.voyageWeight,
+      voyageResults: voyageCandidates,
       prioritizeSourcePaths: sourceIntent,
       pathPreference: recipe.pathPreference,
     });
@@ -3077,8 +3442,7 @@ export class Indexer {
       ? promoteIdentifierMatches(
           query,
           combined,
-          semanticCandidates,
-          keywordCandidates,
+          [semanticCandidates, voyageCandidates, keywordCandidates],
           database,
           allowedChunkIds,
           recipe.pathPreference,
@@ -3086,7 +3450,7 @@ export class Indexer {
         )
       : combined;
 
-    const union = unionCandidates(semanticCandidates, keywordCandidates);
+    const union = unionCandidates(semanticCandidates, voyageCandidates, keywordCandidates);
 
     const deterministicIdentifierLane = recipe.enableDeterministicIdentifierLane
       ? buildDeterministicIdentifierPass(
@@ -3212,6 +3576,10 @@ export class Indexer {
       primaryResults,
       expandedContext,
       taskType,
+      retrieval: {
+        voyageLaneConfigured,
+        voyageLaneUsed: voyageLaneAvailable,
+      },
       reranker: {
         applied: reranked.applied,
         backend: reranked.backend,
@@ -3251,11 +3619,12 @@ export class Indexer {
   }
 
   async getStatus(): Promise<StatusResult> {
-    const { store, configuredProviderInfo } = await this.ensureInitialized();
+    const { configuredProviderInfo } = await this.ensureInitialized();
+    const vectorCount = this.totalVectorCount();
 
     return {
-      indexed: store.count() > 0,
-      vectorCount: store.count(),
+      indexed: vectorCount > 0,
+      vectorCount,
       provider: configuredProviderInfo.provider,
       model: configuredProviderInfo.modelInfo.model,
       indexPath: this.indexPath,
@@ -3273,11 +3642,11 @@ export class Indexer {
   }
 
   private async clearIndexInternal(): Promise<void> {
-    const { store, invertedIndex, database } = await this.ensureInitialized();
+    const { invertedIndex, database } = await this.ensureInitialized();
 
     await this.runWithCrashMarker(async () => {
-      store.clear();
-      store.save();
+      this.clearAllStores();
+      this.saveAllStores();
       invertedIndex.clear();
       invertedIndex.save();
 
@@ -3311,7 +3680,7 @@ export class Indexer {
   private async healthCheckInternal(
     options: { useCrashMarker?: boolean } = {}
   ): Promise<HealthCheckResult> {
-    const { store, invertedIndex, database } = await this.ensureInitialized();
+    const { invertedIndex, database } = await this.ensureInitialized();
     const run = async (): Promise<HealthCheckResult> => {
       this.refreshBranchInfo();
       this.loadFileHashCache();
@@ -3319,7 +3688,7 @@ export class Indexer {
 
       const branchChunkIds = new Set(database.getBranchChunkIds(this.currentBranch));
       const branchSymbolIds = new Set(database.getBranchSymbolIds(this.currentBranch));
-      const { existingChunksByFile } = this.buildBranchStoreChunkMaps(store, branchChunkIds);
+      const { existingChunksByFile } = this.buildBranchStoreChunkMaps(branchChunkIds);
       const currentChunkIds = new Set(branchChunkIds);
       const allSymbolIds = new Set(branchSymbolIds);
       const missingFilePaths = new Set<string>();
@@ -3343,7 +3712,7 @@ export class Indexer {
         if (chunkKeys) {
           for (const key of chunkKeys) {
             currentChunkIds.delete(key);
-            if (this.removeChunkFromRetrievalIfUnreferenced(database, store, invertedIndex, key)) {
+            if (this.removeChunkFromRetrievalIfUnreferenced(database, invertedIndex, key)) {
               removedCount++;
             }
           }
@@ -3371,7 +3740,7 @@ export class Indexer {
       }
 
       if (removedCount > 0) {
-        store.save();
+        this.saveAllStores();
         invertedIndex.save();
       }
 
@@ -3498,6 +3867,7 @@ export class Indexer {
     const embeddingMs = performance.now() - embeddingStartTime;
     this.logger.recordEmbeddingApiCall(tokensUsed);
 
+    // TODO: Component 4 — add a Voyage retrieval lane for code-heavy similarity search.
     const vectorStartTime = performance.now();
     const semanticCandidates = allowedChunkIdList
       ? store.searchFiltered(embedding, allowedChunkIdList, retrievalLimit)

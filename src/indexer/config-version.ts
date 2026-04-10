@@ -7,6 +7,7 @@ export interface ConfigVersion {
   embeddingProvider: ConfiguredProviderInfo["provider"];
   endpointBaseUrl: string;
   documentTaskType: string;
+  voyageModelId: string | null;
   chunkerVersion: string;
   graphExtractorVersion: string;
 }
@@ -17,9 +18,10 @@ interface EmbedConfigIdentity {
   embeddingProvider: ConfiguredProviderInfo["provider"];
   endpointBaseUrl: string;
   documentTaskType: string;
+  voyageModelId: string | null;
 }
 
-function hashSortedObject(value: Record<string, number | string>): string {
+function hashSortedObject(value: Record<string, number | string | null>): string {
   return hashContent(JSON.stringify(value));
 }
 
@@ -39,7 +41,8 @@ function getDocumentTaskType(configuredProviderInfo: ConfiguredProviderInfo): st
 }
 
 function buildEmbedConfigIdentity(
-  configuredProviderInfo: ConfiguredProviderInfo
+  configuredProviderInfo: ConfiguredProviderInfo,
+  voyageModelId: string | null = null
 ): EmbedConfigIdentity {
   return {
     embeddingDimension: configuredProviderInfo.modelInfo.dimensions,
@@ -47,6 +50,7 @@ function buildEmbedConfigIdentity(
     embeddingProvider: configuredProviderInfo.provider,
     endpointBaseUrl: normalizeBaseUrl(configuredProviderInfo.credentials.baseUrl),
     documentTaskType: getDocumentTaskType(configuredProviderInfo),
+    voyageModelId,
   };
 }
 
@@ -61,6 +65,7 @@ export function hashConfigVersion(cv: ConfigVersion): string {
     embeddingProvider: cv.embeddingProvider,
     endpointBaseUrl: cv.endpointBaseUrl,
     documentTaskType: cv.documentTaskType,
+    voyageModelId: cv.voyageModelId,
     chunkerVersion: cv.chunkerVersion,
     graphExtractorVersion: cv.graphExtractorVersion,
   };
@@ -72,14 +77,18 @@ export function hashConfigVersion(cv: ConfigVersion): string {
  * Hash of just the embedding portion of a ConfigVersion.
  * Used as embed_config_hash in EMBED stage input_hash computation.
  */
-export function hashEmbedConfig(configuredProviderInfo: ConfiguredProviderInfo): string {
-  const identity = buildEmbedConfigIdentity(configuredProviderInfo);
+export function hashEmbedConfig(
+  configuredProviderInfo: ConfiguredProviderInfo,
+  voyageModelId: string | null = null
+): string {
+  const identity = buildEmbedConfigIdentity(configuredProviderInfo, voyageModelId);
   const sorted = {
     documentTaskType: identity.documentTaskType,
     embeddingDimension: identity.embeddingDimension,
     embeddingModelId: identity.embeddingModelId,
     embeddingProvider: identity.embeddingProvider,
     endpointBaseUrl: identity.endpointBaseUrl,
+    voyageModelId: identity.voyageModelId,
   };
 
   return hashSortedObject(sorted);
@@ -89,9 +98,10 @@ export function hashEmbedConfig(configuredProviderInfo: ConfiguredProviderInfo):
  * Builds a ConfigVersion from the current runtime state.
  */
 export async function getCurrentConfigVersion(
-  configuredProviderInfo: ConfiguredProviderInfo
+  configuredProviderInfo: ConfiguredProviderInfo,
+  voyageModelId: string | null = null
 ): Promise<ConfigVersion> {
-  const embedIdentity = buildEmbedConfigIdentity(configuredProviderInfo);
+  const embedIdentity = buildEmbedConfigIdentity(configuredProviderInfo, voyageModelId);
 
   return {
     embeddingModelId: embedIdentity.embeddingModelId,
@@ -99,6 +109,7 @@ export async function getCurrentConfigVersion(
     embeddingProvider: embedIdentity.embeddingProvider,
     endpointBaseUrl: embedIdentity.endpointBaseUrl,
     documentTaskType: embedIdentity.documentTaskType,
+    voyageModelId: embedIdentity.voyageModelId,
     chunkerVersion: getChunkerVersion(),
     graphExtractorVersion: "1.0.0",
   };

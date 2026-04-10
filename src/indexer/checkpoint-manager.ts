@@ -224,6 +224,7 @@ export class CheckpointManager {
       configHash,
       embeddingModelId: configVersion.embeddingModelId,
       embeddingDimension: configVersion.embeddingDimension,
+      voyageModelId: configVersion.voyageModelId,
       chunkerVersion: configVersion.chunkerVersion,
       graphExtractorVersion: configVersion.graphExtractorVersion,
       active: true,

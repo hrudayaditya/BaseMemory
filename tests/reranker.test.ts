@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { ChunkMetadata } from "../src/native/index.js";
+import type { SearchTaskType } from "../src/indexer/search-recipes.js";
 import {
   HeuristicLocalRerankerBackend,
   SearchReranker,
@@ -35,7 +36,7 @@ function candidate(
 class ThrowingBackend implements SearchRerankerBackend {
   readonly name = "throwing";
 
-  async rerank(_query: string, _candidates: RerankerCandidate[], _taskType: "general" | "definition" | "test_debug" | "semantic"): Promise<RerankerCandidate[]> {
+  async rerank(_query: string, _candidates: RerankerCandidate[], _taskType: SearchTaskType): Promise<RerankerCandidate[]> {
     throw new Error("boom");
   }
 }
@@ -46,7 +47,7 @@ class ReverseBackend implements SearchRerankerBackend {
   async rerank(
     _query: string,
     candidates: RerankerCandidate[],
-    _taskType: "general" | "definition" | "test_debug" | "semantic"
+    _taskType: SearchTaskType
   ): Promise<RerankerCandidate[]> {
     return [...candidates].reverse();
   }

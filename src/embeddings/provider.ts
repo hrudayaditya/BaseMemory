@@ -11,11 +11,290 @@ export interface EmbeddingBatchResult {
   totalTokensUsed: number;
 }
 
+type EmbeddingInputType = "query" | "document";
+
 export interface EmbeddingProviderInterface {
   embedQuery(query: string): Promise<EmbeddingResult>;
   embedDocument(document: string): Promise<EmbeddingResult>;
   embedBatch(texts: string[]): Promise<EmbeddingBatchResult>;
   getModelInfo(): BaseModelInfo;
+}
+
+export interface VoyageProviderConfig {
+  voyageApiKey?: string;
+  voyageModelId?: string;
+}
+
+const ARCTIC_QUERY_PREFIX = "Represent this sentence for searching relevant passages: ";
+
+const VOYAGE_EMBEDDING_ENDPOINT = "https://api.voyageai.com/v1/embeddings";
+const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-2";
+const VOYAGE_MAX_BATCH_SIZE = 128;
+const VOYAGE_MAX_ATTEMPTS = 3;
+const VOYAGE_BACKOFF_BASE_MS = 1_000;
+const VOYAGE_BACKOFF_JITTER_MS = 200;
+const VOYAGE_TIMEOUT_MS = 30_000;
+
+const VOYAGE_MODEL_SPECS: Record<string, BaseModelInfo> = {
+  "voyage-code-2": {
+    model: "voyage-code-2",
+    dimensions: 1536,
+    maxTokens: 16_000,
+    costPer1MTokens: 0.12,
+  },
+  "voyage-code-3": {
+    model: "voyage-code-3",
+    dimensions: 1024,
+    maxTokens: 32_000,
+    costPer1MTokens: 0.18,
+  },
+};
+
+function normalizeEmbeddingVector(raw: number[]): number[] {
+  return Array.from(Float32Array.from(raw));
+}
+
+function estimateTokenCount(texts: string[]): number {
+  return texts.reduce((sum, text) => sum + Math.ceil(text.length / 4), 0);
+}
+
+function jitteredBackoffDelayMs(attempt: number): number {
+  const baseDelay = VOYAGE_BACKOFF_BASE_MS * (2 ** (attempt - 1));
+  const jitter = Math.floor(Math.random() * ((VOYAGE_BACKOFF_JITTER_MS * 2) + 1)) - VOYAGE_BACKOFF_JITTER_MS;
+  return Math.max(0, baseDelay + jitter);
+}
+
+function isVoyageEmbeddingsResponse(
+  payload: unknown
+): payload is { embeddings: number[][]; total_tokens?: number } {
+  if (!payload || typeof payload !== "object") {
+    return false;
+  }
+
+  const embeddings = (payload as { embeddings?: unknown }).embeddings;
+  return Array.isArray(embeddings) && embeddings.every((embedding) =>
+    Array.isArray(embedding) && embedding.every((value) => typeof value === "number")
+  );
+}
+
+function isOpenAICompatibleEmbeddingResponse(
+  payload: unknown
+): payload is { data: Array<{ embedding: number[] }>; usage?: { total_tokens?: number } } {
+  if (!payload || typeof payload !== "object") {
+    return false;
+  }
+
+  const data = (payload as { data?: unknown }).data;
+  return Array.isArray(data) && data.every((entry) => {
+    if (!entry || typeof entry !== "object") {
+      return false;
+    }
+
+    const embedding = (entry as { embedding?: unknown }).embedding;
+    return Array.isArray(embedding) && embedding.every((value) => typeof value === "number");
+  });
+}
+
+export class VoyageEmbeddingProvider {
+  private readonly apiKey?: string;
+  private readonly modelInfo: BaseModelInfo;
+  private readonly hasUsableApiKey: boolean;
+
+  constructor(config: VoyageProviderConfig) {
+    this.apiKey = config.voyageApiKey?.trim() || undefined;
+    const modelId = config.voyageModelId?.trim() || VOYAGE_DEFAULT_MODEL_ID;
+    this.modelInfo = VOYAGE_MODEL_SPECS[modelId] ?? {
+      model: modelId,
+      dimensions: 1024,
+      maxTokens: 32_000,
+      costPer1MTokens: 0,
+    };
+    this.hasUsableApiKey = Boolean(this.apiKey);
+
+    if (!this.hasUsableApiKey) {
+      console.warn(
+        `[voyage-embeddings] voyageApiKey is missing; ${this.modelInfo.model} embeddings are disabled until a key is configured.`
+      );
+    }
+  }
+
+  async embedQuery(query: string): Promise<EmbeddingResult | null> {
+    const result = await this.embedTexts([query], "query");
+    if (!result) {
+      return null;
+    }
+
+    return {
+      embedding: result.embeddings[0] ?? [],
+      tokensUsed: result.totalTokensUsed,
+    };
+  }
+
+  async embedDocument(document: string): Promise<EmbeddingResult | null> {
+    const result = await this.embedTexts([document], "document");
+    if (!result) {
+      return null;
+    }
+
+    return {
+      embedding: result.embeddings[0] ?? [],
+      tokensUsed: result.totalTokensUsed,
+    };
+  }
+
+  async embedBatch(texts: string[]): Promise<EmbeddingBatchResult | null> {
+    return this.embedTexts(texts, "document");
+  }
+
+  getModelInfo(): BaseModelInfo {
+    return this.modelInfo;
+  }
+
+  private async embedTexts(
+    texts: string[],
+    inputType: EmbeddingInputType
+  ): Promise<EmbeddingBatchResult | null> {
+    if (texts.length === 0) {
+      return {
+        embeddings: [],
+        totalTokensUsed: 0,
+      };
+    }
+
+    if (!this.hasUsableApiKey) {
+      return null;
+    }
+
+    const embeddings: number[][] = [];
+    let totalTokensUsed = 0;
+    const totalBatches = Math.ceil(texts.length / VOYAGE_MAX_BATCH_SIZE);
+
+    for (let batchIndex = 0; batchIndex < totalBatches; batchIndex += 1) {
+      const start = batchIndex * VOYAGE_MAX_BATCH_SIZE;
+      const batch = texts.slice(start, start + VOYAGE_MAX_BATCH_SIZE);
+      const batchResult = await this.embedBatchWithRetry(batch, inputType, batchIndex, totalBatches);
+
+      if (!batchResult) {
+        return null;
+      }
+
+      embeddings.push(...batchResult.embeddings);
+      totalTokensUsed += batchResult.totalTokensUsed;
+    }
+
+    return {
+      embeddings,
+      totalTokensUsed,
+    };
+  }
+
+  private async embedBatchWithRetry(
+    batch: string[],
+    inputType: EmbeddingInputType,
+    batchIndex: number,
+    totalBatches: number
+  ): Promise<EmbeddingBatchResult | null> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= VOYAGE_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        return await this.executeBatchRequest(batch, inputType);
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+
+        if (attempt === VOYAGE_MAX_ATTEMPTS) {
+          break;
+        }
+
+        await this.sleep(jitteredBackoffDelayMs(attempt));
+      }
+    }
+
+    console.error(
+      `[voyage-embeddings] Failed batch ${batchIndex + 1}/${totalBatches} (${batch.length} texts) ` +
+      `after ${VOYAGE_MAX_ATTEMPTS} attempts: ${lastError?.message ?? "unknown error"}`
+    );
+    return null;
+  }
+
+  private async executeBatchRequest(
+    batch: string[],
+    inputType: EmbeddingInputType
+  ): Promise<EmbeddingBatchResult> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), VOYAGE_TIMEOUT_MS);
+    let response: Response;
+
+    try {
+      response = await fetch(VOYAGE_EMBEDDING_ENDPOINT, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          input: batch,
+          model: this.modelInfo.model,
+          input_type: inputType,
+        }),
+        signal: controller.signal,
+      });
+    } catch (error: unknown) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new Error(`Voyage embedding API request timed out after ${VOYAGE_TIMEOUT_MS}ms`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Voyage embedding API error: ${response.status} - ${errorText}`);
+    }
+
+    const payload = await response.json() as unknown;
+    let embeddings: number[][];
+    let totalTokensUsed: number;
+
+    if (isVoyageEmbeddingsResponse(payload)) {
+      embeddings = payload.embeddings.map((embedding) => normalizeEmbeddingVector(embedding));
+      totalTokensUsed = payload.total_tokens ?? estimateTokenCount(batch);
+    } else if (isOpenAICompatibleEmbeddingResponse(payload)) {
+      embeddings = payload.data.map((entry) => normalizeEmbeddingVector(entry.embedding));
+      totalTokensUsed = payload.usage?.total_tokens ?? estimateTokenCount(batch);
+    } else {
+      throw new Error("Voyage embedding API returned unexpected response format");
+    }
+
+    if (embeddings.length !== batch.length) {
+      throw new Error(
+        `Embedding count mismatch: sent ${batch.length} texts but received ${embeddings.length} embeddings`
+      );
+    }
+
+    if (embeddings.length > 0 && embeddings[0]?.length !== this.modelInfo.dimensions) {
+      throw new Error(
+        `Dimension mismatch: expected ${this.modelInfo.dimensions} dimensions for ${this.modelInfo.model}, ` +
+        `but received ${embeddings[0]?.length ?? 0}`
+      );
+    }
+
+    return {
+      embeddings,
+      totalTokensUsed,
+    };
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
+}
+
+export function createVoyageEmbeddingProvider(config: VoyageProviderConfig): VoyageEmbeddingProvider {
+  return new VoyageEmbeddingProvider(config);
 }
 
 /**
@@ -357,7 +636,21 @@ class CustomEmbeddingProvider implements EmbeddingProviderInterface {
     return batches;
   }
 
-  private async embedRequest(texts: string[]): Promise<EmbeddingBatchResult> {
+  private prepareTextsForInputType(
+    texts: string[],
+    inputType: EmbeddingInputType
+  ): string[] {
+    if (this.modelInfo.model === "snowflake-arctic-embed2" && inputType === "query") {
+      return texts.map((text) => `${ARCTIC_QUERY_PREFIX}${text}`);
+    }
+
+    return texts;
+  }
+
+  private async embedRequest(
+    texts: string[],
+    inputType: EmbeddingInputType
+  ): Promise<EmbeddingBatchResult> {
     if (texts.length === 0) {
       return {
         embeddings: [],
@@ -378,6 +671,8 @@ class CustomEmbeddingProvider implements EmbeddingProviderInterface {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
+    const preparedTexts = this.prepareTextsForInputType(texts, inputType);
+
     let response: Response;
     try {
       response = await fetch(`${baseUrl}/embeddings`, {
@@ -385,7 +680,7 @@ class CustomEmbeddingProvider implements EmbeddingProviderInterface {
         headers,
         body: JSON.stringify({
           model: this.modelInfo.model,
-          input: texts,
+          input: preparedTexts,
         }),
         signal: controller.signal,
       });
@@ -430,9 +725,9 @@ class CustomEmbeddingProvider implements EmbeddingProviderInterface {
 
       // Validate the server returned exactly as many embeddings as we sent texts.
       // A mismatch would cause undefined vectors in store.addBatch, corrupting the index.
-      if (data.data.length !== texts.length) {
+      if (data.data.length !== preparedTexts.length) {
         throw new Error(
-          `Embedding count mismatch: sent ${texts.length} texts but received ${data.data.length} embeddings. ` +
+          `Embedding count mismatch: sent ${preparedTexts.length} texts but received ${data.data.length} embeddings. ` +
           `The custom embedding server may not support batch input.`
         );
       }
@@ -450,7 +745,7 @@ class CustomEmbeddingProvider implements EmbeddingProviderInterface {
   }
 
   async embedQuery(query: string): Promise<EmbeddingResult> {
-    const result = await this.embedBatch([query]);
+    const result = await this.embedBatchInternal([query], "query");
     return {
       embedding: result.embeddings[0],
       tokensUsed: result.totalTokensUsed,
@@ -458,7 +753,7 @@ class CustomEmbeddingProvider implements EmbeddingProviderInterface {
   }
 
   async embedDocument(document: string): Promise<EmbeddingResult> {
-    const result = await this.embedBatch([document]);
+    const result = await this.embedBatchInternal([document], "document");
     return {
       embedding: result.embeddings[0],
       tokensUsed: result.totalTokensUsed,
@@ -466,12 +761,19 @@ class CustomEmbeddingProvider implements EmbeddingProviderInterface {
   }
 
   async embedBatch(texts: string[]): Promise<EmbeddingBatchResult> {
+    return this.embedBatchInternal(texts, "document");
+  }
+
+  private async embedBatchInternal(
+    texts: string[],
+    inputType: EmbeddingInputType
+  ): Promise<EmbeddingBatchResult> {
     const requestBatches = this.splitIntoRequestBatches(texts);
     const embeddings: number[][] = [];
     let totalTokensUsed = 0;
 
     for (const batch of requestBatches) {
-      const result = await this.embedRequest(batch);
+      const result = await this.embedRequest(batch, inputType);
       embeddings.push(...result.embeddings);
       totalTokensUsed += result.totalTokensUsed;
     }

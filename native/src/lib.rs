@@ -660,10 +660,17 @@ pub struct ConfigVersionData {
     pub config_hash: String,
     pub embedding_model_id: String,
     pub embedding_dimension: u32,
+    pub voyage_model_id: Option<String>,
     pub chunker_version: String,
     pub graph_extractor_version: String,
     pub active: bool,
     pub created_at: f64,
+}
+
+#[napi(object)]
+pub struct EmbeddingLookupItem {
+    pub content_hash: String,
+    pub embedding: Buffer,
 }
 
 #[napi]
@@ -695,6 +702,39 @@ impl Database {
         let result = db::get_embedding(&conn, &content_hash)
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(result.map(Buffer::from))
+    }
+
+    #[napi]
+    pub fn get_embedding_for_model(&self, content_hash: String, model: String) -> Result<Option<Buffer>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let result = db::get_embedding_for_model(&conn, &content_hash, &model)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(result.map(Buffer::from))
+    }
+
+    #[napi]
+    pub fn get_embeddings_for_model_batch(
+        &self,
+        content_hashes: Vec<String>,
+        model: String,
+    ) -> Result<Vec<EmbeddingLookupItem>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        db::get_embeddings_for_model_batch(&conn, &content_hashes, &model)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(hash, embedding)| EmbeddingLookupItem {
+                        content_hash: hash,
+                        embedding: Buffer::from(embedding),
+                    })
+                    .collect()
+            })
+            .map_err(|e| Error::from_reason(e.to_string()))
     }
 
     #[napi]
@@ -1354,6 +1394,7 @@ impl Database {
             config_hash: row.config_hash,
             embedding_model_id: row.embedding_model_id,
             embedding_dimension: row.embedding_dimension as u32,
+            voyage_model_id: row.voyage_model_id,
             chunker_version: row.chunker_version,
             graph_extractor_version: row.graph_extractor_version,
             active: row.active,
@@ -1371,6 +1412,7 @@ impl Database {
             config_hash: config_version.config_hash,
             embedding_model_id: config_version.embedding_model_id,
             embedding_dimension: config_version.embedding_dimension as i64,
+            voyage_model_id: config_version.voyage_model_id,
             chunker_version: config_version.chunker_version,
             graph_extractor_version: config_version.graph_extractor_version,
             active: config_version.active,
