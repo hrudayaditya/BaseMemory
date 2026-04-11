@@ -1,4 +1,4 @@
-use super::{Chunk, ChunkConfig, ChunkKind, Granularity};
+use super::{exceeds_budget, Chunk, ChunkConfig, ChunkKind, Granularity};
 use crate::hasher::xxhash_content;
 
 fn line_starts(source: &str) -> Vec<usize> {
@@ -52,16 +52,19 @@ pub fn chunk_by_lines(
 
     while start_line_index < lines.len() {
         let mut end_line_index = start_line_index;
-        let mut char_count = 0usize;
 
         while end_line_index < lines.len() {
-            let next_len = lines[end_line_index].len();
-            if end_line_index > start_line_index
-                && char_count + next_len > config.max_chunk_chars_usize()
-            {
+            let candidate_end = end_line_index + 1;
+            let start_byte = starts[start_line_index];
+            let end_byte = if candidate_end < starts.len() {
+                starts[candidate_end]
+            } else {
+                source.len()
+            };
+            let candidate_text = &source[start_byte..end_byte];
+            if end_line_index > start_line_index && exceeds_budget(candidate_text, config) {
                 break;
             }
-            char_count += next_len;
             end_line_index += 1;
         }
 

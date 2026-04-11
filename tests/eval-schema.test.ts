@@ -49,6 +49,33 @@ describe("eval schema", () => {
     expect(dataset.queries[0].queryType).toBeUndefined();
   });
 
+  it("parses extended query types and line ranges", () => {
+    const dataset = parseGoldenDataset(
+      {
+        version: "1.0.0",
+        name: "small",
+        queries: [
+          {
+            id: "q1",
+            query: "what tests cover auth?",
+            queryType: "test-discovery",
+            expected: {
+              filePath: "tests/auth.test.ts",
+              symbol: "auth spec",
+              startLine: 10,
+              endLine: 20,
+            },
+          },
+        ],
+      },
+      "dataset.json"
+    );
+
+    expect(dataset.queries[0].queryType).toBe("test-discovery");
+    expect(dataset.queries[0].expected.startLine).toBe(10);
+    expect(dataset.queries[0].expected.endLine).toBe(20);
+  });
+
   it("accepts an explicit taskType alias on golden queries", () => {
     const dataset = parseGoldenDataset(
       {
@@ -124,20 +151,67 @@ describe("eval schema", () => {
         baselinePath: "benchmarks/baselines/eval-baseline-summary.json",
         failOnMissingBaseline: true,
         thresholds: {
+          hitAt1MaxDrop: 0.05,
           hitAt5MaxDrop: 0.05,
           mrrAt10MaxDrop: 0.02,
           combinedRecallAt10: 0.05,
           expansionHitRate: 0.1,
           p95LatencyMaxMultiplier: 1.5,
+          minHitAt1: 0.2,
         },
       },
       "budget.json"
     );
 
+    expect(budget.thresholds.hitAt1MaxDrop).toBe(0.05);
     expect(budget.thresholds.hitAt5MaxDrop).toBe(0.05);
     expect(budget.thresholds.combinedRecallAt10MaxDrop).toBe(0.05);
     expect(budget.thresholds.expansionHitRateMaxDrop).toBe(0.1);
+    expect(budget.thresholds.minHitAt1).toBe(0.2);
     expect(budget.failOnMissingBaseline).toBe(true);
+  });
+
+  it("rejects partial or invalid expected line ranges", () => {
+    expect(() =>
+      parseGoldenDataset(
+        {
+          version: "1.0.0",
+          name: "small",
+          queries: [
+            {
+              id: "q1",
+              query: "where",
+              expected: {
+                filePath: "a.ts",
+                startLine: 10,
+              },
+            },
+          ],
+        },
+        "dataset.json"
+      )
+    ).toThrow(/endLine/);
+
+    expect(() =>
+      parseGoldenDataset(
+        {
+          version: "1.0.0",
+          name: "small",
+          queries: [
+            {
+              id: "q1",
+              query: "where",
+              expected: {
+                filePath: "a.ts",
+                startLine: 20,
+                endLine: 10,
+              },
+            },
+          ],
+        },
+        "dataset.json"
+      )
+    ).toThrow(/startLine must be less than or equal/);
   });
 
   it("rejects invalid threshold types", () => {

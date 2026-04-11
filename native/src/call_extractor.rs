@@ -3,6 +3,8 @@ use anyhow::{anyhow, Result};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
 
+pub const GRAPH_EXTRACTOR_VERSION: &str = env!("GRAPH_EXTRACTOR_VERSION");
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallType {
     Call,

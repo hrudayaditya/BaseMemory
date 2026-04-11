@@ -51,15 +51,19 @@ function isMoreSpecificSymbol(candidate: SymbolData, currentBest: SymbolData): b
   return candidate.id.localeCompare(currentBest.id) < 0;
 }
 
-function resolveSeedSymbol(database: Database, seed: GraphExpansionSeed): SymbolData | null {
+function resolveSeedSymbol(
+  database: Database,
+  seed: GraphExpansionSeed,
+  branch: string
+): SymbolData | null {
   if (seed.metadata.name) {
-    const symbol = database.getSymbolByName(seed.metadata.name, seed.metadata.filePath);
+    const symbol = database.getSymbolByNameOnBranch(seed.metadata.name, seed.metadata.filePath, branch);
     if (symbol) {
       return symbol;
     }
   }
 
-  const fileSymbols = database.getSymbolsByFile(seed.metadata.filePath);
+  const fileSymbols = database.getSymbolsByFileOnBranch(seed.metadata.filePath, branch);
   let bestSymbol: SymbolData | null = null;
 
   for (const symbol of fileSymbols) {
@@ -78,9 +82,10 @@ function resolveSeedSymbol(database: Database, seed: GraphExpansionSeed): Symbol
 function resolveChunkForSymbol(
   database: Database,
   symbol: SymbolData,
+  branch: string,
   allowedChunkIds: Set<string> | null
 ): GraphExpansionSeed | null {
-  const fileChunks = database.getChunksByFile(symbol.filePath);
+  const fileChunks = database.getChunksByFileOnBranch(symbol.filePath, branch);
   const bestChunk = fileChunks
     .filter((chunk) => !allowedChunkIds || allowedChunkIds.has(chunk.chunkId))
     .filter((chunk) =>
@@ -113,14 +118,14 @@ function resolveChunkForSymbol(
       symbolKind: bestChunk.symbolKind as ChunkSymbolKind | undefined,
       name: bestChunk.name ?? undefined,
       language: bestChunk.language,
-      hash: bestChunk.contentHash,
+      hash: bestChunk.embeddingInputHash,
     },
   };
 }
 
-function resolveTargetSymbols(database: Database, targetName: string): SymbolData[] {
-  const exact = database.getSymbolsByName(targetName);
-  const ci = database.getSymbolsByNameCi(targetName);
+function resolveTargetSymbols(database: Database, targetName: string, branch: string): SymbolData[] {
+  const exact = database.getSymbolsByNameOnBranch(targetName, branch);
+  const ci = database.getSymbolsByNameCiOnBranch(targetName, branch);
   const deduped = new Map<string, SymbolData>();
 
   for (const symbol of [...exact, ...ci]) {
@@ -150,7 +155,7 @@ export function expandGraphContext(
   const expanded: GraphExpansionEntry[] = [];
 
   for (const candidate of primaryCandidates) {
-    const symbol = resolveSeedSymbol(database, candidate);
+    const symbol = resolveSeedSymbol(database, candidate, options.branch);
     if (!symbol || seenSymbols.has(symbol.id)) {
       continue;
     }
@@ -172,12 +177,17 @@ export function expandGraphContext(
 
     const callers = database.getCallersWithContextByTargetSymbolId(current.symbol.id, options.branch);
     for (const edge of callers) {
-      const callerSymbol = database.getSymbolById(edge.fromSymbolId);
+      const callerSymbol = database.getSymbolByIdOnBranch(edge.fromSymbolId, options.branch);
       if (!callerSymbol) {
         continue;
       }
 
-      const callerChunk = resolveChunkForSymbol(database, callerSymbol, options.allowedChunkIds);
+      const callerChunk = resolveChunkForSymbol(
+        database,
+        callerSymbol,
+        options.branch,
+        options.allowedChunkIds
+      );
       if (!callerChunk || seenChunkIds.has(callerChunk.id)) {
         continue;
       }
@@ -200,11 +210,16 @@ export function expandGraphContext(
     const callees = database.getCallees(current.symbol.id, options.branch);
     for (const edge of callees) {
       const calleeSymbols = edge.toSymbolId
-        ? [database.getSymbolById(edge.toSymbolId)].filter((value): value is SymbolData => value !== null)
-        : resolveTargetSymbols(database, edge.targetName);
+        ? [database.getSymbolByIdOnBranch(edge.toSymbolId, options.branch)].filter((value): value is SymbolData => value !== null)
+        : resolveTargetSymbols(database, edge.targetName, options.branch);
 
       for (const calleeSymbol of calleeSymbols) {
-        const calleeChunk = resolveChunkForSymbol(database, calleeSymbol, options.allowedChunkIds);
+        const calleeChunk = resolveChunkForSymbol(
+          database,
+          calleeSymbol,
+          options.branch,
+          options.allowedChunkIds
+        );
         if (!calleeChunk || seenChunkIds.has(calleeChunk.id)) {
           continue;
         }

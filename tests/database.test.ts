@@ -24,7 +24,7 @@ describe("Database", () => {
 
     it("should upsert and retrieve embedding", () => {
       const embedding = Buffer.from(new Float32Array([1.0, 2.0, 3.0]).buffer);
-      db.upsertEmbedding("hash123", embedding, "test chunk text", "test-model");
+      db.upsertEmbedding("hash123", "hash123", embedding, "test chunk text", "test-model");
 
       expect(db.embeddingExists("hash123")).toBe(true);
 
@@ -41,8 +41,8 @@ describe("Database", () => {
       const arcticEmbedding = Buffer.from(new Float32Array([1.0, 2.0, 3.0]).buffer);
       const voyageEmbedding = Buffer.from(new Float32Array([4.0, 5.0, 6.0]).buffer);
 
-      db.upsertEmbedding("hash123", arcticEmbedding, "test chunk text", "arctic-model");
-      db.upsertEmbedding("hash123", voyageEmbedding, "test chunk text", "voyage-model");
+      db.upsertEmbedding("hash123", "hash123", arcticEmbedding, "test chunk text", "arctic-model");
+      db.upsertEmbedding("hash123", "hash123", voyageEmbedding, "test chunk text", "voyage-model");
 
       const retrievedArctic = db.getEmbeddingForModel("hash123", "arctic-model");
       const retrievedVoyage = db.getEmbeddingForModel("hash123", "voyage-model");
@@ -71,7 +71,7 @@ describe("Database", () => {
 
     it("should get missing embeddings from a list", () => {
       const embedding = Buffer.from(new Float32Array([1.0]).buffer);
-      db.upsertEmbedding("exists", embedding, "text", "model");
+      db.upsertEmbedding("exists", "exists", embedding, "text", "model");
 
       const missing = db.getMissingEmbeddings(["exists", "missing1", "missing2"]);
       
@@ -82,7 +82,7 @@ describe("Database", () => {
 
     it("should get missing embeddings for a specific model", () => {
       const embedding = Buffer.from(new Float32Array([1.0]).buffer);
-      db.upsertEmbedding("shared", embedding, "text", "arctic-model");
+      db.upsertEmbedding("shared", "shared", embedding, "text", "arctic-model");
 
       const missingVoyage = db.getMissingEmbeddingsForModel(["shared", "missing"], "voyage-model");
       const missingArctic = db.getMissingEmbeddingsForModel(["shared", "missing"], "arctic-model");
@@ -90,12 +90,26 @@ describe("Database", () => {
       expect(missingVoyage).toEqual(["shared", "missing"]);
       expect(missingArctic).toEqual(["missing"]);
     });
+
+    it("should fetch stored chunk text by content hash in batch", () => {
+      const embedding = Buffer.from(new Float32Array([1.0]).buffer);
+      db.upsertEmbedding("hash-a", "hash-a", embedding, "chunk text a", "arctic-model");
+      db.upsertEmbedding("hash-a", "hash-a", embedding, "chunk text a", "voyage-model");
+      db.upsertEmbedding("hash-b", "hash-b", embedding, "chunk text b", "arctic-model");
+
+      const chunkTexts = db.getChunkTextsBatch(["hash-a", "hash-b", "missing"]);
+
+      expect(chunkTexts.get("hash-a")).toBe("chunk text a");
+      expect(chunkTexts.get("hash-b")).toBe("chunk text b");
+      expect(chunkTexts.has("missing")).toBe(false);
+    });
   });
 
   describe("chunks", () => {
     const testChunk: ChunkData = {
       chunkId: "chunk_abc123",
       contentHash: "hash456",
+      embeddingInputHash: "hash456",
       filePath: "/path/to/file.ts",
       startLine: 10,
       endLine: 20,
@@ -156,6 +170,7 @@ describe("Database", () => {
     const testChunk: ChunkData = {
       chunkId: "chunk_abc123",
       contentHash: "hash456",
+      embeddingInputHash: "hash456",
       filePath: "/path/to/file.ts",
       startLine: 10,
       endLine: 20,
@@ -216,6 +231,70 @@ describe("Database", () => {
       expect(delta.removed).toContain("chunk_main_only");
       expect(delta.added).not.toContain("chunk_abc123");
       expect(delta.removed).not.toContain("chunk_abc123");
+    });
+  });
+
+  describe("branch-scoped lookups", () => {
+    it("should scope chunk and symbol queries to the requested branch", () => {
+      db.upsertChunk({
+        chunkId: "chunk-main",
+        contentHash: "hash-main",
+        embeddingInputHash: "hash-main",
+        filePath: "/path/to/file.ts",
+        startLine: 1,
+        endLine: 10,
+        nodeType: "function",
+        name: "processPayment",
+        language: "typescript",
+      });
+      db.upsertChunk({
+        chunkId: "chunk-feature",
+        contentHash: "hash-feature",
+        embeddingInputHash: "hash-feature",
+        filePath: "/path/to/file.ts",
+        startLine: 20,
+        endLine: 30,
+        nodeType: "function",
+        name: "processPayment",
+        language: "typescript",
+      });
+      db.addChunksToBranch("main", ["chunk-main"]);
+      db.addChunksToBranch("feature", ["chunk-feature"]);
+
+      db.upsertSymbol({
+        id: "sym-main",
+        filePath: "/path/to/file.ts",
+        name: "processPayment",
+        kind: "Function",
+        startLine: 1,
+        startCol: 0,
+        endLine: 10,
+        endCol: 1,
+        language: "typescript",
+      });
+      db.upsertSymbol({
+        id: "sym-feature",
+        filePath: "/path/to/file.ts",
+        name: "processPayment",
+        kind: "Function",
+        startLine: 20,
+        startCol: 0,
+        endLine: 30,
+        endCol: 1,
+        language: "typescript",
+      });
+      db.addSymbolsToBranch("main", ["sym-main"]);
+      db.addSymbolsToBranch("feature", ["sym-feature"]);
+
+      expect(db.getChunksByFileOnBranch("/path/to/file.ts", "main").map((row) => row.chunkId)).toEqual(["chunk-main"]);
+      expect(db.getChunksByFileOnBranch("/path/to/file.ts", "feature").map((row) => row.chunkId)).toEqual(["chunk-feature"]);
+
+      expect(db.getSymbolsByFileOnBranch("/path/to/file.ts", "main").map((row) => row.id)).toEqual(["sym-main"]);
+      expect(db.getSymbolsByFileOnBranch("/path/to/file.ts", "feature").map((row) => row.id)).toEqual(["sym-feature"]);
+      expect(db.getSymbolByIdOnBranch("sym-main", "feature")).toBeNull();
+      expect(db.getSymbolByNameOnBranch("processPayment", "/path/to/file.ts", "main")?.id).toBe("sym-main");
+      expect(db.getSymbolsByNameOnBranch("processPayment", "feature").map((row) => row.id)).toEqual(["sym-feature"]);
+      expect(db.getSymbolsByNameCiOnBranch("PROCESSPAYMENT", "main").map((row) => row.id)).toEqual(["sym-main"]);
     });
   });
 
@@ -290,7 +369,7 @@ describe("Database", () => {
   describe("garbage collection", () => {
     it("should gc orphan embeddings", () => {
       const embedding = Buffer.from(new Float32Array([1.0]).buffer);
-      db.upsertEmbedding("orphan_hash", embedding, "text", "model");
+      db.upsertEmbedding("orphan_hash", "orphan_hash", embedding, "text", "model");
 
       const gcCount = db.gcOrphanEmbeddings();
       
@@ -300,10 +379,11 @@ describe("Database", () => {
 
     it("should not gc referenced embeddings", () => {
       const embedding = Buffer.from(new Float32Array([1.0]).buffer);
-      db.upsertEmbedding("referenced_hash", embedding, "text", "model");
+      db.upsertEmbedding("referenced_hash", "referenced_hash", embedding, "text", "model");
       db.upsertChunk({
         chunkId: "chunk1",
         contentHash: "referenced_hash",
+        embeddingInputHash: "referenced_hash",
         filePath: "/file.ts",
         startLine: 1,
         endLine: 5,
@@ -320,6 +400,7 @@ describe("Database", () => {
       db.upsertChunk({
         chunkId: "orphan_chunk",
         contentHash: "hash",
+        embeddingInputHash: "hash",
         filePath: "/file.ts",
         startLine: 1,
         endLine: 5,
@@ -336,6 +417,7 @@ describe("Database", () => {
       db.upsertChunk({
         chunkId: "referenced_chunk",
         contentHash: "hash",
+        embeddingInputHash: "hash",
         filePath: "/file.ts",
         startLine: 1,
         endLine: 5,
@@ -353,10 +435,11 @@ describe("Database", () => {
   describe("stats", () => {
     it("should return database stats", () => {
       const embedding = Buffer.from(new Float32Array([1.0]).buffer);
-      db.upsertEmbedding("hash1", embedding, "text", "model");
+      db.upsertEmbedding("hash1", "hash1", embedding, "text", "model");
       db.upsertChunk({
         chunkId: "chunk1",
         contentHash: "hash1",
+        embeddingInputHash: "hash1",
         filePath: "/file.ts",
         startLine: 1,
         endLine: 5,
@@ -377,18 +460,21 @@ describe("Database", () => {
     it("should upsert embeddings in batch", () => {
       const items = [
         {
+          embeddingInputHash: "batch_hash1",
           contentHash: "batch_hash1",
           embedding: Buffer.from(new Float32Array([1.0, 2.0]).buffer),
           chunkText: "text1",
           model: "test-model",
         },
         {
+          embeddingInputHash: "batch_hash2",
           contentHash: "batch_hash2",
           embedding: Buffer.from(new Float32Array([3.0, 4.0]).buffer),
           chunkText: "text2",
           model: "test-model",
         },
         {
+          embeddingInputHash: "batch_hash3",
           contentHash: "batch_hash3",
           embedding: Buffer.from(new Float32Array([5.0, 6.0]).buffer),
           chunkText: "text3",
@@ -412,12 +498,14 @@ describe("Database", () => {
     it("should retrieve embeddings in batch for a specific model", () => {
       db.upsertEmbeddingsBatch([
         {
+          embeddingInputHash: "shared-hash",
           contentHash: "shared-hash",
           embedding: Buffer.from(new Float32Array([1.0, 2.0]).buffer),
           chunkText: "text1",
           model: "arctic-model",
         },
         {
+          embeddingInputHash: "shared-hash",
           contentHash: "shared-hash",
           embedding: Buffer.from(new Float32Array([3.0, 4.0]).buffer),
           chunkText: "text1",
@@ -443,6 +531,7 @@ describe("Database", () => {
         {
           chunkId: "batch_chunk1",
           contentHash: "hash1",
+          embeddingInputHash: "hash1",
           filePath: "/file1.ts",
           startLine: 1,
           endLine: 10,
@@ -453,6 +542,7 @@ describe("Database", () => {
         {
           chunkId: "batch_chunk2",
           contentHash: "hash2",
+          embeddingInputHash: "hash2",
           filePath: "/file2.ts",
           startLine: 20,
           endLine: 30,
@@ -463,6 +553,7 @@ describe("Database", () => {
         {
           chunkId: "batch_chunk3",
           contentHash: "hash3",
+          embeddingInputHash: "hash3",
           filePath: "/file1.ts",
           startLine: 50,
           endLine: 60,
@@ -495,9 +586,9 @@ describe("Database", () => {
 
     it("should add chunks to branch in batch", () => {
       const chunks: ChunkData[] = [
-        { chunkId: "c1", contentHash: "h1", filePath: "/f.ts", startLine: 1, endLine: 5, language: "ts" },
-        { chunkId: "c2", contentHash: "h2", filePath: "/f.ts", startLine: 10, endLine: 15, language: "ts" },
-        { chunkId: "c3", contentHash: "h3", filePath: "/f.ts", startLine: 20, endLine: 25, language: "ts" },
+        { chunkId: "c1", contentHash: "h1", embeddingInputHash: "h1", filePath: "/f.ts", startLine: 1, endLine: 5, language: "ts" },
+        { chunkId: "c2", contentHash: "h2", embeddingInputHash: "h2", filePath: "/f.ts", startLine: 10, endLine: 15, language: "ts" },
+        { chunkId: "c3", contentHash: "h3", embeddingInputHash: "h3", filePath: "/f.ts", startLine: 20, endLine: 25, language: "ts" },
       ];
       db.upsertChunksBatch(chunks);
 
@@ -519,6 +610,7 @@ describe("Database", () => {
       db.upsertChunk({
         chunkId: "update_chunk",
         contentHash: "old_hash",
+        embeddingInputHash: "old_hash",
         filePath: "/old.ts",
         startLine: 1,
         endLine: 5,
@@ -528,6 +620,7 @@ describe("Database", () => {
       db.upsertChunksBatch([{
         chunkId: "update_chunk",
         contentHash: "new_hash",
+        embeddingInputHash: "new_hash",
         filePath: "/new.ts",
         startLine: 10,
         endLine: 20,
@@ -538,6 +631,89 @@ describe("Database", () => {
       expect(chunk!.contentHash).toBe("new_hash");
       expect(chunk!.filePath).toBe("/new.ts");
       expect(chunk!.startLine).toBe(10);
+    });
+  });
+
+  describe("config version records", () => {
+    it("round-trips config versions by hash and tracks the active row", () => {
+      db.activateConfigVersion({
+        configHash: "cfg-main",
+        embeddingModelId: "mock-embedding-model",
+        embeddingDimension: 8,
+        voyageModelId: "voyage-code-2",
+        embeddingPrefixVersion: 3,
+        chunkerVersion: "chunker-v1",
+        graphExtractorVersion: "graph-v1",
+        active: true,
+        createdAt: 100,
+      });
+
+      expect(db.getActiveConfigVersion()).toEqual({
+        configHash: "cfg-main",
+        embeddingModelId: "mock-embedding-model",
+        embeddingDimension: 8,
+        voyageModelId: "voyage-code-2",
+        embeddingPrefixVersion: 3,
+        chunkerVersion: "chunker-v1",
+        graphExtractorVersion: "graph-v1",
+        active: true,
+        createdAt: 100,
+      });
+      expect(db.getConfigVersion("cfg-main")).toEqual({
+        configHash: "cfg-main",
+        embeddingModelId: "mock-embedding-model",
+        embeddingDimension: 8,
+        voyageModelId: "voyage-code-2",
+        embeddingPrefixVersion: 3,
+        chunkerVersion: "chunker-v1",
+        graphExtractorVersion: "graph-v1",
+        active: true,
+        createdAt: 100,
+      });
+      expect(db.getConfigVersion("missing-config")).toBeNull();
+    });
+
+    it("stores the applied config hash per branch", () => {
+      db.activateConfigVersion({
+        configHash: "cfg-main",
+        embeddingModelId: "mock-embedding-model",
+        embeddingDimension: 8,
+        voyageModelId: null,
+        embeddingPrefixVersion: 3,
+        chunkerVersion: "chunker-v1",
+        graphExtractorVersion: "graph-v1",
+        active: true,
+        createdAt: 100,
+      });
+      db.activateConfigVersion({
+        configHash: "cfg-feature",
+        embeddingModelId: "mock-embedding-model-v2",
+        embeddingDimension: 8,
+        voyageModelId: null,
+        embeddingPrefixVersion: 3,
+        chunkerVersion: "chunker-v1",
+        graphExtractorVersion: "graph-v1",
+        active: true,
+        createdAt: 200,
+      });
+
+      db.upsertBranchConfigVersion({
+        branch: "main",
+        configHash: "cfg-main",
+        appliedAt: 150,
+      });
+      db.upsertBranchConfigVersion({
+        branch: "main",
+        configHash: "cfg-feature",
+        appliedAt: 250,
+      });
+
+      expect(db.getBranchConfigVersion("main")).toEqual({
+        branch: "main",
+        configHash: "cfg-feature",
+        appliedAt: 250,
+      });
+      expect(db.getBranchConfigVersion("feature")).toBeNull();
     });
   });
 });

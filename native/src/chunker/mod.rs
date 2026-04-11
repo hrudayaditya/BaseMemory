@@ -12,7 +12,7 @@ use napi_derive::napi;
 use policy::get_policy;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::cell::RefCell;
 use tree_sitter::Parser;
 
 pub const CHUNKER_VERSION: &str = env!("CHUNKER_VERSION");
@@ -34,6 +34,8 @@ pub enum SymbolKind {
     Class,
     Interface,
     Struct,
+    Type,
+    Constant,
     Test,
     Module,
     Block,
@@ -49,8 +51,11 @@ pub enum Granularity {
 #[napi(object)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkConfig {
+    /// Soft secondary token budget for split decisions. Set to 0 to disable it.
     pub target_token_budget: u32,
+    /// Breaking change: measured in non-whitespace Unicode characters, not bytes.
     pub max_chunk_chars: u32,
+    /// Breaking change: measured in non-whitespace Unicode characters, not bytes.
     pub min_chunk_chars: u32,
     pub merge_small_siblings: bool,
     pub attach_comments: bool,
@@ -69,19 +74,55 @@ impl ChunkConfig {
     pub fn min_chunk_chars_usize(&self) -> usize {
         self.min_chunk_chars as usize
     }
+
+    pub fn effective_max_non_whitespace_chars_usize(&self) -> usize {
+        let max_chars = self.max_chunk_chars_usize().max(1);
+        if self.target_token_budget == 0 {
+            return max_chars;
+        }
+
+        let max_by_tokens = (((self.target_token_budget as f64) * 4.0) / 1.4)
+            .floor()
+            .max(1.0) as usize;
+        max_chars.min(max_by_tokens)
+    }
 }
 
 impl Default for ChunkConfig {
     fn default() -> Self {
         Self {
-            target_token_budget: 1500,
-            max_chunk_chars: 3000,
-            min_chunk_chars: 200,
+            target_token_budget: 512,
+            max_chunk_chars: 2000,
+            min_chunk_chars: 400,
             merge_small_siblings: true,
             attach_comments: true,
             emit_coarse_chunks: true,
         }
     }
+}
+
+pub(crate) fn non_whitespace_len(s: &str) -> usize {
+    s.chars().filter(|c| !c.is_whitespace()).count()
+}
+
+pub(crate) fn estimate_token_count(non_whitespace_len: usize) -> usize {
+    (((non_whitespace_len as f64 * 1.4) / 4.0).ceil()) as usize
+}
+
+pub(crate) fn exceeds_budget(text: &str, config: &ChunkConfig) -> bool {
+    let nw = non_whitespace_len(text);
+    if nw > config.max_chunk_chars_usize() {
+        return true;
+    }
+
+    if config.target_token_budget > 0 {
+        let estimated_tokens = estimate_token_count(nw);
+        if estimated_tokens > config.target_token_budget_usize() {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[napi(object)]
@@ -102,18 +143,16 @@ pub struct Chunk {
 }
 
 #[cfg(test)]
-static TEST_LOGS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+thread_local! {
+    static TEST_LOGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
 
 fn emit_log(level: &str, message: String) {
     eprintln!("[chunker:{level}] {message}");
 
     #[cfg(test)]
     {
-        if let Some(logs) = TEST_LOGS.get() {
-            if let Ok(mut guard) = logs.lock() {
-                guard.push(message);
-            }
-        }
+        TEST_LOGS.with(|logs| logs.borrow_mut().push(message));
     }
 }
 
@@ -127,19 +166,12 @@ pub(crate) fn log_debug(message: String) {
 
 #[cfg(test)]
 fn clear_captured_logs() {
-    let logs = TEST_LOGS.get_or_init(|| Mutex::new(Vec::new()));
-    if let Ok(mut guard) = logs.lock() {
-        guard.clear();
-    }
+    TEST_LOGS.with(|logs| logs.borrow_mut().clear());
 }
 
 #[cfg(test)]
 fn captured_logs() -> Vec<String> {
-    TEST_LOGS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .map(|guard| guard.clone())
-        .unwrap_or_default()
+    TEST_LOGS.with(|logs| logs.borrow().clone())
 }
 
 fn normalize_language(file_path: &str, language: &str) -> String {
@@ -254,23 +286,49 @@ fn gap_fill_chunk(
     })
 }
 
-fn floor_char_boundary(source: &str, mut index: usize) -> usize {
-    if index >= source.len() {
-        return source.len();
+fn find_budget_char_split_end(
+    file_path: &str,
+    language: &str,
+    source_code: &str,
+    start: usize,
+    end: usize,
+    config: &ChunkConfig,
+) -> Result<usize, ChunkerError> {
+    let text = source_code
+        .get(start..end)
+        .ok_or_else(|| ChunkerError::InvalidSlice {
+            file_path: file_path.to_string(),
+            start,
+            end,
+        })?;
+
+    let mut split_end = start;
+    let mut non_whitespace = 0usize;
+    let max_non_whitespace = config.effective_max_non_whitespace_chars_usize();
+
+    for (offset, ch) in text.char_indices() {
+        if !ch.is_whitespace() && non_whitespace + 1 > max_non_whitespace {
+            break;
+        }
+        if !ch.is_whitespace() {
+            non_whitespace += 1;
+        }
+        split_end = start + offset + ch.len_utf8();
     }
 
-    while index > 0 && !source_code_is_char_boundary(source, index) {
-        index -= 1;
+    if split_end > start {
+        return Ok(split_end);
     }
 
-    index
+    Err(ChunkerError::ChunkTooLarge {
+        file_path: file_path.to_string(),
+        language: language.to_string(),
+        chunk_len: non_whitespace_len(text),
+        max_len: max_non_whitespace,
+    })
 }
 
-fn source_code_is_char_boundary(source: &str, index: usize) -> bool {
-    source.is_char_boundary(index)
-}
-
-fn split_range_to_max_sized_chunks(
+pub(crate) fn split_range_to_max_sized_chunks(
     file_path: &str,
     language: &str,
     source_code: &str,
@@ -278,33 +336,63 @@ fn split_range_to_max_sized_chunks(
     start: usize,
     end: usize,
     base_chunk: &Chunk,
-    max_len: usize,
+    config: &ChunkConfig,
 ) -> Result<Vec<Chunk>, ChunkerError> {
     let mut chunks = Vec::new();
     let mut segment_start = start;
+    let max_len = config.effective_max_non_whitespace_chars_usize();
+    let chunk_non_whitespace = non_whitespace_len(&base_chunk.text);
+    let estimated_tokens = estimate_token_count(chunk_non_whitespace);
+
+    log_warn(format!(
+        "chunker force-split on line boundaries file_path={} language={} chunk_non_whitespace_chars={} estimated_tokens={} max_chunk_chars={} target_token_budget={} symbol_name={}",
+        file_path,
+        language,
+        chunk_non_whitespace,
+        estimated_tokens,
+        config.max_chunk_chars,
+        config.target_token_budget,
+        base_chunk.symbol_name.as_deref().unwrap_or("<anonymous>")
+    ));
 
     while segment_start < end {
-        let max_end = floor_char_boundary(source_code, (segment_start + max_len).min(end));
-        let mut segment_end = line_starts
+        let mut segment_end = None;
+        let mut candidate_boundaries: Vec<usize> = line_starts
             .iter()
             .copied()
-            .take_while(|line_start| *line_start <= max_end)
+            .take_while(|line_start| *line_start <= end)
             .filter(|line_start| *line_start > segment_start)
-            .last()
-            .unwrap_or(max_end);
-
-        if segment_end <= segment_start {
-            segment_end = max_end;
+            .collect();
+        if candidate_boundaries.last().copied() != Some(end) {
+            candidate_boundaries.push(end);
         }
 
-        if segment_end <= segment_start {
-            return Err(ChunkerError::ChunkTooLarge {
-                file_path: file_path.to_string(),
-                language: language.to_string(),
-                chunk_len: end.saturating_sub(start),
-                max_len,
-            });
+        for boundary in candidate_boundaries {
+            let text = source_code
+                .get(segment_start..boundary)
+                .ok_or_else(|| ChunkerError::InvalidSlice {
+                    file_path: file_path.to_string(),
+                    start: segment_start,
+                    end: boundary,
+                })?;
+            if exceeds_budget(text, config) {
+                break;
+            }
+            segment_end = Some(boundary);
         }
+
+        let segment_end = if let Some(boundary) = segment_end {
+            boundary
+        } else {
+            find_budget_char_split_end(
+                file_path,
+                language,
+                source_code,
+                segment_start,
+                end,
+                config,
+            )?
+        };
 
         let text = source_code
             .get(segment_start..segment_end)
@@ -315,11 +403,11 @@ fn split_range_to_max_sized_chunks(
             })?
             .to_string();
 
-        if text.len() > max_len {
+        if exceeds_budget(&text, config) {
             return Err(ChunkerError::ChunkTooLarge {
                 file_path: file_path.to_string(),
                 language: language.to_string(),
-                chunk_len: text.len(),
+                chunk_len: non_whitespace_len(&text),
                 max_len,
             });
         }
@@ -349,7 +437,7 @@ fn split_range_to_max_sized_chunks(
     Ok(chunks)
 }
 
-fn enforce_fine_chunk_max_size(
+pub(crate) fn enforce_fine_chunk_max_size(
     file_path: &str,
     language: &str,
     source_code: &str,
@@ -357,11 +445,10 @@ fn enforce_fine_chunk_max_size(
     chunks: Vec<Chunk>,
 ) -> Result<Vec<Chunk>, ChunkerError> {
     let line_starts = build_line_index(source_code);
-    let max_len = config.max_chunk_chars_usize();
     let mut result = Vec::with_capacity(chunks.len());
 
     for chunk in chunks {
-        if chunk.granularity == Granularity::Fine && chunk.text.len() > max_len {
+        if chunk.granularity == Granularity::Fine && exceeds_budget(&chunk.text, config) {
             result.extend(split_range_to_max_sized_chunks(
                 file_path,
                 language,
@@ -370,7 +457,7 @@ fn enforce_fine_chunk_max_size(
                 chunk.start_byte as usize,
                 chunk.end_byte as usize,
                 &chunk,
-                max_len,
+                config,
             )?);
         } else {
             result.push(chunk);
@@ -479,7 +566,7 @@ fn enforce_fine_chunk_coverage(
                 covered_until,
                 start,
             )?;
-            if gap_chunk.text.len() > config.max_chunk_chars_usize() {
+            if exceeds_budget(&gap_chunk.text, config) {
                 normalized.extend(split_range_to_max_sized_chunks(
                     file_path,
                     language,
@@ -488,7 +575,7 @@ fn enforce_fine_chunk_coverage(
                     covered_until,
                     start,
                     &gap_chunk,
-                    config.max_chunk_chars_usize(),
+                    config,
                 )?);
             } else {
                 normalized.push(gap_chunk);
@@ -508,7 +595,7 @@ fn enforce_fine_chunk_coverage(
             covered_until,
             source_code.len(),
         )?;
-        if gap_chunk.text.len() > config.max_chunk_chars_usize() {
+        if exceeds_budget(&gap_chunk.text, config) {
             normalized.extend(split_range_to_max_sized_chunks(
                 file_path,
                 language,
@@ -517,7 +604,7 @@ fn enforce_fine_chunk_coverage(
                 covered_until,
                 source_code.len(),
                 &gap_chunk,
-                config.max_chunk_chars_usize(),
+                config,
             )?);
         } else {
             normalized.push(gap_chunk);
@@ -663,6 +750,23 @@ mod tests {
             .collect()
     }
 
+    fn named_fine_chunk<'a>(chunks: &'a [Chunk], name: &str) -> &'a Chunk {
+        chunks
+            .iter()
+            .find(|chunk| {
+                chunk.symbol_name.as_deref() == Some(name)
+                    && chunk.granularity == Granularity::Fine
+            })
+            .unwrap_or_else(|| panic!("missing fine chunk for {name}"))
+    }
+
+    fn named_chunk<'a>(chunks: &'a [Chunk], name: &str) -> &'a Chunk {
+        chunks
+            .iter()
+            .find(|chunk| chunk.symbol_name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("missing chunk for {name}"))
+    }
+
     #[test]
     fn attaches_leading_comments_to_typescript_function() {
         let source = r#"// explains foo
@@ -701,6 +805,458 @@ export function foo() {
     }
 
     #[test]
+    fn keeps_decorated_module_level_python_functions_as_functions() {
+        let source = r#"@app.route("/")
+def index():
+    return "ok"
+"#;
+
+        let chunks = chunk_file("app.py", "python", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let function_chunk = named_fine_chunk(&chunks, "index");
+
+        assert_eq!(function_chunk.symbol_kind, Some(SymbolKind::Function));
+        assert_eq!(function_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn keeps_module_level_pytest_fixtures_as_functions() {
+        let source = r#"@pytest.fixture
+def my_fixture():
+    return 1
+"#;
+
+        let chunks = chunk_file("fixture.py", "python", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let fixture_chunk = named_fine_chunk(&chunks, "my_fixture");
+
+        assert_eq!(fixture_chunk.symbol_kind, Some(SymbolKind::Function));
+        assert_eq!(fixture_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn keeps_decorated_class_methods_as_methods() {
+        let source = r#"class Example:
+    @classmethod
+    def foo(cls):
+        return cls
+"#;
+
+        let chunks = chunk_file("example.py", "python", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let method_chunk = named_fine_chunk(&chunks, "foo");
+
+        assert_eq!(method_chunk.symbol_kind, Some(SymbolKind::Method));
+        assert_eq!(method_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn attaches_rust_doc_comments_to_function_chunks() {
+        let source = r#"/// This is a doc comment
+fn foo() {}
+"#;
+
+        let chunks = chunk_file("lib.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let function_chunk = named_fine_chunk(&chunks, "foo");
+
+        assert!(function_chunk.text.starts_with("/// This is a doc comment"));
+        assert_eq!(function_chunk.symbol_kind, Some(SymbolKind::Function));
+    }
+
+    #[test]
+    fn attaches_rust_doc_comments_to_struct_chunks() {
+        let source = r#"/// Shared config
+struct Config {
+    enabled: bool,
+}
+"#;
+
+        let chunks = chunk_file("lib.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let struct_chunk = named_fine_chunk(&chunks, "Config");
+
+        assert!(struct_chunk.text.starts_with("/// Shared config"));
+        assert_eq!(struct_chunk.symbol_kind, Some(SymbolKind::Struct));
+    }
+
+    #[test]
+    fn captures_rust_macro_definitions() {
+        let source = r#"macro_rules! my_macro {
+    () => {};
+}
+"#;
+
+        let chunks = chunk_file("lib.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let macro_chunk = named_fine_chunk(&chunks, "my_macro");
+
+        assert_eq!(macro_chunk.symbol_kind, Some(SymbolKind::Function));
+        assert_eq!(macro_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_rust_type_aliases() {
+        let source = r#"type Meters = f64;
+"#;
+
+        let chunks = chunk_file("lib.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let type_chunk = named_fine_chunk(&chunks, "Meters");
+
+        assert_eq!(type_chunk.symbol_kind, Some(SymbolKind::Type));
+        assert_eq!(type_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_rust_const_items() {
+        let source = r#"const MAX: usize = 1024;
+"#;
+
+        let chunks = chunk_file("lib.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let const_chunk = named_fine_chunk(&chunks, "MAX");
+
+        assert_eq!(const_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(const_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_rust_static_items() {
+        let source = r#"static INSTANCE: Lazy<Config> = Lazy::new(Config::default);
+"#;
+
+        let chunks = chunk_file("lib.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let static_chunk = named_fine_chunk(&chunks, "INSTANCE");
+
+        assert_eq!(static_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(static_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn keeps_rust_enums_typed_as_type_symbols() {
+        let source = r#"enum Direction {
+    North,
+    South,
+}
+"#;
+
+        let chunks = chunk_file("lib.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let enum_chunk = named_fine_chunk(&chunks, "Direction");
+
+        assert_eq!(enum_chunk.symbol_kind, Some(SymbolKind::Type));
+        assert_eq!(enum_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn classifies_inherent_rust_impls_as_blocks() {
+        let source = r#"impl MyStruct {
+    fn run(&self) {}
+}
+"#;
+
+        let chunks = chunk_file("lib.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let impl_chunk = named_chunk(&chunks, "MyStruct");
+
+        assert_eq!(impl_chunk.symbol_kind, Some(SymbolKind::Block));
+        assert_eq!(impl_chunk.chunk_kind, ChunkKind::Code);
+        assert_eq!(impl_chunk.granularity, Granularity::Coarse);
+
+        let method_chunk = named_fine_chunk(&chunks, "run");
+        assert_eq!(method_chunk.symbol_kind, Some(SymbolKind::Method));
+    }
+
+    #[test]
+    fn classifies_trait_rust_impls_as_blocks_and_includes_trait_name() {
+        let source = r#"impl Display for MyStruct {
+    fn fmt(&self) {}
+}
+"#;
+
+        let chunks = chunk_file("lib.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let impl_chunk = named_chunk(&chunks, "Display for MyStruct");
+
+        assert_eq!(impl_chunk.symbol_kind, Some(SymbolKind::Block));
+        assert_eq!(impl_chunk.chunk_kind, ChunkKind::Code);
+        assert_eq!(impl_chunk.granularity, Granularity::Coarse);
+    }
+
+    #[test]
+    fn captures_go_const_specs() {
+        let source = r#"package demo
+
+const A = 1
+"#;
+
+        let chunks = chunk_file("demo.go", "go", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let const_chunk = named_fine_chunk(&chunks, "A");
+
+        assert_eq!(const_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(const_chunk.chunk_kind, ChunkKind::Code);
+        assert!(const_chunk.text.contains("const A = 1"));
+    }
+
+    #[test]
+    fn captures_grouped_go_const_specs_without_anonymous_wrapper_gap_chunks() {
+        let source = r#"package demo
+
+const (
+    A = 1
+    B = 2
+)
+"#;
+
+        let chunks = chunk_file("demo.go", "go", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let a_chunk = named_fine_chunk(&chunks, "A");
+        let b_chunk = named_fine_chunk(&chunks, "B");
+
+        assert_eq!(a_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(b_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.symbol_name.is_none()
+                && chunk.granularity == Granularity::Fine
+                && chunk.text.contains("const (")
+        }));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.symbol_name.is_none()
+                && chunk.granularity == Granularity::Fine
+                && chunk.text.trim() == ")"
+        }));
+    }
+
+    #[test]
+    fn captures_go_package_level_vars() {
+        let source = r#"package demo
+
+var x int = 0
+"#;
+
+        let chunks = chunk_file("demo.go", "go", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let var_chunk = named_fine_chunk(&chunks, "x");
+
+        assert_eq!(var_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(var_chunk.chunk_kind, ChunkKind::Code);
+        assert!(var_chunk.text.contains("var x int = 0"));
+    }
+
+    #[test]
+    fn captures_go_type_aliases() {
+        let source = r#"package demo
+
+type MyAlias = string
+"#;
+
+        let chunks = chunk_file("demo.go", "go", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let alias_chunk = named_fine_chunk(&chunks, "MyAlias");
+
+        assert_eq!(alias_chunk.symbol_kind, Some(SymbolKind::Type));
+        assert_eq!(alias_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn qualifies_go_pointer_receiver_methods() {
+        let source = r#"package demo
+
+type MyStruct struct{}
+
+func (s *MyStruct) DoThing() {}
+"#;
+
+        let chunks = chunk_file("demo.go", "go", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let method_chunk = named_fine_chunk(&chunks, "MyStruct.DoThing");
+
+        assert_eq!(method_chunk.symbol_kind, Some(SymbolKind::Method));
+        assert_eq!(method_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn qualifies_go_value_receiver_methods() {
+        let source = r#"package demo
+
+type MyStruct struct{}
+
+func (s MyStruct) Value() int { return 1 }
+"#;
+
+        let chunks = chunk_file("demo.go", "go", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let method_chunk = named_fine_chunk(&chunks, "MyStruct.Value");
+
+        assert_eq!(method_chunk.symbol_kind, Some(SymbolKind::Method));
+        assert_eq!(method_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_grouped_go_type_declarations_without_anonymous_wrapper_gap_chunks() {
+        let source = r#"package demo
+
+type (
+    X struct{}
+    Y = string
+)
+"#;
+
+        let chunks = chunk_file("demo.go", "go", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let x_chunk = named_fine_chunk(&chunks, "X");
+        let y_chunk = named_fine_chunk(&chunks, "Y");
+
+        assert_eq!(x_chunk.symbol_kind, Some(SymbolKind::Struct));
+        assert_eq!(y_chunk.symbol_kind, Some(SymbolKind::Type));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.symbol_name.is_none()
+                && chunk.granularity == Granularity::Fine
+                && chunk.text.contains("type (")
+        }));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.symbol_name.is_none()
+                && chunk.granularity == Granularity::Fine
+                && chunk.text.trim() == ")"
+        }));
+    }
+
+    #[test]
+    fn captures_module_level_python_assignments_as_constants() {
+        let source = r#"BASE_URL = "https://api.example.com"
+"#;
+
+        let chunks = chunk_file("settings.py", "python", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let constant_chunk = named_fine_chunk(&chunks, "BASE_URL");
+
+        assert_eq!(constant_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(constant_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn ignores_python_assignments_inside_function_bodies() {
+        let source = r#"def build():
+    BASE_URL = "https://api.example.com"
+    return BASE_URL
+"#;
+
+        let chunks = chunk_file("settings.py", "python", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(!chunks
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("BASE_URL")));
+    }
+
+    #[test]
+    fn captures_python_all_exports_as_constants() {
+        let source = r#"__all__ = ["A", "B"]
+"#;
+
+        let chunks = chunk_file("exports.py", "python", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let all_chunk = named_fine_chunk(&chunks, "__all__");
+
+        assert_eq!(all_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(all_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_python_type_alias_statements() {
+        let source = r#"type Vector = list[float]
+"#;
+
+        let chunks = chunk_file("types.py", "python", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let alias_chunk = named_fine_chunk(&chunks, "Vector");
+
+        assert_eq!(alias_chunk.symbol_kind, Some(SymbolKind::Type));
+        assert_eq!(alias_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_module_level_python_docstrings_as_doc_chunks() {
+        let source = r#""""This module does X."""
+
+VALUE = 1
+"#;
+
+        let chunks = chunk_file("module.py", "python", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let doc_chunk = chunks
+            .iter()
+            .find(|chunk| chunk.chunk_kind == ChunkKind::Doc && chunk.granularity == Granularity::Fine)
+            .unwrap_or_else(|| panic!("missing module doc chunk"));
+
+        assert_eq!(doc_chunk.symbol_kind, Some(SymbolKind::Block));
+        assert!(doc_chunk.text.contains("This module does X."));
+    }
+
+    #[test]
+    fn captures_function_level_python_docstrings_as_doc_chunks() {
+        let source = r#"def render():
+    """Render docs."""
+    return "ok"
+"#;
+
+        let chunks = chunk_file("example.py", "python", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let doc_chunk = chunks
+            .iter()
+            .find(|chunk| {
+                chunk.chunk_kind == ChunkKind::Doc
+                    && chunk.granularity == Granularity::Fine
+                    && chunk.text.contains("Render docs.")
+            })
+            .unwrap_or_else(|| panic!("missing function doc chunk"));
+
+        assert_eq!(doc_chunk.symbol_kind, Some(SymbolKind::Block));
+    }
+
+    #[test]
+    fn captures_class_level_python_docstrings_as_doc_chunks() {
+        let source = r#"class Example:
+    """Class docs."""
+
+    def run(self):
+        return 1
+"#;
+
+        let chunks = chunk_file("example.py", "python", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let doc_chunk = chunks
+            .iter()
+            .find(|chunk| {
+                chunk.chunk_kind == ChunkKind::Doc
+                    && chunk.granularity == Granularity::Fine
+                    && chunk.text.contains("Class docs.")
+            })
+            .unwrap_or_else(|| panic!("missing class doc chunk"));
+
+        assert_eq!(doc_chunk.symbol_kind, Some(SymbolKind::Block));
+    }
+
+    #[test]
+    fn does_not_treat_non_leading_python_strings_as_doc_chunks() {
+        let source = r#"def run():
+    value = 1
+    "not a docstring"
+    return value
+"#;
+
+        let chunks = chunk_file("example.py", "python", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.chunk_kind == ChunkKind::Doc && chunk.text.contains("not a docstring")
+        }));
+    }
+
+    #[test]
     fn falls_back_for_unknown_languages() {
         let source = "alpha\nbeta\ngamma\ndelta\n";
         let chunks = chunk_file(
@@ -716,6 +1272,37 @@ export function foo() {
 
         assert!(!chunks.is_empty());
         assert!(chunks.iter().all(|chunk| chunk.symbol_kind.is_none()));
+    }
+
+    #[test]
+    fn measures_non_whitespace_length_correctly() {
+        assert_eq!(non_whitespace_len("  fn foo() { }  "), 9);
+    }
+
+    #[test]
+    fn uses_non_whitespace_length_for_budget_checks() {
+        let config = ChunkConfig {
+            target_token_budget: 0,
+            max_chunk_chars: 2000,
+            ..ChunkConfig::default()
+        };
+
+        assert!(exceeds_budget(&"a ".repeat(2001), &config));
+        assert!(!exceeds_budget(&"a ".repeat(1999), &config));
+    }
+
+    #[test]
+    fn uses_estimated_token_budget_as_soft_secondary_limit() {
+        let config = ChunkConfig {
+            target_token_budget: 512,
+            max_chunk_chars: 2000,
+            ..ChunkConfig::default()
+        };
+
+        assert_eq!(estimate_token_count(1400), 490);
+        assert_eq!(estimate_token_count(1800), 630);
+        assert!(!exceeds_budget(&"a".repeat(1400), &config));
+        assert!(exceeds_budget(&"a".repeat(1800), &config));
     }
 
     #[test]
@@ -776,7 +1363,96 @@ const bar = () => {
 
         let fine = fine_chunks(&chunks);
         assert!(fine.len() > 1);
-        assert!(fine.iter().all(|chunk| chunk.text.len() <= 200));
+        assert!(fine.iter().all(|chunk| !exceeds_budget(&chunk.text, &ChunkConfig {
+            max_chunk_chars: 200,
+            min_chunk_chars: 20,
+            ..ChunkConfig::default()
+        })));
+    }
+
+    #[test]
+    fn statement_splits_large_functions_at_statement_boundaries() {
+        let source = format!(
+            "export function huge() {{\n  const first = \"{}\";\n  const second = \"{}\";\n  const third = \"{}\";\n  const fourth = \"{}\";\n  const fifth = \"{}\";\n}}\n",
+            "a".repeat(70),
+            "b".repeat(70),
+            "c".repeat(70),
+            "d".repeat(70),
+            "e".repeat(70),
+        );
+        let config = ChunkConfig {
+            target_token_budget: 0,
+            max_chunk_chars: 120,
+            min_chunk_chars: 20,
+            ..ChunkConfig::default()
+        };
+
+        let chunks =
+            chunk_file("huge.ts", "typescript", &source, &config).unwrap_or_else(|err| panic!("{err}"));
+
+        let fine: Vec<&Chunk> = fine_chunks(&chunks)
+            .into_iter()
+            .filter(|chunk| chunk.symbol_name.as_deref() == Some("huge"))
+            .collect();
+
+        assert!(fine.len() > 1);
+        assert!(fine.iter().skip(1).all(|chunk| {
+            let trimmed = chunk.text.trim_start();
+            trimmed.starts_with("const second")
+                || trimmed.starts_with("const third")
+                || trimmed.starts_with("const fourth")
+                || trimmed.starts_with("const fifth")
+        }));
+    }
+
+    #[test]
+    fn falls_back_to_line_splitting_for_single_enormous_statements() {
+        clear_captured_logs();
+
+        let repeated = "    \"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\",\n".repeat(24);
+        let source = format!(
+            "export function huge() {{\n  const value = [\n{}  ].join(\"\");\n}}\n",
+            repeated
+        );
+        let config = ChunkConfig {
+            target_token_budget: 0,
+            max_chunk_chars: 120,
+            min_chunk_chars: 20,
+            ..ChunkConfig::default()
+        };
+
+        let chunks =
+            chunk_file("huge.ts", "typescript", &source, &config).unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(fine_chunks(&chunks).len() > 1);
+        assert!(captured_logs()
+            .iter()
+            .any(|message| message.contains("chunker force-split on line boundaries")));
+    }
+
+    #[test]
+    fn falls_back_to_line_splitting_when_no_statement_body_is_identified() {
+        clear_captured_logs();
+
+        let repeated = (0..18)
+            .map(|index| format!("  key{}: \"{}\"", index, "x".repeat(40)))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        let source = format!("export const BIG = {{\n{}\n}};\n", repeated);
+        let config = ChunkConfig {
+            target_token_budget: 0,
+            max_chunk_chars: 120,
+            min_chunk_chars: 20,
+            ..ChunkConfig::default()
+        };
+
+        let chunks =
+            chunk_file("big.ts", "typescript", &source, &config).unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(fine_chunks(&chunks).len() > 1);
+        assert!(captured_logs()
+            .iter()
+            .any(|message| message.contains("chunker force-split on line boundaries")));
     }
 
     #[test]
@@ -810,8 +1486,8 @@ export function beta() {
     fn logs_when_no_semantic_units_are_found_for_supported_language() {
         clear_captured_logs();
 
-        let source = r#"import { helper } from "./helper";
-const answer = 42;
+        let source = r#"import "./setup";
+import "./polyfills";
 "#;
 
         let _ = chunk_file(
@@ -865,7 +1541,7 @@ export const codebase_search: ToolDefinition = tool({
                     && chunk.granularity == Granularity::Fine
             })
             .unwrap_or_else(|| panic!("missing find_similar chunk"));
-        assert_eq!(find_similar.symbol_kind, Some(SymbolKind::Module));
+        assert_eq!(find_similar.symbol_kind, Some(SymbolKind::Function));
         assert_eq!(find_similar.chunk_kind, ChunkKind::Code);
         assert!(find_similar.text.contains("export const find_similar"));
 
@@ -876,7 +1552,7 @@ export const codebase_search: ToolDefinition = tool({
                     && chunk.granularity == Granularity::Fine
             })
             .unwrap_or_else(|| panic!("missing codebase_search chunk"));
-        assert_eq!(codebase_search.symbol_kind, Some(SymbolKind::Module));
+        assert_eq!(codebase_search.symbol_kind, Some(SymbolKind::Function));
         assert_eq!(codebase_search.chunk_kind, ChunkKind::Code);
         assert!(codebase_search.text.contains("export const codebase_search"));
 
@@ -902,7 +1578,7 @@ export const codebase_search: ToolDefinition = tool({
     }
 
     #[test]
-    fn ignores_plain_exported_constants_for_module_fallback() {
+    fn captures_plain_exported_constants_without_module_fallback() {
         let source = r#"export const MAX_RETRIES = 3;
 export const config = { key: "value" };
 "#;
@@ -910,12 +1586,13 @@ export const config = { key: "value" };
         let chunks = chunk_file("constants.ts", "typescript", source, &ChunkConfig::default())
             .unwrap_or_else(|err| panic!("{err}"));
 
-        assert!(!chunks
-            .iter()
-            .any(|chunk| chunk.symbol_name.as_deref() == Some("MAX_RETRIES")));
-        assert!(!chunks
-            .iter()
-            .any(|chunk| chunk.symbol_name.as_deref() == Some("config")));
+        let retries_chunk = named_fine_chunk(&chunks, "MAX_RETRIES");
+        assert_eq!(retries_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(retries_chunk.chunk_kind, ChunkKind::Code);
+
+        let config_chunk = named_fine_chunk(&chunks, "config");
+        assert_eq!(config_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(config_chunk.chunk_kind, ChunkKind::Code);
     }
 
     #[test]
@@ -936,5 +1613,504 @@ export const config = { key: "value" };
             .unwrap_or_else(|| panic!("missing describe test chunk"));
         assert_eq!(describe_chunk.chunk_kind, ChunkKind::Test);
         assert_eq!(describe_chunk.symbol_kind, Some(SymbolKind::Test));
+    }
+
+    #[test]
+    fn captures_typescript_type_alias_declarations() {
+        let source = r#"export type ButtonProps = {
+  label: string;
+  disabled?: boolean;
+};
+"#;
+
+        let chunks = chunk_file("types.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let alias_chunk = named_fine_chunk(&chunks, "ButtonProps");
+        assert_eq!(alias_chunk.symbol_kind, Some(SymbolKind::Type));
+        assert_eq!(alias_chunk.chunk_kind, ChunkKind::Code);
+        assert!(alias_chunk.text.contains("type ButtonProps"));
+    }
+
+    #[test]
+    fn captures_typescript_enum_declarations() {
+        let source = r#"export enum ButtonSize {
+  Sm = "sm",
+  Lg = "lg",
+}
+"#;
+
+        let chunks = chunk_file("enum.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let enum_chunk = named_fine_chunk(&chunks, "ButtonSize");
+        assert_eq!(enum_chunk.symbol_kind, Some(SymbolKind::Type));
+        assert_eq!(enum_chunk.chunk_kind, ChunkKind::Code);
+        assert!(chunks.iter().any(|chunk| {
+            chunk.symbol_name.as_deref() == Some("ButtonSize")
+                && chunk.granularity == Granularity::Coarse
+        }));
+    }
+
+    #[test]
+    fn captures_typescript_internal_modules() {
+        let source = r#"namespace Accordion {
+  export const Root = 1;
+}
+"#;
+
+        let chunks = chunk_file("namespace.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let namespace_chunk = chunks
+            .iter()
+            .find(|chunk| chunk.symbol_name.as_deref() == Some("Accordion"))
+            .unwrap_or_else(|| panic!("missing Accordion namespace chunk"));
+        assert_eq!(namespace_chunk.symbol_kind, Some(SymbolKind::Module));
+        assert_eq!(namespace_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_export_clause_names() {
+        let source = r#"export { Accordion, AccordionItem } from "./accordion";
+"#;
+
+        let chunks = chunk_file("barrel.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let export_chunk = named_fine_chunk(&chunks, "export{Accordion,AccordionItem}");
+        assert_eq!(export_chunk.symbol_kind, Some(SymbolKind::Module));
+    }
+
+    #[test]
+    fn truncates_long_export_clause_names() {
+        let source = r#"export { Accordion, AccordionItem, AccordionTrigger, AccordionContent, AccordionHeader } from "./accordion";
+"#;
+
+        let chunks = chunk_file("barrel.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let export_chunk = named_fine_chunk(&chunks, "export{Accordion,AccordionItem,AccordionTrigger,...}");
+        assert_eq!(export_chunk.symbol_kind, Some(SymbolKind::Module));
+    }
+
+    #[test]
+    fn classifies_forward_ref_wrappers_as_functions() {
+        let source = r#"const Accordion = React.forwardRef((props, ref) => {
+  return null;
+});
+"#;
+
+        let chunks = chunk_file("component.tsx", "tsx", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let component_chunk = named_fine_chunk(&chunks, "Accordion");
+        assert_eq!(component_chunk.symbol_kind, Some(SymbolKind::Function));
+    }
+
+    #[test]
+    fn classifies_memo_wrappers_as_functions() {
+        let source = r#"const MemoThing = React.memo(function MemoThingInner() {
+  return null;
+});
+"#;
+
+        let chunks = chunk_file("component.tsx", "tsx", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let memo_chunk = named_fine_chunk(&chunks, "MemoThing");
+        assert_eq!(memo_chunk.symbol_kind, Some(SymbolKind::Function));
+    }
+
+    #[test]
+    fn captures_member_expression_component_aliases() {
+        let source = r#"const Accordion = AccordionPrimitive.Root;
+"#;
+
+        let chunks = chunk_file("component.tsx", "tsx", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let alias_chunk = named_fine_chunk(&chunks, "Accordion");
+        assert_eq!(alias_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(alias_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn synthesizes_name_for_anonymous_default_exports() {
+        let source = r#"export default () => {
+  return 1;
+};
+"#;
+
+        let chunks = chunk_file("default.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let default_chunk = named_fine_chunk(&chunks, "<default>");
+        assert_eq!(default_chunk.symbol_kind, Some(SymbolKind::Function));
+        assert_eq!(default_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn attaches_display_name_assignments_to_previous_component_chunk() {
+        let source = r#"const AccordionItem = React.forwardRef((props, ref) => {
+  return null;
+});
+AccordionItem.displayName = AccordionPrimitive.Item.displayName;
+"#;
+
+        let chunks = chunk_file("component.tsx", "tsx", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let component_chunk = named_fine_chunk(&chunks, "AccordionItem");
+        assert!(component_chunk.text.contains("AccordionItem.displayName ="));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.symbol_name.is_none() && chunk.text.contains("displayName")
+        }));
+    }
+
+    #[test]
+    fn captures_commonjs_exports_in_javascript() {
+        let source = r#"module.exports = createApi();
+exports.helper = helper;
+"#;
+
+        let chunks = chunk_file("index.js", "javascript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let module_exports = named_fine_chunk(&chunks, "<module.exports>");
+        assert_eq!(module_exports.symbol_kind, Some(SymbolKind::Module));
+
+        let helper_export = named_fine_chunk(&chunks, "helper");
+        assert_eq!(helper_export.symbol_kind, Some(SymbolKind::Module));
+    }
+
+    #[test]
+    fn classifies_exported_string_constants() {
+        let source = r#"export const BASE_URL = "https://api.example.com";
+"#;
+
+        let chunks = chunk_file("config.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let constant_chunk = named_fine_chunk(&chunks, "BASE_URL");
+        assert_eq!(constant_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(constant_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn classifies_exported_numeric_constants() {
+        let source = r#"export const MAX_RETRIES = 3;
+"#;
+
+        let chunks = chunk_file("config.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let constant_chunk = named_fine_chunk(&chunks, "MAX_RETRIES");
+        assert_eq!(constant_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(constant_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn classifies_nullish_coalescing_config_constants() {
+        let source = r#"export const API_BASE_URL =
+  import.meta.env.VITE_API_URL ?? "http://localhost:3001";
+"#;
+
+        let chunks = chunk_file("config.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let constant_chunk = named_fine_chunk(&chunks, "API_BASE_URL");
+        assert_eq!(constant_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(constant_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn preserves_small_named_chunks_below_min_threshold() {
+        let source = r#"export const X = "value";
+"#;
+        let config = ChunkConfig {
+            target_token_budget: 512,
+            max_chunk_chars: 2000,
+            min_chunk_chars: 400,
+            merge_small_siblings: true,
+            attach_comments: true,
+            emit_coarse_chunks: true,
+        };
+
+        let chunks = chunk_file("small-constant.ts", "typescript", source, &config)
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let fine: Vec<&Chunk> = fine_chunks(&chunks);
+        assert_eq!(fine.len(), 1);
+        assert_eq!(fine[0].symbol_name.as_deref(), Some("X"));
+        assert_eq!(fine[0].symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(fine[0].chunk_kind, ChunkKind::Code);
+        assert!(non_whitespace_len(&fine[0].text) < config.min_chunk_chars_usize());
+    }
+
+    #[test]
+    fn preserves_small_unnamed_import_only_files_as_fallback_chunks() {
+        let source = r#"import "./setup";
+"#;
+        let config = ChunkConfig {
+            target_token_budget: 512,
+            max_chunk_chars: 2000,
+            min_chunk_chars: 400,
+            merge_small_siblings: true,
+            attach_comments: true,
+            emit_coarse_chunks: true,
+        };
+
+        let chunks = chunk_file("imports.ts", "typescript", source, &config)
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let fine: Vec<&Chunk> = fine_chunks(&chunks);
+        assert_eq!(fine.len(), 1);
+        assert_eq!(fine[0].symbol_name, None);
+        assert_eq!(fine[0].chunk_kind, ChunkKind::Code);
+        assert!(fine[0].text.contains("import \"./setup\";"));
+        assert!(non_whitespace_len(&fine[0].text) < config.min_chunk_chars_usize());
+    }
+
+    #[test]
+    fn classifies_default_exported_object_literals_as_constants() {
+        let source = r#"export default {
+  theme: {},
+};
+"#;
+
+        let chunks = chunk_file("tailwind.config.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let default_chunk = named_fine_chunk(&chunks, "<default>");
+        assert_eq!(default_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(default_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn classifies_default_exported_satisfies_objects_as_constants() {
+        let source = r#"export default {
+  theme: {},
+} satisfies Config;
+"#;
+
+        let chunks = chunk_file("tailwind.config.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let default_chunk = named_fine_chunk(&chunks, "<default>");
+        assert_eq!(default_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(default_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn classifies_commonjs_object_literal_exports_as_constants() {
+        let source = r#"module.exports = {
+  plugins: [],
+};
+"#;
+
+        let chunks = chunk_file("postcss.config.js", "javascript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let default_chunk = named_fine_chunk(&chunks, "<module.exports>");
+        assert_eq!(default_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(default_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_java_records() {
+        let source = r#"record Point(int x, int y) {}
+"#;
+
+        let chunks = chunk_file("Point.java", "java", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let record_chunk = named_fine_chunk(&chunks, "Point");
+        assert_eq!(record_chunk.symbol_kind, Some(SymbolKind::Class));
+        assert_eq!(record_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_java_static_initializers() {
+        let source = r#"class Config {
+  static { config = loadConfig(); }
+}
+"#;
+
+        let chunks = chunk_file("Config.java", "java", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let init_chunk = named_fine_chunk(&chunks, "<static_init>");
+        assert_eq!(init_chunk.symbol_kind, Some(SymbolKind::Block));
+        assert_eq!(init_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_csharp_file_scoped_namespaces() {
+        let source = r#"namespace Foo.Bar;
+
+public class Example {}
+"#;
+
+        let chunks = chunk_file("Program.cs", "csharp", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let namespace_chunk = named_chunk(&chunks, "Foo.Bar");
+        assert_eq!(namespace_chunk.symbol_kind, Some(SymbolKind::Module));
+        assert_eq!(namespace_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_csharp_top_level_statements() {
+        let source = r#"Console.WriteLine("hello");
+"#;
+
+        let chunks = chunk_file("Program.cs", "csharp", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let top_level_chunk = named_fine_chunk(&chunks, "<top-level>");
+        assert_eq!(top_level_chunk.symbol_kind, Some(SymbolKind::Block));
+        assert_eq!(top_level_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_csharp_indexers() {
+        let source = r#"public class Items {
+  public string this[int index] { get; set; }
+}
+"#;
+
+        let chunks = chunk_file("Items.cs", "csharp", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let indexer_chunk = named_fine_chunk(&chunks, "this[]");
+        assert_eq!(indexer_chunk.symbol_kind, Some(SymbolKind::Method));
+        assert_eq!(indexer_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_ruby_attr_accessor_dsl_calls_inside_classes() {
+        let source = r#"class User
+  attr_accessor :name, :email
+end
+"#;
+
+        let chunks = chunk_file("user.rb", "ruby", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let attr_chunk = named_fine_chunk(&chunks, "attr_accessor");
+        assert_eq!(attr_chunk.symbol_kind, Some(SymbolKind::Block));
+        assert_eq!(attr_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_ruby_association_dsl_calls_inside_classes() {
+        let source = r#"class User
+  has_many :posts
+end
+"#;
+
+        let chunks = chunk_file("user.rb", "ruby", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let association_chunk = named_fine_chunk(&chunks, "has_many");
+        assert_eq!(association_chunk.symbol_kind, Some(SymbolKind::Block));
+        assert_eq!(association_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn ignores_ruby_dsl_calls_inside_method_bodies() {
+        let source = r#"class User
+  def configure
+    has_many :posts
+  end
+end
+"#;
+
+        let chunks = chunk_file("user.rb", "ruby", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(!chunks
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("has_many")));
+    }
+
+    #[test]
+    fn captures_ruby_include_calls_inside_classes() {
+        let source = r#"class User
+  include Comparable
+end
+"#;
+
+        let chunks = chunk_file("user.rb", "ruby", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let include_chunk = named_fine_chunk(&chunks, "include");
+        assert_eq!(include_chunk.symbol_kind, Some(SymbolKind::Block));
+        assert_eq!(include_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_php_constants() {
+        let source = r#"<?php
+const FOO = 1;
+"#;
+
+        let chunks = chunk_file("constants.php", "php", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let const_chunk = named_fine_chunk(&chunks, "FOO");
+        assert_eq!(const_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(const_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_grouped_php_constants_without_anonymous_wrapper_gap_chunks() {
+        let source = r#"<?php
+const A = 1, B = 2;
+"#;
+
+        let chunks = chunk_file("constants.php", "php", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let a_chunk = named_fine_chunk(&chunks, "A");
+        let b_chunk = named_fine_chunk(&chunks, "B");
+        assert_eq!(a_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(b_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.symbol_name.is_none()
+                && chunk.granularity == Granularity::Fine
+                && chunk.text.contains("const A = 1, B = 2;")
+        }));
+    }
+
+    #[test]
+    fn captures_php_arrow_functions_assigned_to_variables() {
+        let source = r#"<?php
+$myFn = fn($x) => $x * 2;
+"#;
+
+        let chunks = chunk_file("functions.php", "php", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let function_chunk = named_fine_chunk(&chunks, "myFn");
+        assert_eq!(function_chunk.symbol_kind, Some(SymbolKind::Function));
+        assert_eq!(function_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn ignores_php_arrow_functions_passed_as_arguments() {
+        let source = r#"<?php
+array_map(fn($x) => $x, $arr);
+"#;
+
+        let chunks = chunk_file("functions.php", "php", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.symbol_name.as_deref() == Some("fn")
+                || chunk.text.contains("fn($x) => $x")
+                    && chunk.symbol_name.is_some()
+        }));
     }
 }

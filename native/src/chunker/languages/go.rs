@@ -1,4 +1,4 @@
-use super::super::policy::{extract_name_by_fields, LanguagePolicy, SemanticInfo};
+use super::super::policy::{extract_name_by_fields, node_text, LanguagePolicy, SemanticInfo};
 use super::super::{ChunkKind, SymbolKind};
 use tree_sitter::Node;
 
@@ -13,7 +13,11 @@ fn is_comment_kind(kind: &str) -> bool {
 }
 
 fn classify_go_function(node: Node<'_>, source: &str, is_method: bool) -> SemanticInfo {
-    let name = extract_name_by_fields(node, source, &["name"]);
+    let name = if is_method {
+        classify_go_method_name(node, source).or_else(|| extract_name_by_fields(node, source, &["name"]))
+    } else {
+        extract_name_by_fields(node, source, &["name"])
+    };
     let is_test = name
         .as_deref()
         .map(|value| {
@@ -41,12 +45,39 @@ fn classify_go_function(node: Node<'_>, source: &str, is_method: bool) -> Semant
     }
 }
 
+fn first_go_name(node: Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("name")
+        .and_then(|child| node_text(child, source))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+fn extract_go_receiver_type(node: Node<'_>, source: &str) -> Option<String> {
+    let receiver_list = node.child_by_field_name("receiver")?;
+    let parameter = receiver_list.named_child(0)?;
+    let type_node = parameter.child_by_field_name("type")?;
+    let type_text = node_text(type_node, source)?.trim();
+    let receiver = type_text.trim_start_matches('*').trim();
+    if receiver.is_empty() {
+        return None;
+    }
+
+    Some(receiver.to_string())
+}
+
+fn classify_go_method_name(node: Node<'_>, source: &str) -> Option<String> {
+    let method_name = extract_name_by_fields(node, source, &["name"])?;
+    let receiver_type = extract_go_receiver_type(node, source)?;
+    Some(format!("{receiver_type}.{method_name}"))
+}
+
 fn classify_go_type_spec(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     let type_node = node.child_by_field_name("type")?;
     let symbol_kind = match type_node.kind() {
         "struct_type" => SymbolKind::Struct,
         "interface_type" => SymbolKind::Interface,
-        _ => SymbolKind::Block,
+        _ => SymbolKind::Type,
     };
 
     Some(SemanticInfo {
@@ -57,10 +88,28 @@ fn classify_go_type_spec(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     })
 }
 
+fn classify_go_named_value_spec(
+    node: Node<'_>,
+    source: &str,
+    symbol_kind: SymbolKind,
+) -> Option<SemanticInfo> {
+    Some(SemanticInfo {
+        symbol_name: first_go_name(node, source),
+        symbol_kind: Some(symbol_kind),
+        chunk_kind: ChunkKind::Code,
+        coarse_eligible: false,
+    })
+}
+
 fn classify_go_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     match node.kind() {
         "function_declaration" => Some(classify_go_function(node, source, false)),
         "method_declaration" => Some(classify_go_function(node, source, true)),
+        "const_declaration" | "var_declaration" | "type_declaration" => None,
+        "const_spec" | "var_spec" => {
+            classify_go_named_value_spec(node, source, SymbolKind::Constant)
+        }
+        "type_alias" => classify_go_named_value_spec(node, source, SymbolKind::Type),
         "type_spec" => classify_go_type_spec(node, source),
         _ => None,
     }

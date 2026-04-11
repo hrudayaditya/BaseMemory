@@ -494,14 +494,24 @@ describe("retrieval ranking", () => {
     )).toBe("bug");
   });
 
+  it("infers test_debug for natural-language test discovery queries", () => {
+    expect(inferTaskType("what tests cover the login flow?")).toBe("test_debug");
+    expect(inferTaskType("where are the auth tests?")).toBe("test_debug");
+    expect(inferTaskType("failing test for payment processing")).toBe("test_debug");
+    expect(inferTaskType("what does the login flow test")).toBe("test_debug");
+    expect(inferTaskType("how does beforeEach set up auth state?")).toBe("test_debug");
+  });
+
   it("does not override an explicitly provided task type during inference", () => {
     expect(inferTaskType(
       "Expected behavior: abort: true should stop. Actual behavior: it continues validating.",
       "definition"
     )).toBe("definition");
+    expect(inferTaskType("what tests cover the login flow?", "general")).toBe("general");
   });
 
   it("avoids false-positive bug inference for ordinary definition lookup queries", () => {
     expect(inferTaskType("where is rankHybridResults implementation")).toBe("general");
+    expect(inferTaskType("what does the App component render?")).toBe("general");
   });
 });

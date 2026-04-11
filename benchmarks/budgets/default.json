@@ -3,12 +3,14 @@
   "baselinePath": "benchmarks/baselines/eval-baseline-summary.json",
   "failOnMissingBaseline": true,
   "thresholds": {
+    "hitAt1MaxDrop": 0.05,
     "hitAt5MaxDrop": 0.03,
     "mrrAt10MaxDrop": 0.03,
     "combinedRecallAt10": 0.05,
     "expansionHitRate": 0.10,
     "p95LatencyMaxMultiplier": 1.35,
     "p95LatencyMaxAbsoluteMs": 4000,
+    "minHitAt1": 0.2,
     "minHitAt5": 0.4,
     "minMrrAt10": 0.25
   }

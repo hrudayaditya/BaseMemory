@@ -10,7 +10,6 @@ const __dirname = path.dirname(__filename);
 
 const BASE_MEMORY_ROOT = path.resolve(__dirname, "..");
 const CONFIG_PATH = path.join(BASE_MEMORY_ROOT, ".opencode", "codebase-index.json");
-const TARGET_REPO = "/Users/aady/Documents/Get Decimal AI Projects/mirror-site-builder";
 const RESULT_LIMIT = 5;
 const SNIPPET_LENGTH = 240;
 
@@ -33,16 +32,17 @@ function formatSnippet(content: string): string {
 
 async function main(): Promise<void> {
   const query = process.argv[2]?.trim();
+  const targetRepo = process.argv[3]?.trim() || BASE_MEMORY_ROOT;
 
   if (!query) {
-    throw new Error('Usage: npx tsx scripts/search-repo.ts "your search query"');
+    throw new Error('Usage: npx tsx scripts/search-repo.ts "your search query" [target-repo]');
   }
 
   const config = loadConfig(CONFIG_PATH);
-  const indexer = new Indexer(TARGET_REPO, config);
+  const indexer = new Indexer(targetRepo, config);
 
   console.log(`Config: ${CONFIG_PATH}`);
-  console.log(`Target repo: ${TARGET_REPO}`);
+  console.log(`Target repo: ${targetRepo}`);
   console.log(`Query: ${query}`);
   console.log("Initializing indexer...");
 

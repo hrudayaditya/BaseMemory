@@ -21,6 +21,7 @@ export function checkGate(
   budget: EvalBudget
 ): EvalGateResult {
   const comparisonLike = {
+    hitAt1: current.metrics.hitAt1 - baseline.metrics.hitAt1,
     hitAt5: current.metrics.hitAt5 - baseline.metrics.hitAt5,
     mrrAt10: current.metrics.mrrAt10 - baseline.metrics.mrrAt10,
     combinedRecallAt10: current.metrics.combinedRecallAt10 - baseline.metrics.combinedRecallAt10,
@@ -28,6 +29,20 @@ export function checkGate(
   };
   const violations: EvalGateResult["violations"] = [];
   const regressions: EvalGateResult["regressions"] = [];
+
+  if (
+    budget.thresholds.hitAt1MaxDrop !== undefined &&
+    comparisonLike.hitAt1 < -budget.thresholds.hitAt1MaxDrop
+  ) {
+    regressions.push(
+      buildMaxDropRegression(
+        "hitAt1",
+        baseline.metrics.hitAt1,
+        current.metrics.hitAt1,
+        budget.thresholds.hitAt1MaxDrop
+      )
+    );
+  }
 
   if (
     budget.thresholds.hitAt5MaxDrop !== undefined &&
@@ -111,6 +126,13 @@ export function evaluateBudgetGate(
 
   const { thresholds } = budget;
 
+  if (thresholds.minHitAt1 !== undefined && summary.metrics.hitAt1 < thresholds.minHitAt1) {
+    violations.push({
+      metric: "minHitAt1",
+      message: `Hit@1 ${summary.metrics.hitAt1.toFixed(4)} is below minimum ${thresholds.minHitAt1.toFixed(4)}`,
+    });
+  }
+
   if (thresholds.minHitAt5 !== undefined && summary.metrics.hitAt5 < thresholds.minHitAt5) {
     violations.push({
       metric: "minHitAt5",
@@ -126,6 +148,20 @@ export function evaluateBudgetGate(
   }
 
   if (comparison) {
+    if (
+      thresholds.hitAt1MaxDrop !== undefined &&
+      comparison.deltas.hitAt1.absolute < -thresholds.hitAt1MaxDrop
+    ) {
+      regressions.push(
+        buildMaxDropRegression(
+          "hitAt1",
+          comparison.deltas.hitAt1.baseline,
+          comparison.deltas.hitAt1.current,
+          thresholds.hitAt1MaxDrop
+        )
+      );
+    }
+
     if (
       thresholds.hitAt5MaxDrop !== undefined &&
       comparison.deltas.hitAt5.absolute < -thresholds.hitAt5MaxDrop

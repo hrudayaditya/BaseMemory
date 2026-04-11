@@ -31,7 +31,266 @@ fn is_comment_kind(kind: &str) -> bool {
     kind == "comment"
 }
 
-fn classify_export_statement(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
+fn simple_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
+    let name = node.child_by_field_name("name")?;
+    if name.kind() != "identifier" {
+        return None;
+    }
+
+    node_text(name, source)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+fn member_expression_property_name(node: Node<'_>, source: &str) -> Option<String> {
+    let property = node.child_by_field_name("property")?;
+    node_text(property, source)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+fn member_expression_object_text(node: Node<'_>, source: &str) -> Option<String> {
+    let object = node.child_by_field_name("object")?;
+    node_text(object, source)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+fn unwrap_transparent_expression(mut node: Node<'_>) -> Node<'_> {
+    loop {
+        let next = match node.kind() {
+            "parenthesized_expression" => {
+                let mut cursor = node.walk();
+                let child = node.named_children(&mut cursor).next();
+                child
+            }
+            "as_expression" | "satisfies_expression" | "non_null_expression" => node
+                .child_by_field_name("expression")
+                .or_else(|| node.child_by_field_name("left"))
+                .or_else(|| {
+                    let mut cursor = node.walk();
+                    let child = node.named_children(&mut cursor).next();
+                    child
+                }),
+            "type_assertion" => node.child_by_field_name("expression").or_else(|| {
+                let mut cursor = node.walk();
+                let child = node.named_children(&mut cursor).last();
+                child
+            }),
+            _ => None,
+        };
+
+        if let Some(next) = next {
+            node = next;
+            continue;
+        }
+
+        return node;
+    }
+}
+
+fn classify_constant_expression(node: Node<'_>, source: &str) -> Option<bool> {
+    let node = unwrap_transparent_expression(node);
+
+    match node.kind() {
+        "string"
+        | "string_literal"
+        | "template_string"
+        | "template_literal"
+        | "number"
+        | "true"
+        | "false"
+        | "null" => Some(false),
+        "object" | "array" => Some(true),
+        "identifier" => node_text(node, source)
+            .map(str::trim)
+            .filter(|text| *text == "undefined")
+            .map(|_| false),
+        "member_expression" | "subscript_expression" | "meta_property" => Some(false),
+        "unary_expression" => {
+            let mut cursor = node.walk();
+            let child = node.named_children(&mut cursor).next()?;
+            classify_constant_expression(child, source)
+        }
+        "binary_expression" | "ternary_expression" => {
+            let mut coarse_eligible = false;
+            let mut saw_child = false;
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                coarse_eligible |= classify_constant_expression(child, source)?;
+                saw_child = true;
+            }
+
+            saw_child.then_some(coarse_eligible)
+        }
+        _ => None,
+    }
+}
+
+fn classify_call_wrapper(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
+    let symbol_name = simple_declarator_name(node, source)?;
+    let value = node.child_by_field_name("value")?;
+    if value.kind() != "call_expression" {
+        return None;
+    }
+
+    let function = value.child_by_field_name("function")?;
+    let symbol_kind = match function.kind() {
+        "member_expression" => match member_expression_property_name(function, source).as_deref() {
+            Some("createContext") | Some("createStore") => SymbolKind::Block,
+            Some("forwardRef") | Some("memo") | Some("lazy") => SymbolKind::Function,
+            _ => SymbolKind::Function,
+        },
+        "identifier" => SymbolKind::Function,
+        _ => SymbolKind::Function,
+    };
+
+    Some(SemanticInfo {
+        symbol_name: Some(symbol_name),
+        symbol_kind: Some(symbol_kind),
+        chunk_kind: ChunkKind::Code,
+        coarse_eligible: false,
+    })
+}
+
+fn classify_constant_declarator(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
+    let symbol_name = simple_declarator_name(node, source)?;
+    let value = node.child_by_field_name("value")?;
+    let coarse_eligible = classify_constant_expression(value, source)?;
+
+    Some(SemanticInfo {
+        symbol_name: Some(symbol_name),
+        symbol_kind: Some(SymbolKind::Constant),
+        chunk_kind: ChunkKind::Code,
+        coarse_eligible,
+    })
+}
+
+fn classify_export_clause(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
+    let mut names = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "export_specifier" {
+            continue;
+        }
+
+        if let Some(name) = extract_name_by_fields(child, source, &["alias", "name"]) {
+            names.push(name);
+        }
+    }
+
+    if names.is_empty() {
+        return None;
+    }
+
+    let display = if names.len() > 3 {
+        format!("export{{{},{},{},...}}", names[0], names[1], names[2])
+    } else {
+        format!("export{{{}}}", names.join(","))
+    };
+
+    Some(SemanticInfo {
+        symbol_name: Some(display),
+        symbol_kind: Some(SymbolKind::Module),
+        chunk_kind: ChunkKind::Code,
+        coarse_eligible: false,
+    })
+}
+
+fn classify_internal_module(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
+    let symbol_name = node
+        .child_by_field_name("name")
+        .and_then(|name_node| {
+            extract_string_literal(name_node, source).or_else(|| {
+                node_text(name_node, source)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToString::to_string)
+            })
+        })
+        .or_else(|| extract_name_by_fields(node, source, &["name"]))?;
+
+    Some(SemanticInfo {
+        symbol_name: Some(symbol_name),
+        symbol_kind: Some(SymbolKind::Module),
+        chunk_kind: ChunkKind::Code,
+        coarse_eligible: true,
+    })
+}
+
+fn classify_export_default_expression(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
+    let node = unwrap_transparent_expression(node);
+    let symbol_name = Some("<default>".to_string());
+    match node.kind() {
+        "arrow_function" | "function" | "function_expression" => Some(SemanticInfo {
+            symbol_name,
+            symbol_kind: Some(SymbolKind::Function),
+            chunk_kind: ChunkKind::Code,
+            coarse_eligible: false,
+        }),
+        "class" => Some(SemanticInfo {
+            symbol_name,
+            symbol_kind: Some(SymbolKind::Module),
+            chunk_kind: ChunkKind::Code,
+            coarse_eligible: true,
+        }),
+        "call_expression" => Some(SemanticInfo {
+            symbol_name,
+            symbol_kind: Some(SymbolKind::Module),
+            chunk_kind: ChunkKind::Code,
+            coarse_eligible: false,
+        }),
+        "identifier" | "member_expression" => Some(SemanticInfo {
+            symbol_name,
+            symbol_kind: Some(SymbolKind::Module),
+            chunk_kind: ChunkKind::Code,
+            coarse_eligible: false,
+        }),
+        _ => classify_constant_expression(node, source).map(|coarse_eligible| SemanticInfo {
+            symbol_name,
+            symbol_kind: Some(SymbolKind::Constant),
+            chunk_kind: ChunkKind::Code,
+            coarse_eligible,
+        }),
+    }
+}
+
+fn classify_ambient_declaration(
+    node: Node<'_>,
+    source: &str,
+    allow_commonjs: bool,
+) -> Option<SemanticInfo> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "comment" {
+            continue;
+        }
+
+        if let Some(info) = classify_ts_js_node_impl(child, source, allow_commonjs) {
+            return Some(info);
+        }
+    }
+
+    None
+}
+
+fn classify_internal_module_statement(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
+    if node.kind() != "expression_statement" {
+        return None;
+    }
+
+    let internal_module = first_named_child_of_kind(node, "internal_module")?;
+    classify_internal_module(internal_module, source)
+}
+
+fn classify_export_statement(
+    node: Node<'_>,
+    source: &str,
+    allow_commonjs: bool,
+) -> Option<SemanticInfo> {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() == "comment" {
@@ -43,26 +302,14 @@ fn classify_export_statement(node: Node<'_>, source: &str) -> Option<SemanticInf
                 if let Some(info) = classify_variable_declarator(declarator, source) {
                     return Some(info);
                 }
-
-                if declarator
-                    .child_by_field_name("value")
-                    .is_some_and(|value| value.kind() == "call_expression")
-                {
-                    if let Some(symbol_name) =
-                        extract_name_by_fields(declarator, source, &["name"])
-                    {
-                        return Some(SemanticInfo {
-                            symbol_name: Some(symbol_name),
-                            symbol_kind: Some(SymbolKind::Module),
-                            chunk_kind: ChunkKind::Code,
-                            coarse_eligible: false,
-                        });
-                    }
-                }
             }
         }
 
-        if let Some(info) = classify_ts_js_node(child, source) {
+        if let Some(info) = classify_export_default_expression(child, source) {
+            return Some(info);
+        }
+
+        if let Some(info) = classify_ts_js_node_impl(child, source, allow_commonjs) {
             return Some(info);
         }
     }
@@ -86,7 +333,8 @@ fn classify_variable_declarator(node: Node<'_>, source: &str) -> Option<Semantic
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
         }),
-        _ => None,
+        "call_expression" => classify_call_wrapper(node, source),
+        _ => classify_constant_declarator(node, source),
     }
 }
 
@@ -149,9 +397,65 @@ fn is_js_test_call(node: Node<'_>, source: &str) -> bool {
     }
 }
 
-fn classify_ts_js_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
+fn classify_commonjs_assignment(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
+    let assignment = if node.kind() == "expression_statement" {
+        first_named_child_of_kind(node, "assignment_expression")
+    } else {
+        None
+    }?;
+
+    let left = assignment.child_by_field_name("left")?;
+    if left.kind() != "member_expression" {
+        return None;
+    }
+
+    let object = member_expression_object_text(left, source)?;
+    let property = member_expression_property_name(left, source)?;
+    let right = assignment
+        .child_by_field_name("right")
+        .map(unwrap_transparent_expression);
+    let is_constant_export = right
+        .map(|rhs| matches!(rhs.kind(), "object" | "array"))
+        .unwrap_or(false);
+
+    if object == "module" && property == "exports" {
+        return Some(SemanticInfo {
+            symbol_name: Some("<module.exports>".to_string()),
+            symbol_kind: Some(if is_constant_export {
+                SymbolKind::Constant
+            } else {
+                SymbolKind::Module
+            }),
+            chunk_kind: ChunkKind::Code,
+            coarse_eligible: is_constant_export,
+        });
+    }
+
+    if object == "exports" {
+        return Some(SemanticInfo {
+            symbol_name: Some(property),
+            symbol_kind: Some(if is_constant_export {
+                SymbolKind::Constant
+            } else {
+                SymbolKind::Module
+            }),
+            chunk_kind: ChunkKind::Code,
+            coarse_eligible: is_constant_export,
+        });
+    }
+
+    None
+}
+
+fn classify_ts_js_node_impl(
+    node: Node<'_>,
+    source: &str,
+    allow_commonjs: bool,
+) -> Option<SemanticInfo> {
     match node.kind() {
-        "export_statement" => classify_export_statement(node, source),
+        "ambient_declaration" => classify_ambient_declaration(node, source, allow_commonjs),
+        "export_statement" => classify_export_statement(node, source, allow_commonjs),
+        "export_clause" => classify_export_clause(node, source),
         "function_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
             symbol_kind: Some(SymbolKind::Function),
@@ -176,37 +480,66 @@ fn classify_ts_js_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
         }),
+        "type_alias_declaration" => Some(SemanticInfo {
+            symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_kind: Some(SymbolKind::Type),
+            chunk_kind: ChunkKind::Code,
+            coarse_eligible: false,
+        }),
+        "enum_declaration" => Some(SemanticInfo {
+            symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_kind: Some(SymbolKind::Type),
+            chunk_kind: ChunkKind::Code,
+            coarse_eligible: true,
+        }),
+        "internal_module" => classify_internal_module(node, source),
         "variable_declarator" => classify_variable_declarator(node, source),
-        "expression_statement" | "call_expression" => classify_test_expression(node, source),
+        "expression_statement" | "call_expression" => classify_test_expression(node, source)
+            .or_else(|| {
+                if allow_commonjs {
+                    classify_commonjs_assignment(node, source)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| classify_internal_module_statement(node, source)),
         "lexical_declaration" if has_descendant_kind(node, &["variable_declarator"]) => None,
         _ => None,
     }
 }
 
+fn classify_ts_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
+    classify_ts_js_node_impl(node, source, false)
+}
+
+fn classify_js_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
+    classify_ts_js_node_impl(node, source, true)
+}
+
 pub const TYPESCRIPT_POLICY: LanguagePolicy = LanguagePolicy {
     language_name: "typescript",
     parser_language: ts_language,
-    classify_node: classify_ts_js_node,
+    classify_node: classify_ts_node,
     is_comment_kind,
 };
 
 pub const TSX_POLICY: LanguagePolicy = LanguagePolicy {
     language_name: "tsx",
     parser_language: tsx_language,
-    classify_node: classify_ts_js_node,
+    classify_node: classify_ts_node,
     is_comment_kind,
 };
 
 pub const JAVASCRIPT_POLICY: LanguagePolicy = LanguagePolicy {
     language_name: "javascript",
     parser_language: js_language,
-    classify_node: classify_ts_js_node,
+    classify_node: classify_js_node,
     is_comment_kind,
 };
 
 pub const JSX_POLICY: LanguagePolicy = LanguagePolicy {
     language_name: "jsx",
     parser_language: js_language,
-    classify_node: classify_ts_js_node,
+    classify_node: classify_js_node,
     is_comment_kind,
 };

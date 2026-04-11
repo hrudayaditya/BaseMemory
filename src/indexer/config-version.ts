@@ -1,5 +1,9 @@
 import type { ConfiguredProviderInfo } from "../embeddings/detector.js";
-import { getChunkerVersion, hashContent } from "../native/index.js";
+import {
+  getChunkerVersion,
+  getGraphExtractorVersion,
+  hashContent,
+} from "../native/index.js";
 
 export interface ConfigVersion {
   embeddingModelId: string;
@@ -8,6 +12,7 @@ export interface ConfigVersion {
   endpointBaseUrl: string;
   documentTaskType: string;
   voyageModelId: string | null;
+  embeddingPrefixVersion: number;
   chunkerVersion: string;
   graphExtractorVersion: string;
 }
@@ -19,7 +24,10 @@ interface EmbedConfigIdentity {
   endpointBaseUrl: string;
   documentTaskType: string;
   voyageModelId: string | null;
+  embeddingPrefixVersion: number;
 }
+
+export const EMBEDDING_PREFIX_VERSION = 3;
 
 function hashSortedObject(value: Record<string, number | string | null>): string {
   return hashContent(JSON.stringify(value));
@@ -51,6 +59,7 @@ function buildEmbedConfigIdentity(
     endpointBaseUrl: normalizeBaseUrl(configuredProviderInfo.credentials.baseUrl),
     documentTaskType: getDocumentTaskType(configuredProviderInfo),
     voyageModelId,
+    embeddingPrefixVersion: EMBEDDING_PREFIX_VERSION,
   };
 }
 
@@ -66,6 +75,7 @@ export function hashConfigVersion(cv: ConfigVersion): string {
     endpointBaseUrl: cv.endpointBaseUrl,
     documentTaskType: cv.documentTaskType,
     voyageModelId: cv.voyageModelId,
+    embeddingPrefixVersion: cv.embeddingPrefixVersion,
     chunkerVersion: cv.chunkerVersion,
     graphExtractorVersion: cv.graphExtractorVersion,
   };
@@ -89,6 +99,7 @@ export function hashEmbedConfig(
     embeddingProvider: identity.embeddingProvider,
     endpointBaseUrl: identity.endpointBaseUrl,
     voyageModelId: identity.voyageModelId,
+    embeddingPrefixVersion: identity.embeddingPrefixVersion,
   };
 
   return hashSortedObject(sorted);
@@ -110,7 +121,8 @@ export async function getCurrentConfigVersion(
     endpointBaseUrl: embedIdentity.endpointBaseUrl,
     documentTaskType: embedIdentity.documentTaskType,
     voyageModelId: embedIdentity.voyageModelId,
+    embeddingPrefixVersion: embedIdentity.embeddingPrefixVersion,
     chunkerVersion: getChunkerVersion(),
-    graphExtractorVersion: "1.0.0",
+    graphExtractorVersion: getGraphExtractorVersion(),
   };
 }

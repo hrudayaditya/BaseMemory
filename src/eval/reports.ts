@@ -161,6 +161,9 @@ export function createSummaryMarkdown(
     lines.push("| Metric | Baseline | Current | Delta |");
     lines.push("|---|---:|---:|---:|");
     lines.push(
+      `| Hit@1 | ${formatPct(comparison.deltas.hitAt1.baseline)} | ${formatPct(comparison.deltas.hitAt1.current)} | ${signed(comparison.deltas.hitAt1.absolute)} |`
+    );
+    lines.push(
       `| Hit@5 | ${formatPct(comparison.deltas.hitAt5.baseline)} | ${formatPct(comparison.deltas.hitAt5.current)} | ${signed(comparison.deltas.hitAt5.absolute)} |`
     );
     lines.push(

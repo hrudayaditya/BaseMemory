@@ -9,7 +9,7 @@ fn rust_language() -> tree_sitter::Language {
 }
 
 fn is_comment_kind(kind: &str) -> bool {
-    matches!(kind, "line_comment" | "block_comment")
+    matches!(kind, "line_comment" | "block_comment" | "doc_comment")
 }
 
 fn has_test_attribute(node: Node<'_>, source: &str) -> bool {
@@ -61,33 +61,60 @@ fn classify_rust_function(node: Node<'_>, source: &str) -> SemanticInfo {
     }
 }
 
+fn classify_named_rust_item(
+    node: Node<'_>,
+    source: &str,
+    symbol_kind: SymbolKind,
+    coarse_eligible: bool,
+) -> Option<SemanticInfo> {
+    Some(SemanticInfo {
+        symbol_name: extract_name_by_fields(node, source, &["name"]),
+        symbol_kind: Some(symbol_kind),
+        chunk_kind: ChunkKind::Code,
+        coarse_eligible,
+    })
+}
+
+fn impl_item_name(node: Node<'_>, source: &str) -> Option<String> {
+    let type_name = node
+        .child_by_field_name("type")
+        .and_then(|child| node_text(child, source))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string);
+    let trait_name = node
+        .child_by_field_name("trait")
+        .and_then(|child| node_text(child, source))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string);
+
+    match (trait_name, type_name) {
+        (Some(trait_name), Some(type_name)) => Some(format!("{trait_name} for {type_name}")),
+        (None, Some(type_name)) => Some(type_name),
+        (Some(trait_name), None) => Some(trait_name),
+        (None, None) => first_named_child_of_kind(node, "type_identifier")
+            .and_then(|child| node_text(child, source).map(str::trim))
+            .filter(|text| !text.is_empty())
+            .map(ToString::to_string),
+    }
+}
+
 fn classify_rust_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     match node.kind() {
         "function_item" => Some(classify_rust_function(node, source)),
-        "struct_item" | "enum_item" => Some(SemanticInfo {
-            symbol_name: extract_name_by_fields(node, source, &["name"]),
-            symbol_kind: Some(SymbolKind::Struct),
-            chunk_kind: ChunkKind::Code,
-            coarse_eligible: true,
-        }),
-        "trait_item" => Some(SemanticInfo {
-            symbol_name: extract_name_by_fields(node, source, &["name"]),
-            symbol_kind: Some(SymbolKind::Interface),
-            chunk_kind: ChunkKind::Code,
-            coarse_eligible: true,
-        }),
-        "mod_item" => Some(SemanticInfo {
-            symbol_name: extract_name_by_fields(node, source, &["name"]),
-            symbol_kind: Some(SymbolKind::Module),
-            chunk_kind: ChunkKind::Code,
-            coarse_eligible: true,
-        }),
+        "struct_item" => classify_named_rust_item(node, source, SymbolKind::Struct, true),
+        "enum_item" => classify_named_rust_item(node, source, SymbolKind::Type, true),
+        "trait_item" => classify_named_rust_item(node, source, SymbolKind::Interface, true),
+        "mod_item" => classify_named_rust_item(node, source, SymbolKind::Module, true),
+        "macro_definition" => classify_named_rust_item(node, source, SymbolKind::Function, false),
+        "type_item" => classify_named_rust_item(node, source, SymbolKind::Type, false),
+        "const_item" | "static_item" => {
+            classify_named_rust_item(node, source, SymbolKind::Constant, false)
+        }
         "impl_item" => Some(SemanticInfo {
-            symbol_name: extract_name_by_fields(node, source, &["type", "trait"]).or_else(|| {
-                first_named_child_of_kind(node, "type_identifier")
-                    .and_then(|child| node_text(child, source).map(ToString::to_string))
-            }),
-            symbol_kind: Some(SymbolKind::Module),
+            symbol_name: impl_item_name(node, source),
+            symbol_kind: Some(SymbolKind::Block),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
         }),

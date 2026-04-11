@@ -112,6 +112,7 @@ describe("eval budget gate", () => {
       name: "default",
       failOnMissingBaseline: true,
       thresholds: {
+        hitAt1MaxDrop: 0.03,
         hitAt5MaxDrop: 0.03,
         mrrAt10MaxDrop: 0.03,
         combinedRecallAt10MaxDrop: 0.05,
@@ -124,6 +125,7 @@ describe("eval budget gate", () => {
       ...summary(5),
       metrics: {
         ...summary(5).metrics,
+        hitAt1: 0.98,
         hitAt5: 0.98,
         mrrAt10: 0.98,
         combinedRecallAt10: 0.96,
@@ -141,6 +143,7 @@ describe("eval budget gate", () => {
       name: "default",
       failOnMissingBaseline: true,
       thresholds: {
+        hitAt1MaxDrop: 0.03,
         hitAt5MaxDrop: 0.03,
         combinedRecallAt10MaxDrop: 0.05,
         expansionHitRateMaxDrop: 0.1,
@@ -152,6 +155,7 @@ describe("eval budget gate", () => {
       ...summary(5),
       metrics: {
         ...summary(5).metrics,
+        hitAt1: 0.9,
         hitAt5: 0.9,
         combinedRecallAt10: 0.8,
         expansionHitRate: 0.85,
@@ -162,9 +166,34 @@ describe("eval budget gate", () => {
     expect(gate.passed).toBe(false);
     expect(gate.regressions.map((item) => item.metric).sort()).toEqual([
       "combinedRecallAt10",
+      "hitAt1",
       "hitAt5",
       "expansionHitRate",
     ].sort());
-    expect(gate.violations).toHaveLength(3);
+    expect(gate.violations).toHaveLength(4);
+  });
+
+  it("enforces absolute minimum Hit@1 when configured", () => {
+    const budget: EvalBudget = {
+      name: "default",
+      failOnMissingBaseline: true,
+      thresholds: {
+        minHitAt1: 0.9,
+      },
+    };
+
+    const gate = evaluateBudgetGate(
+      budget,
+      {
+        ...summary(5),
+        metrics: {
+          ...summary(5).metrics,
+          hitAt1: 0.8,
+        },
+      },
+      comparisonWithBaselineP95(5)
+    );
+    expect(gate.passed).toBe(false);
+    expect(gate.violations.some((violation) => violation.metric === "minHitAt1")).toBe(true);
   });
 });

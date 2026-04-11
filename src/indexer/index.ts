@@ -129,8 +129,11 @@ function mapSemanticChunkType(symbolKind: string | undefined): ChunkMetadata["ch
       return "interface";
     case "Struct":
       return "struct";
+    case "Type":
+      return "type";
     case "Module":
       return "module";
+    case "Constant":
     default:
       return "other";
   }
@@ -242,6 +245,7 @@ interface PendingChunk {
   text: string;
   content: string;
   contentHash: string;
+  embeddingInputHash: string;
   metadata: ChunkMetadata;
 }
 
@@ -674,9 +678,54 @@ function hasWeakShouldButBugSignal(query: string): boolean {
   return (butIndex - shouldIndex) <= 80;
 }
 
+function isTestQuestionContext(query: string): boolean {
+  return /\?/.test(query) || /^\s*(?:what|where|which|how|why)\b/i.test(query);
+}
+
+function containsTestDebugSignals(query: string): boolean {
+  const lower = query.toLowerCase();
+
+  if (
+    /\b(?:failing|broken)\s+tests?\b/.test(lower) ||
+    /\btest failure\b/.test(lower)
+  ) {
+    return true;
+  }
+
+  if (
+    /\bwhat does\s+.+\s+test\b/.test(lower) ||
+    /\btests?\s+for\b/.test(lower) ||
+    /\bwhat tests?\s+cover\b/.test(lower) ||
+    /\bwhere are(?:\s+the)?\s+.+\s+tests?\b/.test(lower) ||
+    /\btest(?:s)?\s+(?:cover|covers|covering)\b/.test(lower)
+  ) {
+    return true;
+  }
+
+  if (
+    /\bcoverage\b/.test(lower) &&
+    /\b(?:test|tests|spec|specs|cover|covers|covering)\b/.test(lower)
+  ) {
+    return true;
+  }
+
+  if (
+    isTestQuestionContext(query) &&
+    /\b(?:describe|it block|beforeeach)\b/i.test(query)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
 export function inferTaskType(query: string, explicit?: SearchTaskType): SearchTaskType {
   if (explicit) {
     return explicit;
+  }
+
+  if (containsTestDebugSignals(query)) {
+    return "test_debug";
   }
 
   if (/\bexpected behavior\b/i.test(query) || /\bactual behavior\b/i.test(query)) {
@@ -1315,7 +1364,7 @@ function promoteIdentifierMatches(
             symbolKind: chunk.symbolKind as ChunkSymbolKind | undefined,
             name: chunk.name ?? undefined,
             language: chunk.language,
-            hash: chunk.contentHash,
+            hash: chunk.embeddingInputHash,
           };
 
           const baselineScore = existing?.score ?? 0.5;
@@ -1444,7 +1493,7 @@ function buildSymbolDefinitionLane(
           chunkType,
           name: chunk.name ?? undefined,
           language: chunk.language,
-          hash: chunk.contentHash,
+          hash: chunk.embeddingInputHash,
         },
       });
     }
@@ -2288,6 +2337,7 @@ export class Indexer {
       const chunkData: ChunkData = {
         chunkId: key,
         contentHash: metadata.hash,
+        embeddingInputHash: metadata.hash,
         filePath: metadata.filePath,
         startLine: metadata.startLine,
         endLine: metadata.endLine,
@@ -2495,9 +2545,9 @@ export class Indexer {
           getChunkerLanguage(file.path),
           file.content,
           {
-            targetTokenBudget: 1500,
-            maxChunkChars: 3000,
-            minChunkChars: 200,
+            targetTokenBudget: 512,
+            maxChunkChars: 2000,
+            minChunkChars: 400,
             mergeSmallSiblings: true,
             attachComments: true,
             emitCoarseChunks: true,
@@ -2664,20 +2714,24 @@ export class Indexer {
 
   private clearCallEdgesForSymbolIfUnreferenced(database: Database, symbolId: string): boolean {
     if (database.symbolExistsOnOtherBranches(this.currentBranch, symbolId)) {
+      database.unresolveCallEdgesByTargetSymbolForBranch(symbolId, this.currentBranch);
       database.deleteCallEdgesBySymbolForBranch(symbolId, this.currentBranch);
       return false;
     }
 
+    database.deleteCallEdgesByTargetSymbol(symbolId);
     database.deleteCallEdgesBySymbol(symbolId);
     return true;
   }
 
   private removeSymbolFromGraphIfUnreferenced(database: Database, symbolId: string): boolean {
     if (database.symbolExistsOnOtherBranches(this.currentBranch, symbolId)) {
+      database.unresolveCallEdgesByTargetSymbolForBranch(symbolId, this.currentBranch);
       database.deleteCallEdgesBySymbolForBranch(symbolId, this.currentBranch);
       return false;
     }
 
+    database.deleteCallEdgesByTargetSymbol(symbolId);
     database.deleteCallEdgesBySymbol(symbolId);
     database.deleteSymbol(symbolId);
     return true;
@@ -3002,14 +3056,34 @@ export class Indexer {
     return lines.slice(metadata.startLine - 1, metadata.endLine).join("\n");
   }
 
+  private async batchFetchStoredChunkTexts(
+    embeddingInputHashes: string[]
+  ): Promise<Map<string, string>> {
+    const uniqueEmbeddingInputHashes = Array.from(
+      new Set(
+        embeddingInputHashes.filter((embeddingInputHash) => embeddingInputHash.length > 0)
+      )
+    );
+    if (uniqueEmbeddingInputHashes.length === 0) {
+      return new Map();
+    }
+
+    const { database } = await this.ensureInitialized();
+    return database.getChunkTextsBatch(uniqueEmbeddingInputHashes);
+  }
+
   private async buildRerankerCandidates(
     candidates: RankedCandidate[],
-    fileContentCache: Map<string, string | null>
+    fileContentCache: Map<string, string | null>,
+    storedChunkTexts: Map<string, string>
   ): Promise<RerankerCandidate[]> {
     return Promise.all(
       candidates.map(async (candidate) => {
-        const fileContent = await this.readFileContentCached(candidate.metadata.filePath, fileContentCache);
-        const content = this.getChunkContentFromFile(fileContent, candidate.metadata);
+        let content = storedChunkTexts.get(candidate.metadata.hash) ?? "";
+        if (content.length === 0) {
+          const fileContent = await this.readFileContentCached(candidate.metadata.filePath, fileContentCache);
+          content = this.getChunkContentFromFile(fileContent, candidate.metadata);
+        }
 
         return {
           id: candidate.id,
@@ -3048,7 +3122,8 @@ export class Indexer {
   private async materializeRankedResults(
     candidates: RankedCandidate[],
     options: { metadataOnly: boolean; contextLines: number },
-    fileContentCache: Map<string, string | null>
+    fileContentCache: Map<string, string | null>,
+    storedChunkTexts: Map<string, string>
   ): Promise<SearchResult[]> {
     return Promise.all(
       candidates.map(async (candidate) => {
@@ -3056,15 +3131,22 @@ export class Indexer {
         let startLine = candidate.metadata.startLine;
         let endLine = candidate.metadata.endLine;
 
-        const fileContent = await this.readFileContentCached(candidate.metadata.filePath, fileContentCache);
         if (!options.metadataOnly) {
-          if (fileContent === null) {
-            content = "[File not accessible]";
-          } else if (this.config.search.includeContext) {
-            const lines = fileContent.split("\n");
-            startLine = Math.max(1, candidate.metadata.startLine - options.contextLines);
-            endLine = Math.min(lines.length, candidate.metadata.endLine + options.contextLines);
-            content = lines.slice(startLine - 1, endLine).join("\n");
+          const storedChunkText = storedChunkTexts.get(candidate.metadata.hash);
+          if (storedChunkText !== undefined) {
+            content = storedChunkText;
+          } else {
+            const fileContent = await this.readFileContentCached(candidate.metadata.filePath, fileContentCache);
+            if (fileContent === null) {
+              content = "[File not accessible]";
+            } else if (this.config.search.includeContext) {
+              const lines = fileContent.split("\n");
+              startLine = Math.max(1, candidate.metadata.startLine - options.contextLines);
+              endLine = Math.min(lines.length, candidate.metadata.endLine + options.contextLines);
+              content = lines.slice(startLine - 1, endLine).join("\n");
+            } else {
+              content = this.getChunkContentFromFile(fileContent, candidate.metadata);
+            }
           }
         }
 
@@ -3087,7 +3169,8 @@ export class Indexer {
   private async materializeExpandedContext(
     entries: GraphExpansionEntry[],
     options: { metadataOnly: boolean; contextLines: number },
-    fileContentCache: Map<string, string | null>
+    fileContentCache: Map<string, string | null>,
+    storedChunkTexts: Map<string, string>
   ): Promise<GraphContextResult[]> {
     return Promise.all(
       entries.map(async (entry) => {
@@ -3099,7 +3182,8 @@ export class Indexer {
             relation: entry.relation,
           }],
           options,
-          fileContentCache
+          fileContentCache,
+          storedChunkTexts
         );
 
         return {
@@ -3131,7 +3215,10 @@ export class Indexer {
     const headSize = Math.min(rerankTopN, candidates.length);
     const head = candidates.slice(0, headSize);
     const tail = candidates.slice(headSize);
-    const rerankerCandidates = await this.buildRerankerCandidates(head, fileContentCache);
+    const storedChunkTexts = await this.batchFetchStoredChunkTexts(
+      head.map((candidate) => candidate.metadata.hash)
+    );
+    const rerankerCandidates = await this.buildRerankerCandidates(head, fileContentCache, storedChunkTexts);
     const reranked = await this.searchReranker.rerank(query, rerankerCandidates, taskType);
 
     if (!reranked.applied) {
@@ -3547,28 +3634,39 @@ export class Indexer {
     const metadataOnly = options?.metadataOnly ?? false;
     const contextLines = options?.contextLines ?? this.config.search.contextLines;
     const visiblePrimaryCandidates = reranked.ordered.slice(0, maxResults);
-    const primaryResults = await this.materializeRankedResults(
-      visiblePrimaryCandidates,
-      { metadataOnly, contextLines },
-      fileContentCache
-    );
-
-    let expandedContext: GraphContextResult[] = [];
+    let expanded: GraphExpansionEntry[] = [];
     const graphDepth = Math.max(0, Math.min(2, options?.graphDepth ?? recipe.graphDepth ?? 0));
     if (graphDepth > 0) {
       const graphSeeds: GraphExpansionSeed[] = visiblePrimaryCandidates.map((candidate) => ({
         id: candidate.id,
         metadata: candidate.metadata,
       }));
-      const expanded = expandGraphContext(database, graphSeeds, {
+      expanded = expandGraphContext(database, graphSeeds, {
         branch: this.currentBranch,
         depth: graphDepth,
         allowedChunkIds,
       });
+    }
+    const storedChunkTexts = metadataOnly
+      ? new Map<string, string>()
+      : await this.batchFetchStoredChunkTexts([
+          ...visiblePrimaryCandidates.map((candidate) => candidate.metadata.hash),
+          ...expanded.map((entry) => entry.metadata.hash),
+        ]);
+    const primaryResults = await this.materializeRankedResults(
+      visiblePrimaryCandidates,
+      { metadataOnly, contextLines },
+      fileContentCache,
+      storedChunkTexts
+    );
+
+    let expandedContext: GraphContextResult[] = [];
+    if (expanded.length > 0) {
       expandedContext = await this.materializeExpandedContext(
         expanded,
         { metadataOnly, contextLines },
-        fileContentCache
+        fileContentCache,
+        storedChunkTexts
       );
     }
 
@@ -3636,7 +3734,8 @@ export class Indexer {
 
   // clearIndex is intentionally a global reset. It is only used by force=true
   // before a rebuild, so it wipes retrieval state, branch catalogs, file-hash
-  // caches, failed-batch backlog, and Merkle snapshots across every branch.
+  // caches, failed-batch backlog, Merkle snapshots, and incremental control
+  // state across every branch.
   async clearIndex(): Promise<void> {
     return this.runSerializedIndexOperation(() => this.clearIndexInternal());
   }
@@ -3659,6 +3758,11 @@ export class Indexer {
       database.gcOrphanCallEdges();
       database.gcOrphanChunks();
       database.gcOrphanEmbeddings();
+      // Clear control-plane state after the data plane so any mid-reset crash
+      // biases toward a fully cold rebuild instead of stale "complete" stages.
+      database.clearAllPipelineState();
+      database.clearAllPipelineRuns();
+      database.clearAllConfigVersions();
 
       // Clear index metadata so compatibility is re-evaluated from scratch.
       database.deleteMetadata("index.version");
@@ -3670,6 +3774,7 @@ export class Indexer {
 
       // Re-validate compatibility (no stored metadata = compatible).
       this.indexCompatibility = this.validateIndexCompatibility(this.configuredProviderInfo!);
+      this.orchestrator.resetStartupState();
     });
   }
 
@@ -3940,7 +4045,7 @@ export class Indexer {
     options: HardRetrievalFilters & { filterByBranch?: boolean }
   ): Set<string> | null {
     const filterByBranch = options.filterByBranch ?? true;
-    const applyBranchFilter = filterByBranch && this.currentBranch !== "default";
+    const applyBranchFilter = filterByBranch && this.currentBranch.trim().length > 0;
     const hasMetadataFilters = Boolean(
       options.fileType || options.directory || options.chunkType || options.excludeFile
     );

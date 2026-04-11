@@ -14,6 +14,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub use chunker::{Chunk, ChunkConfig, ChunkKind, Granularity, SymbolKind};
 pub use hasher::*;
@@ -33,6 +34,29 @@ pub use merkle::{
 pub use parser::*;
 pub use store::*;
 pub use types::*;
+
+const SQLITE_WRITE_RETRY_ATTEMPTS: usize = 2;
+const SQLITE_WRITE_RETRY_BASE_DELAY_MS: u64 = 50;
+
+fn retry_busy_write<T, F>(mut operation: F) -> Result<T>
+where
+    F: FnMut() -> db::DbResult<T>,
+{
+    let mut delay_ms = SQLITE_WRITE_RETRY_BASE_DELAY_MS;
+
+    for attempt in 0..=SQLITE_WRITE_RETRY_ATTEMPTS {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if db::is_busy_error(&error) && attempt < SQLITE_WRITE_RETRY_ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                delay_ms = (delay_ms * 2).min(500);
+            }
+            Err(error) => return Err(Error::from_reason(error.to_string())),
+        }
+    }
+
+    unreachable!("retry loop must return or error");
+}
 
 #[napi]
 pub fn chunk_file(
@@ -73,6 +97,11 @@ pub fn hash_file(file_path: String) -> Result<String> {
 #[napi]
 pub fn get_chunker_version() -> String {
     chunker::CHUNKER_VERSION.to_string()
+}
+
+#[napi]
+pub fn get_graph_extractor_version() -> String {
+    call_extractor::GRAPH_EXTRACTOR_VERSION.to_string()
 }
 
 #[napi]
@@ -592,6 +621,7 @@ pub struct Database {
 pub struct ChunkData {
     pub chunk_id: String,
     pub content_hash: String,
+    pub embedding_input_hash: String,
     pub file_path: String,
     pub start_line: u32,
     pub end_line: u32,
@@ -617,6 +647,7 @@ pub struct BranchDelta {
 
 #[napi(object)]
 pub struct EmbeddingBatchItem {
+    pub embedding_input_hash: String,
     pub content_hash: String,
     pub embedding: Buffer,
     pub chunk_text: String,
@@ -661,6 +692,7 @@ pub struct ConfigVersionData {
     pub embedding_model_id: String,
     pub embedding_dimension: u32,
     pub voyage_model_id: Option<String>,
+    pub embedding_prefix_version: u32,
     pub chunker_version: String,
     pub graph_extractor_version: String,
     pub active: bool,
@@ -668,9 +700,22 @@ pub struct ConfigVersionData {
 }
 
 #[napi(object)]
+pub struct BranchConfigVersionData {
+    pub branch: String,
+    pub config_hash: String,
+    pub applied_at: f64,
+}
+
+#[napi(object)]
 pub struct EmbeddingLookupItem {
-    pub content_hash: String,
+    pub embedding_input_hash: String,
     pub embedding: Buffer,
+}
+
+#[napi(object)]
+pub struct ChunkTextLookupItem {
+    pub embedding_input_hash: String,
+    pub chunk_text: String,
 }
 
 #[napi]
@@ -685,32 +730,37 @@ impl Database {
     }
 
     #[napi]
-    pub fn embedding_exists(&self, content_hash: String) -> Result<bool> {
+    pub fn embedding_exists(&self, embedding_input_hash: String) -> Result<bool> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        db::embedding_exists(&conn, &content_hash).map_err(|e| Error::from_reason(e.to_string()))
+        db::embedding_exists(&conn, &embedding_input_hash)
+            .map_err(|e| Error::from_reason(e.to_string()))
     }
 
     #[napi]
-    pub fn get_embedding(&self, content_hash: String) -> Result<Option<Buffer>> {
+    pub fn get_embedding(&self, embedding_input_hash: String) -> Result<Option<Buffer>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        let result = db::get_embedding(&conn, &content_hash)
+        let result = db::get_embedding(&conn, &embedding_input_hash)
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(result.map(Buffer::from))
     }
 
     #[napi]
-    pub fn get_embedding_for_model(&self, content_hash: String, model: String) -> Result<Option<Buffer>> {
+    pub fn get_embedding_for_model(
+        &self,
+        embedding_input_hash: String,
+        model: String,
+    ) -> Result<Option<Buffer>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        let result = db::get_embedding_for_model(&conn, &content_hash, &model)
+        let result = db::get_embedding_for_model(&conn, &embedding_input_hash, &model)
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(result.map(Buffer::from))
     }
@@ -718,19 +768,40 @@ impl Database {
     #[napi]
     pub fn get_embeddings_for_model_batch(
         &self,
-        content_hashes: Vec<String>,
+        embedding_input_hashes: Vec<String>,
         model: String,
     ) -> Result<Vec<EmbeddingLookupItem>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        db::get_embeddings_for_model_batch(&conn, &content_hashes, &model)
+        db::get_embeddings_for_model_batch(&conn, &embedding_input_hashes, &model)
             .map(|rows| {
                 rows.into_iter()
                     .map(|(hash, embedding)| EmbeddingLookupItem {
-                        content_hash: hash,
+                        embedding_input_hash: hash,
                         embedding: Buffer::from(embedding),
+                    })
+                    .collect()
+            })
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn get_chunk_texts_batch(
+        &self,
+        embedding_input_hashes: Vec<String>,
+    ) -> Result<Vec<ChunkTextLookupItem>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        db::get_chunk_texts_batch(&conn, &embedding_input_hashes)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(hash, chunk_text)| ChunkTextLookupItem {
+                        embedding_input_hash: hash,
+                        chunk_text,
                     })
                     .collect()
             })
@@ -740,6 +811,7 @@ impl Database {
     #[napi]
     pub fn upsert_embedding(
         &self,
+        embedding_input_hash: String,
         content_hash: String,
         embedding: Buffer,
         chunk_text: String,
@@ -749,31 +821,41 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        db::upsert_embedding(&conn, &content_hash, &embedding, &chunk_text, &model)
-            .map_err(|e| Error::from_reason(e.to_string()))
+        db::upsert_embedding(
+            &conn,
+            &embedding_input_hash,
+            &content_hash,
+            &embedding,
+            &chunk_text,
+            &model,
+        )
+        .map_err(|e| Error::from_reason(e.to_string()))
     }
 
     #[napi]
-    pub fn get_missing_embeddings(&self, content_hashes: Vec<String>) -> Result<Vec<String>> {
+    pub fn get_missing_embeddings(
+        &self,
+        embedding_input_hashes: Vec<String>,
+    ) -> Result<Vec<String>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        db::get_missing_embeddings(&conn, &content_hashes)
+        db::get_missing_embeddings(&conn, &embedding_input_hashes)
             .map_err(|e| Error::from_reason(e.to_string()))
     }
 
     #[napi]
     pub fn get_missing_embeddings_for_model(
         &self,
-        content_hashes: Vec<String>,
+        embedding_input_hashes: Vec<String>,
         model: String,
     ) -> Result<Vec<String>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        db::get_missing_embeddings_for_model(&conn, &content_hashes, &model)
+        db::get_missing_embeddings_for_model(&conn, &embedding_input_hashes, &model)
             .map_err(|e| Error::from_reason(e.to_string()))
     }
 
@@ -787,6 +869,7 @@ impl Database {
             &conn,
             &chunk.chunk_id,
             &chunk.content_hash,
+            &chunk.embedding_input_hash,
             &chunk.file_path,
             chunk.start_line,
             chunk.end_line,
@@ -810,6 +893,7 @@ impl Database {
         Ok(result.map(|row| ChunkData {
             chunk_id: row.chunk_id,
             content_hash: row.content_hash,
+            embedding_input_hash: row.embedding_input_hash,
             file_path: row.file_path,
             start_line: row.start_line,
             end_line: row.end_line,
@@ -834,6 +918,37 @@ impl Database {
             .map(|row| ChunkData {
                 chunk_id: row.chunk_id,
                 content_hash: row.content_hash,
+                embedding_input_hash: row.embedding_input_hash,
+                file_path: row.file_path,
+                start_line: row.start_line,
+                end_line: row.end_line,
+                node_type: row.node_type,
+                name: row.name,
+                chunk_kind: row.chunk_kind,
+                symbol_kind: row.symbol_kind,
+                language: row.language,
+            })
+            .collect())
+    }
+
+    #[napi]
+    pub fn get_chunks_by_file_on_branch(
+        &self,
+        file_path: String,
+        branch: String,
+    ) -> Result<Vec<ChunkData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows = db::get_chunks_by_file_on_branch(&conn, &file_path, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ChunkData {
+                chunk_id: row.chunk_id,
+                content_hash: row.content_hash,
+                embedding_input_hash: row.embedding_input_hash,
                 file_path: row.file_path,
                 start_line: row.start_line,
                 end_line: row.end_line,
@@ -859,6 +974,7 @@ impl Database {
             .map(|row| ChunkData {
                 chunk_id: row.chunk_id,
                 content_hash: row.content_hash,
+                embedding_input_hash: row.embedding_input_hash,
                 file_path: row.file_path,
                 start_line: row.start_line,
                 end_line: row.end_line,
@@ -884,6 +1000,7 @@ impl Database {
             .map(|row| ChunkData {
                 chunk_id: row.chunk_id,
                 content_hash: row.content_hash,
+                embedding_input_hash: row.embedding_input_hash,
                 file_path: row.file_path,
                 start_line: row.start_line,
                 end_line: row.end_line,
@@ -944,10 +1061,11 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        let batch: Vec<(String, Vec<u8>, String, String)> = items
+        let batch: Vec<(String, String, Vec<u8>, String, String)> = items
             .into_iter()
             .map(|item| {
                 (
+                    item.embedding_input_hash,
                     item.content_hash,
                     item.embedding.to_vec(),
                     item.chunk_text,
@@ -955,8 +1073,7 @@ impl Database {
                 )
             })
             .collect();
-        db::upsert_embeddings_batch(&mut conn, &batch)
-            .map_err(|e| Error::from_reason(e.to_string()))
+        retry_busy_write(|| db::upsert_embeddings_batch(&mut conn, &batch))
     }
 
     #[napi]
@@ -970,6 +1087,7 @@ impl Database {
             .map(|c| db::ChunkRow {
                 chunk_id: c.chunk_id,
                 content_hash: c.content_hash,
+                embedding_input_hash: c.embedding_input_hash,
                 file_path: c.file_path,
                 start_line: c.start_line,
                 end_line: c.end_line,
@@ -980,7 +1098,7 @@ impl Database {
                 language: c.language,
             })
             .collect();
-        db::upsert_chunks_batch(&mut conn, &batch).map_err(|e| Error::from_reason(e.to_string()))
+        retry_busy_write(|| db::upsert_chunks_batch(&mut conn, &batch))
     }
 
     #[napi]
@@ -989,8 +1107,7 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        db::add_chunks_to_branch_batch(&mut conn, &branch, &chunk_ids)
-            .map_err(|e| Error::from_reason(e.to_string()))
+        retry_busy_write(|| db::add_chunks_to_branch_batch(&mut conn, &branch, &chunk_ids))
     }
 
     #[napi]
@@ -1196,7 +1313,7 @@ impl Database {
             error: state.error,
             updated_at: state.updated_at as i64,
         };
-        db::upsert_pipeline_state(&conn, &row).map_err(|e| Error::from_reason(e.to_string()))
+        retry_busy_write(|| db::upsert_pipeline_state(&conn, &row))
     }
 
     #[napi]
@@ -1281,6 +1398,17 @@ impl Database {
         Ok(count as u32)
     }
 
+    #[napi]
+    pub fn clear_all_pipeline_state(&self) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = retry_busy_write(|| db::clear_all_pipeline_state(&conn))
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
     // ── Pipeline run methods ───────────────────────────────────────
 
     #[napi]
@@ -1298,8 +1426,7 @@ impl Database {
             started_at: run.started_at as i64,
             completed_at: run.completed_at.map(|value| value as i64),
         };
-        db::start_pipeline_run(&mut conn, &row, cancelled_at as i64)
-            .map_err(|e| Error::from_reason(e.to_string()))
+        retry_busy_write(|| db::start_pipeline_run(&mut conn, &row, cancelled_at as i64))
     }
 
     #[napi]
@@ -1313,8 +1440,7 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        db::update_pipeline_run_status(&conn, &run_id, &status, completed_at as i64)
-            .map_err(|e| Error::from_reason(e.to_string()))
+        retry_busy_write(|| db::update_pipeline_run_status(&conn, &run_id, &status, completed_at as i64))
     }
 
     #[napi]
@@ -1342,8 +1468,7 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        let count = db::cancel_active_pipeline_runs(&conn, &branch, cancelled_at as i64)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = retry_busy_write(|| db::cancel_active_pipeline_runs(&conn, &branch, cancelled_at as i64))?;
         Ok(count as u32)
     }
 
@@ -1380,7 +1505,39 @@ impl Database {
         Ok(count as u32)
     }
 
+    #[napi]
+    pub fn clear_all_pipeline_runs(&self) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = retry_busy_write(|| db::clear_all_pipeline_runs(&conn))
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
     // ── Config version methods ─────────────────────────────────────
+
+    #[napi]
+    pub fn get_config_version(&self, config_hash: String) -> Result<Option<ConfigVersionData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let result = db::get_config_version(&conn, &config_hash)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(result.map(|row| ConfigVersionData {
+            config_hash: row.config_hash,
+            embedding_model_id: row.embedding_model_id,
+            embedding_dimension: row.embedding_dimension as u32,
+            voyage_model_id: row.voyage_model_id,
+            embedding_prefix_version: row.embedding_prefix_version as u32,
+            chunker_version: row.chunker_version,
+            graph_extractor_version: row.graph_extractor_version,
+            active: row.active,
+            created_at: row.created_at as f64,
+        }))
+    }
 
     #[napi]
     pub fn get_active_config_version(&self) -> Result<Option<ConfigVersionData>> {
@@ -1395,6 +1552,7 @@ impl Database {
             embedding_model_id: row.embedding_model_id,
             embedding_dimension: row.embedding_dimension as u32,
             voyage_model_id: row.voyage_model_id,
+            embedding_prefix_version: row.embedding_prefix_version as u32,
             chunker_version: row.chunker_version,
             graph_extractor_version: row.graph_extractor_version,
             active: row.active,
@@ -1413,12 +1571,56 @@ impl Database {
             embedding_model_id: config_version.embedding_model_id,
             embedding_dimension: config_version.embedding_dimension as i64,
             voyage_model_id: config_version.voyage_model_id,
+            embedding_prefix_version: config_version.embedding_prefix_version as i64,
             chunker_version: config_version.chunker_version,
             graph_extractor_version: config_version.graph_extractor_version,
             active: config_version.active,
             created_at: config_version.created_at as i64,
         };
-        db::activate_config_version(&mut conn, &row).map_err(|e| Error::from_reason(e.to_string()))
+        retry_busy_write(|| db::activate_config_version(&mut conn, &row))
+    }
+
+    #[napi]
+    pub fn get_branch_config_version(&self, branch: String) -> Result<Option<BranchConfigVersionData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let result = db::get_branch_config_version(&conn, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(result.map(|row| BranchConfigVersionData {
+            branch: row.branch,
+            config_hash: row.config_hash,
+            applied_at: row.applied_at as f64,
+        }))
+    }
+
+    #[napi]
+    pub fn upsert_branch_config_version(
+        &self,
+        branch_config: BranchConfigVersionData,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let row = db::BranchConfigVersionRow {
+            branch: branch_config.branch,
+            config_hash: branch_config.config_hash,
+            applied_at: branch_config.applied_at as i64,
+        };
+        retry_busy_write(|| db::upsert_branch_config_version(&conn, &row))
+    }
+
+    #[napi]
+    pub fn clear_all_config_versions(&self) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = retry_busy_write(|| db::clear_all_config_versions(&conn))
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
     }
 
     // ── Symbol methods ──────────────────────────────────────────────
@@ -1463,7 +1665,7 @@ impl Database {
                 language: s.language,
             })
             .collect();
-        db::upsert_symbols_batch(&mut conn, &rows).map_err(|e| Error::from_reason(e.to_string()))
+        retry_busy_write(|| db::upsert_symbols_batch(&mut conn, &rows))
     }
 
     #[napi]
@@ -1491,12 +1693,65 @@ impl Database {
     }
 
     #[napi]
+    pub fn get_symbols_by_file_on_branch(
+        &self,
+        file_path: String,
+        branch: String,
+    ) -> Result<Vec<SymbolData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows = db::get_symbols_by_file_on_branch(&conn, &file_path, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SymbolData {
+                id: r.id,
+                file_path: r.file_path,
+                name: r.name,
+                kind: r.kind,
+                start_line: r.start_line,
+                start_col: r.start_col,
+                end_line: r.end_line,
+                end_col: r.end_col,
+                language: r.language,
+            })
+            .collect())
+    }
+
+    #[napi]
     pub fn get_symbol_by_id(&self, symbol_id: String) -> Result<Option<SymbolData>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let row = db::get_symbol_by_id(&conn, &symbol_id)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(row.map(|r| SymbolData {
+            id: r.id,
+            file_path: r.file_path,
+            name: r.name,
+            kind: r.kind,
+            start_line: r.start_line,
+            start_col: r.start_col,
+            end_line: r.end_line,
+            end_col: r.end_col,
+            language: r.language,
+        }))
+    }
+
+    #[napi]
+    pub fn get_symbol_by_id_on_branch(
+        &self,
+        symbol_id: String,
+        branch: String,
+    ) -> Result<Option<SymbolData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let row = db::get_symbol_by_id_on_branch(&conn, &symbol_id, &branch)
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(row.map(|r| SymbolData {
             id: r.id,
@@ -1537,6 +1792,32 @@ impl Database {
     }
 
     #[napi]
+    pub fn get_symbol_by_name_on_branch(
+        &self,
+        name: String,
+        file_path: String,
+        branch: String,
+    ) -> Result<Option<SymbolData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let row = db::get_symbol_by_name_on_branch(&conn, &name, &file_path, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(row.map(|r| SymbolData {
+            id: r.id,
+            file_path: r.file_path,
+            name: r.name,
+            kind: r.kind,
+            start_line: r.start_line,
+            start_col: r.start_col,
+            end_line: r.end_line,
+            end_col: r.end_col,
+            language: r.language,
+        }))
+    }
+
+    #[napi]
     pub fn get_symbols_by_name(&self, name: String) -> Result<Vec<SymbolData>> {
         let conn = self
             .conn
@@ -1561,12 +1842,68 @@ impl Database {
     }
 
     #[napi]
+    pub fn get_symbols_by_name_on_branch(
+        &self,
+        name: String,
+        branch: String,
+    ) -> Result<Vec<SymbolData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows = db::get_symbols_by_name_on_branch(&conn, &name, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SymbolData {
+                id: r.id,
+                file_path: r.file_path,
+                name: r.name,
+                kind: r.kind,
+                start_line: r.start_line,
+                start_col: r.start_col,
+                end_line: r.end_line,
+                end_col: r.end_col,
+                language: r.language,
+            })
+            .collect())
+    }
+
+    #[napi]
     pub fn get_symbols_by_name_ci(&self, name: String) -> Result<Vec<SymbolData>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let rows = db::get_symbols_by_name_ci(&conn, &name)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SymbolData {
+                id: r.id,
+                file_path: r.file_path,
+                name: r.name,
+                kind: r.kind,
+                start_line: r.start_line,
+                start_col: r.start_col,
+                end_line: r.end_line,
+                end_col: r.end_col,
+                language: r.language,
+            })
+            .collect())
+    }
+
+    #[napi]
+    pub fn get_symbols_by_name_ci_on_branch(
+        &self,
+        name: String,
+        branch: String,
+    ) -> Result<Vec<SymbolData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows = db::get_symbols_by_name_ci_on_branch(&conn, &name, &branch)
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(rows
             .into_iter()
@@ -1666,7 +2003,7 @@ impl Database {
                 is_resolved: e.is_resolved,
             })
             .collect();
-        db::upsert_call_edges_batch(&mut conn, &rows).map_err(|e| Error::from_reason(e.to_string()))
+        retry_busy_write(|| db::upsert_call_edges_batch(&mut conn, &rows))
     }
 
     #[napi]
@@ -1835,6 +2172,32 @@ impl Database {
     }
 
     #[napi]
+    pub fn unresolve_call_edges_by_target_symbol_for_branch(
+        &self,
+        symbol_id: String,
+        branch: String,
+    ) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = db::unresolve_call_edges_by_target_symbol_for_branch(&conn, &symbol_id, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    #[napi]
+    pub fn delete_call_edges_by_target_symbol(&self, symbol_id: String) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = db::delete_call_edges_by_target_symbol(&conn, &symbol_id)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    #[napi]
     pub fn resolve_call_edge(
         &self,
         edge_id: String,
@@ -1880,8 +2243,7 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        db::add_symbols_to_branch_batch(&mut conn, &branch, &symbol_ids)
-            .map_err(|e| Error::from_reason(e.to_string()))
+        retry_busy_write(|| db::add_symbols_to_branch_batch(&mut conn, &branch, &symbol_ids))
     }
 
     #[napi]

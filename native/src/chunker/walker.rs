@@ -1,7 +1,9 @@
 use super::error::ChunkerError;
 use super::log_warn;
 use super::policy::{LanguagePolicy, SemanticInfo};
-use super::{Chunk, ChunkConfig, ChunkKind, Granularity, SymbolKind};
+use super::{
+    exceeds_budget, non_whitespace_len, Chunk, ChunkConfig, ChunkKind, Granularity, SymbolKind,
+};
 use crate::hasher::xxhash_content;
 use tree_sitter::{Node, Tree};
 
@@ -75,6 +77,20 @@ impl<'a> WalkerContext<'a> {
             text,
         })
     }
+
+    fn range_non_whitespace_len(&self, start: usize, end: usize) -> usize {
+        self.source
+            .get(start..end)
+            .map(non_whitespace_len)
+            .unwrap_or(usize::MAX)
+    }
+
+    fn range_exceeds_budget(&self, start: usize, end: usize) -> bool {
+        self.source
+            .get(start..end)
+            .map(|text| exceeds_budget(text, self.config))
+            .unwrap_or(true)
+    }
 }
 
 fn build_line_index(source: &str) -> Vec<usize> {
@@ -89,6 +105,124 @@ fn build_line_index(source: &str) -> Vec<usize> {
 
 fn classify(policy: &'static LanguagePolicy, node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     (policy.classify_node)(node, source)
+}
+
+fn is_go_transparent_declaration_container(language: &str, node: Node<'_>) -> bool {
+    language == "go"
+        && matches!(
+            node.kind(),
+            "const_declaration" | "var_declaration" | "type_declaration"
+        )
+}
+
+fn go_container_keyword(container_kind: &str) -> Option<&'static str> {
+    match container_kind {
+        "const_declaration" => Some("const"),
+        "var_declaration" => Some("var"),
+        "type_declaration" => Some("type"),
+        _ => None,
+    }
+}
+
+fn go_container_wrapper_start(text: &str, keyword: &str) -> Option<usize> {
+    let start = text.rfind(keyword)?;
+    let wrapper = &text[start..];
+    let rest = wrapper[keyword.len()..].trim();
+    if rest.is_empty() || rest == "(" {
+        Some(start)
+    } else {
+        None
+    }
+}
+
+fn try_absorb_go_declaration_prefix(
+    ctx: &WalkerContext<'_>,
+    start: usize,
+    end: usize,
+    chunks: &mut Vec<PendingChunk>,
+    first_child: &mut PendingChunk,
+) -> bool {
+    if ctx.language != "go" || start >= end {
+        return false;
+    }
+
+    let Ok(text) = ctx.slice(start, end) else {
+        return false;
+    };
+    let keywords: &[&str] = match first_child.symbol_kind {
+        Some(SymbolKind::Constant) => &["const", "var"],
+        Some(SymbolKind::Type | SymbolKind::Struct | SymbolKind::Interface) => &["type"],
+        _ => return false,
+    };
+
+    for keyword in keywords {
+        if let Some(wrapper_offset) = go_container_wrapper_start(text, keyword) {
+            let wrapper_start = start + wrapper_offset;
+            if start < wrapper_start {
+                emit_gap(ctx, start, wrapper_start, chunks);
+            }
+            first_child.start_byte = wrapper_start;
+            return true;
+        }
+    }
+
+    false
+}
+
+fn try_absorb_go_container_leading_gap(
+    ctx: &WalkerContext<'_>,
+    container: Node<'_>,
+    start: usize,
+    end: usize,
+    chunks: &mut Vec<PendingChunk>,
+    first_child: &mut PendingChunk,
+) -> bool {
+    if !is_go_transparent_declaration_container(ctx.language, container) || start >= end {
+        return false;
+    }
+
+    let Some(keyword) = go_container_keyword(container.kind()) else {
+        return false;
+    };
+    let Ok(text) = ctx.slice(start, end) else {
+        return false;
+    };
+    let Some(wrapper_offset) = go_container_wrapper_start(text, keyword) else {
+        return false;
+    };
+
+    let wrapper_start = start + wrapper_offset;
+    if start < wrapper_start {
+        emit_gap(ctx, start, wrapper_start, chunks);
+    }
+
+    first_child.start_byte = wrapper_start;
+    true
+}
+
+fn try_absorb_go_container_trailing_gap(
+    ctx: &WalkerContext<'_>,
+    container: Node<'_>,
+    start: usize,
+    end: usize,
+    chunks: &mut [PendingChunk],
+) -> bool {
+    if !is_go_transparent_declaration_container(ctx.language, container) || start >= end {
+        return false;
+    }
+
+    let Ok(text) = ctx.slice(start, end) else {
+        return false;
+    };
+    if text.trim() != ")" {
+        return false;
+    }
+
+    let Some(last) = chunks.last_mut() else {
+        return false;
+    };
+    last.end_byte = end;
+    true
 }
 
 fn attached_start(ctx: &WalkerContext<'_>, node: Node<'_>) -> usize {
@@ -115,7 +249,9 @@ fn collect_split_children<'tree>(
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if classify(ctx.policy, child, ctx.source).is_some() {
+        if classify(ctx.policy, child, ctx.source).is_some()
+            || is_go_transparent_declaration_container(ctx.language, child)
+        {
             results.push(child);
         } else {
             collect_split_children(ctx, child, results);
@@ -160,6 +296,104 @@ fn emit_gap(ctx: &WalkerContext<'_>, start: usize, end: usize, chunks: &mut Vec<
     });
 }
 
+fn is_js_like_language(language: &str) -> bool {
+    matches!(language, "typescript" | "tsx" | "javascript" | "jsx")
+}
+
+fn extract_display_name_target(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "expression_statement" {
+        return None;
+    }
+
+    let assignment = {
+        let mut cursor = node.walk();
+        let assignment = node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "assignment_expression");
+        assignment
+    }?;
+    if assignment.kind() != "assignment_expression" {
+        return None;
+    }
+
+    let left = assignment.child_by_field_name("left")?;
+    if left.kind() != "member_expression" {
+        return None;
+    }
+
+    let property = left.child_by_field_name("property")?;
+    let property_name = source
+        .get(property.start_byte()..property.end_byte())?
+        .trim();
+    if property_name != "displayName" {
+        return None;
+    }
+
+    let object = left.child_by_field_name("object")?;
+    if object.kind() != "identifier" {
+        return None;
+    }
+
+    let object_name = source
+        .get(object.start_byte()..object.end_byte())?
+        .trim();
+    if object_name.is_empty() {
+        return None;
+    }
+
+    Some(object_name.to_string())
+}
+
+fn try_attach_display_name_gap(
+    ctx: &WalkerContext<'_>,
+    container: Node<'_>,
+    start: usize,
+    end: usize,
+    chunks: &mut Vec<PendingChunk>,
+) -> bool {
+    if !is_js_like_language(ctx.language) || start >= end {
+        return false;
+    }
+
+    let Some(last) = chunks.last_mut() else {
+        return false;
+    };
+    let Some(symbol_name) = last.symbol_name.as_deref() else {
+        return false;
+    };
+
+    let mut found_attachment = false;
+    let mut cursor = container.walk();
+    for child in container.named_children(&mut cursor) {
+        if child.start_byte() < start || child.end_byte() > end {
+            continue;
+        }
+
+        if (ctx.policy.is_comment_kind)(child.kind()) {
+            continue;
+        }
+
+        if let Some(target_name) = extract_display_name_target(child, ctx.source) {
+            if target_name == symbol_name {
+                if found_attachment {
+                    return false;
+                }
+                found_attachment = true;
+                continue;
+            }
+        }
+
+        return false;
+    }
+
+    if !found_attachment {
+        return false;
+    }
+
+    last.end_byte = end;
+    true
+}
+
 fn merge_small_siblings(ctx: &WalkerContext<'_>, chunks: &mut Vec<PendingChunk>) {
     if !ctx.config.merge_small_siblings || chunks.len() < 2 {
         return;
@@ -173,13 +407,21 @@ fn merge_small_siblings(ctx: &WalkerContext<'_>, chunks: &mut Vec<PendingChunk>)
 
         while index + 1 < chunks.len() {
             let next = &chunks[index + 1];
-            let current_len = current.end_byte.saturating_sub(current.start_byte);
-            let next_len = next.end_byte.saturating_sub(next.start_byte);
-            let combined_len = next.end_byte.saturating_sub(current.start_byte);
+            if current.symbol_name.is_some() || next.symbol_name.is_some() {
+                break;
+            }
+            let current_len = ctx.range_non_whitespace_len(current.start_byte, current.end_byte);
+            let next_len = ctx.range_non_whitespace_len(next.start_byte, next.end_byte);
+            let combined_len = ctx.range_non_whitespace_len(current.start_byte, next.end_byte);
 
             let is_small = current_len + next_len < ctx.config.min_chunk_chars_usize();
-            let is_mergeable = current.symbol_name.is_none()
-                && next.symbol_name.is_none()
+            let is_gap_like = |chunk: &PendingChunk| {
+                chunk.symbol_name.is_none()
+                    && matches!(chunk.chunk_kind, ChunkKind::Code)
+                    && matches!(chunk.symbol_kind, None | Some(SymbolKind::Block))
+            };
+            let is_mergeable = is_gap_like(&current)
+                && is_gap_like(next)
                 && combined_len <= ctx.config.max_chunk_chars_usize();
 
             if !is_small || !is_mergeable {
@@ -199,6 +441,74 @@ fn merge_small_siblings(ctx: &WalkerContext<'_>, chunks: &mut Vec<PendingChunk>)
     *chunks = merged;
 }
 
+fn is_statement_container_kind(kind: &str) -> bool {
+    kind.contains("body") || kind.contains("block") || kind == "declaration_list"
+}
+
+fn find_statement_container(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+    children.into_iter().rev().find(|child| {
+        child.end_byte() == node.end_byte()
+            && is_statement_container_kind(child.kind())
+            && child.named_child_count() > 0
+    })
+}
+
+fn split_oversized_leaf_node_by_statements(
+    ctx: &WalkerContext<'_>,
+    node: Node<'_>,
+    template: &PendingChunk,
+) -> Option<Vec<PendingChunk>> {
+    let container = find_statement_container(node)?;
+    let mut cursor = container.walk();
+    let statements: Vec<Node<'_>> = container.named_children(&mut cursor).collect();
+    if statements.len() < 2 {
+        return None;
+    }
+
+    let mut chunks = Vec::new();
+    let mut group_start = template.start_byte;
+    let mut first_statement_index = 0usize;
+
+    for (index, statement) in statements.iter().enumerate() {
+        let candidate_end = statements
+            .get(index + 1)
+            .map(|next| next.start_byte())
+            .unwrap_or(template.end_byte);
+
+        if index > first_statement_index && ctx.range_exceeds_budget(group_start, candidate_end) {
+            chunks.push(PendingChunk {
+                symbol_name: template.symbol_name.clone(),
+                symbol_kind: template.symbol_kind.clone(),
+                chunk_kind: template.chunk_kind.clone(),
+                granularity: template.granularity.clone(),
+                start_byte: group_start,
+                end_byte: statement.start_byte(),
+            });
+            group_start = statement.start_byte();
+            first_statement_index = index;
+        }
+    }
+
+    let final_chunk = PendingChunk {
+        symbol_name: template.symbol_name.clone(),
+        symbol_kind: template.symbol_kind.clone(),
+        chunk_kind: template.chunk_kind.clone(),
+        granularity: template.granularity.clone(),
+        start_byte: group_start,
+        end_byte: template.end_byte,
+    };
+
+    chunks.push(final_chunk);
+
+    if chunks.len() <= 1 {
+        return None;
+    }
+
+    Some(chunks)
+}
+
 fn build_semantic_chunk(
     ctx: &WalkerContext<'_>,
     node: Node<'_>,
@@ -206,30 +516,45 @@ fn build_semantic_chunk(
 ) -> Vec<PendingChunk> {
     let node_start = attached_start(ctx, node);
     let node_end = node.end_byte();
-    let node_len = node_end.saturating_sub(node_start);
     let split_children = find_split_children(ctx, node);
     let should_prefer_children = info.coarse_eligible && !split_children.is_empty();
 
-    if node_len <= ctx.config.max_chunk_chars_usize() && !should_prefer_children {
+    let template = PendingChunk {
+        symbol_name: info.symbol_name,
+        symbol_kind: info.symbol_kind,
+        chunk_kind: info.chunk_kind,
+        granularity: Granularity::Fine,
+        start_byte: node_start,
+        end_byte: node_end,
+    };
+
+    if !ctx.range_exceeds_budget(node_start, node_end) && !should_prefer_children {
         return vec![PendingChunk {
-            symbol_name: info.symbol_name,
-            symbol_kind: info.symbol_kind,
-            chunk_kind: info.chunk_kind,
-            granularity: Granularity::Fine,
-            start_byte: node_start,
-            end_byte: node_end,
+            symbol_name: template.symbol_name,
+            symbol_kind: template.symbol_kind,
+            chunk_kind: template.chunk_kind,
+            granularity: template.granularity,
+            start_byte: template.start_byte,
+            end_byte: template.end_byte,
         }];
     }
 
+    if !info.coarse_eligible {
+        if let Some(statement_chunks) = split_oversized_leaf_node_by_statements(ctx, node, &template)
+        {
+            return statement_chunks;
+        }
+
+        return vec![template];
+    }
+
     if split_children.is_empty() {
-        return vec![PendingChunk {
-            symbol_name: info.symbol_name,
-            symbol_kind: info.symbol_kind,
-            chunk_kind: info.chunk_kind,
-            granularity: Granularity::Fine,
-            start_byte: node_start,
-            end_byte: node_end,
-        }];
+        if let Some(statement_chunks) = split_oversized_leaf_node_by_statements(ctx, node, &template)
+        {
+            return statement_chunks;
+        }
+
+        return vec![template];
     }
 
     let mut chunks = Vec::new();
@@ -247,8 +572,35 @@ fn build_semantic_chunk(
         if cursor < first_start {
             if ctx.is_whitespace_only(cursor, first_start) {
                 child_chunks[0].start_byte = cursor;
+            } else if try_absorb_go_declaration_prefix(
+                ctx,
+                cursor,
+                first_start,
+                &mut chunks,
+                &mut child_chunks[0],
+            ) {
+            } else if try_absorb_go_container_leading_gap(
+                ctx,
+                child,
+                cursor,
+                first_start,
+                &mut chunks,
+                &mut child_chunks[0],
+            ) {
+            } else if chunks.is_empty()
+                && try_absorb_go_container_leading_gap(
+                    ctx,
+                    node,
+                    cursor,
+                    first_start,
+                    &mut chunks,
+                    &mut child_chunks[0],
+                )
+            {
             } else {
-                emit_gap(ctx, cursor, first_start, &mut chunks);
+                if !try_attach_display_name_gap(ctx, node, cursor, first_start, &mut chunks) {
+                    emit_gap(ctx, cursor, first_start, &mut chunks);
+                }
             }
         }
 
@@ -262,113 +614,13 @@ fn build_semantic_chunk(
     }
 
     if cursor < node_end {
-        emit_gap(ctx, cursor, node_end, &mut chunks);
+        if !try_attach_display_name_gap(ctx, node, cursor, node_end, &mut chunks) {
+            emit_gap(ctx, cursor, node_end, &mut chunks);
+        }
     }
 
     merge_small_siblings(ctx, &mut chunks);
     chunks
-}
-
-fn floor_char_boundary(source: &str, mut index: usize) -> usize {
-    if index >= source.len() {
-        return source.len();
-    }
-
-    while index > 0 && !source.is_char_boundary(index) {
-        index -= 1;
-    }
-
-    index
-}
-
-fn split_chunk_at_line_boundaries(
-    ctx: &WalkerContext<'_>,
-    chunk: &Chunk,
-) -> Result<Vec<Chunk>, ChunkerError> {
-    let max_len = ctx.config.max_chunk_chars_usize();
-    if chunk.text.len() <= max_len || chunk.granularity != Granularity::Fine {
-        return Ok(vec![chunk.clone()]);
-    }
-
-    log_warn(format!(
-        "chunker force-split on line boundaries file_path={} language={} chunk_size={} max_chunk_chars={} symbol_name={}",
-        ctx.file_path,
-        ctx.language,
-        chunk.text.len(),
-        max_len,
-        chunk.symbol_name.as_deref().unwrap_or("<anonymous>")
-    ));
-
-    let start = chunk.start_byte as usize;
-    let end = chunk.end_byte as usize;
-    let mut segments = Vec::new();
-    let mut segment_start = start;
-
-    while segment_start < end {
-        let max_end = floor_char_boundary(ctx.source, (segment_start + max_len).min(end));
-        let mut segment_end = ctx
-            .line_starts
-            .iter()
-            .copied()
-            .take_while(|line_start| *line_start <= max_end)
-            .filter(|line_start| *line_start > segment_start)
-            .last()
-            .unwrap_or(max_end);
-
-        if segment_end <= segment_start {
-            segment_end = max_end;
-        }
-
-        if segment_end <= segment_start {
-            return Err(ChunkerError::ChunkTooLarge {
-                file_path: ctx.file_path.to_string(),
-                language: ctx.language.to_string(),
-                chunk_len: chunk.text.len(),
-                max_len,
-            });
-        }
-
-        let pending = PendingChunk {
-            symbol_name: chunk.symbol_name.clone(),
-            symbol_kind: chunk.symbol_kind.clone(),
-            chunk_kind: chunk.chunk_kind.clone(),
-            granularity: Granularity::Fine,
-            start_byte: segment_start,
-            end_byte: segment_end,
-        };
-
-        let finalized = ctx.finalize_chunk(pending)?;
-        if finalized.text.len() > max_len {
-            return Err(ChunkerError::ChunkTooLarge {
-                file_path: ctx.file_path.to_string(),
-                language: ctx.language.to_string(),
-                chunk_len: finalized.text.len(),
-                max_len,
-            });
-        }
-
-        segments.push(finalized);
-        segment_start = segment_end;
-    }
-
-    Ok(segments)
-}
-
-fn enforce_fine_chunk_max_size(
-    ctx: &WalkerContext<'_>,
-    chunks: Vec<Chunk>,
-) -> Result<Vec<Chunk>, ChunkerError> {
-    let mut result = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        if chunk.granularity == Granularity::Fine
-            && chunk.text.len() > ctx.config.max_chunk_chars_usize()
-        {
-            result.extend(split_chunk_at_line_boundaries(ctx, &chunk)?);
-        } else {
-            result.push(chunk);
-        }
-    }
-    Ok(result)
 }
 
 fn build_node_chunks(ctx: &WalkerContext<'_>, node: Node<'_>) -> Vec<PendingChunk> {
@@ -378,14 +630,24 @@ fn build_node_chunks(ctx: &WalkerContext<'_>, node: Node<'_>) -> Vec<PendingChun
 
     let split_children = find_split_children(ctx, node);
     if split_children.is_empty() {
-        return vec![PendingChunk {
+        let template = PendingChunk {
             symbol_name: None,
             symbol_kind: Some(SymbolKind::Block),
             chunk_kind: ChunkKind::Code,
             granularity: Granularity::Fine,
             start_byte: node.start_byte(),
             end_byte: node.end_byte(),
-        }];
+        };
+
+        if ctx.range_exceeds_budget(template.start_byte, template.end_byte) {
+            if let Some(statement_chunks) =
+                split_oversized_leaf_node_by_statements(ctx, node, &template)
+            {
+                return statement_chunks;
+            }
+        }
+
+        return vec![template];
     }
 
     let mut chunks = Vec::new();
@@ -403,8 +665,25 @@ fn build_node_chunks(ctx: &WalkerContext<'_>, node: Node<'_>) -> Vec<PendingChun
         if cursor < first_start {
             if ctx.is_whitespace_only(cursor, first_start) {
                 child_chunks[0].start_byte = cursor;
+            } else if try_absorb_go_declaration_prefix(
+                ctx,
+                cursor,
+                first_start,
+                &mut chunks,
+                &mut child_chunks[0],
+            ) {
+            } else if try_absorb_go_container_leading_gap(
+                ctx,
+                child,
+                cursor,
+                first_start,
+                &mut chunks,
+                &mut child_chunks[0],
+            ) {
             } else {
-                emit_gap(ctx, cursor, first_start, &mut chunks);
+                if !try_attach_display_name_gap(ctx, node, cursor, first_start, &mut chunks) {
+                    emit_gap(ctx, cursor, first_start, &mut chunks);
+                }
             }
         }
 
@@ -418,7 +697,11 @@ fn build_node_chunks(ctx: &WalkerContext<'_>, node: Node<'_>) -> Vec<PendingChun
     }
 
     if cursor < node.end_byte() {
-        emit_gap(ctx, cursor, node.end_byte(), &mut chunks);
+        if !try_absorb_go_container_trailing_gap(ctx, node, cursor, node.end_byte(), &mut chunks)
+            && !try_attach_display_name_gap(ctx, node, cursor, node.end_byte(), &mut chunks)
+        {
+            emit_gap(ctx, cursor, node.end_byte(), &mut chunks);
+        }
     }
 
     merge_small_siblings(ctx, &mut chunks);
@@ -478,7 +761,13 @@ pub fn chunk_tree(
     for chunk in pending {
         chunks.push(ctx.finalize_chunk(chunk)?);
     }
-    let mut chunks = enforce_fine_chunk_max_size(&ctx, chunks)?;
+    let mut chunks = super::enforce_fine_chunk_max_size(
+        file_path,
+        language,
+        source,
+        config,
+        chunks,
+    )?;
 
     if config.emit_coarse_chunks {
         for (node, info) in top_level_semantic_nodes(&ctx, root) {

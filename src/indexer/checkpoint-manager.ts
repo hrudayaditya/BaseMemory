@@ -5,6 +5,7 @@ import {
   Database,
   type PipelineRunData,
   type PipelineStateData,
+  type StoredBranchConfigVersionData,
   type StoredConfigVersionData,
 } from "../native/index.js";
 
@@ -19,12 +20,14 @@ export interface CheckpointManagerOptions {
 }
 
 /**
- * Owns all reads and writes to pipeline_state and pipeline_runs.
+ * Owns all reads and writes to pipeline_state, pipeline_runs, and the
+ * persisted config records that drive branch-level invalidation.
  *
  * Expected stage input hashes are constructed by the orchestrator, not here:
  * CHUNK: `hash(fileContentHash + chunkerVersion)`
- * EMBED: file-level aggregate of `hash(chunkHash + embedConfigHash)` across the file's current chunks,
- *   where `embedConfigHash = hashEmbedConfig(providerInfo)`
+ * EMBED: file-level aggregate of `hash(embeddingInputHash + embedConfigHash)` across the file's
+ *   current chunks, where `embeddingInputHash = hash(createEmbeddingText(...))` and
+ *   `embedConfigHash = hashEmbedConfig(providerInfo)`
  * INDEX: file-level bookkeeping hash derived from the current chunk/embed identity; INDEX still reruns
  *   whenever CHUNK changes structure or EMBED reruns any chunk
  * GRAPH: `hash(fileContentHash + graphExtractorVersion)`
@@ -219,16 +222,33 @@ export class CheckpointManager {
     return this.database.getActiveConfigVersion();
   }
 
+  getConfigVersion(configHash: string): StoredConfigVersionData | null {
+    return this.database.getConfigVersion(configHash);
+  }
+
   activateConfigVersion(configHash: string, configVersion: ConfigVersion): void {
     this.database.activateConfigVersion({
       configHash,
       embeddingModelId: configVersion.embeddingModelId,
       embeddingDimension: configVersion.embeddingDimension,
       voyageModelId: configVersion.voyageModelId,
+      embeddingPrefixVersion: configVersion.embeddingPrefixVersion,
       chunkerVersion: configVersion.chunkerVersion,
       graphExtractorVersion: configVersion.graphExtractorVersion,
       active: true,
       createdAt: this.now(),
+    });
+  }
+
+  getBranchConfigVersion(branch: string): StoredBranchConfigVersionData | null {
+    return this.database.getBranchConfigVersion(branch);
+  }
+
+  markBranchConfigApplied(branch: string, configHash: string): void {
+    this.database.upsertBranchConfigVersion({
+      branch,
+      configHash,
+      appliedAt: this.now(),
     });
   }
 }

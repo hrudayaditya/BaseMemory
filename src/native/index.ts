@@ -70,6 +70,7 @@ export interface CodeChunk {
   endLine: number;
   chunkType: ChunkType;
   name?: string;
+  symbolKind?: ChunkSymbolKind;
   language: string;
 }
 
@@ -79,6 +80,8 @@ export type ChunkSymbolKind =
   | "Class"
   | "Interface"
   | "Struct"
+  | "Type"
+  | "Constant"
   | "Test"
   | "Module"
   | "Block";
@@ -213,9 +216,9 @@ export interface ChunkMetadata {
 }
 
 const DEFAULT_CHUNK_CONFIG: ChunkConfig = {
-  targetTokenBudget: 1500,
-  maxChunkChars: 3000,
-  minChunkChars: 200,
+  targetTokenBudget: 512,
+  maxChunkChars: 2000,
+  minChunkChars: 400,
   mergeSmallSiblings: true,
   attachComments: true,
   emitCoarseChunks: true,
@@ -286,6 +289,10 @@ export function hashFile(filePath: string): string {
 
 export function getChunkerVersion(): string {
   return native.getChunkerVersion();
+}
+
+export function getGraphExtractorVersion(): string {
+  return native.getGraphExtractorVersion();
 }
 
 function mapMerkleDiff(diff: any): MerkleDiff {
@@ -475,63 +482,71 @@ export function estimateTokens(text: string): number {
   return Math.ceil(text.length / CHARS_PER_TOKEN);
 }
 
-export function createEmbeddingText(chunk: CodeChunk, filePath: string): string {
-  const parts: string[] = [];
-  
-  const fileName = filePath.split("/").pop() || filePath;
-  const dirPath = filePath.split("/").slice(-3, -1).join("/");
-  
-  const langDescriptors: Record<string, string> = {
-    typescript: "TypeScript",
-    javascript: "JavaScript", 
-    python: "Python",
-    rust: "Rust",
-    go: "Go",
-    java: "Java",
-  };
-  
-  const typeDescriptors: Record<string, string> = {
-    function_declaration: "function",
-    function: "function",
-    arrow_function: "arrow function",
-    method_definition: "method",
-    class_declaration: "class",
-    interface_declaration: "interface",
-    type_alias_declaration: "type alias",
-    enum_declaration: "enum",
-    export_statement: "export",
-    lexical_declaration: "variable declaration",
-    function_definition: "function",
-    class_definition: "class",
-    function_item: "function",
-    impl_item: "implementation",
-    struct_item: "struct",
-    enum_item: "enum",
-    trait_item: "trait",
-  };
+function normalizeEmbeddingPath(filePath: string, projectRoot?: string): string {
+  const normalizedFilePath = filePath.replace(/\\/g, "/");
+  if (!projectRoot) {
+    return normalizedFilePath.replace(/^\/+/, "");
+  }
 
-  const lang = langDescriptors[chunk.language] || chunk.language;
-  const typeDesc = typeDescriptors[chunk.chunkType] || chunk.chunkType;
-  
-  if (chunk.name) {
-    parts.push(`${lang} ${typeDesc} "${chunk.name}"`);
-  } else {
-    parts.push(`${lang} ${typeDesc}`);
+  const relativePath = path.relative(projectRoot, filePath).replace(/\\/g, "/");
+  if (
+    relativePath.length > 0 &&
+    relativePath !== ".." &&
+    !relativePath.startsWith("../") &&
+    !path.isAbsolute(relativePath)
+  ) {
+    return relativePath;
   }
-  
-  if (dirPath) {
-    parts.push(`in ${dirPath}/${fileName}`);
-  } else {
-    parts.push(`in ${fileName}`);
+
+  return normalizedFilePath.replace(/^\/+/, "");
+}
+
+function isSyntheticSymbolName(name: string | undefined): boolean {
+  return Boolean(name && name.startsWith("<") && name.endsWith(">"));
+}
+
+function normalizeIdentifierTerms(name: string): string {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .replace(/[^a-zA-Z0-9]+/g, " ")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function formatSymbolDescriptor(chunk: CodeChunk): string | null {
+  if (!chunk.name || isSyntheticSymbolName(chunk.name)) {
+    return null;
   }
-  
-  const semanticHints = extractSemanticHints(chunk.name || "", chunk.content);
-  if (semanticHints.length > 0) {
-    parts.push(`Purpose: ${semanticHints.join(", ")}`);
+
+  const normalizedTerms = normalizeIdentifierTerms(chunk.name);
+  const includeTerms =
+    normalizedTerms.length > 0 && normalizedTerms !== chunk.name.trim().toLowerCase();
+
+  if (chunk.symbolKind) {
+    return includeTerms
+      ? `symbol: ${chunk.name} (${chunk.symbolKind.toLowerCase()}) terms: ${normalizedTerms}`
+      : `symbol: ${chunk.name} (${chunk.symbolKind.toLowerCase()})`;
   }
-  
+
+  return includeTerms ? `symbol: ${chunk.name} terms: ${normalizedTerms}` : `symbol: ${chunk.name}`;
+}
+
+export function createEmbeddingText(
+  chunk: CodeChunk,
+  filePath: string,
+  projectRoot?: string
+): string {
+  const parts: string[] = [
+    `file: ${normalizeEmbeddingPath(filePath, projectRoot)}`,
+  ];
+  const symbolDescriptor = formatSymbolDescriptor(chunk);
+  if (symbolDescriptor) {
+    parts.push(symbolDescriptor);
+  }
   parts.push("");
-  
+
   let content = chunk.content;
   const headerLength = parts.join("\n").length;
   const maxContentChars = (MAX_SINGLE_CHUNK_TOKENS * CHARS_PER_TOKEN) - headerLength;
@@ -543,6 +558,31 @@ export function createEmbeddingText(chunk: CodeChunk, filePath: string): string 
   parts.push(content);
 
   return parts.join("\n");
+}
+
+export interface PreparedEmbeddingInput {
+  text: string;
+  hash: string;
+}
+
+export function prepareEmbeddingInput(
+  chunk: CodeChunk,
+  filePath: string,
+  projectRoot?: string
+): PreparedEmbeddingInput {
+  const text = createEmbeddingText(chunk, filePath, projectRoot);
+  return {
+    text,
+    hash: hashContent(text),
+  };
+}
+
+export function buildEmbeddingInputHash(
+  chunk: CodeChunk,
+  filePath: string,
+  projectRoot?: string
+): string {
+  return prepareEmbeddingInput(chunk, filePath, projectRoot).hash;
 }
 
 export function createDynamicBatches<T extends { text: string }>(chunks: T[]): T[][] {
@@ -568,114 +608,6 @@ export function createDynamicBatches<T extends { text: string }>(chunks: T[]): T
   }
   
   return batches;
-}
-
-function extractSemanticHints(name: string, content: string): string[] {
-  const hints: string[] = [];
-  const combined = `${name} ${content}`.toLowerCase();
-  
-  const signature = extractFunctionSignature(content);
-  if (signature) {
-    hints.push(signature);
-  }
-  
-  const patterns: Array<[RegExp, string]> = [
-    [/auth|login|logout|signin|signout|credential/i, "authentication"],
-    [/password|hash|bcrypt|argon/i, "password handling"],
-    [/token|jwt|bearer|oauth/i, "token management"],
-    [/user|account|profile|member/i, "user management"],
-    [/permission|role|access|authorize/i, "authorization"],
-    [/validate|verify|check|assert/i, "validation"],
-    [/error|exception|throw|catch/i, "error handling"],
-    [/log|debug|trace|info|warn/i, "logging"],
-    [/cache|memoize|store/i, "caching"],
-    [/fetch|request|response|api|http/i, "HTTP/API"],
-    [/database|db|query|sql|mongo/i, "database"],
-    [/file|read|write|stream|path/i, "file operations"],
-    [/parse|serialize|json|xml/i, "data parsing"],
-    [/encrypt|decrypt|crypto|secret|cipher|cryptographic/i, "encryption/cryptography"],
-    [/test|spec|mock|stub|expect/i, "testing"],
-    [/config|setting|option|env/i, "configuration"],
-    [/route|endpoint|handler|controller|middleware/i, "routing/middleware"],
-    [/render|component|view|template/i, "UI rendering"],
-    [/state|redux|store|dispatch/i, "state management"],
-    [/hook|effect|memo|callback/i, "React hooks"],
-  ];
-  
-  for (const [pattern, hint] of patterns) {
-    if (pattern.test(combined) && !hints.includes(hint)) {
-      hints.push(hint);
-    }
-  }
-  
-  return hints.slice(0, 6);
-}
-
-function extractFunctionSignature(content: string): string | null {
-  const tsJsPatterns = [
-    /(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*(?:<[^>]+>)?\s*\(([^)]*)\)\s*(?::\s*([^{]+))?/,
-    /(?:export\s+)?const\s+(\w+)\s*(?::\s*[^=]+)?\s*=\s*(?:async\s+)?\(([^)]*)\)\s*(?::\s*([^=>{]+))?\s*=>/,
-    /(?:export\s+)?const\s+(\w+)\s*(?::\s*[^=]+)?\s*=\s*(?:async\s+)?function\s*\(([^)]*)\)/,
-  ];
-  
-  const pyPatterns = [
-    /def\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*([^:]+))?:/,
-    /async\s+def\s+(\w+)\s*\(([^)]*)\)\s*(?:->\s*([^:]+))?:/,
-  ];
-  
-  const goPatterns = [
-    /func\s+(?:\([^)]+\)\s+)?(\w+)\s*\(([^)]*)\)\s*(?:\(([^)]+)\)|([^{\n]+))?/,
-  ];
-  
-  const rustPatterns = [
-    /(?:pub\s+)?(?:async\s+)?fn\s+(\w+)\s*(?:<[^>]+>)?\s*\(([^)]*)\)\s*(?:->\s*([^{]+))?/,
-  ];
-  
-  for (const pattern of [...tsJsPatterns, ...pyPatterns, ...goPatterns, ...rustPatterns]) {
-    const match = content.match(pattern);
-    if (match) {
-      const funcName = match[1];
-      const params = match[2]?.trim() || "";
-      const returnType = (match[3] || match[4])?.trim();
-      
-      const paramNames = extractParamNames(params);
-      
-      let sig = `${funcName}(${paramNames.join(", ")})`;
-      if (returnType && returnType.length < 50) {
-        sig += ` -> ${returnType.replace(/\s+/g, " ").trim()}`;
-      }
-      
-      if (sig.length < 100) {
-        return sig;
-      }
-    }
-  }
-  
-  return null;
-}
-
-function extractParamNames(params: string): string[] {
-  if (!params.trim()) return [];
-  
-  const names: string[] = [];
-  const parts = params.split(",");
-  
-  for (const part of parts) {
-    const trimmed = part.trim();
-    if (!trimmed) continue;
-    
-    const tsMatch = trimmed.match(/^(\w+)\s*[?:]?/);
-    const pyMatch = trimmed.match(/^(\w+)\s*(?::|=)/);
-    const goMatch = trimmed.match(/^(\w+)\s+\w/);
-    const rustMatch = trimmed.match(/^(\w+)\s*:/);
-    
-    const match = tsMatch || pyMatch || goMatch || rustMatch;
-    if (match && match[1] !== "self" && match[1] !== "this") {
-      names.push(match[1]);
-    }
-  }
-  
-  return names.slice(0, 5);
 }
 
 export function generateChunkId(filePath: string, chunk: CodeChunk): string {
@@ -749,6 +681,7 @@ export class InvertedIndex {
 export interface ChunkData {
   chunkId: string;
   contentHash: string;
+  embeddingInputHash: string;
   filePath: string;
   startLine: number;
   endLine: number;
@@ -804,10 +737,17 @@ export interface StoredConfigVersionData {
   embeddingModelId: string;
   embeddingDimension: number;
   voyageModelId?: string | null;
+  embeddingPrefixVersion?: number;
   chunkerVersion: string;
   graphExtractorVersion: string;
   active: boolean;
   createdAt: number;
+}
+
+export interface StoredBranchConfigVersionData {
+  branch: string;
+  configHash: string;
+  appliedAt: number;
 }
 
 export class Database {
@@ -817,44 +757,71 @@ export class Database {
     this.inner = new native.Database(dbPath);
   }
 
-  embeddingExists(contentHash: string): boolean {
-    return this.inner.embeddingExists(contentHash);
+  embeddingExists(embeddingInputHash: string): boolean {
+    return this.inner.embeddingExists(embeddingInputHash);
   }
 
-  getEmbedding(contentHash: string): Buffer | null {
-    return this.inner.getEmbedding(contentHash) ?? null;
+  getEmbedding(embeddingInputHash: string): Buffer | null {
+    return this.inner.getEmbedding(embeddingInputHash) ?? null;
   }
 
-  getEmbeddingForModel(contentHash: string, model: string): Buffer | null {
-    return this.inner.getEmbeddingForModel(contentHash, model) ?? null;
+  getEmbeddingForModel(embeddingInputHash: string, model: string): Buffer | null {
+    return this.inner.getEmbeddingForModel(embeddingInputHash, model) ?? null;
   }
 
-  getEmbeddingsForModelBatch(contentHashes: string[], model: string): Map<string, Buffer> {
-    const results = this.inner.getEmbeddingsForModelBatch(contentHashes, model);
+  getEmbeddingsForModelBatch(embeddingInputHashes: string[], model: string): Map<string, Buffer> {
+    const results = this.inner.getEmbeddingsForModelBatch(embeddingInputHashes, model);
     const map = new Map<string, Buffer>();
     for (const item of results as Array<{
-      contentHash?: string;
-      content_hash?: string;
+      embeddingInputHash?: string;
+      embedding_input_hash?: string;
       embedding: Buffer;
     }>) {
-      const contentHash = item.contentHash ?? item.content_hash;
-      if (!contentHash) continue;
-      map.set(contentHash, item.embedding);
+      const embeddingInputHash =
+        item.embeddingInputHash ?? item.embedding_input_hash;
+      if (!embeddingInputHash) continue;
+      map.set(embeddingInputHash, item.embedding);
+    }
+    return map;
+  }
+
+  getChunkTextsBatch(embeddingInputHashes: string[]): Map<string, string> {
+    const results = this.inner.getChunkTextsBatch(embeddingInputHashes);
+    const map = new Map<string, string>();
+    for (const item of results as Array<{
+      embeddingInputHash?: string;
+      embedding_input_hash?: string;
+      chunkText?: string;
+      chunk_text?: string;
+    }>) {
+      const embeddingInputHash =
+        item.embeddingInputHash ?? item.embedding_input_hash;
+      const chunkText = item.chunkText ?? item.chunk_text;
+      if (!embeddingInputHash || chunkText === undefined) continue;
+      map.set(embeddingInputHash, chunkText);
     }
     return map;
   }
 
   upsertEmbedding(
+    embeddingInputHash: string,
     contentHash: string,
     embedding: Buffer,
     chunkText: string,
     model: string
   ): void {
-    this.inner.upsertEmbedding(contentHash, embedding, chunkText, model);
+    this.inner.upsertEmbedding(
+      embeddingInputHash,
+      contentHash,
+      embedding,
+      chunkText,
+      model
+    );
   }
 
   upsertEmbeddingsBatch(
     items: Array<{
+      embeddingInputHash: string;
       contentHash: string;
       embedding: Buffer;
       chunkText: string;
@@ -865,12 +832,15 @@ export class Database {
     this.inner.upsertEmbeddingsBatch(items);
   }
 
-  getMissingEmbeddings(contentHashes: string[]): string[] {
-    return this.inner.getMissingEmbeddings(contentHashes);
+  getMissingEmbeddings(embeddingInputHashes: string[]): string[] {
+    return this.inner.getMissingEmbeddings(embeddingInputHashes);
   }
 
-  getMissingEmbeddingsForModel(contentHashes: string[], model: string): string[] {
-    return this.inner.getMissingEmbeddingsForModel(contentHashes, model);
+  getMissingEmbeddingsForModel(
+    embeddingInputHashes: string[],
+    model: string
+  ): string[] {
+    return this.inner.getMissingEmbeddingsForModel(embeddingInputHashes, model);
   }
 
   upsertChunk(chunk: ChunkData): void {
@@ -888,6 +858,10 @@ export class Database {
 
   getChunksByFile(filePath: string): ChunkData[] {
     return this.inner.getChunksByFile(filePath);
+  }
+
+  getChunksByFileOnBranch(filePath: string, branch: string): ChunkData[] {
+    return this.inner.getChunksByFileOnBranch(filePath, branch);
   }
 
   getChunksByName(name: string): ChunkData[] {
@@ -1032,6 +1006,10 @@ export class Database {
     return this.inner.clearPipelineStateForFile(branch, filePath);
   }
 
+  clearAllPipelineState(): number {
+    return this.inner.clearAllPipelineState();
+  }
+
   startPipelineRun(run: PipelineRunData, cancelledAt: number): void {
     this.inner.startPipelineRun({
       runId: run.runId,
@@ -1085,6 +1063,29 @@ export class Database {
     return this.inner.pruneFinishedPipelineRuns(olderThan);
   }
 
+  getConfigVersion(configHash: string): StoredConfigVersionData | null {
+    const result = this.inner.getConfigVersion(configHash);
+    if (result === null || result === undefined) {
+      return null;
+    }
+    return {
+      configHash: result.configHash ?? result.config_hash,
+      embeddingModelId: result.embeddingModelId ?? result.embedding_model_id,
+      embeddingDimension: result.embeddingDimension ?? result.embedding_dimension,
+      voyageModelId: result.voyageModelId ?? result.voyage_model_id ?? null,
+      embeddingPrefixVersion:
+        result.embeddingPrefixVersion ?? result.embedding_prefix_version ?? 0,
+      chunkerVersion: result.chunkerVersion ?? result.chunker_version,
+      graphExtractorVersion: result.graphExtractorVersion ?? result.graph_extractor_version,
+      active: result.active,
+      createdAt: result.createdAt ?? result.created_at,
+    };
+  }
+
+  clearAllPipelineRuns(): number {
+    return this.inner.clearAllPipelineRuns();
+  }
+
   getActiveConfigVersion(): StoredConfigVersionData | null {
     const result = this.inner.getActiveConfigVersion();
     if (result === null || result === undefined) {
@@ -1095,6 +1096,8 @@ export class Database {
       embeddingModelId: result.embeddingModelId ?? result.embedding_model_id,
       embeddingDimension: result.embeddingDimension ?? result.embedding_dimension,
       voyageModelId: result.voyageModelId ?? result.voyage_model_id ?? null,
+      embeddingPrefixVersion:
+        result.embeddingPrefixVersion ?? result.embedding_prefix_version ?? 0,
       chunkerVersion: result.chunkerVersion ?? result.chunker_version,
       graphExtractorVersion: result.graphExtractorVersion ?? result.graph_extractor_version,
       active: result.active,
@@ -1107,6 +1110,7 @@ export class Database {
       configHash: configVersion.configHash,
       embeddingModelId: configVersion.embeddingModelId,
       embeddingDimension: configVersion.embeddingDimension,
+      embeddingPrefixVersion: configVersion.embeddingPrefixVersion ?? 0,
       chunkerVersion: configVersion.chunkerVersion,
       graphExtractorVersion: configVersion.graphExtractorVersion,
       active: configVersion.active,
@@ -1116,6 +1120,30 @@ export class Database {
         : {}),
     };
     this.inner.activateConfigVersion(payload);
+  }
+
+  getBranchConfigVersion(branch: string): StoredBranchConfigVersionData | null {
+    const result = this.inner.getBranchConfigVersion(branch);
+    if (result === null || result === undefined) {
+      return null;
+    }
+    return {
+      branch: result.branch,
+      configHash: result.configHash ?? result.config_hash,
+      appliedAt: result.appliedAt ?? result.applied_at,
+    };
+  }
+
+  upsertBranchConfigVersion(branchConfig: StoredBranchConfigVersionData): void {
+    this.inner.upsertBranchConfigVersion({
+      branch: branchConfig.branch,
+      configHash: branchConfig.configHash,
+      appliedAt: branchConfig.appliedAt,
+    });
+  }
+
+  clearAllConfigVersions(): number {
+    return this.inner.clearAllConfigVersions();
   }
 
   // ── Symbol methods ──────────────────────────────────────────────
@@ -1133,20 +1161,40 @@ export class Database {
     return this.inner.getSymbolsByFile(filePath);
   }
 
+  getSymbolsByFileOnBranch(filePath: string, branch: string): SymbolData[] {
+    return this.inner.getSymbolsByFileOnBranch(filePath, branch);
+  }
+
   getSymbolById(symbolId: string): SymbolData | null {
     return this.inner.getSymbolById(symbolId) ?? null;
+  }
+
+  getSymbolByIdOnBranch(symbolId: string, branch: string): SymbolData | null {
+    return this.inner.getSymbolByIdOnBranch(symbolId, branch) ?? null;
   }
 
   getSymbolByName(name: string, filePath: string): SymbolData | null {
     return this.inner.getSymbolByName(name, filePath) ?? null;
   }
 
+  getSymbolByNameOnBranch(name: string, filePath: string, branch: string): SymbolData | null {
+    return this.inner.getSymbolByNameOnBranch(name, filePath, branch) ?? null;
+  }
+
   getSymbolsByName(name: string): SymbolData[] {
     return this.inner.getSymbolsByName(name);
   }
 
+  getSymbolsByNameOnBranch(name: string, branch: string): SymbolData[] {
+    return this.inner.getSymbolsByNameOnBranch(name, branch);
+  }
+
   getSymbolsByNameCi(name: string): SymbolData[] {
     return this.inner.getSymbolsByNameCi(name);
+  }
+
+  getSymbolsByNameCiOnBranch(name: string, branch: string): SymbolData[] {
+    return this.inner.getSymbolsByNameCiOnBranch(name, branch);
   }
 
   symbolExistsOnOtherBranches(branch: string, symbolId: string): boolean {
@@ -1198,6 +1246,14 @@ export class Database {
 
   deleteCallEdgesBySymbolForBranch(symbolId: string, branch: string): number {
     return this.inner.deleteCallEdgesBySymbolForBranch(symbolId, branch);
+  }
+
+  unresolveCallEdgesByTargetSymbolForBranch(symbolId: string, branch: string): number {
+    return this.inner.unresolveCallEdgesByTargetSymbolForBranch(symbolId, branch);
+  }
+
+  deleteCallEdgesByTargetSymbol(symbolId: string): number {
+    return this.inner.deleteCallEdgesByTargetSymbol(symbolId);
   }
 
   resolveCallEdge(

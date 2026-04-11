@@ -8,12 +8,13 @@ import type { ConfiguredProviderInfo } from "../embeddings/detector.js";
 import {
   buildMerkleSnapshot,
   createDynamicBatches,
-  createEmbeddingText,
   diffMerkleSnapshots,
   generateChunkId,
   hashContent,
+  prepareEmbeddingInput,
   type ChunkData,
   type ChunkMetadata,
+  type ChunkSymbolKind,
   type Database,
   type InvertedIndex,
   type MerkleDiff,
@@ -167,7 +168,7 @@ interface FileJobPlan {
   oldChunkIds: Set<string>;
   oldSymbolIds: Set<string>;
   newSymbolIds: Set<string>;
-  materializedChunkIds: Set<string>;
+  primaryMaterializedChunkIds: Set<string>;
   embedStageInputHash: string;
   indexStageInputHash: string;
   chunkRan: boolean;
@@ -178,6 +179,8 @@ interface FileJobPlan {
 interface ChunkRecord {
   chunkId: string;
   contentHash: string;
+  embeddingInputHash: string;
+  embeddingText?: string;
   filePath: string;
   startLine: number;
   endLine: number;
@@ -195,6 +198,7 @@ interface EmbeddingWorkChunk {
   text: string;
   content: string;
   contentHash: string;
+  embeddingInputHash: string;
   metadata: ChunkMetadata;
 }
 
@@ -213,6 +217,8 @@ interface RunContext {
   invertedIndex: InvertedIndex;
   database: Database;
   configuredProviderInfo: ConfiguredProviderInfo;
+  forceFreshPrimaryEmbeddings: boolean;
+  forceFreshVoyageEmbeddings: boolean;
   branchChunkIds: Set<string>;
   currentChunkIds: Set<string>;
   existingChunks: Map<string, string>;
@@ -231,6 +237,19 @@ interface RunContext {
   stats: IndexStats;
   baseSnapshot: string | null;
   fileHashes: Map<string, string>;
+}
+
+type StoredConfigRecord = NonNullable<
+  ReturnType<CheckpointManager["getActiveConfigVersion"]>
+>;
+
+interface ConfigRebuildPlan {
+  resetChunk: boolean;
+  resetEmbed: boolean;
+  resetIndex: boolean;
+  resetGraph: boolean;
+  forceFreshPrimaryEmbeddings: boolean;
+  forceFreshVoyageEmbeddings: boolean;
 }
 
 const COLD_START_BATCH_SIZE = 50;
@@ -500,21 +519,23 @@ export function buildChunkStageInputHash(
 }
 
 export function buildChunkEmbedInputHash(
-  chunkHash: string,
+  embeddingInputHash: string,
   embedConfigHash: string
 ): string {
-  return hashContent(chunkHash + embedConfigHash);
+  return hashContent(embeddingInputHash + embedConfigHash);
 }
 
 // pipeline_state is keyed per file, so EMBED identity must be aggregated from the
 // file's current chunks rather than stored per chunk.
 export function buildEmbedStageInputHash(
-  chunkHashes: string[],
+  embeddingInputHashes: string[],
   embedConfigHash: string
 ): string {
-  const chunkInputs = [...chunkHashes]
+  const chunkInputs = [...embeddingInputHashes]
     .sort()
-    .map((chunkHash) => buildChunkEmbedInputHash(chunkHash, embedConfigHash));
+    .map((embeddingInputHash) =>
+      buildChunkEmbedInputHash(embeddingInputHash, embedConfigHash)
+    );
   return hashContent([embedConfigHash, ...chunkInputs].join("\n"));
 }
 
@@ -522,10 +543,10 @@ export function buildEmbedStageInputHash(
 // but pipeline_state requires a concrete non-null hash. We persist the current
 // file-level embed identity so the checkpoint row stays verifiable.
 export function buildIndexStageInputHash(
-  chunkHashes: string[],
+  embeddingInputHashes: string[],
   embedConfigHash: string
 ): string {
-  return buildEmbedStageInputHash(chunkHashes, embedConfigHash);
+  return buildEmbedStageInputHash(embeddingInputHashes, embedConfigHash);
 }
 
 export function buildGraphStageInputHash(
@@ -582,6 +603,268 @@ export class IncrementalIndexOrchestrator {
   private forceColdStart = false;
 
   constructor(private readonly host: IncrementalIndexOrchestratorHost) {}
+
+  resetStartupState(): void {
+    this.startupComplete = false;
+    this.forceColdStart = false;
+    this.pendingHotUpdatePaths.clear();
+  }
+
+  private buildConfigRebuildPlan(
+    previousConfig: StoredConfigRecord | null,
+    currentConfig: ConfigVersion,
+    currentConfigHash: string
+  ): ConfigRebuildPlan {
+    if (!previousConfig) {
+      return {
+        resetChunk: true,
+        resetEmbed: true,
+        resetIndex: true,
+        resetGraph: true,
+        forceFreshPrimaryEmbeddings: true,
+        forceFreshVoyageEmbeddings: true,
+      };
+    }
+
+    const chunkChanged = previousConfig.chunkerVersion !== currentConfig.chunkerVersion;
+    const graphChanged =
+      previousConfig.graphExtractorVersion !== currentConfig.graphExtractorVersion;
+    const voyageChanged =
+      (previousConfig.voyageModelId ?? null) !== currentConfig.voyageModelId;
+    const prefixChanged =
+      (previousConfig.embeddingPrefixVersion ?? 0) !== currentConfig.embeddingPrefixVersion;
+    const primaryEmbedVisibleChanged =
+      previousConfig.embeddingModelId !== currentConfig.embeddingModelId ||
+      previousConfig.embeddingDimension !== currentConfig.embeddingDimension ||
+      prefixChanged;
+    const hiddenPrimaryEmbedConfigChanged =
+      previousConfig.configHash !== currentConfigHash &&
+      !chunkChanged &&
+      !graphChanged &&
+      !primaryEmbedVisibleChanged &&
+      !voyageChanged;
+    const primaryEmbedChanged =
+      primaryEmbedVisibleChanged || hiddenPrimaryEmbedConfigChanged;
+    const voyageEmbedChanged = voyageChanged || prefixChanged;
+
+    if (chunkChanged) {
+      return {
+        resetChunk: true,
+        resetEmbed: true,
+        resetIndex: true,
+        resetGraph: true,
+        forceFreshPrimaryEmbeddings: primaryEmbedChanged,
+        forceFreshVoyageEmbeddings: voyageEmbedChanged,
+      };
+    }
+
+    return {
+      resetChunk: false,
+      resetEmbed: primaryEmbedChanged || voyageEmbedChanged,
+      resetIndex: primaryEmbedChanged || voyageEmbedChanged,
+      resetGraph: graphChanged,
+      forceFreshPrimaryEmbeddings: primaryEmbedChanged,
+      forceFreshVoyageEmbeddings: voyageEmbedChanged,
+    };
+  }
+
+  private applyConfigRebuildPlan(branch: string, plan: ConfigRebuildPlan): void {
+    if (plan.resetChunk) {
+      this.checkpoints.resetStageType(branch, "chunk");
+    }
+    if (plan.resetEmbed) {
+      this.checkpoints.resetStageType(branch, "embed");
+    }
+    if (plan.resetIndex) {
+      this.checkpoints.resetStageType(branch, "index");
+    }
+    if (plan.resetGraph) {
+      this.checkpoints.resetStageType(branch, "graph");
+    }
+  }
+
+  private resolveBranchBaselineConfig(
+    branch: string,
+    currentConfigHash: string,
+    fallbackConfig: StoredConfigRecord | null = null
+  ): StoredConfigRecord | null {
+    const branchConfig = this.checkpoints.getBranchConfigVersion(branch);
+    if (branchConfig) {
+      const persisted = this.checkpoints.getConfigVersion(branchConfig.configHash);
+      if (persisted) {
+        return persisted;
+      }
+    }
+
+    if (fallbackConfig && fallbackConfig.configHash !== currentConfigHash) {
+      return fallbackConfig;
+    }
+
+    return null;
+  }
+
+  private async enqueueFilesForRun(
+    context: RunContext,
+    filePaths: string[],
+    trigger: IndexJob["trigger"],
+    priority: IndexJob["priority"]
+  ): Promise<void> {
+    for (
+      let batchStart = 0;
+      batchStart < filePaths.length;
+      batchStart += COLD_START_BATCH_SIZE
+    ) {
+      const batch = filePaths.slice(batchStart, batchStart + COLD_START_BATCH_SIZE);
+
+      for (const filePath of batch) {
+        this.checkpoints.ensureTrackedFile(context.branch, filePath);
+        this.queue.enqueue({
+          branch: context.branch,
+          filePath,
+          priority,
+          trigger,
+          runId: context.runId,
+        });
+      }
+
+      await this.drainRunContext(context, {
+        maxCountedJobs: batch.length,
+        countJob: (job) =>
+          job.branch === context.branch &&
+          job.runId === context.runId &&
+          job.trigger === trigger,
+      });
+
+      while (this.queue.hasPendingAtOrAbove("high")) {
+        await this.drainRunContext(context);
+      }
+    }
+  }
+
+  private async runBranchWideConfigChange(
+    resources: InitializationResources,
+    branch: string,
+    configVersion: ConfigVersion,
+    configHash: string,
+    plan: ConfigRebuildPlan,
+    options: {
+      storedSnapshot?: string | null;
+      currentSnapshot?: string | null;
+    } = {}
+  ): Promise<void> {
+    const storedSnapshot =
+      options.storedSnapshot ?? this.getStoredSnapshot(resources.database, branch);
+    const currentSnapshot =
+      options.currentSnapshot ??
+      (
+        await buildMerkleSnapshot(
+          this.host.getProjectRoot(),
+          branch,
+          this.host.buildMerkleIgnoreRules()
+        )
+      ).snapshot;
+    const fileHashes = toAbsoluteFileHashes(this.host.getProjectRoot(), currentSnapshot);
+    const run = this.checkpoints.startRun(branch, "config_change", configHash);
+    const context = this.createRunContext({
+      ...resources,
+      branch,
+      runId: run.runId,
+      runType: "config_change",
+      configVersion,
+      configHash,
+      forceFreshPrimaryEmbeddings: plan.forceFreshPrimaryEmbeddings,
+      forceFreshVoyageEmbeddings: plan.forceFreshVoyageEmbeddings,
+      baseSnapshot: storedSnapshot,
+      fileHashes,
+    });
+
+    const trackedDeletedFiles = Array.from(
+      new Set(
+        this.checkpoints
+          .getKnownFiles(branch)
+          .map((filePath) => toAbsolutePath(this.host.getProjectRoot(), filePath))
+          .filter((filePath) => !fileHashes.has(filePath))
+      )
+    ).sort((left, right) => left.localeCompare(right));
+
+    for (const filePath of trackedDeletedFiles) {
+      this.processRemovedFile(context, filePath);
+    }
+
+    const branchFilePaths = Array.from(fileHashes.keys());
+    context.stats.totalFiles = branchFilePaths.length;
+    await this.enqueueFilesForRun(context, branchFilePaths, "config_change", "normal");
+    await this.drainRunContext(context);
+    await this.finalizeRunContext(context);
+  }
+
+  private async ensureBranchConfigApplied(
+    resources: InitializationResources,
+    branch: string,
+    currentConfig: ConfigVersion,
+    currentConfigHash: string,
+    options: {
+      fallbackConfig?: StoredConfigRecord | null;
+      storedSnapshot?: string | null;
+      currentSnapshot?: string | null;
+    } = {}
+  ): Promise<boolean> {
+    const branchConfig = this.checkpoints.getBranchConfigVersion(branch);
+    if (branchConfig?.configHash === currentConfigHash) {
+      return false;
+    }
+
+    const storedSnapshot =
+      options.storedSnapshot ?? this.getStoredSnapshot(resources.database, branch);
+    const currentSnapshot =
+      options.currentSnapshot ??
+      (
+        await buildMerkleSnapshot(
+          this.host.getProjectRoot(),
+          branch,
+          this.host.buildMerkleIgnoreRules()
+        )
+      ).snapshot;
+    const fileHashes = toAbsoluteFileHashes(this.host.getProjectRoot(), currentSnapshot);
+    const knownFiles = this.checkpoints.getKnownFiles(branch);
+
+    if (!storedSnapshot && knownFiles.length === 0) {
+      return false;
+    }
+
+    if (knownFiles.length === 0 && fileHashes.size === 0) {
+      this.checkpoints.markBranchConfigApplied(branch, currentConfigHash);
+      return false;
+    }
+
+    const previousConfig = this.resolveBranchBaselineConfig(
+      branch,
+      currentConfigHash,
+      options.fallbackConfig ?? null
+    );
+    const plan = this.buildConfigRebuildPlan(
+      previousConfig,
+      currentConfig,
+      currentConfigHash
+    );
+
+    if (
+      !plan.resetChunk &&
+      !plan.resetEmbed &&
+      !plan.resetIndex &&
+      !plan.resetGraph
+    ) {
+      this.checkpoints.markBranchConfigApplied(branch, currentConfigHash);
+      return false;
+    }
+
+    this.applyConfigRebuildPlan(branch, plan);
+    await this.runBranchWideConfigChange(resources, branch, currentConfig, currentConfigHash, plan, {
+      storedSnapshot,
+      currentSnapshot,
+    });
+    return true;
+  }
 
   private getCheckpointManager(database: Database): CheckpointManager {
     if (!this.checkpointManager) {
@@ -655,40 +938,7 @@ export class IncrementalIndexOrchestrator {
 
       context.stats.totalFiles = fileHashes.size;
       const coldStartFilePaths = Array.from(fileHashes.keys());
-      for (
-        let batchStart = 0;
-        batchStart < coldStartFilePaths.length;
-        batchStart += COLD_START_BATCH_SIZE
-      ) {
-        const batch = coldStartFilePaths.slice(
-          batchStart,
-          batchStart + COLD_START_BATCH_SIZE
-        );
-
-        for (const filePath of batch) {
-          this.checkpoints.ensureTrackedFile(branch, filePath);
-          this.queue.enqueue({
-            branch,
-            filePath,
-            priority: "low",
-            trigger: "cold_start",
-            runId: run.runId,
-          });
-        }
-
-        await this.drainRunContext(context, {
-          maxCountedJobs: batch.length,
-          countJob: (job) =>
-            job.branch === context.branch &&
-            job.runId === context.runId &&
-            job.trigger === "cold_start",
-        });
-
-        while (this.queue.hasPendingAtOrAbove("high")) {
-          await this.drainRunContext(context);
-        }
-      }
-
+      await this.enqueueFilesForRun(context, coldStartFilePaths, "cold_start", "low");
       await this.drainRunContext(context);
       return this.finalizeRunContext(context, onProgress);
     });
@@ -770,6 +1020,11 @@ export class IncrementalIndexOrchestrator {
     await this.ensureStartupState();
 
     const resources = await this.prepareRun();
+    const currentConfig = await getCurrentConfigVersion(
+      resources.configuredProviderInfo,
+      resources.voyageModelId
+    );
+    const currentConfigHash = hashConfigVersion(currentConfig);
     if (oldBranch) {
       this.checkpoints.cancelActiveRuns(oldBranch);
       this.queue.purgeBranch(oldBranch);
@@ -789,6 +1044,21 @@ export class IncrementalIndexOrchestrator {
       newBranch,
       this.host.buildMerkleIgnoreRules()
     );
+    if (
+      await this.ensureBranchConfigApplied(
+        resources,
+        newBranch,
+        currentConfig,
+        currentConfigHash,
+        {
+          storedSnapshot,
+          currentSnapshot: currentSnapshot.snapshot,
+        }
+      )
+    ) {
+      return;
+    }
+
     const diff = await import("../native/index.js").then(({ diffMerkleSnapshots }) =>
       diffMerkleSnapshots(storedSnapshot, currentSnapshot.snapshot)
     );
@@ -802,76 +1072,16 @@ export class IncrementalIndexOrchestrator {
   }
 
   async handleConfigChange(
+    resources: InitializationResources,
     branch: string,
     oldConfig: ReturnType<CheckpointManager["getActiveConfigVersion"]>,
     newConfig: ConfigVersion,
     newConfigHash: string
   ): Promise<void> {
-    const knownFiles = this.checkpoints
-      .getKnownFiles(branch)
-      .map((filePath) => toAbsolutePath(this.host.getProjectRoot(), filePath));
-    if (knownFiles.length === 0) {
-      this.checkpoints.activateConfigVersion(newConfigHash, newConfig);
-      return;
-    }
-
-    const chunkChanged = oldConfig?.chunkerVersion !== newConfig.chunkerVersion;
-    const graphChanged = oldConfig?.graphExtractorVersion !== newConfig.graphExtractorVersion;
-    const embedChanged = oldConfig
-      ? oldConfig.embeddingModelId !== newConfig.embeddingModelId ||
-        oldConfig.embeddingDimension !== newConfig.embeddingDimension ||
-        (oldConfig.voyageModelId ?? null) !== newConfig.voyageModelId
-      : false;
-
-    if (!chunkChanged && !embedChanged && !graphChanged) {
-      this.checkpoints.activateConfigVersion(newConfigHash, newConfig);
-      return;
-    }
-
-    if (chunkChanged) {
-      this.checkpoints.resetStageType(branch, "chunk");
-    }
-    if (embedChanged) {
-      this.checkpoints.resetStageType(branch, "embed");
-      this.checkpoints.resetStageType(branch, "index");
-    }
-    if (graphChanged) {
-      this.checkpoints.resetStageType(branch, "graph");
-    }
-
     this.checkpoints.activateConfigVersion(newConfigHash, newConfig);
-
-    const resources = await this.prepareRun();
-    const run = this.checkpoints.startRun(branch, "config_change", newConfigHash);
-    const snapshot = this.getStoredSnapshot(resources.database, branch);
-    const fileHashes = snapshot
-      ? toAbsoluteFileHashes(this.host.getProjectRoot(), snapshot)
-      : new Map<string, string>();
-
-    for (const filePath of knownFiles) {
-      this.checkpoints.ensureTrackedFile(branch, filePath);
-      this.queue.enqueue({
-        branch,
-        filePath,
-        priority: "normal",
-        trigger: "config_change",
-        runId: run.runId,
-      });
-    }
-
-    const context = this.createRunContext({
-      ...resources,
-      branch,
-      runId: run.runId,
-      runType: "config_change",
-      configVersion: newConfig,
-      configHash: newConfigHash,
-      baseSnapshot: snapshot,
-      fileHashes,
+    await this.ensureBranchConfigApplied(resources, branch, newConfig, newConfigHash, {
+      fallbackConfig: oldConfig,
     });
-    context.stats.totalFiles = knownFiles.length;
-    await this.drainRunContext(context);
-    await this.finalizeRunContext(context);
   }
 
   private async ensureStartupState(): Promise<void> {
@@ -889,7 +1099,20 @@ export class IncrementalIndexOrchestrator {
     const activeConfig = this.checkpoints.getActiveConfigVersion();
 
     if (!activeConfig || activeConfig.configHash !== currentConfigHash) {
-      await this.handleConfigChange(branch, activeConfig, currentConfig, currentConfigHash);
+      await this.handleConfigChange(
+        resources,
+        branch,
+        activeConfig,
+        currentConfig,
+        currentConfigHash
+      );
+    } else {
+      await this.ensureBranchConfigApplied(
+        resources,
+        branch,
+        currentConfig,
+        currentConfigHash
+      );
     }
 
     if (this.host.consumeRecoveredFromCrash()) {
@@ -983,6 +1206,8 @@ export class IncrementalIndexOrchestrator {
     runType: PipelineRunType;
     configVersion: ConfigVersion;
     configHash: string;
+    forceFreshPrimaryEmbeddings?: boolean;
+    forceFreshVoyageEmbeddings?: boolean;
     baseSnapshot: string | null;
     fileHashes: Map<string, string>;
   } & InitializationResources): RunContext {
@@ -1010,6 +1235,8 @@ export class IncrementalIndexOrchestrator {
       invertedIndex: args.invertedIndex,
       database: args.database,
       configuredProviderInfo: args.configuredProviderInfo,
+      forceFreshPrimaryEmbeddings: args.forceFreshPrimaryEmbeddings ?? false,
+      forceFreshVoyageEmbeddings: args.forceFreshVoyageEmbeddings ?? false,
       branchChunkIds,
       currentChunkIds: new Set(branchChunkIds),
       existingChunks,
@@ -1229,6 +1456,7 @@ export class IncrementalIndexOrchestrator {
       const chunkRows: ChunkData[] = currentChunks.map((chunk) => ({
         chunkId: chunk.chunkId,
         contentHash: chunk.contentHash,
+        embeddingInputHash: chunk.embeddingInputHash,
         filePath: chunk.filePath,
         startLine: chunk.startLine,
         endLine: chunk.endLine,
@@ -1249,9 +1477,17 @@ export class IncrementalIndexOrchestrator {
       context.configuredProviderInfo,
       context.voyageModelId
     );
-    const currentChunkHashes = currentChunks.map((chunk) => chunk.chunkHash);
-    const embedStageInputHash = buildEmbedStageInputHash(currentChunkHashes, embedConfigHash);
-    const indexStageInputHash = buildIndexStageInputHash(currentChunkHashes, embedConfigHash);
+    const currentEmbeddingInputHashes = currentChunks.map(
+      (chunk) => chunk.embeddingInputHash
+    );
+    const embedStageInputHash = buildEmbedStageInputHash(
+      currentEmbeddingInputHashes,
+      embedConfigHash
+    );
+    const indexStageInputHash = buildIndexStageInputHash(
+      currentEmbeddingInputHashes,
+      embedConfigHash
+    );
     const embedStageIsStale = this.checkpoints.isStageStale(
       context.branch,
       filePath,
@@ -1292,7 +1528,7 @@ export class IncrementalIndexOrchestrator {
       oldChunkIds,
       oldSymbolIds,
       newSymbolIds: new Set<string>(),
-      materializedChunkIds: new Set<string>(),
+      primaryMaterializedChunkIds: new Set<string>(),
       embedStageInputHash,
       indexStageInputHash,
       chunkRan,
@@ -1350,35 +1586,48 @@ export class IncrementalIndexOrchestrator {
     const voyageStore = context.voyageStore;
     const voyageModelId = context.voyageModelId;
     const voyageEnabled = Boolean(voyageProvider && voyageStore && voyageModelId);
-    const contentHashes = plan.dirtyChunks.map((chunk) => chunk.contentHash);
-    const missingArcticEmbeddings = new Set(
-      database.getMissingEmbeddingsForModel(
-        contentHashes,
-        arcticModelId
-      )
+    const embeddingInputHashes = plan.dirtyChunks.map(
+      (chunk) => chunk.embeddingInputHash
     );
+    const missingArcticEmbeddings = context.forceFreshPrimaryEmbeddings
+      ? new Set(embeddingInputHashes)
+      : new Set(
+          database.getMissingEmbeddingsForModel(
+            embeddingInputHashes,
+            arcticModelId
+          )
+        );
     const missingVoyageEmbeddings = voyageEnabled && voyageModelId
-      ? new Set(database.getMissingEmbeddingsForModel(contentHashes, voyageModelId))
+      ? context.forceFreshVoyageEmbeddings
+        ? new Set(embeddingInputHashes)
+        : new Set(
+            database.getMissingEmbeddingsForModel(
+              embeddingInputHashes,
+              voyageModelId
+            )
+          )
       : new Set<string>();
     const embeddingQueue = new PQueue(this.host.getProviderRateLimits(context.configuredProviderInfo.provider));
 
-    const cachedArcticHashes = Array.from(
-      new Set(
-        plan.dirtyChunks
-          .filter((chunk) => !missingArcticEmbeddings.has(chunk.contentHash))
-          .map((chunk) => chunk.contentHash)
-      )
-    );
+    const cachedArcticHashes = context.forceFreshPrimaryEmbeddings
+      ? []
+      : Array.from(
+          new Set(
+            plan.dirtyChunks
+              .filter((chunk) => !missingArcticEmbeddings.has(chunk.embeddingInputHash))
+              .map((chunk) => chunk.embeddingInputHash)
+          )
+        );
     const cachedArcticEmbeddings = database.getEmbeddingsForModelBatch(
       cachedArcticHashes,
       arcticModelId
     );
-    const cachedVoyageHashes = voyageEnabled && voyageModelId
+    const cachedVoyageHashes = voyageEnabled && voyageModelId && !context.forceFreshVoyageEmbeddings
       ? Array.from(
           new Set(
             plan.dirtyChunks
-              .filter((chunk) => !missingVoyageEmbeddings.has(chunk.contentHash))
-              .map((chunk) => chunk.contentHash)
+              .filter((chunk) => !missingVoyageEmbeddings.has(chunk.embeddingInputHash))
+              .map((chunk) => chunk.embeddingInputHash)
           )
         )
       : [];
@@ -1387,10 +1636,11 @@ export class IncrementalIndexOrchestrator {
       : new Map<string, Buffer>();
 
     for (const chunk of plan.dirtyChunks) {
-      if (!missingArcticEmbeddings.has(chunk.contentHash)) {
-        const embeddingBuffer = cachedArcticEmbeddings.get(chunk.contentHash);
+      if (!missingArcticEmbeddings.has(chunk.embeddingInputHash)) {
+        const embeddingBuffer = cachedArcticEmbeddings.get(chunk.embeddingInputHash);
         if (!embeddingBuffer) {
-          const error = `Missing cached ${arcticModelId} embedding for ${chunk.contentHash}`;
+          const error =
+            `Missing cached ${arcticModelId} embedding for ${chunk.embeddingInputHash}`;
           this.checkpoints.markStageFailed(
             context.branch,
             filePath,
@@ -1410,20 +1660,24 @@ export class IncrementalIndexOrchestrator {
         store.add(chunk.id, vector, chunk.metadata);
         invertedIndex.removeChunk(chunk.id);
         invertedIndex.addChunk(chunk.id, chunk.content);
-        plan.materializedChunkIds.add(chunk.id);
+        plan.primaryMaterializedChunkIds.add(chunk.id);
         context.stats.existingChunks += 1;
         context.stats.indexedChunks += 1;
       }
 
-      if (voyageEnabled && voyageStore && !missingVoyageEmbeddings.has(chunk.contentHash)) {
-        const embeddingBuffer = cachedVoyageEmbeddings.get(chunk.contentHash);
+      if (
+        voyageEnabled &&
+        voyageStore &&
+        !missingVoyageEmbeddings.has(chunk.embeddingInputHash)
+      ) {
+        const embeddingBuffer = cachedVoyageEmbeddings.get(chunk.embeddingInputHash);
         if (!embeddingBuffer) {
           this.host.logger.warn("Voyage cached embedding missing; scheduling re-embed for batch", {
             chunkId: chunk.id,
             filePath,
             model: voyageModelId,
           });
-          missingVoyageEmbeddings.add(chunk.contentHash);
+          missingVoyageEmbeddings.add(chunk.embeddingInputHash);
           continue;
         }
 
@@ -1435,7 +1689,6 @@ export class IncrementalIndexOrchestrator {
           )
         );
         voyageStore.add(chunk.id, vector, chunk.metadata);
-        plan.materializedChunkIds.add(chunk.id);
       }
     }
 
@@ -1443,22 +1696,24 @@ export class IncrementalIndexOrchestrator {
       plan.dirtyChunks
         .filter(
           (chunk) =>
-            missingArcticEmbeddings.has(chunk.contentHash) ||
-            (voyageEnabled && missingVoyageEmbeddings.has(chunk.contentHash))
+            missingArcticEmbeddings.has(chunk.embeddingInputHash) ||
+            (voyageEnabled && missingVoyageEmbeddings.has(chunk.embeddingInputHash))
         )
     );
 
     for (const batch of batches) {
       await embeddingQueue.add(async () => {
         const arcticBatch = batch.filter((chunk) =>
-          missingArcticEmbeddings.has(chunk.contentHash)
+          missingArcticEmbeddings.has(chunk.embeddingInputHash)
         );
         const voyageBatch = voyageEnabled
-          ? batch.filter((chunk) => missingVoyageEmbeddings.has(chunk.contentHash))
+          ? batch.filter((chunk) =>
+              missingVoyageEmbeddings.has(chunk.embeddingInputHash)
+            )
           : [];
 
         try {
-          const [arcticResult, voyageResult] = await Promise.all([
+          const [arcticOutcome, voyageOutcome] = await Promise.allSettled([
             arcticBatch.length > 0
               ? pRetry(
                   async () => provider.embedBatch(arcticBatch.map((chunk) => chunk.text)),
@@ -1490,41 +1745,64 @@ export class IncrementalIndexOrchestrator {
               : Promise.resolve(null),
           ]);
 
+          let arcticFailure: unknown = null;
+          let voyageFailure: unknown = null;
+
           if (arcticBatch.length > 0) {
-            const arcticVectors = arcticResult?.embeddings ?? [];
-            const arcticItems = arcticBatch.map((chunk, index) => {
-              const vector = arcticVectors[index];
-              if (!vector) {
-                throw new Error(`Missing embedding vector for ${chunk.id}`);
+            if (arcticOutcome.status === "fulfilled") {
+              try {
+                const arcticVectors = arcticOutcome.value?.embeddings ?? [];
+                const arcticItems = arcticBatch.map((chunk, index) => {
+                  const vector = arcticVectors[index];
+                  if (!vector) {
+                    throw new Error(`Missing embedding vector for ${chunk.id}`);
+                  }
+                  return {
+                    id: chunk.id,
+                    vector,
+                    metadata: chunk.metadata,
+                  };
+                });
+                store.addBatch(arcticItems);
+                database.upsertEmbeddingsBatch(
+                  arcticBatch.map((chunk, index) => ({
+                    embeddingInputHash: chunk.embeddingInputHash,
+                    contentHash: chunk.contentHash,
+                    embedding: Buffer.from(new Float32Array(arcticVectors[index] ?? []).buffer),
+                    chunkText: chunk.content,
+                    model: arcticModelId,
+                  }))
+                );
+                for (const chunk of arcticBatch) {
+                  invertedIndex.removeChunk(chunk.id);
+                  invertedIndex.addChunk(chunk.id, chunk.content);
+                  plan.primaryMaterializedChunkIds.add(chunk.id);
+                }
+                context.stats.indexedChunks += arcticBatch.length;
+                context.stats.tokensUsed += arcticOutcome.value?.totalTokensUsed ?? 0;
+                this.host.logger.recordChunksEmbedded(arcticBatch.length);
+                this.host.logger.recordEmbeddingApiCall(arcticOutcome.value?.totalTokensUsed ?? 0);
+              } catch (error) {
+                arcticFailure = error;
               }
-              return {
-                id: chunk.id,
-                vector,
-                metadata: chunk.metadata,
-              };
-            });
-            store.addBatch(arcticItems);
-            database.upsertEmbeddingsBatch(
-              arcticBatch.map((chunk, index) => ({
-                contentHash: chunk.contentHash,
-                embedding: Buffer.from(new Float32Array(arcticVectors[index] ?? []).buffer),
-                chunkText: chunk.content,
-                model: arcticModelId,
-              }))
-            );
-            for (const chunk of arcticBatch) {
-              invertedIndex.removeChunk(chunk.id);
-              invertedIndex.addChunk(chunk.id, chunk.content);
-              plan.materializedChunkIds.add(chunk.id);
+            } else {
+              arcticFailure = arcticOutcome.reason;
             }
-            context.stats.indexedChunks += arcticBatch.length;
-            context.stats.tokensUsed += arcticResult?.totalTokensUsed ?? 0;
-            this.host.logger.recordChunksEmbedded(arcticBatch.length);
-            this.host.logger.recordEmbeddingApiCall(arcticResult?.totalTokensUsed ?? 0);
           }
 
           if (voyageEnabled && voyageStore && voyageModelId && voyageBatch.length > 0) {
-            if (!voyageResult) {
+            if (voyageOutcome.status === "rejected") {
+              voyageFailure = voyageOutcome.reason;
+              this.host.logger.warn(
+                "Voyage embeddings unavailable for batch; continuing with Arctic-only indexing",
+                {
+                  batchSize: voyageBatch.length,
+                  filePath,
+                  model: voyageModelId,
+                  error: getErrorMessage(voyageOutcome.reason),
+                }
+              );
+            } else if (!voyageOutcome.value) {
               this.host.logger.warn(
                 "Voyage embeddings unavailable for batch; continuing with Arctic-only indexing",
                 {
@@ -1534,33 +1812,52 @@ export class IncrementalIndexOrchestrator {
                 }
               );
             } else {
-              const voyageVectors = voyageResult.embeddings;
-              const voyageItems = voyageBatch.map((chunk, index) => {
-                const vector = voyageVectors[index];
-                if (!vector) {
-                  throw new Error(`Missing Voyage embedding vector for ${chunk.id}`);
-                }
-                return {
-                  id: chunk.id,
-                  vector,
-                  metadata: chunk.metadata,
-                };
-              });
-              voyageStore.addBatch(voyageItems);
-              database.upsertEmbeddingsBatch(
-                voyageBatch.map((chunk, index) => ({
-                  contentHash: chunk.contentHash,
-                  embedding: Buffer.from(new Float32Array(voyageVectors[index] ?? []).buffer),
-                  chunkText: chunk.content,
-                  model: voyageModelId,
-                }))
-              );
-              for (const chunk of voyageBatch) {
-                plan.materializedChunkIds.add(chunk.id);
+              try {
+                const voyageVectors = voyageOutcome.value.embeddings;
+                const voyageItems = voyageBatch.map((chunk, index) => {
+                  const vector = voyageVectors[index];
+                  if (!vector) {
+                    throw new Error(`Missing Voyage embedding vector for ${chunk.id}`);
+                  }
+                  return {
+                    id: chunk.id,
+                    vector,
+                    metadata: chunk.metadata,
+                  };
+                });
+                voyageStore.addBatch(voyageItems);
+                database.upsertEmbeddingsBatch(
+                  voyageBatch.map((chunk, index) => ({
+                    embeddingInputHash: chunk.embeddingInputHash,
+                    contentHash: chunk.contentHash,
+                    embedding: Buffer.from(new Float32Array(voyageVectors[index] ?? []).buffer),
+                    chunkText: chunk.content,
+                    model: voyageModelId,
+                  }))
+                );
+                context.stats.tokensUsed += voyageOutcome.value.totalTokensUsed;
+                this.host.logger.recordEmbeddingApiCall(voyageOutcome.value.totalTokensUsed);
+              } catch (error) {
+                voyageFailure = error;
+                this.host.logger.warn(
+                  "Voyage embedding batch persistence failed; continuing with Arctic-only indexing",
+                  {
+                    batchSize: voyageBatch.length,
+                    filePath,
+                    model: voyageModelId,
+                    error: getErrorMessage(error),
+                  }
+                );
               }
-              context.stats.tokensUsed += voyageResult.totalTokensUsed;
-              this.host.logger.recordEmbeddingApiCall(voyageResult.totalTokensUsed);
             }
+          }
+
+          if (arcticFailure) {
+            throw arcticFailure;
+          }
+
+          if (voyageFailure) {
+            this.host.logger.recordEmbeddingError();
           }
         } catch (error) {
           this.host.logger.recordEmbeddingError();
@@ -1717,27 +2014,38 @@ export class IncrementalIndexOrchestrator {
     parsedFile: OrchestratorParsedFile
   ): ChunkRecord[] {
     const filteredChunks = applyChunkFilters(parsedFile.chunks, this.host.getConfig());
-    return filteredChunks.map((chunk) => ({
-      chunkId: generateChunkId(absolutePath, {
+    return filteredChunks.map((chunk) => {
+      const embeddingChunk = {
         content: chunk.content,
         startLine: chunk.startLine,
         endLine: chunk.endLine,
         chunkType: chunk.chunkType,
         name: chunk.name,
+        symbolKind: chunk.symbolKind as ChunkSymbolKind | undefined,
         language: chunk.language,
-      }),
-      contentHash: hashContent(chunk.content),
-      filePath: parsedFile.path,
-      startLine: chunk.startLine,
-      endLine: chunk.endLine,
-      nodeType: chunk.chunkType,
-      name: chunk.name,
-      chunkKind: chunk.chunkKind,
-      symbolKind: chunk.symbolKind,
-      language: chunk.language,
-      text: chunk.content,
-      chunkHash: chunk.chunkHash,
-    }));
+      };
+      const embeddingInput = prepareEmbeddingInput(
+        embeddingChunk,
+        parsedFile.path,
+        this.host.getProjectRoot()
+      );
+      return {
+        chunkId: generateChunkId(absolutePath, embeddingChunk),
+        contentHash: hashContent(chunk.content),
+        embeddingInputHash: embeddingInput.hash,
+        embeddingText: embeddingInput.text,
+        filePath: parsedFile.path,
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        nodeType: chunk.chunkType,
+        name: chunk.name,
+        chunkKind: chunk.chunkKind,
+        symbolKind: chunk.symbolKind,
+        language: chunk.language,
+        text: chunk.content,
+        chunkHash: chunk.chunkHash,
+      };
+    });
   }
 
   private diffChunksForFile(
@@ -1753,7 +2061,7 @@ export class IncrementalIndexOrchestrator {
 
     for (const chunk of currentChunks) {
       if (
-        context.existingChunks.get(chunk.chunkId) === chunk.contentHash &&
+        context.existingChunks.get(chunk.chunkId) === chunk.embeddingInputHash &&
         context.invertedIndex.hasChunk(chunk.chunkId)
       ) {
         continue;
@@ -1776,6 +2084,7 @@ export class IncrementalIndexOrchestrator {
       .map((chunk) => ({
         chunkId: chunk.chunkId,
         contentHash: chunk.contentHash,
+        embeddingInputHash: chunk.embeddingInputHash,
         filePath: chunk.filePath,
         startLine: chunk.startLine,
         endLine: chunk.endLine,
@@ -1788,21 +2097,16 @@ export class IncrementalIndexOrchestrator {
   }
 
   private toEmbeddingWorkChunk(chunk: ChunkRecord): EmbeddingWorkChunk {
+    if (!chunk.embeddingText) {
+      throw new Error(`Missing precomputed embedding text for ${chunk.chunkId}`);
+    }
+
     return {
       id: chunk.chunkId,
-      text: createEmbeddingText(
-        {
-          content: chunk.text,
-          startLine: chunk.startLine,
-          endLine: chunk.endLine,
-          chunkType: chunk.nodeType as ChunkMetadata["chunkType"],
-          name: chunk.name,
-          language: chunk.language,
-        },
-        chunk.filePath
-      ),
+      text: chunk.embeddingText,
       content: chunk.text,
       contentHash: chunk.contentHash,
+      embeddingInputHash: chunk.embeddingInputHash,
       metadata: {
         filePath: chunk.filePath,
         startLine: chunk.startLine,
@@ -1810,7 +2114,7 @@ export class IncrementalIndexOrchestrator {
         chunkType: (chunk.nodeType as ChunkMetadata["chunkType"]) ?? "other",
         name: chunk.name,
         language: chunk.language,
-        hash: chunk.contentHash,
+        hash: chunk.embeddingInputHash,
       },
     };
   }
@@ -1834,7 +2138,7 @@ export class IncrementalIndexOrchestrator {
     for (const chunk of plan.currentChunks) {
       context.currentChunkIds.add(chunk.chunkId);
       context.branchChunkIds.add(chunk.chunkId);
-      context.existingChunks.set(chunk.chunkId, chunk.contentHash);
+      context.existingChunks.set(chunk.chunkId, chunk.embeddingInputHash);
     }
     context.existingChunksByFile.set(
       filePath,
@@ -1869,7 +2173,10 @@ export class IncrementalIndexOrchestrator {
     context: RunContext,
     plan: FileJobPlan
   ): void {
-    for (const chunkId of plan.materializedChunkIds) {
+    // Preserve successful best-effort Voyage materialization when Arctic fails.
+    // A failed file should roll back only the primary retrieval lane artifacts
+    // that would otherwise surface stale or incomplete results.
+    for (const chunkId of plan.primaryMaterializedChunkIds) {
       this.host.removeChunkFromRetrievalIfUnreferenced(
         context.database,
         context.invertedIndex,
@@ -1975,6 +2282,7 @@ export class IncrementalIndexOrchestrator {
     context.database.saveMerkleSnapshot(committedSnapshot);
 
     if (context.failedFiles.size === 0) {
+      this.checkpoints.markBranchConfigApplied(context.branch, context.configHash);
       this.checkpoints.markRunComplete(context.runId);
     } else {
       this.checkpoints.markRunFailed(context.runId);

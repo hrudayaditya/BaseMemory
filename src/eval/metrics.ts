@@ -2,6 +2,7 @@ import { estimateTokens } from "../utils/cost.js";
 
 import type {
   EvalMetrics,
+  EvalSearchResult,
   FailureBucket,
   GoldenQuery,
   PerQueryEvalResult,
@@ -25,21 +26,44 @@ function normalizePath(input: string): string {
   return input.replace(/\\/g, "/");
 }
 
-function uniqueResultsByPath(results: PerQueryEvalResult["results"]): PerQueryEvalResult["results"] {
+function hasExpectedLineRange(query: GoldenQuery): boolean {
+  return query.expected.startLine !== undefined && query.expected.endLine !== undefined;
+}
+
+function rangesOverlap(
+  actualStartLine: number,
+  actualEndLine: number,
+  expectedStartLine: number,
+  expectedEndLine: number
+): boolean {
+  return actualStartLine <= expectedEndLine && actualEndLine >= expectedStartLine;
+}
+
+function resultIdentity(result: EvalSearchResult): string {
+  return [
+    normalizePath(result.filePath),
+    result.startLine,
+    result.endLine,
+    result.name ?? "",
+    result.chunkType,
+  ].join(":");
+}
+
+function uniqueResultsByIdentity(results: PerQueryEvalResult["results"]): PerQueryEvalResult["results"] {
   const seen = new Set<string>();
   const unique: PerQueryEvalResult["results"] = [];
 
   for (const result of results) {
-    const normalized = normalizePath(result.filePath);
-    if (seen.has(normalized)) continue;
-    seen.add(normalized);
+    const identity = resultIdentity(result);
+    if (seen.has(identity)) continue;
+    seen.add(identity);
     unique.push(result);
   }
 
   return unique;
 }
 
-function mergeUniqueResultsByPath(
+function mergeUniqueResultsByIdentity(
   primaryResults: PerQueryEvalResult["results"],
   expandedResults: PerQueryEvalResult["results"]
 ): PerQueryEvalResult["results"] {
@@ -47,11 +71,11 @@ function mergeUniqueResultsByPath(
   const seen = new Set<string>();
 
   for (const result of [...primaryResults, ...expandedResults]) {
-    const normalized = normalizePath(result.filePath);
-    if (seen.has(normalized)) {
+    const identity = resultIdentity(result);
+    if (seen.has(identity)) {
       continue;
     }
-    seen.add(normalized);
+    seen.add(identity);
     merged.push(result);
   }
 
@@ -75,47 +99,73 @@ function isRelevantResult(filePath: string, relevantPaths: string[]): boolean {
   return relevantPaths.some((expected) => pathMatchesExpected(filePath, expected));
 }
 
+export function matchesExpectedResult(result: EvalSearchResult, query: GoldenQuery): boolean {
+  const relevantPaths = getRelevantPaths(query);
+  if (!isRelevantResult(result.filePath, relevantPaths)) {
+    return false;
+  }
+
+  if (query.expected.symbol && result.name !== query.expected.symbol) {
+    return false;
+  }
+
+  if (
+    hasExpectedLineRange(query) &&
+    !rangesOverlap(
+      result.startLine,
+      result.endLine,
+      query.expected.startLine!,
+      query.expected.endLine!
+    )
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
 function combinedRecallAtK(
   primaryResults: PerQueryEvalResult["results"],
   expandedResults: PerQueryEvalResult["results"],
-  relevantPaths: string[],
+  query: GoldenQuery,
   k: number
 ): number {
+  const relevantPaths = getRelevantPaths(query);
   if (relevantPaths.length === 0) {
     return 0;
   }
 
-  const combined = mergeUniqueResultsByPath(primaryResults, expandedResults).slice(0, k);
-  const matchedRelevantPaths = relevantPaths.filter((expectedPath) =>
-    combined.some((result) => pathMatchesExpected(result.filePath, expectedPath))
-  );
-  return matchedRelevantPaths.length / relevantPaths.length;
+  const combined = mergeUniqueResultsByIdentity(primaryResults, expandedResults).slice(0, k);
+  return combined.some((result) => matchesExpectedResult(result, query)) ? 1 : 0;
 }
 
-function reciprocalRankAtK(results: PerQueryEvalResult["results"], relevantPaths: string[], k: number): number {
-  const top = uniqueResultsByPath(results).slice(0, k);
+function reciprocalRankAtK(results: PerQueryEvalResult["results"], query: GoldenQuery, k: number): number {
+  const top = uniqueResultsByIdentity(results).slice(0, k);
   for (let i = 0; i < top.length; i += 1) {
-    if (isRelevantResult(top[i].filePath, relevantPaths)) {
+    if (matchesExpectedResult(top[i], query)) {
       return 1 / (i + 1);
     }
   }
   return 0;
 }
 
-function ndcgAtK(results: PerQueryEvalResult["results"], relevantPaths: string[], k: number): number {
-  const top = uniqueResultsByPath(results).slice(0, k);
-  const dcg = top.reduce((sum, result, i) => {
-    const rel = isRelevantResult(result.filePath, relevantPaths) ? 1 : 0;
-    return sum + rel / Math.log2(i + 2);
-  }, 0);
+function dcgFromLabels(labels: number[]): number {
+  return labels.reduce((sum, rel, i) => sum + rel / Math.log2(i + 2), 0);
+}
 
-  const idealLen = Math.min(k, relevantPaths.length);
-  const idcg = Array.from({ length: idealLen }, (_, i) => 1 / Math.log2(i + 2)).reduce(
-    (sum, value) => sum + value,
-    0
-  );
+function ndcgAtK(results: PerQueryEvalResult["results"], query: GoldenQuery, k: number): number {
+  const top = uniqueResultsByIdentity(results).slice(0, k);
+  const relevanceLabels = top.map((result) => (matchesExpectedResult(result, query) ? 1 : 0));
+  const dcg = dcgFromLabels(relevanceLabels);
+  const idealLabels = [...relevanceLabels].sort((a, b) => b - a);
+  const idcg = dcgFromLabels(idealLabels);
 
-  return idcg === 0 ? 0 : dcg / idcg;
+  if (idcg === 0) {
+    return 0;
+  }
+
+  // Floating-point error should never push a normalized metric outside [0, 1].
+  return Math.max(0, Math.min(1, dcg / idcg));
 }
 
 function isDocsOrTestsPath(filePath: string): boolean {
@@ -135,27 +185,32 @@ export function classifyFailureBucket(
   k: number
 ): FailureBucket | undefined {
   const relevantPaths = getRelevantPaths(query);
-  const top = uniqueResultsByPath(results).slice(0, k);
-  const hasRelevantTopK = top.some((result) => isRelevantResult(result.filePath, relevantPaths));
+  const top = uniqueResultsByIdentity(results).slice(0, k);
+  const hasExactTopK = top.some((result) => matchesExpectedResult(result, query));
+  const hasRelevantFileTopK = top.some((result) => isRelevantResult(result.filePath, relevantPaths));
 
-  if (!hasRelevantTopK) {
+  if (!hasExactTopK) {
+    if ((query.expected.symbol || hasExpectedLineRange(query)) && hasRelevantFileTopK) {
+      return "wrong-symbol";
+    }
     return "no-relevant-hit-top-k";
   }
 
-  if (query.expected.symbol) {
-    const hasSymbol = top.some(
-      (result) =>
-        isRelevantResult(result.filePath, relevantPaths) && result.name === query.expected.symbol
-    );
-    if (!hasSymbol) return "wrong-symbol";
+  const top1 = top[0];
+  if (
+    top1 &&
+    !matchesExpectedResult(top1, query) &&
+    isRelevantResult(top1.filePath, relevantPaths) &&
+    (query.expected.symbol || hasExpectedLineRange(query))
+  ) {
+    return "wrong-symbol";
   }
 
-  const top1 = top[0];
-  if (top1 && !isRelevantResult(top1.filePath, relevantPaths) && isDocsOrTestsPath(top1.filePath)) {
+  if (top1 && !matchesExpectedResult(top1, query) && isDocsOrTestsPath(top1.filePath)) {
     return "docs-tests-outranking-source";
   }
 
-  if (top1 && !isRelevantResult(top1.filePath, relevantPaths)) {
+  if (top1 && !matchesExpectedResult(top1, query)) {
     return "wrong-file";
   }
 
@@ -174,12 +229,11 @@ export function buildPerQueryResult(
   expandedResults: PerQueryEvalResult["results"] = [],
   expandedRelations: string[] = []
 ): PerQueryEvalResult {
-  const relevantPaths = getRelevantPaths(query);
-  const deduped = uniqueResultsByPath(results);
-  const dedupedExpanded = uniqueResultsByPath(expandedResults);
+  const deduped = uniqueResultsByIdentity(results);
+  const dedupedExpanded = uniqueResultsByIdentity(expandedResults);
   const hitAt = (cutoff: number): boolean =>
-    deduped.slice(0, cutoff).some((result) => isRelevantResult(result.filePath, relevantPaths));
-  const expandedHit = dedupedExpanded.some((result) => isRelevantResult(result.filePath, relevantPaths));
+    deduped.slice(0, cutoff).some((result) => matchesExpectedResult(result, query));
+  const expandedHit = dedupedExpanded.some((result) => matchesExpectedResult(result, query));
 
   const perQuery: PerQueryEvalResult = {
     id: query.id,
@@ -194,10 +248,10 @@ export function buildPerQueryResult(
     hitAt5: hitAt(5),
     hitAt10: hitAt(10),
     expandedHit,
-    expandedRecallAtK: combinedRecallAtK(deduped, dedupedExpanded, relevantPaths, k),
+    expandedRecallAtK: combinedRecallAtK(deduped, dedupedExpanded, query, k),
     expandedRelations: expandedRelations.length > 0 ? Array.from(new Set(expandedRelations)).sort() : undefined,
-    reciprocalRankAt10: reciprocalRankAtK(deduped, relevantPaths, 10),
-    ndcgAt10: ndcgAtK(deduped, relevantPaths, 10),
+    reciprocalRankAt10: reciprocalRankAtK(deduped, query, 10),
+    ndcgAt10: ndcgAtK(deduped, query, 10),
     failureBucket: classifyFailureBucket(query, results, k),
     results: deduped,
   };

@@ -6,12 +6,13 @@ import {
   type ConfiguredProviderInfo,
 } from "../src/embeddings/detector.js";
 import {
+  EMBEDDING_PREFIX_VERSION,
   type ConfigVersion,
   getCurrentConfigVersion,
   hashConfigVersion,
   hashEmbedConfig,
 } from "../src/indexer/config-version.js";
-import { getChunkerVersion } from "../src/native/index.js";
+import { getChunkerVersion, getGraphExtractorVersion } from "../src/native/index.js";
 
 function createOpenAiProvider(): ConfiguredProviderInfo {
   return {
@@ -63,6 +64,15 @@ describe("config-version", () => {
     expect(versionA).toBe(versionB);
   });
 
+  it("returns a stable non-empty graph extractor version", () => {
+    const versionA = getGraphExtractorVersion();
+    const versionB = getGraphExtractorVersion();
+
+    expect(versionA).toMatch(/^[0-9a-f]{16}$/);
+    expect(versionA).not.toBe("1.0.0");
+    expect(versionA).toBe(versionB);
+  });
+
   it("hashConfigVersion is deterministic and order-independent", () => {
     const base: ConfigVersion = {
       embeddingModelId: "text-embedding-3-small",
@@ -71,19 +81,21 @@ describe("config-version", () => {
       endpointBaseUrl: "https://api.openai.com/v1",
       documentTaskType: "",
       voyageModelId: null,
+      embeddingPrefixVersion: EMBEDDING_PREFIX_VERSION,
       chunkerVersion: "chunker-v1",
-      graphExtractorVersion: "1.0.0",
+      graphExtractorVersion: "graph-v1",
     };
 
     const reordered = {
       documentTaskType: "",
       endpointBaseUrl: "https://api.openai.com/v1",
       embeddingProvider: "openai",
-      graphExtractorVersion: "1.0.0",
+      graphExtractorVersion: "graph-v1",
       chunkerVersion: "chunker-v1",
       embeddingDimension: 1536,
       embeddingModelId: "text-embedding-3-small",
       voyageModelId: null,
+      embeddingPrefixVersion: EMBEDDING_PREFIX_VERSION,
     } as ConfigVersion;
 
     expect(hashConfigVersion(base)).toBe(hashConfigVersion(base));
@@ -98,8 +110,9 @@ describe("config-version", () => {
       endpointBaseUrl: "https://api.openai.com/v1",
       documentTaskType: "",
       voyageModelId: null,
+      embeddingPrefixVersion: EMBEDDING_PREFIX_VERSION,
       chunkerVersion: "chunker-v1",
-      graphExtractorVersion: "1.0.0",
+      graphExtractorVersion: "graph-v1",
     };
 
     expect(hashConfigVersion(base)).not.toBe(hashConfigVersion({
@@ -124,6 +137,10 @@ describe("config-version", () => {
     }));
     expect(hashConfigVersion(base)).not.toBe(hashConfigVersion({
       ...base,
+      embeddingPrefixVersion: 0,
+    }));
+    expect(hashConfigVersion(base)).not.toBe(hashConfigVersion({
+      ...base,
       chunkerVersion: "chunker-v2",
     }));
     expect(hashConfigVersion(base)).not.toBe(hashConfigVersion({
@@ -134,6 +151,32 @@ describe("config-version", () => {
       ...base,
       voyageModelId: "voyage-code-2",
     }));
+  });
+
+  it("hashConfigVersion stays stable for the same graph extractor version and changes when it drifts", () => {
+    const base: ConfigVersion = {
+      embeddingModelId: "text-embedding-3-small",
+      embeddingDimension: 1536,
+      embeddingProvider: "openai",
+      endpointBaseUrl: "https://api.openai.com/v1",
+      documentTaskType: "",
+      voyageModelId: null,
+      embeddingPrefixVersion: EMBEDDING_PREFIX_VERSION,
+      chunkerVersion: "chunker-v1",
+      graphExtractorVersion: "graph-v1",
+    };
+
+    const sameVersion = {
+      ...base,
+      graphExtractorVersion: "graph-v1",
+    };
+    const driftedVersion = {
+      ...base,
+      graphExtractorVersion: "graph-v2",
+    };
+
+    expect(hashConfigVersion(base)).toBe(hashConfigVersion(sameVersion));
+    expect(hashConfigVersion(base)).not.toBe(hashConfigVersion(driftedVersion));
   });
 
   it("hashEmbedConfig changes when provider type changes for the same model and dimension", () => {
@@ -218,8 +261,9 @@ describe("config-version", () => {
       endpointBaseUrl: "http://localhost:11434/v1",
       documentTaskType: "",
       voyageModelId: null,
+      embeddingPrefixVersion: EMBEDDING_PREFIX_VERSION,
       chunkerVersion: getChunkerVersion(),
-      graphExtractorVersion: "1.0.0",
+      graphExtractorVersion: getGraphExtractorVersion(),
     });
   });
 
@@ -233,5 +277,6 @@ describe("config-version", () => {
     const configVersion = await getCurrentConfigVersion(providerInfo, "voyage-code-2");
 
     expect(configVersion.voyageModelId).toBe("voyage-code-2");
+    expect(configVersion.embeddingPrefixVersion).toBe(EMBEDDING_PREFIX_VERSION);
   });
 });

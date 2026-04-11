@@ -20,17 +20,36 @@ fn is_comment_kind(kind: &str) -> bool {
 
 fn classify_csharp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     match node.kind() {
-        "method_declaration" | "constructor_declaration" | "property_declaration" => {
+        "method_declaration"
+        | "constructor_declaration"
+        | "property_declaration"
+        | "indexer_declaration" => {
             Some(SemanticInfo {
-                symbol_name: extract_name_by_fields(node, source, &["name"]),
+                symbol_name: if node.kind() == "indexer_declaration" {
+                    Some("this[]".to_string())
+                } else {
+                    extract_name_by_fields(node, source, &["name"])
+                },
                 symbol_kind: Some(SymbolKind::Method),
                 chunk_kind: ChunkKind::Code,
                 coarse_eligible: false,
             })
         }
-        "class_declaration" | "record_declaration" | "enum_declaration" => Some(SemanticInfo {
+        "namespace_declaration" | "file_scoped_namespace_declaration" => Some(SemanticInfo {
+            symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_kind: Some(SymbolKind::Module),
+            chunk_kind: ChunkKind::Code,
+            coarse_eligible: true,
+        }),
+        "class_declaration" | "record_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
             symbol_kind: Some(SymbolKind::Class),
+            chunk_kind: ChunkKind::Code,
+            coarse_eligible: true,
+        }),
+        "enum_declaration" => Some(SemanticInfo {
+            symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_kind: Some(SymbolKind::Type),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
         }),
@@ -46,6 +65,12 @@ fn classify_csharp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
         }),
+        "global_statement" => Some(SemanticInfo {
+            symbol_name: Some("<top-level>".to_string()),
+            symbol_kind: Some(SymbolKind::Block),
+            chunk_kind: ChunkKind::Code,
+            coarse_eligible: false,
+        }),
         _ => None,
     }
 }
@@ -58,9 +83,15 @@ fn classify_c_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
         }),
-        "struct_specifier" | "enum_specifier" | "type_definition" => Some(SemanticInfo {
+        "struct_specifier" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
             symbol_kind: Some(SymbolKind::Struct),
+            chunk_kind: ChunkKind::Code,
+            coarse_eligible: true,
+        }),
+        "enum_specifier" | "type_definition" => Some(SemanticInfo {
+            symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_kind: Some(SymbolKind::Type),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
         }),
@@ -76,9 +107,15 @@ fn classify_cpp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
         }),
-        "class_specifier" | "enum_specifier" | "template_declaration" => Some(SemanticInfo {
+        "class_specifier" | "template_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
             symbol_kind: Some(SymbolKind::Class),
+            chunk_kind: ChunkKind::Code,
+            coarse_eligible: true,
+        }),
+        "enum_specifier" => Some(SemanticInfo {
+            symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_kind: Some(SymbolKind::Type),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
         }),

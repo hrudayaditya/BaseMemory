@@ -17,6 +17,7 @@ describe("CheckpointManager", () => {
     database.upsertChunk({
       chunkId,
       contentHash: `${chunkId}-content`,
+      embeddingInputHash: `${chunkId}-content`,
       filePath,
       startLine: 1,
       endLine: 10,

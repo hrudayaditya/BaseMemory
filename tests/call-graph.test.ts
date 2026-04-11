@@ -2,12 +2,41 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import type { SymbolData, CallEdgeData } from "../src/native/index.js";
+import type { ChunkData, SymbolData, CallEdgeData } from "../src/native/index.js";
 
 import { extractCalls, Database, hashContent } from "../src/native/index.js";
 import { Indexer } from "../src/indexer/index.js";
+import { expandGraphContext } from "../src/indexer/graph-expansion.js";
 
 const fixturesDir = path.join(__dirname, "fixtures", "call-graph");
+
+type GraphCleanupIndexer = Indexer & {
+  currentBranch: string;
+  clearCallEdgesForSymbolIfUnreferenced: (database: Database, symbolId: string) => boolean;
+  removeSymbolFromGraphIfUnreferenced: (database: Database, symbolId: string) => boolean;
+};
+
+function cleanupIndexer(branch: string): GraphCleanupIndexer {
+  const indexer = Object.create(Indexer.prototype) as GraphCleanupIndexer;
+  indexer.currentBranch = branch;
+  return indexer;
+}
+
+function chunk(chunkId: string, name: string, filePath: string): ChunkData {
+  return {
+    chunkId,
+    contentHash: chunkId,
+    embeddingInputHash: chunkId,
+    filePath,
+    startLine: 1,
+    endLine: 10,
+    language: "typescript",
+    name,
+    nodeType: "function",
+    chunkKind: "Code",
+    symbolKind: "Function",
+  };
+}
 
 describe("call-graph", () => {
   let tempDir: string;
@@ -770,6 +799,276 @@ describe("call-graph", () => {
       const otherCallers = db.getCallers("sharedTarget", "other");
       expect(otherCallers.length).toBe(1);
       expect(otherCallers[0].fromSymbolId).toBe("sym_br_b");
+    });
+  });
+
+  describe("graph cleanup", () => {
+    it("unresolves inbound edges instead of leaving stale target ids on branch-local symbol removal", () => {
+      const db = new Database(path.join(tempDir, "test.db"));
+
+      const filePath = "/src/graph.ts";
+      const symbols: SymbolData[] = [
+        {
+          id: "sym_caller",
+          filePath,
+          name: "caller",
+          kind: "function",
+          startLine: 1,
+          startCol: 0,
+          endLine: 5,
+          endCol: 0,
+          language: "typescript",
+        },
+        {
+          id: "sym_target",
+          filePath,
+          name: "callee",
+          kind: "function",
+          startLine: 7,
+          startCol: 0,
+          endLine: 10,
+          endCol: 0,
+          language: "typescript",
+        },
+      ];
+      db.upsertSymbolsBatch(symbols);
+      db.addSymbolsToBranchBatch("main", ["sym_caller", "sym_target"]);
+      db.addSymbolsToBranchBatch("feature", ["sym_caller"]);
+
+      db.upsertCallEdgesBatch([
+        {
+          id: "edge-main",
+          branch: "main",
+          fromSymbolId: "sym_caller",
+          targetName: "callee",
+          targetFilePath: filePath,
+          targetKind: "function",
+          toSymbolId: "sym_target",
+          callType: "Call",
+          line: 3,
+          col: 2,
+          isResolved: true,
+        },
+        {
+          id: "edge-feature",
+          branch: "feature",
+          fromSymbolId: "sym_caller",
+          targetName: "callee",
+          targetFilePath: filePath,
+          targetKind: "function",
+          toSymbolId: "sym_target",
+          callType: "Call",
+          line: 3,
+          col: 2,
+          isResolved: true,
+        },
+      ]);
+
+      const indexer = cleanupIndexer("feature");
+      expect(indexer.clearCallEdgesForSymbolIfUnreferenced(db, "sym_target")).toBe(false);
+
+      expect(db.getCallersWithContextByTargetSymbolId("sym_target", "feature")).toHaveLength(0);
+      const featureEdges = db.getCallees("sym_caller", "feature");
+      expect(featureEdges).toHaveLength(1);
+      expect(featureEdges[0].isResolved).toBe(false);
+      expect(featureEdges[0].toSymbolId).toBeUndefined();
+      expect(featureEdges[0].targetFilePath).toBeUndefined();
+      expect(featureEdges[0].targetKind).toBeUndefined();
+    });
+
+    it("keeps resolved inbound edges on other branches intact when removing a symbol on one branch", () => {
+      const db = new Database(path.join(tempDir, "test.db"));
+
+      const filePath = "/src/graph.ts";
+      const symbols: SymbolData[] = [
+        {
+          id: "sym_caller",
+          filePath,
+          name: "caller",
+          kind: "function",
+          startLine: 1,
+          startCol: 0,
+          endLine: 5,
+          endCol: 0,
+          language: "typescript",
+        },
+        {
+          id: "sym_target",
+          filePath,
+          name: "callee",
+          kind: "function",
+          startLine: 7,
+          startCol: 0,
+          endLine: 10,
+          endCol: 0,
+          language: "typescript",
+        },
+      ];
+      db.upsertSymbolsBatch(symbols);
+      db.addSymbolsToBranchBatch("main", ["sym_caller", "sym_target"]);
+      db.addSymbolsToBranchBatch("feature", ["sym_caller"]);
+
+      db.upsertCallEdgesBatch([
+        {
+          id: "edge-main",
+          branch: "main",
+          fromSymbolId: "sym_caller",
+          targetName: "callee",
+          targetFilePath: filePath,
+          targetKind: "function",
+          toSymbolId: "sym_target",
+          callType: "Call",
+          line: 3,
+          col: 2,
+          isResolved: true,
+        },
+        {
+          id: "edge-feature",
+          branch: "feature",
+          fromSymbolId: "sym_caller",
+          targetName: "callee",
+          targetFilePath: filePath,
+          targetKind: "function",
+          toSymbolId: "sym_target",
+          callType: "Call",
+          line: 3,
+          col: 2,
+          isResolved: true,
+        },
+      ]);
+
+      const indexer = cleanupIndexer("feature");
+      expect(indexer.removeSymbolFromGraphIfUnreferenced(db, "sym_target")).toBe(false);
+
+      const featureEdges = db.getCallees("sym_caller", "feature");
+      expect(featureEdges).toHaveLength(1);
+      expect(featureEdges[0].isResolved).toBe(false);
+      expect(featureEdges[0].toSymbolId).toBeUndefined();
+
+      const mainEdges = db.getCallees("sym_caller", "main");
+      expect(mainEdges).toHaveLength(1);
+      expect(mainEdges[0].isResolved).toBe(true);
+      expect(mainEdges[0].toSymbolId).toBe("sym_target");
+      expect(db.getCallersWithContextByTargetSymbolId("sym_target", "main")).toHaveLength(1);
+      expect(db.getSymbolById("sym_target")?.name).toBe("callee");
+    });
+
+    it("removes stale old target ids after a rename and graph traversal follows the renamed symbol", () => {
+      const db = new Database(path.join(tempDir, "test.db"));
+
+      const filePath = "/src/config.ts";
+      const callerSymbol: SymbolData = {
+        id: "sym_bootstrap",
+        filePath,
+        name: "bootstrap",
+        kind: "function",
+        startLine: 1,
+        startCol: 0,
+        endLine: 5,
+        endCol: 0,
+        language: "typescript",
+      };
+      const oldTargetSymbol: SymbolData = {
+        id: "sym_parse",
+        filePath,
+        name: "parseConfig",
+        kind: "function",
+        startLine: 7,
+        startCol: 0,
+        endLine: 10,
+        endCol: 0,
+        language: "typescript",
+      };
+
+      db.upsertSymbolsBatch([callerSymbol, oldTargetSymbol]);
+      db.upsertChunksBatch([
+        chunk("callerChunk", "bootstrap", filePath),
+        chunk("parseChunk", "parseConfig", filePath),
+      ]);
+      db.addSymbolsToBranchBatch("main", ["sym_bootstrap", "sym_parse"]);
+      db.addChunksToBranchBatch("main", ["callerChunk", "parseChunk"]);
+      db.upsertCallEdgesBatch([
+        {
+          id: "edge-parse",
+          branch: "main",
+          fromSymbolId: "sym_bootstrap",
+          targetName: "parseConfig",
+          targetFilePath: filePath,
+          targetKind: "function",
+          toSymbolId: "sym_parse",
+          callType: "Call",
+          line: 3,
+          col: 2,
+          isResolved: true,
+        },
+      ]);
+
+      const indexer = cleanupIndexer("main");
+      expect(indexer.removeSymbolFromGraphIfUnreferenced(db, "sym_parse")).toBe(true);
+
+      const renamedTargetSymbol: SymbolData = {
+        id: "sym_load",
+        filePath,
+        name: "loadConfig",
+        kind: "function",
+        startLine: 7,
+        startCol: 0,
+        endLine: 10,
+        endCol: 0,
+        language: "typescript",
+      };
+      db.upsertSymbolsBatch([renamedTargetSymbol]);
+      db.upsertChunksBatch([chunk("loadChunk", "loadConfig", filePath)]);
+      db.clearBranchSymbols("main");
+      db.addSymbolsToBranchBatch("main", ["sym_bootstrap", "sym_load"]);
+      db.clearBranch("main");
+      db.addChunksToBranchBatch("main", ["callerChunk", "loadChunk"]);
+      db.upsertCallEdgesBatch([
+        {
+          id: "edge-load",
+          branch: "main",
+          fromSymbolId: "sym_bootstrap",
+          targetName: "loadConfig",
+          targetFilePath: filePath,
+          targetKind: "function",
+          toSymbolId: "sym_load",
+          callType: "Call",
+          line: 3,
+          col: 2,
+          isResolved: true,
+        },
+      ]);
+
+      expect(db.getCallersWithContextByTargetSymbolId("sym_parse", "main")).toHaveLength(0);
+      const currentCallees = db.getCallees("sym_bootstrap", "main");
+      expect(currentCallees).toHaveLength(1);
+      expect(currentCallees[0].toSymbolId).toBe("sym_load");
+      expect(currentCallees[0].targetName).toBe("loadConfig");
+
+      const expanded = expandGraphContext(
+        db,
+        [{
+          id: "loadChunk",
+          metadata: {
+            filePath,
+            startLine: 1,
+            endLine: 10,
+            chunkType: "function",
+            language: "typescript",
+            hash: "loadChunk",
+            name: "loadConfig",
+          },
+        }],
+        {
+          branch: "main",
+          depth: 1,
+          allowedChunkIds: new Set(["callerChunk", "loadChunk"]),
+        }
+      );
+
+      expect(expanded).toHaveLength(1);
+      expect(expanded[0].relation).toBe("caller");
+      expect(expanded[0].metadata.name).toBe("bootstrap");
     });
   });
 

@@ -24,6 +24,7 @@ function chunk(chunkId: string, name: string, filePath: string): ChunkData {
   return {
     chunkId,
     contentHash: chunkId,
+    embeddingInputHash: chunkId,
     filePath,
     startLine: 1,
     endLine: 10,
@@ -40,8 +41,16 @@ function fakeDatabase(input: {
   chunks: ChunkData[];
   callers?: CallerRow[];
   callees?: CalleeRow[];
+  branchSymbols?: Record<string, string[]>;
+  branchChunks?: Record<string, string[]>;
 }): Database {
   const symbolsById = new Map(input.symbols.map((item) => [item.id, item]));
+  const branchSymbolIds = new Map(
+    Object.entries(input.branchSymbols ?? {}).map(([branch, ids]) => [branch, new Set(ids)])
+  );
+  const branchChunkIds = new Map(
+    Object.entries(input.branchChunks ?? {}).map(([branch, ids]) => [branch, new Set(ids)])
+  );
   const symbolsByFile = new Map<string, SymbolData[]>();
   for (const item of input.symbols) {
     symbolsByFile.set(item.filePath, [...(symbolsByFile.get(item.filePath) ?? []), item]);
@@ -51,7 +60,51 @@ function fakeDatabase(input: {
     chunksByFile.set(item.filePath, [...(chunksByFile.get(item.filePath) ?? []), item]);
   }
 
+  const filterSymbolsByBranch = (branch: string, symbols: SymbolData[]): SymbolData[] => {
+    const allowed = branchSymbolIds.get(branch);
+    if (!allowed) {
+      return symbols;
+    }
+    return symbols.filter((item) => allowed.has(item.id));
+  };
+
+  const filterChunksByBranch = (branch: string, chunks: ChunkData[]): ChunkData[] => {
+    const allowed = branchChunkIds.get(branch);
+    if (!allowed) {
+      return chunks;
+    }
+    return chunks.filter((item) => allowed.has(item.chunkId));
+  };
+
   return {
+    getSymbolByNameOnBranch(name: string, filePath: string, branch: string) {
+      return filterSymbolsByBranch(branch, symbolsByFile.get(filePath) ?? [])
+        .find((item) => item.name === name) ?? null;
+    },
+    getSymbolsByFileOnBranch(filePath: string, branch: string) {
+      return filterSymbolsByBranch(branch, symbolsByFile.get(filePath) ?? []);
+    },
+    getSymbolsByNameOnBranch(name: string, branch: string) {
+      return filterSymbolsByBranch(branch, input.symbols).filter((item) => item.name === name);
+    },
+    getSymbolsByNameCiOnBranch(name: string, branch: string) {
+      return filterSymbolsByBranch(branch, input.symbols)
+        .filter((item) => item.name.toLowerCase() === name.toLowerCase());
+    },
+    getSymbolByIdOnBranch(symbolId: string, branch: string) {
+      const symbol = symbolsById.get(symbolId) ?? null;
+      if (symbol === null) {
+        return null;
+      }
+      const allowed = branchSymbolIds.get(branch);
+      if (allowed && !allowed.has(symbolId)) {
+        return null;
+      }
+      return symbol;
+    },
+    getChunksByFileOnBranch(filePath: string, branch: string) {
+      return filterChunksByBranch(branch, chunksByFile.get(filePath) ?? []);
+    },
     getSymbolByName(name: string, filePath: string) {
       return (symbolsByFile.get(filePath) ?? []).find((item) => item.name === name) ?? null;
     },
@@ -71,13 +124,22 @@ function fakeDatabase(input: {
       return chunksByFile.get(filePath) ?? [];
     },
     getCallersWithContext(_targetName: string, _branch: string) {
-      return (input.callers ?? []).filter((item) => item.targetName === _targetName);
+      return (input.callers ?? []).filter((item) =>
+        item.targetName === _targetName &&
+        (!("branch" in item) || item.branch === _branch)
+      );
     },
     getCallersWithContextByTargetSymbolId(_targetSymbolId: string, _branch: string) {
-      return (input.callers ?? []).filter((item) => item.toSymbolId === _targetSymbolId);
+      return (input.callers ?? []).filter((item) =>
+        item.toSymbolId === _targetSymbolId &&
+        (!("branch" in item) || item.branch === _branch)
+      );
     },
     getCallees(_symbolId: string, _branch: string) {
-      return (input.callees ?? []).filter((item) => item.fromSymbolId === _symbolId);
+      return (input.callees ?? []).filter((item) =>
+        item.fromSymbolId === _symbolId &&
+        (!("branch" in item) || item.branch === _branch)
+      );
     },
   } as unknown as Database;
 }
@@ -241,6 +303,76 @@ describe("graph expansion", () => {
       allowedChunkIds: new Set(["seedChunk", "callerChunk", "rootChunk"]),
     });
     expect(depthTwo.map((item) => item.metadata.name)).toEqual(["submitCheckout", "handleRequest"]);
+  });
+
+  it("scopes seed and unresolved target symbol resolution to the active branch", () => {
+    const db = fakeDatabase({
+      symbols: [
+        symbol("seed-main", "processPayment", "/repo/src/payment.ts"),
+        symbol("seed-feature", "processPayment", "/repo/src/payment.ts"),
+        symbol("callee-main", "saveReceipt", "/repo/src/receipt.ts"),
+        symbol("callee-feature", "saveReceipt", "/repo/src/receipt.ts"),
+      ],
+      chunks: [
+        chunk("seedChunkMain", "processPayment", "/repo/src/payment.ts"),
+        chunk("seedChunkFeature", "processPayment", "/repo/src/payment.ts"),
+        chunk("calleeChunkMain", "saveReceipt", "/repo/src/receipt.ts"),
+        chunk("calleeChunkFeature", "saveReceipt", "/repo/src/receipt.ts"),
+      ],
+      branchSymbols: {
+        main: ["seed-main", "callee-main"],
+        feature: ["seed-feature", "callee-feature"],
+      },
+      branchChunks: {
+        main: ["seedChunkMain", "calleeChunkMain"],
+        feature: ["seedChunkFeature", "calleeChunkFeature"],
+      },
+      callees: [{
+        id: "edge-main",
+        fromSymbolId: "seed-main",
+        fromSymbolName: "processPayment",
+        fromSymbolFilePath: "/repo/src/payment.ts",
+        targetName: "saveReceipt",
+        toSymbolId: null,
+        callType: "Call",
+        line: 8,
+        col: 2,
+        isResolved: false,
+      }, {
+        id: "edge-feature",
+        fromSymbolId: "seed-feature",
+        fromSymbolName: "processPayment",
+        fromSymbolFilePath: "/repo/src/payment.ts",
+        targetName: "saveReceipt",
+        toSymbolId: null,
+        callType: "Call",
+        line: 8,
+        col: 2,
+        isResolved: false,
+      }],
+    });
+
+    const mainExpanded = expandGraphContext(db, [{
+      id: "seedChunkMain",
+      metadata: meta("processPayment", "/repo/src/payment.ts"),
+    }], {
+      branch: "main",
+      depth: 1,
+      allowedChunkIds: new Set(["seedChunkMain", "calleeChunkMain"]),
+    });
+    expect(mainExpanded).toHaveLength(1);
+    expect(mainExpanded[0]?.id).toBe("calleeChunkMain");
+
+    const featureExpanded = expandGraphContext(db, [{
+      id: "seedChunkFeature",
+      metadata: meta("processPayment", "/repo/src/payment.ts"),
+    }], {
+      branch: "feature",
+      depth: 1,
+      allowedChunkIds: new Set(["seedChunkFeature", "calleeChunkFeature"]),
+    });
+    expect(featureExpanded).toHaveLength(1);
+    expect(featureExpanded[0]?.id).toBe("calleeChunkFeature");
   });
 
   it("fails gracefully when a seed has no symbol record", () => {

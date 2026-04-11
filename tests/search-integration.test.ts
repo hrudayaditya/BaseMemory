@@ -770,6 +770,46 @@ steps to reproduce:
     expect(results).toEqual([]);
   });
 
+  it("keeps branch filtering active on a real branch named default", async () => {
+    execFileSync("git", ["branch", "-m", "default"], { cwd: tempDir, stdio: "ignore" });
+
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const database = new Database(path.join(tempDir, ".opencode", "index", "codebase.db"));
+    const defaultChunkIds = database.getBranchChunkIds("default");
+    expect(defaultChunkIds.length).toBeGreaterThan(0);
+
+    database.clearBranch("default");
+    database.addChunksToBranch("feature/test", defaultChunkIds);
+
+    const results = await indexer.search("rankHybridResults", 5, {
+      metadataOnly: true,
+      filterByBranch: true,
+    });
+
+    expect(results).toEqual([]);
+  });
+
   it("returns an empty result for an empty query without error", async () => {
     const config = parseConfig({
       embeddingProvider: "custom",
@@ -882,6 +922,105 @@ steps to reproduce:
 
     expect(detailed.primaryResults).toEqual(baseline);
     expect(detailed.expandedContext).toEqual([]);
+  });
+
+  it("uses indexed chunk text for snippets and reranker content after files change on disk", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    fs.writeFileSync(
+      path.join(tempDir, "app", "indexer", "index.ts"),
+      `export function rankHybridResults(query: string) { return query.toUpperCase(); }
+export function rerankResults(query: string) { return rankHybridResults(query) + "!"; }
+export function searchEntry(query: string) { return rerankResults(query) + "!"; }
+`,
+      "utf-8"
+    );
+
+    const database = new Database(path.join(tempDir, ".opencode", "index", "codebase.db"));
+    const indexedFilePath = fs.realpathSync(path.join(tempDir, "app", "indexer", "index.ts"));
+    const chunkRows = database.getChunksByFile(indexedFilePath);
+    const rankHybridChunk = chunkRows.find((chunk) => chunk.name === "rankHybridResults");
+    const rerankChunk = chunkRows.find((chunk) => chunk.name === "rerankResults");
+
+    expect(rankHybridChunk).toBeDefined();
+    expect(rerankChunk).toBeDefined();
+
+    const toCandidate = (chunk: NonNullable<typeof rankHybridChunk>, score: number) => ({
+      id: chunk.chunkId,
+      score,
+      metadata: {
+        filePath: chunk.filePath,
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        chunkType: (chunk.nodeType ?? "other") as any,
+        language: chunk.language,
+        hash: chunk.embeddingInputHash,
+        name: chunk.name ?? undefined,
+      },
+      chunkKind: chunk.chunkKind ?? undefined,
+      symbolKind: chunk.symbolKind ?? undefined,
+    });
+
+    const internals = indexer as unknown as {
+      batchFetchStoredChunkTexts: (contentHashes: string[]) => Promise<Map<string, string>>;
+      buildRerankerCandidates: (
+        candidates: Array<ReturnType<typeof toCandidate>>,
+        fileContentCache: Map<string, string | null>,
+        storedChunkTexts: Map<string, string>
+      ) => Promise<RerankerCandidate[]>;
+      materializeRankedResults: (
+        candidates: Array<ReturnType<typeof toCandidate>>,
+        options: { metadataOnly: boolean; contextLines: number },
+        fileContentCache: Map<string, string | null>,
+        storedChunkTexts: Map<string, string>
+      ) => Promise<Array<{ content: string; name?: string }>>;
+    };
+
+    const candidates = [toCandidate(rankHybridChunk!, 0.8), toCandidate(rerankChunk!, 0.7)];
+    const storedChunkTexts = await internals.batchFetchStoredChunkTexts(
+      candidates.map((candidate) => candidate.metadata.hash)
+    );
+    const rerankerCandidates = await internals.buildRerankerCandidates(
+      candidates,
+      new Map(),
+      storedChunkTexts
+    );
+    const [materialized] = await internals.materializeRankedResults(
+      [candidates[0]],
+      { metadataOnly: false, contextLines: 0 },
+      new Map(),
+      storedChunkTexts
+    );
+
+    expect(materialized?.content).toContain("return query.length;");
+    expect(materialized?.content).not.toContain("return query.toUpperCase();");
+
+    const rerankerCandidate = rerankerCandidates.find(
+      (candidate) => candidate.metadata.name === "rankHybridResults"
+    );
+    expect(rerankerCandidate).toBeDefined();
+    expect(rerankerCandidate?.content).toContain("return query.length;");
+    expect(rerankerCandidate?.content).not.toContain("return query.toUpperCase();");
   });
 
   it("returns caller/callee graph expansion separately from primary results", async () => {

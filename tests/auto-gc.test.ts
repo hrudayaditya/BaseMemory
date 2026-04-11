@@ -200,13 +200,14 @@ describe("Auto-GC", () => {
 
     it("should calculate orphan count from stats", () => {
       const embedding = Buffer.from(new Float32Array([1.0, 2.0]).buffer);
-      db.upsertEmbedding("hash1", embedding, "text1", "model");
-      db.upsertEmbedding("hash2", embedding, "text2", "model");
-      db.upsertEmbedding("hash3", embedding, "text3", "model");
+      db.upsertEmbedding("hash1", "hash1", embedding, "text1", "model");
+      db.upsertEmbedding("hash2", "hash2", embedding, "text2", "model");
+      db.upsertEmbedding("hash3", "hash3", embedding, "text3", "model");
 
       db.upsertChunk({
         chunkId: "chunk1",
         contentHash: "hash1",
+        embeddingInputHash: "hash1",
         filePath: "/file.ts",
         startLine: 1,
         endLine: 5,
@@ -225,13 +226,14 @@ describe("Auto-GC", () => {
       const gcOrphanThreshold = 1;
 
       const embedding = Buffer.from(new Float32Array([1.0, 2.0]).buffer);
-      db.upsertEmbedding("hash1", embedding, "text1", "model");
-      db.upsertEmbedding("hash2", embedding, "text2", "model");
-      db.upsertEmbedding("hash3", embedding, "text3", "model");
+      db.upsertEmbedding("hash1", "hash1", embedding, "text1", "model");
+      db.upsertEmbedding("hash2", "hash2", embedding, "text2", "model");
+      db.upsertEmbedding("hash3", "hash3", embedding, "text3", "model");
 
       db.upsertChunk({
         chunkId: "chunk1",
         contentHash: "hash1",
+        embeddingInputHash: "hash1",
         filePath: "/file.ts",
         startLine: 1,
         endLine: 5,
@@ -255,11 +257,12 @@ describe("Auto-GC", () => {
       const gcOrphanThreshold = 100;
 
       const embedding = Buffer.from(new Float32Array([1.0, 2.0]).buffer);
-      db.upsertEmbedding("hash1", embedding, "text1", "model");
+      db.upsertEmbedding("hash1", "hash1", embedding, "text1", "model");
 
       db.upsertChunk({
         chunkId: "chunk1",
         contentHash: "hash1",
+        embeddingInputHash: "hash1",
         filePath: "/file.ts",
         startLine: 1,
         endLine: 5,

@@ -38,7 +38,7 @@ export async function buildDeltaIndexes(
     const chunk = database.getChunk(chunkId);
     if (!chunk) continue;
 
-    const embedding = database.getEmbeddingForModel(chunk.contentHash, modelId);
+    const embedding = database.getEmbeddingForModel(chunk.embeddingInputHash, modelId);
     if (!embedding) continue;
 
     const vector = bufferToFloat32Array(embedding);
@@ -49,7 +49,7 @@ export async function buildDeltaIndexes(
       chunkType: (chunk.nodeType || "other") as ChunkType,
       name: chunk.name,
       language: chunk.language,
-      hash: chunk.contentHash,
+      hash: chunk.embeddingInputHash,
     });
 
     const chunkContent = getChunkContent(chunk);

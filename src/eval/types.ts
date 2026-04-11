@@ -5,12 +5,20 @@ export type GoldenQueryType =
   | "definition"
   | "implementation-intent"
   | "similarity"
-  | "keyword-heavy";
+  | "keyword-heavy"
+  | "config-lookup"
+  | "test-discovery"
+  | "bug-report"
+  | "cross-file-relationship"
+  | "file-intent"
+  | "concept";
 
 export interface GoldenExpected {
   filePath?: string;
   acceptableFiles?: string[];
   symbol?: string;
+  startLine?: number;
+  endLine?: number;
   branch?: string;
 }
 
@@ -34,12 +42,14 @@ export interface EvalBudget {
   baselinePath?: string;
   failOnMissingBaseline: boolean;
   thresholds: {
+    hitAt1MaxDrop?: number;
     hitAt5MaxDrop?: number;
     mrrAt10MaxDrop?: number;
     combinedRecallAt10MaxDrop?: number;
     expansionHitRateMaxDrop?: number;
     p95LatencyMaxMultiplier?: number;
     p95LatencyMaxAbsoluteMs?: number;
+    minHitAt1?: number;
     minHitAt5?: number;
     minMrrAt10?: number;
   };
@@ -48,6 +58,7 @@ export interface EvalBudget {
 export interface EvalRecipeOverrides {
   bm25Weight?: number;
   denseWeight?: number;
+  voyageWeight?: number;
   identifierBoost?: number;
   graphDepth?: number;
   finalRerankTopN?: number;
@@ -124,6 +135,7 @@ export interface EvalMetrics {
 export interface EvalSearchConfig
   extends Pick<SearchConfig, "fusionStrategy" | "hybridWeight" | "rrfK" | "rerankTopN"> {
   useQueryTypes: boolean;
+  taskTypeOverride?: SearchTaskType;
   recipeOverrides?: EvalRecipeOverrides;
   effectiveTaskType: string;
   effectiveFinalRerankTopN: number;
@@ -191,6 +203,7 @@ export interface EvalGateResult {
 export interface EvalRecipeOverrideSweep {
   bm25Weight?: number[];
   denseWeight?: number[];
+  voyageWeight?: number[];
   identifierBoost?: number[];
   graphDepth?: number[];
   finalRerankTopN?: number[];
@@ -201,6 +214,7 @@ export interface SweepDefinition {
   hybridWeight?: number[];
   rrfK?: number[];
   rerankTopN?: number[];
+  taskType?: SearchTaskType[];
   recipeOverrides?: EvalRecipeOverrideSweep;
 }
 
@@ -232,6 +246,7 @@ export interface EvalRunOptions {
   ciMode: boolean;
   budgetPath?: string;
   reindex: boolean;
+  taskTypeOverride?: SearchTaskType;
   searchOverrides?: Partial<Pick<SearchConfig, "fusionStrategy" | "hybridWeight" | "rrfK" | "rerankTopN">>;
   recipeOverrides?: EvalRecipeOverrides;
 }

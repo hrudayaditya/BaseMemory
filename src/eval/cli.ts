@@ -1,5 +1,7 @@
 import * as path from "path";
 
+import { isSearchTaskType, type SearchTaskType } from "../indexer/search-recipes.js";
+
 import { compareSummaries } from "./compare.js";
 import { createSummaryMarkdown, createRunDirectory, loadSummary, writeJson, writeText } from "./reports.js";
 import { runEvaluation, runSweep } from "./runner.js";
@@ -19,8 +21,10 @@ interface ParsedArgs {
   hybridWeight?: number;
   rrfK?: number;
   rerankTopN?: number;
+  taskType?: SearchTaskType;
   bm25Weight?: number;
   denseWeight?: number;
+  voyageWeight?: number;
   identifierBoost?: number;
   graphDepth?: number;
   finalRerankTopN?: number;
@@ -56,8 +60,10 @@ Search overrides:
   --hybridWeight <0-1>
   --rrfK <number>
   --rerankTopN <number>
+  --taskType <general|definition|bug|test_debug|semantic>
   --bm25Weight <0-1>
   --denseWeight <0-1>
+  --voyageWeight <0-1>
   --identifierBoost <number>
   --graphDepth <number>
   --finalRerankTopN <number>
@@ -67,8 +73,10 @@ Sweep options (comma-separated values):
   --sweepHybridWeight <0.3,0.5,0.7>
   --sweepRrfK <30,60,90>
   --sweepRerankTopN <10,20,40>
+  --sweepTaskType <general,test_debug,bug>
   --sweepBm25Weight <0.3,0.5,0.7>
   --sweepDenseWeight <0.3,0.5,0.7>
+  --sweepVoyageWeight <0.1,0.2,0.4>
   --sweepIdentifierBoost <1,1.5,2>
   --sweepGraphDepth <0,1,2>
   --sweepFinalRerankTopN <0,10,20>
@@ -107,14 +115,31 @@ function parseCsvFusion(value: string): Array<"rrf" | "weighted"> {
   return parsed;
 }
 
+function parseTaskTypeArg(value: string, flag: string): SearchTaskType {
+  if (!isSearchTaskType(value)) {
+    throw new Error(`${flag} must be one of: general, definition, bug, test_debug, semantic`);
+  }
+  return value;
+}
+
+function parseCsvTaskTypes(value: string, flag: string): SearchTaskType[] {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+    .map((item) => parseTaskTypeArg(item, flag));
+}
+
 function hasSweepOptions(sweep: SweepDefinition): boolean {
   return Boolean(
     (sweep.fusionStrategy && sweep.fusionStrategy.length > 0) ||
       (sweep.hybridWeight && sweep.hybridWeight.length > 0) ||
       (sweep.rrfK && sweep.rrfK.length > 0) ||
       (sweep.rerankTopN && sweep.rerankTopN.length > 0) ||
+      (sweep.taskType && sweep.taskType.length > 0) ||
       (sweep.recipeOverrides?.bm25Weight && sweep.recipeOverrides.bm25Weight.length > 0) ||
       (sweep.recipeOverrides?.denseWeight && sweep.recipeOverrides.denseWeight.length > 0) ||
+      (sweep.recipeOverrides?.voyageWeight && sweep.recipeOverrides.voyageWeight.length > 0) ||
       (sweep.recipeOverrides?.identifierBoost && sweep.recipeOverrides.identifierBoost.length > 0) ||
       (sweep.recipeOverrides?.graphDepth && sweep.recipeOverrides.graphDepth.length > 0) ||
       (sweep.recipeOverrides?.finalRerankTopN && sweep.recipeOverrides.finalRerankTopN.length > 0)
@@ -202,6 +227,11 @@ function parseEvalArgs(argv: string[], cwd: string): ParsedArgs {
       i += 1;
       continue;
     }
+    if (arg === "--taskType" && next) {
+      parsed.taskType = parseTaskTypeArg(next, "--taskType");
+      i += 1;
+      continue;
+    }
     if (arg === "--bm25Weight" && next) {
       parsed.bm25Weight = parseNumber(next, "--bm25Weight");
       i += 1;
@@ -209,6 +239,11 @@ function parseEvalArgs(argv: string[], cwd: string): ParsedArgs {
     }
     if (arg === "--denseWeight" && next) {
       parsed.denseWeight = parseNumber(next, "--denseWeight");
+      i += 1;
+      continue;
+    }
+    if (arg === "--voyageWeight" && next) {
+      parsed.voyageWeight = parseNumber(next, "--voyageWeight");
       i += 1;
       continue;
     }
@@ -247,6 +282,11 @@ function parseEvalArgs(argv: string[], cwd: string): ParsedArgs {
       i += 1;
       continue;
     }
+    if (arg === "--sweepTaskType" && next) {
+      parsed.sweep.taskType = parseCsvTaskTypes(next, "--sweepTaskType");
+      i += 1;
+      continue;
+    }
     if (arg === "--sweepBm25Weight" && next) {
       parsed.sweep.recipeOverrides = {
         ...parsed.sweep.recipeOverrides,
@@ -259,6 +299,14 @@ function parseEvalArgs(argv: string[], cwd: string): ParsedArgs {
       parsed.sweep.recipeOverrides = {
         ...parsed.sweep.recipeOverrides,
         denseWeight: parseCsvNumbers(next, "--sweepDenseWeight"),
+      };
+      i += 1;
+      continue;
+    }
+    if (arg === "--sweepVoyageWeight" && next) {
+      parsed.sweep.recipeOverrides = {
+        ...parsed.sweep.recipeOverrides,
+        voyageWeight: parseCsvNumbers(next, "--sweepVoyageWeight"),
       };
       i += 1;
       continue;
@@ -325,6 +373,7 @@ function toRunOptions(parsed: ParsedArgs): EvalRunOptions {
     budgetPath: parsed.budgetPath,
     ciMode: parsed.ciMode,
     reindex: parsed.reindex,
+    taskTypeOverride: parsed.taskType,
     searchOverrides: {
       ...(parsed.fusionStrategy !== undefined ? { fusionStrategy: parsed.fusionStrategy } : {}),
       ...(parsed.hybridWeight !== undefined ? { hybridWeight: parsed.hybridWeight } : {}),
@@ -334,6 +383,7 @@ function toRunOptions(parsed: ParsedArgs): EvalRunOptions {
     recipeOverrides: {
       ...(parsed.bm25Weight !== undefined ? { bm25Weight: parsed.bm25Weight } : {}),
       ...(parsed.denseWeight !== undefined ? { denseWeight: parsed.denseWeight } : {}),
+      ...(parsed.voyageWeight !== undefined ? { voyageWeight: parsed.voyageWeight } : {}),
       ...(parsed.identifierBoost !== undefined ? { identifierBoost: parsed.identifierBoost } : {}),
       ...(parsed.graphDepth !== undefined ? { graphDepth: parsed.graphDepth } : {}),
       ...(parsed.finalRerankTopN !== undefined ? { finalRerankTopN: parsed.finalRerankTopN } : {}),

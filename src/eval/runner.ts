@@ -323,14 +323,20 @@ interface EvalQueryPlan {
   graphDepth: number;
   bm25Weight?: number;
   denseWeight?: number;
+  voyageWeight?: number;
   identifierBoost?: number;
   filterByBranch: boolean;
 }
 
 function resolveEvalTaskType(
   effectiveConfig: ReturnType<typeof resolveSearchConfig>,
-  query: Pick<PerQueryEvalResult, "queryType"> & { taskType?: SearchTaskType }
+  query: Pick<PerQueryEvalResult, "queryType"> & { taskType?: SearchTaskType },
+  taskTypeOverride?: SearchTaskType
 ): SearchTaskType {
+  if (taskTypeOverride) {
+    return taskTypeOverride;
+  }
+
   if (query.taskType) {
     return query.taskType;
   }
@@ -346,9 +352,10 @@ function resolveEvalQueryPlan(
   effectiveConfig: ReturnType<typeof resolveSearchConfig>,
   query: Pick<PerQueryEvalResult, "queryType"> & { taskType?: SearchTaskType },
   recipeOverrides: EvalRunOptions["recipeOverrides"],
+  taskTypeOverride: EvalRunOptions["taskTypeOverride"],
   expectedBranch?: string
 ): EvalQueryPlan {
-  const taskType = resolveEvalTaskType(effectiveConfig, query);
+  const taskType = resolveEvalTaskType(effectiveConfig, query, taskTypeOverride);
   const recipe = getSearchRecipe(taskType);
 
   return {
@@ -357,6 +364,7 @@ function resolveEvalQueryPlan(
     graphDepth: recipeOverrides?.graphDepth ?? recipe.graphDepth ?? DEFAULT_EVAL_GRAPH_DEPTH,
     bm25Weight: recipeOverrides?.bm25Weight,
     denseWeight: recipeOverrides?.denseWeight,
+    voyageWeight: recipeOverrides?.voyageWeight,
     identifierBoost: recipeOverrides?.identifierBoost,
     filterByBranch: expectedBranch ? true : false,
   };
@@ -417,6 +425,7 @@ async function finalizeEvaluationRun(
       effectiveConfig,
       query,
       options.recipeOverrides,
+      options.taskTypeOverride,
       query.expected.branch
     );
     effectivePlans.push(queryPlan);
@@ -430,6 +439,7 @@ async function finalizeEvaluationRun(
       finalRerankTopN: queryPlan.finalRerankTopN,
       bm25Weight: queryPlan.bm25Weight,
       denseWeight: queryPlan.denseWeight,
+      voyageWeight: queryPlan.voyageWeight,
       identifierBoost: queryPlan.identifierBoost,
     });
     const elapsed = performance.now() - start;
@@ -483,6 +493,7 @@ async function finalizeEvaluationRun(
       rrfK: effectiveConfig.search.rrfK,
       rerankTopN: effectiveConfig.search.rerankTopN,
       useQueryTypes: effectiveConfig.eval.useQueryTypes,
+      taskTypeOverride: options.taskTypeOverride,
       recipeOverrides: options.recipeOverrides,
       effectiveTaskType: effectiveSearchConfig.effectiveTaskType,
       effectiveFinalRerankTopN: effectiveSearchConfig.effectiveFinalRerankTopN,
@@ -611,6 +622,10 @@ export async function runSweep(
     sweep.recipeOverrides?.denseWeight && sweep.recipeOverrides.denseWeight.length > 0
       ? [...sweep.recipeOverrides.denseWeight]
       : [options.recipeOverrides?.denseWeight];
+  const recipeVoyageValues: Array<number | undefined> =
+    sweep.recipeOverrides?.voyageWeight && sweep.recipeOverrides.voyageWeight.length > 0
+      ? [...sweep.recipeOverrides.voyageWeight]
+      : [options.recipeOverrides?.voyageWeight];
   const recipeIdentifierBoostValues: Array<number | undefined> =
     sweep.recipeOverrides?.identifierBoost && sweep.recipeOverrides.identifierBoost.length > 0
       ? [...sweep.recipeOverrides.identifierBoost]
@@ -623,6 +638,8 @@ export async function runSweep(
     sweep.recipeOverrides?.finalRerankTopN && sweep.recipeOverrides.finalRerankTopN.length > 0
       ? [...sweep.recipeOverrides.finalRerankTopN]
       : [options.recipeOverrides?.finalRerankTopN];
+  const taskTypeValues: Array<SearchTaskType | undefined> =
+    sweep.taskType && sweep.taskType.length > 0 ? [...sweep.taskType] : [options.taskTypeOverride];
 
   const runs: SweepRunSummary[] = [];
   let sweepIndexer: Indexer | null = null;
@@ -635,53 +652,59 @@ export async function runSweep(
             for (const recipeBm25Weight of recipeBm25Values) {
               for (const recipeDenseWeight of recipeDenseValues) {
                 for (const recipeIdentifierBoost of recipeIdentifierBoostValues) {
-                  for (const recipeGraphDepth of recipeGraphDepthValues) {
-                    for (const recipeFinalRerankTopN of recipeFinalRerankValues) {
-                      const effectiveConfig = resolveSearchConfig(parsedConfig, {
-                        ...(fusion !== undefined ? { fusionStrategy: fusion } : {}),
-                        ...(hybridWeight !== undefined ? { hybridWeight } : {}),
-                        ...(rrfK !== undefined ? { rrfK } : {}),
-                        ...(rerankTopN !== undefined ? { rerankTopN } : {}),
-                      });
-                      const effectiveRunOptions: EvalRunOptions = {
-                        ...options,
-                        recipeOverrides: {
-                          ...(recipeBm25Weight !== undefined ? { bm25Weight: recipeBm25Weight } : {}),
-                          ...(recipeDenseWeight !== undefined ? { denseWeight: recipeDenseWeight } : {}),
-                          ...(recipeIdentifierBoost !== undefined ? { identifierBoost: recipeIdentifierBoost } : {}),
-                          ...(recipeGraphDepth !== undefined ? { graphDepth: recipeGraphDepth } : {}),
-                          ...(recipeFinalRerankTopN !== undefined ? { finalRerankTopN: recipeFinalRerankTopN } : {}),
-                        },
-                      };
+                  for (const recipeVoyageWeight of recipeVoyageValues) {
+                    for (const recipeGraphDepth of recipeGraphDepthValues) {
+                      for (const recipeFinalRerankTopN of recipeFinalRerankValues) {
+                        for (const taskTypeOverride of taskTypeValues) {
+                          const effectiveConfig = resolveSearchConfig(parsedConfig, {
+                            ...(fusion !== undefined ? { fusionStrategy: fusion } : {}),
+                            ...(hybridWeight !== undefined ? { hybridWeight } : {}),
+                            ...(rrfK !== undefined ? { rrfK } : {}),
+                            ...(rerankTopN !== undefined ? { rerankTopN } : {}),
+                          });
+                          const effectiveRunOptions: EvalRunOptions = {
+                            ...options,
+                            taskTypeOverride,
+                            recipeOverrides: {
+                              ...(recipeBm25Weight !== undefined ? { bm25Weight: recipeBm25Weight } : {}),
+                              ...(recipeDenseWeight !== undefined ? { denseWeight: recipeDenseWeight } : {}),
+                              ...(recipeVoyageWeight !== undefined ? { voyageWeight: recipeVoyageWeight } : {}),
+                              ...(recipeIdentifierBoost !== undefined ? { identifierBoost: recipeIdentifierBoost } : {}),
+                              ...(recipeGraphDepth !== undefined ? { graphDepth: recipeGraphDepth } : {}),
+                              ...(recipeFinalRerankTopN !== undefined ? { finalRerankTopN: recipeFinalRerankTopN } : {}),
+                            },
+                          };
 
-                      if (!sweepIndexer) {
-                        if (options.reindex) {
-                          clearIndexRoot(options.projectRoot, effectiveConfig.scope);
+                          if (!sweepIndexer) {
+                            if (options.reindex) {
+                              clearIndexRoot(options.projectRoot, effectiveConfig.scope);
+                            }
+                            sweepIndexer = new Indexer(options.projectRoot, effectiveConfig);
+                            const indexStats = await sweepIndexer.index();
+                            await assertSearchableEvalCorpus(sweepIndexer, indexStats);
+                          } else {
+                            // Search-parameter sweeps do not change indexed artifacts, so reuse
+                            // the same indexer instance and swap only the search config.
+                            applySearchConfigToIndexer(sweepIndexer, effectiveConfig);
+                          }
+
+                          const run = await finalizeEvaluationRun(
+                            effectiveRunOptions,
+                            sweepIndexer,
+                            effectiveConfig,
+                            datasetPath,
+                            againstPath,
+                            budgetPath
+                          );
+
+                          runs.push({
+                            searchConfig: run.summary.searchConfig,
+                            summary: run.summary,
+                            comparison: run.comparison,
+                            gate: run.gate,
+                          });
                         }
-                        sweepIndexer = new Indexer(options.projectRoot, effectiveConfig);
-                        const indexStats = await sweepIndexer.index();
-                        await assertSearchableEvalCorpus(sweepIndexer, indexStats);
-                      } else {
-                        // Search-parameter sweeps do not change indexed artifacts, so reuse
-                        // the same indexer instance and swap only the search config.
-                        applySearchConfigToIndexer(sweepIndexer, effectiveConfig);
                       }
-
-                      const run = await finalizeEvaluationRun(
-                        effectiveRunOptions,
-                        sweepIndexer,
-                        effectiveConfig,
-                        datasetPath,
-                        againstPath,
-                        budgetPath
-                      );
-
-                      runs.push({
-                        searchConfig: run.summary.searchConfig,
-                        summary: run.summary,
-                        comparison: run.comparison,
-                        gate: run.gate,
-                      });
                     }
                   }
                 }

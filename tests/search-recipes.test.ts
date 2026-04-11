@@ -71,7 +71,13 @@ describe("search recipes", () => {
   it("maps eval query types into explicit task recipes", () => {
     expect(mapEvalQueryTypeToTaskType("definition")).toBe("definition");
     expect(mapEvalQueryTypeToTaskType("implementation-intent")).toBe("definition");
+    expect(mapEvalQueryTypeToTaskType("config-lookup")).toBe("definition");
+    expect(mapEvalQueryTypeToTaskType("cross-file-relationship")).toBe("definition");
+    expect(mapEvalQueryTypeToTaskType("test-discovery")).toBe("test_debug");
+    expect(mapEvalQueryTypeToTaskType("bug-report")).toBe("bug");
     expect(mapEvalQueryTypeToTaskType("similarity")).toBe("semantic");
+    expect(mapEvalQueryTypeToTaskType("file-intent")).toBe("semantic");
+    expect(mapEvalQueryTypeToTaskType("concept")).toBe("semantic");
     expect(mapEvalQueryTypeToTaskType("keyword-heavy")).toBe("general");
   });
 
@@ -88,12 +94,24 @@ describe("search recipes", () => {
       "implementation-intent",
       "similarity",
       "keyword-heavy",
+      "config-lookup",
+      "test-discovery",
+      "bug-report",
+      "cross-file-relationship",
+      "file-intent",
+      "concept",
     ]);
     expect(queryTypes.map((queryType) => mapEvalQueryTypeToTaskType(queryType))).toEqual([
       "definition",
       "definition",
       "semantic",
       "general",
+      "definition",
+      "test_debug",
+      "bug",
+      "definition",
+      "semantic",
+      "semantic",
     ]);
   });
 });

@@ -1,4 +1,4 @@
-use super::super::policy::{extract_name_by_fields, LanguagePolicy, SemanticInfo};
+use super::super::policy::{extract_name_by_fields, node_text, LanguagePolicy, SemanticInfo};
 use super::super::{ChunkKind, SymbolKind};
 use tree_sitter::Node;
 
@@ -16,6 +16,48 @@ fn ruby_is_comment_kind(kind: &str) -> bool {
 
 fn bash_is_comment_kind(kind: &str) -> bool {
     kind == "comment"
+}
+
+fn is_ruby_dsl_method(name: &str) -> bool {
+    matches!(
+        name,
+        "attr_accessor"
+            | "attr_reader"
+            | "attr_writer"
+            | "include"
+            | "extend"
+            | "prepend"
+            | "has_many"
+            | "has_one"
+            | "belongs_to"
+            | "has_and_belongs_to_many"
+            | "validates"
+            | "validates_presence_of"
+            | "validates_uniqueness_of"
+            | "scope"
+            | "before_action"
+            | "after_action"
+            | "around_action"
+            | "before_save"
+            | "after_save"
+            | "before_create"
+            | "after_create"
+    )
+}
+
+fn is_ruby_class_or_module_body_call(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+
+    match parent.kind() {
+        "class" | "module" => true,
+        "body_statement" => parent
+            .parent()
+            .map(|grandparent| matches!(grandparent.kind(), "class" | "module"))
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 fn classify_ruby_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
@@ -38,6 +80,24 @@ fn classify_ruby_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
         }),
+        "call" => {
+            if !is_ruby_class_or_module_body_call(node) {
+                return None;
+            }
+
+            let method = node.child_by_field_name("method")?;
+            let method_name = node_text(method, source)?.trim();
+            if !is_ruby_dsl_method(method_name) {
+                return None;
+            }
+
+            Some(SemanticInfo {
+                symbol_name: Some(method_name.to_string()),
+                symbol_kind: Some(SymbolKind::Block),
+                chunk_kind: ChunkKind::Code,
+                coarse_eligible: false,
+            })
+        }
         _ => None,
     }
 }

@@ -57,8 +57,9 @@ fn map_chunk(chunk: crate::chunker::Chunk) -> CodeChunk {
         Some(SymbolKind::Class) => "class",
         Some(SymbolKind::Interface) => "interface",
         Some(SymbolKind::Struct) => "struct",
+        Some(SymbolKind::Type) => "type",
         Some(SymbolKind::Module) => "module",
-        Some(SymbolKind::Block) | None => match chunk.chunk_kind {
+        Some(SymbolKind::Constant) | Some(SymbolKind::Block) | None => match chunk.chunk_kind {
             ChunkKind::Test => "function",
             ChunkKind::Code | ChunkKind::Doc | ChunkKind::Config => "other",
         },

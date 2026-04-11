@@ -487,36 +487,79 @@ export const codebase_search: ToolDefinition = tool({
   });
 
   describe("createEmbeddingText", () => {
-    it("should create embedding text with metadata", () => {
+    it("creates embedding text with a structured file and symbol prefix", () => {
       const chunk: CodeChunk = {
         content: "function test() { return 1; }",
         startLine: 1,
         endLine: 3,
         chunkType: "function",
         name: "test",
+        symbolKind: "Function",
         language: "typescript",
       };
 
-      const text = createEmbeddingText(chunk, "/src/utils/helper.ts");
+      const text = createEmbeddingText(
+        chunk,
+        "/repo/src/utils/helper.ts",
+        "/repo"
+      );
 
-      expect(text).toContain("TypeScript");
-      expect(text).toContain("test");
+      expect(text).toContain("file: src/utils/helper.ts");
+      expect(text).toContain("symbol: test (function)");
       expect(text).toContain("function test()");
     });
 
-    it("should extract semantic hints", () => {
+    it("suppresses synthetic symbol names from the prefix", () => {
       const chunk: CodeChunk = {
-        content: "async function validateToken(token: string) { return jwt.verify(token); }",
+        content: "export default { value: 1 };",
         startLine: 1,
-        endLine: 5,
-        chunkType: "function",
-        name: "validateToken",
+        endLine: 1,
+        chunkType: "other",
+        name: "<default>",
+        symbolKind: "Constant",
         language: "typescript",
       };
 
-      const text = createEmbeddingText(chunk, "/src/auth.ts");
+      const text = createEmbeddingText(chunk, "/repo/src/config.ts", "/repo");
 
-      expect(text.toLowerCase()).toContain("token");
+      expect(text).toContain("file: src/config.ts");
+      expect(text).not.toContain("<default>");
+      expect(text).not.toContain("symbol:");
+    });
+
+    it("uses only a file prefix when the chunk has no symbol name", () => {
+      const chunk: CodeChunk = {
+        content: "import \"./setup\";",
+        startLine: 1,
+        endLine: 1,
+        chunkType: "other",
+        language: "typescript",
+      };
+
+      const text = createEmbeddingText(chunk, "/repo/src/main.ts", "/repo");
+
+      expect(text).toContain("file: src/main.ts");
+      expect(text).not.toContain("symbol:");
+    });
+
+    it("adds normalized identifier terms for vocabulary-mismatched symbols", () => {
+      const text = createEmbeddingText(
+        {
+          content: "export const API_BASE_URL = 'http://localhost:3001';",
+          startLine: 1,
+          endLine: 1,
+          chunkType: "function",
+          name: "API_BASE_URL",
+          symbolKind: "Constant",
+          language: "typescript",
+        },
+        "/repo/src/config/api.ts",
+        "/repo"
+      );
+
+      expect(text).toContain("file: src/config/api.ts");
+      expect(text).toContain("symbol: API_BASE_URL (constant) terms: api base url");
+      expect(text).toContain("export const API_BASE_URL = 'http://localhost:3001';");
     });
   });
 
