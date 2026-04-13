@@ -62,7 +62,7 @@
       "queryType": "definition",
       "expected": {
         "filePath": "native/src/chunker/languages/typescript.rs",
-        "symbol": "classify_ts_js_node"
+        "symbol": "classify_ts_js_node_impl"
       }
     },
     {
@@ -194,8 +194,8 @@
       "expected": {
         "filePath": "src/indexer/graph-expansion.ts",
         "symbol": "expandGraphContext",
-        "startLine": 138,
-        "endLine": 138
+        "startLine": 155,
+        "endLine": 285
       }
     },
     {
@@ -205,8 +205,8 @@
       "expected": {
         "filePath": "src/indexer/incremental-index-orchestrator.ts",
         "symbol": "processEmbedStage",
-        "startLine": 1318,
-        "endLine": 1318
+        "startLine": 1587,
+        "endLine": 1931
       }
     },
     {
@@ -215,9 +215,9 @@
       "queryType": "bug-report",
       "expected": {
         "filePath": "src/indexer/index.ts",
-        "symbol": "buildAllowedChunkIds",
-        "startLine": 4025,
-        "endLine": 4025
+        "symbol": "getActiveBranchKey",
+        "startLine": 2038,
+        "endLine": 2040
       }
     },
     {
@@ -227,8 +227,8 @@
       "expected": {
         "filePath": "src/indexer/index.ts",
         "symbol": "materializeRankedResults",
-        "startLine": 3112,
-        "endLine": 3112
+        "startLine": 3356,
+        "endLine": 3401
       }
     },
     {
@@ -239,7 +239,7 @@
         "filePath": "native/src/db.rs",
         "symbol": "retry_busy_sqlite",
         "startLine": 45,
-        "endLine": 45
+        "endLine": 63
       }
     },
     {
@@ -249,8 +249,8 @@
       "expected": {
         "filePath": "src/eval/runner.ts",
         "symbol": "finalizeEvaluationRun",
-        "startLine": 405,
-        "endLine": 405
+        "startLine": 390,
+        "endLine": 542
       }
     },
     {
@@ -260,8 +260,8 @@
       "expected": {
         "filePath": "src/eval/runner.ts",
         "symbol": "finalizeEvaluationRun",
-        "startLine": 405,
-        "endLine": 405
+        "startLine": 390,
+        "endLine": 542
       }
     },
     {
@@ -271,8 +271,8 @@
       "expected": {
         "filePath": "src/eval/runner.ts",
         "symbol": "finalizeEvaluationRun",
-        "startLine": 405,
-        "endLine": 405
+        "startLine": 390,
+        "endLine": 542
       }
     },
     {
@@ -282,8 +282,8 @@
       "expected": {
         "filePath": "src/eval/runner.ts",
         "symbol": "resolveEvalTaskType",
-        "startLine": 331,
-        "endLine": 331
+        "startLine": 316,
+        "endLine": 334
       }
     },
     {
@@ -292,9 +292,9 @@
       "queryType": "cross-file-relationship",
       "expected": {
         "filePath": "src/indexer/incremental-index-orchestrator.ts",
-        "symbol": "toEmbeddingWorkChunk",
-        "startLine": 1853,
-        "endLine": 1853
+        "symbol": "buildChunkRecords",
+        "startLine": 2060,
+        "endLine": 2099
       }
     },
     {
@@ -344,8 +344,8 @@
       "expected": {
         "filePath": "src/eval/budget.ts",
         "symbol": "evaluateBudgetGate",
-        "startLine": 103,
-        "endLine": 103
+        "startLine": 118,
+        "endLine": 258
       }
     },
     {
@@ -355,8 +355,8 @@
       "expected": {
         "filePath": "src/native/index.ts",
         "symbol": "createEmbeddingText",
-        "startLine": 532,
-        "endLine": 532
+        "startLine": 641,
+        "endLine": 684
       }
     },
     {
@@ -366,8 +366,8 @@
       "expected": {
         "filePath": "src/eval/runner.ts",
         "symbol": "resolveEvalTaskType",
-        "startLine": 331,
-        "endLine": 331
+        "startLine": 316,
+        "endLine": 334
       }
     },
     {
@@ -378,7 +378,7 @@
         "filePath": "src/indexer/search-recipes.ts",
         "symbol": "mapEvalQueryTypeToTaskType",
         "startLine": 128,
-        "endLine": 128
+        "endLine": 165
       }
     },
     {
@@ -389,7 +389,7 @@
         "filePath": "src/indexer/watcher-tti.ts",
         "symbol": "recordWatcherEventTimestamp",
         "startLine": 14,
-        "endLine": 14
+        "endLine": 19
       }
     }
   ]

@@ -103,7 +103,7 @@ function formatStatus(status: {
 
 const CHUNK_TYPE_ENUM = [
   "function", "class", "method", "interface", "type",
-  "enum", "struct", "impl", "trait", "module", "other",
+  "enum", "struct", "impl", "trait", "module", "constant", "other",
 ] as const;
 const TASK_TYPE_ENUM = [...SEARCH_TASK_TYPES] as [typeof SEARCH_TASK_TYPES[number], ...typeof SEARCH_TASK_TYPES[number][]];
 
@@ -165,9 +165,11 @@ export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndex
       }
 
       const formatted = response.primaryResults.map((r, idx) => {
+        const relationPrefix = r.relation ? `${r.relation} depth=${r.depth ?? 1} ` : "";
+        const provenance = r.viaSymbol ? ` via ${r.viaSymbol}` : "";
         const header = r.name
-          ? `[${idx + 1}] ${r.chunkType} "${r.name}" in ${r.filePath}:${r.startLine}-${r.endLine}`
-          : `[${idx + 1}] ${r.chunkType} in ${r.filePath}:${r.startLine}-${r.endLine}`;
+          ? `[${idx + 1}] ${relationPrefix}${r.chunkType} "${r.name}" in ${r.filePath}:${r.startLine}-${r.endLine}${provenance}`
+          : `[${idx + 1}] ${relationPrefix}${r.chunkType} in ${r.filePath}:${r.startLine}-${r.endLine}${provenance}`;
         return `${header} (score: ${r.score.toFixed(2)})\n\`\`\`\n${truncateContent(r.content)}\n\`\`\``;
       });
 
@@ -216,9 +218,11 @@ export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndex
       }
 
       const formatted = response.primaryResults.map((r, idx) => {
+        const relationPrefix = r.relation ? `${r.relation} depth=${r.depth ?? 1} ` : "";
+        const provenance = r.viaSymbol ? ` via ${r.viaSymbol}` : "";
         const location = `${r.filePath}:${r.startLine}-${r.endLine}`;
         const name = r.name ? `"${r.name}"` : "(anonymous)";
-        return `[${idx + 1}] ${r.chunkType} ${name} at ${location} (score: ${r.score.toFixed(2)})`;
+        return `[${idx + 1}] ${relationPrefix}${r.chunkType} ${name} at ${location}${provenance} (score: ${r.score.toFixed(2)})`;
       });
 
       const primary = `Found ${response.primaryResults.length} locations for "${args.query}":\n\n${formatted.join("\n")}\n\nUse Read tool to examine specific files.`;

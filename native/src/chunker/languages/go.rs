@@ -14,7 +14,8 @@ fn is_comment_kind(kind: &str) -> bool {
 
 fn classify_go_function(node: Node<'_>, source: &str, is_method: bool) -> SemanticInfo {
     let name = if is_method {
-        classify_go_method_name(node, source).or_else(|| extract_name_by_fields(node, source, &["name"]))
+        classify_go_method_name(node, source)
+            .or_else(|| extract_name_by_fields(node, source, &["name"]))
     } else {
         extract_name_by_fields(node, source, &["name"])
     };

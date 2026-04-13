@@ -128,12 +128,15 @@ export function isSearchTaskType(value: string): value is SearchTaskType {
 export function mapEvalQueryTypeToTaskType(
   queryType:
     | "definition"
+    | "identifier-heavy"
     | "implementation-intent"
     | "similarity"
     | "keyword-heavy"
     | "config-lookup"
+    | "config-constant-lookup"
     | "test-discovery"
     | "bug-report"
+    | "bug-error-lookup"
     | "cross-file-relationship"
     | "file-intent"
     | "concept"
@@ -141,13 +144,17 @@ export function mapEvalQueryTypeToTaskType(
   switch (queryType) {
     case "definition":
     case "implementation-intent":
+    case "config-constant-lookup":
     case "config-lookup":
     case "cross-file-relationship":
       return "definition";
     case "test-discovery":
       return "test_debug";
     case "bug-report":
+    case "bug-error-lookup":
       return "bug";
+    case "identifier-heavy":
+      return "general";
     case "similarity":
     case "file-intent":
     case "concept":

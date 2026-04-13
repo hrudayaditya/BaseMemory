@@ -1,13 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { VoyageEmbeddingProvider } from "../src/embeddings/provider.js";
+import {
+  EmbeddingTransientError,
+  VoyageEmbeddingProvider,
+} from "../src/embeddings/provider.js";
 
 const VOYAGE_CODE_2_DIMENSIONS = 1536;
 
 describe("VoyageEmbeddingProvider", () => {
   let fetchSpy: ReturnType<typeof vi.spyOn>;
   let warnSpy: ReturnType<typeof vi.spyOn>;
-  let errorSpy: ReturnType<typeof vi.spyOn>;
 
   function createEmbedding(value: number): number[] {
     return new Array(VOYAGE_CODE_2_DIMENSIONS).fill(value);
@@ -26,13 +28,11 @@ describe("VoyageEmbeddingProvider", () => {
   beforeEach(() => {
     fetchSpy = vi.spyOn(globalThis, "fetch");
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
   });
 
   afterEach(() => {
     fetchSpy.mockRestore();
     warnSpy.mockRestore();
-    errorSpy.mockRestore();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -142,10 +142,9 @@ describe("VoyageEmbeddingProvider", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(3);
     expect(result).not.toBeNull();
     expect(result!.embedding[0]).toBeCloseTo(0.4);
-    expect(errorSpy).not.toHaveBeenCalled();
   });
 
-  it("returns null and logs an error when all retries are exhausted", async () => {
+  it("throws a transient error when all retries are exhausted", async () => {
     vi.useFakeTimers();
     vi.spyOn(Math, "random").mockReturnValue(0.5);
     fetchSpy
@@ -155,14 +154,18 @@ describe("VoyageEmbeddingProvider", () => {
 
     const provider = createProvider({ voyageApiKey: "voyage-test-key" });
     const promise = provider.embedBatch(["doc"]);
+    const settled = promise.then<Error>(
+      () => {
+        throw new Error("Expected promise to reject");
+      },
+      (failure: unknown) => failure instanceof Error ? failure : new Error(String(failure))
+    );
     await vi.runAllTimersAsync();
-    const result = await promise;
+    const error = await settled;
 
     expect(fetchSpy).toHaveBeenCalledTimes(3);
-    expect(result).toBeNull();
-    expect(errorSpy).toHaveBeenCalledWith(
-      expect.stringContaining("Failed batch 1/1 (1 texts)")
-    );
+    expect(error).toBeInstanceOf(EmbeddingTransientError);
+    expect(error.message).toContain("500");
   });
 
   it("treats rate limits as retryable failures", async () => {

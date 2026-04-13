@@ -1,4 +1,12 @@
-import type { ChunkKind, ChunkMetadata, ChunkSymbolKind, Database, SymbolData } from "../native/index.js";
+import type {
+  CallEdgeData,
+  ChunkKind,
+  ChunkMetadata,
+  ChunkSymbolKind,
+  Database,
+  SymbolChunkData,
+  SymbolData,
+} from "../native/index.js";
 
 export interface GraphExpansionMetadata extends ChunkMetadata {
   chunkKind?: ChunkKind;
@@ -17,6 +25,8 @@ export interface GraphExpansionEntry {
   depth: number;
   viaSymbol?: string;
 }
+
+export type GraphExpansionDirection = "caller" | "callee" | "both";
 
 interface QueueEntry {
   symbol: SymbolData;
@@ -79,60 +89,67 @@ function resolveSeedSymbol(
   return bestSymbol;
 }
 
-function resolveChunkForSymbol(
+function resolveChunksForSymbolsBatch(
   database: Database,
-  symbol: SymbolData,
+  symbols: SymbolData[],
   branch: string,
   allowedChunkIds: Set<string> | null
-): GraphExpansionSeed | null {
-  const fileChunks = database.getChunksByFileOnBranch(symbol.filePath, branch);
-  const bestChunk = fileChunks
-    .filter((chunk) => !allowedChunkIds || allowedChunkIds.has(chunk.chunkId))
-    .filter((chunk) =>
-      chunk.startLine <= symbol.startLine &&
-      chunk.endLine >= symbol.endLine
-    )
-    .sort((left, right) => {
-      const leftNameMatch = left.name === symbol.name ? 1 : 0;
-      const rightNameMatch = right.name === symbol.name ? 1 : 0;
-      if (leftNameMatch !== rightNameMatch) {
-        return rightNameMatch - leftNameMatch;
-      }
-      const leftSpan = left.endLine - left.startLine;
-      const rightSpan = right.endLine - right.startLine;
-      return leftSpan - rightSpan;
-    })[0];
-
-  if (!bestChunk) {
-    return null;
+): Map<string, GraphExpansionSeed> {
+  if (symbols.length === 0) {
+    return new Map();
   }
 
+  const rows = database.getChunksForSymbolsBatch(
+    symbols.map((symbol) => symbol.id),
+    branch,
+    allowedChunkIds ? [...allowedChunkIds] : undefined
+  );
+
+  const resolved = new Map<string, GraphExpansionSeed>();
+  for (const row of rows) {
+    resolved.set(row.symbolId, chunkRowToSeed(row));
+  }
+  return resolved;
+}
+
+function chunkRowToSeed(row: SymbolChunkData): GraphExpansionSeed {
   return {
-    id: bestChunk.chunkId,
+    id: row.chunkId,
     metadata: {
-      filePath: bestChunk.filePath,
-      startLine: bestChunk.startLine,
-      endLine: bestChunk.endLine,
-      chunkType: (bestChunk.nodeType ?? "other") as ChunkMetadata["chunkType"],
-      chunkKind: bestChunk.chunkKind as ChunkKind | undefined,
-      symbolKind: bestChunk.symbolKind as ChunkSymbolKind | undefined,
-      name: bestChunk.name ?? undefined,
-      language: bestChunk.language,
-      hash: bestChunk.embeddingInputHash,
+      filePath: row.filePath,
+      startLine: row.startLine,
+      endLine: row.endLine,
+      chunkType: (row.nodeType ?? "other") as ChunkMetadata["chunkType"],
+      chunkKind: row.chunkKind as ChunkKind | undefined,
+      symbolKind: row.symbolKind as ChunkSymbolKind | undefined,
+      name: row.name ?? undefined,
+      language: row.language,
+      hash: row.embeddingInputHash,
     },
   };
 }
 
-function resolveTargetSymbols(database: Database, targetName: string, branch: string): SymbolData[] {
-  const exact = database.getSymbolsByNameOnBranch(targetName, branch);
-  const ci = database.getSymbolsByNameCiOnBranch(targetName, branch);
-  const deduped = new Map<string, SymbolData>();
+function groupEdgesBySymbolId(
+  edges: CallEdgeData[],
+  getKey: (edge: CallEdgeData) => string | undefined
+): Map<string, CallEdgeData[]> {
+  const grouped = new Map<string, CallEdgeData[]>();
 
-  for (const symbol of [...exact, ...ci]) {
-    deduped.set(symbol.id, symbol);
+  for (const edge of edges) {
+    const key = getKey(edge);
+    if (!key) {
+      continue;
+    }
+
+    const bucket = grouped.get(key);
+    if (bucket) {
+      bucket.push(edge);
+    } else {
+      grouped.set(key, [edge]);
+    }
   }
 
-  return Array.from(deduped.values());
+  return grouped;
 }
 
 export function expandGraphContext(
@@ -141,6 +158,7 @@ export function expandGraphContext(
   options: {
     branch: string;
     depth: number;
+    direction?: GraphExpansionDirection;
     allowedChunkIds: Set<string> | null;
   }
 ): GraphExpansionEntry[] {
@@ -148,10 +166,12 @@ export function expandGraphContext(
     return [];
   }
 
+  const direction = options.direction ?? "both";
+
   const primaryIds = new Set(primaryCandidates.map((candidate) => candidate.id));
-  const seenChunkIds = new Set(primaryIds);
+  const seenChunkIds = new Set(direction === "both" ? primaryIds : []);
   const seenSymbols = new Set<string>();
-  const queue: QueueEntry[] = [];
+  let frontier: QueueEntry[] = [];
   const expanded: GraphExpansionEntry[] = [];
 
   for (const candidate of primaryCandidates) {
@@ -160,85 +180,105 @@ export function expandGraphContext(
       continue;
     }
     seenSymbols.add(symbol.id);
-    queue.push({ symbol, depth: 0 });
+    frontier.push({ symbol, depth: 0 });
   }
 
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (!current) {
-      continue;
+  while (frontier.length > 0) {
+    const currentDepth = frontier[0]?.depth ?? 0;
+    if (currentDepth >= options.depth) {
+      break;
     }
 
-    if (current.depth >= options.depth) {
-      continue;
+    const nextDepth = currentDepth + 1;
+    const frontierSymbolIds = frontier.map((entry) => entry.symbol.id);
+    const edgeBatch = database.getCallEdgeFrontierBatch(frontierSymbolIds, options.branch);
+    const callersByTarget = groupEdgesBySymbolId(edgeBatch.callers, (edge) => edge.toSymbolId);
+    const calleesBySource = groupEdgesBySymbolId(edgeBatch.callees, (edge) => edge.fromSymbolId);
+
+    const relatedSymbolIds = new Set<string>();
+    for (const edge of edgeBatch.callers) {
+      relatedSymbolIds.add(edge.fromSymbolId);
     }
-
-    const nextDepth = current.depth + 1;
-
-    const callers = database.getCallersWithContextByTargetSymbolId(current.symbol.id, options.branch);
-    for (const edge of callers) {
-      const callerSymbol = database.getSymbolByIdOnBranch(edge.fromSymbolId, options.branch);
-      if (!callerSymbol) {
-        continue;
-      }
-
-      const callerChunk = resolveChunkForSymbol(
-        database,
-        callerSymbol,
-        options.branch,
-        options.allowedChunkIds
-      );
-      if (!callerChunk || seenChunkIds.has(callerChunk.id)) {
-        continue;
-      }
-
-      seenChunkIds.add(callerChunk.id);
-      expanded.push({
-        id: callerChunk.id,
-        metadata: callerChunk.metadata,
-        relation: "caller",
-        depth: nextDepth,
-        viaSymbol: current.symbol.name,
-      });
-
-      if (!seenSymbols.has(callerSymbol.id)) {
-        seenSymbols.add(callerSymbol.id);
-        queue.push({ symbol: callerSymbol, depth: nextDepth });
+    for (const edge of edgeBatch.callees) {
+      if (edge.toSymbolId) {
+        relatedSymbolIds.add(edge.toSymbolId);
       }
     }
 
-    const callees = database.getCallees(current.symbol.id, options.branch);
-    for (const edge of callees) {
-      const calleeSymbols = edge.toSymbolId
-        ? [database.getSymbolByIdOnBranch(edge.toSymbolId, options.branch)].filter((value): value is SymbolData => value !== null)
-        : resolveTargetSymbols(database, edge.targetName, options.branch);
+    const relatedSymbols = database.getSymbolsByIdsOnBranch([...relatedSymbolIds], options.branch);
+    const symbolsById = new Map(relatedSymbols.map((symbol) => [symbol.id, symbol]));
+    const chunksBySymbolId = resolveChunksForSymbolsBatch(
+      database,
+      relatedSymbols,
+      options.branch,
+      options.allowedChunkIds
+    );
 
-      for (const calleeSymbol of calleeSymbols) {
-        const calleeChunk = resolveChunkForSymbol(
-          database,
-          calleeSymbol,
-          options.branch,
-          options.allowedChunkIds
-        );
-        if (!calleeChunk || seenChunkIds.has(calleeChunk.id)) {
-          continue;
-        }
+    const nextFrontier: QueueEntry[] = [];
 
-        seenChunkIds.add(calleeChunk.id);
-        expanded.push({
-          id: calleeChunk.id,
-          metadata: calleeChunk.metadata,
-          relation: "callee",
-          depth: nextDepth,
-          viaSymbol: current.symbol.name,
-        });
+    for (const current of frontier) {
+      if (direction !== "callee") {
+        for (const edge of callersByTarget.get(current.symbol.id) ?? []) {
+          const callerSymbol = symbolsById.get(edge.fromSymbolId);
+          if (!callerSymbol) {
+            continue;
+          }
 
-        if (!seenSymbols.has(calleeSymbol.id)) {
-          seenSymbols.add(calleeSymbol.id);
-          queue.push({ symbol: calleeSymbol, depth: nextDepth });
+          const callerChunk = chunksBySymbolId.get(callerSymbol.id);
+          if (!callerChunk || seenChunkIds.has(callerChunk.id)) {
+            continue;
+          }
+
+          seenChunkIds.add(callerChunk.id);
+          expanded.push({
+            id: callerChunk.id,
+            metadata: callerChunk.metadata,
+            relation: "caller",
+            depth: nextDepth,
+            viaSymbol: current.symbol.name,
+          });
+
+          if (!seenSymbols.has(callerSymbol.id)) {
+            seenSymbols.add(callerSymbol.id);
+            nextFrontier.push({ symbol: callerSymbol, depth: nextDepth });
+          }
         }
       }
+
+      if (direction !== "caller") {
+        for (const edge of calleesBySource.get(current.symbol.id) ?? []) {
+          if (!edge.toSymbolId) {
+            continue;
+          }
+
+          const calleeSymbol = symbolsById.get(edge.toSymbolId);
+          if (!calleeSymbol) {
+            continue;
+          }
+
+          const calleeChunk = chunksBySymbolId.get(calleeSymbol.id);
+          if (!calleeChunk || seenChunkIds.has(calleeChunk.id)) {
+            continue;
+          }
+
+          seenChunkIds.add(calleeChunk.id);
+          expanded.push({
+            id: calleeChunk.id,
+            metadata: calleeChunk.metadata,
+            relation: "callee",
+            depth: nextDepth,
+            viaSymbol: current.symbol.name,
+          });
+
+          if (!seenSymbols.has(calleeSymbol.id)) {
+            seenSymbols.add(calleeSymbol.id);
+            nextFrontier.push({ symbol: calleeSymbol, depth: nextDepth });
+          }
+        }
+      }
     }
+
+    frontier = nextFrontier;
   }
 
   return expanded;

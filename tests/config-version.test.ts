@@ -6,13 +6,16 @@ import {
   type ConfiguredProviderInfo,
 } from "../src/embeddings/detector.js";
 import {
-  EMBEDDING_PREFIX_VERSION,
   type ConfigVersion,
   getCurrentConfigVersion,
   hashConfigVersion,
   hashEmbedConfig,
 } from "../src/indexer/config-version.js";
-import { getChunkerVersion, getGraphExtractorVersion } from "../src/native/index.js";
+import {
+  EMBEDDING_INPUT_FORMAT_VERSION,
+  getChunkerVersion,
+  getGraphExtractorVersion,
+} from "../src/native/index.js";
 
 function createOpenAiProvider(): ConfiguredProviderInfo {
   return {
@@ -77,11 +80,12 @@ describe("config-version", () => {
     const base: ConfigVersion = {
       embeddingModelId: "text-embedding-3-small",
       embeddingDimension: 1536,
+      embeddingMaxTokens: 8191,
       embeddingProvider: "openai",
       endpointBaseUrl: "https://api.openai.com/v1",
       documentTaskType: "",
       voyageModelId: null,
-      embeddingPrefixVersion: EMBEDDING_PREFIX_VERSION,
+      embeddingPrefixVersion: EMBEDDING_INPUT_FORMAT_VERSION,
       chunkerVersion: "chunker-v1",
       graphExtractorVersion: "graph-v1",
     };
@@ -94,8 +98,9 @@ describe("config-version", () => {
       chunkerVersion: "chunker-v1",
       embeddingDimension: 1536,
       embeddingModelId: "text-embedding-3-small",
+      embeddingMaxTokens: 8191,
       voyageModelId: null,
-      embeddingPrefixVersion: EMBEDDING_PREFIX_VERSION,
+      embeddingPrefixVersion: EMBEDDING_INPUT_FORMAT_VERSION,
     } as ConfigVersion;
 
     expect(hashConfigVersion(base)).toBe(hashConfigVersion(base));
@@ -106,11 +111,12 @@ describe("config-version", () => {
     const base: ConfigVersion = {
       embeddingModelId: "text-embedding-3-small",
       embeddingDimension: 1536,
+      embeddingMaxTokens: 8191,
       embeddingProvider: "openai",
       endpointBaseUrl: "https://api.openai.com/v1",
       documentTaskType: "",
       voyageModelId: null,
-      embeddingPrefixVersion: EMBEDDING_PREFIX_VERSION,
+      embeddingPrefixVersion: EMBEDDING_INPUT_FORMAT_VERSION,
       chunkerVersion: "chunker-v1",
       graphExtractorVersion: "graph-v1",
     };
@@ -122,6 +128,10 @@ describe("config-version", () => {
     expect(hashConfigVersion(base)).not.toBe(hashConfigVersion({
       ...base,
       embeddingDimension: 3072,
+    }));
+    expect(hashConfigVersion(base)).not.toBe(hashConfigVersion({
+      ...base,
+      embeddingMaxTokens: 512,
     }));
     expect(hashConfigVersion(base)).not.toBe(hashConfigVersion({
       ...base,
@@ -157,11 +167,12 @@ describe("config-version", () => {
     const base: ConfigVersion = {
       embeddingModelId: "text-embedding-3-small",
       embeddingDimension: 1536,
+      embeddingMaxTokens: 8191,
       embeddingProvider: "openai",
       endpointBaseUrl: "https://api.openai.com/v1",
       documentTaskType: "",
       voyageModelId: null,
-      embeddingPrefixVersion: EMBEDDING_PREFIX_VERSION,
+      embeddingPrefixVersion: EMBEDDING_INPUT_FORMAT_VERSION,
       chunkerVersion: "chunker-v1",
       graphExtractorVersion: "graph-v1",
     };
@@ -212,6 +223,23 @@ describe("config-version", () => {
     expect(hashEmbedConfig(taskAwareProvider)).not.toBe(hashEmbedConfig(defaultTaskProvider));
   });
 
+  it("hashEmbedConfig changes when the active max token budget changes", () => {
+    const providerA = createCustomProviderInfo({
+      baseUrl: "http://localhost:11434/v1",
+      model: "nomic-embed-text",
+      dimensions: 768,
+      maxTokens: 8192,
+    });
+    const providerB = createCustomProviderInfo({
+      baseUrl: "http://localhost:11434/v1",
+      model: "nomic-embed-text",
+      dimensions: 768,
+      maxTokens: 512,
+    });
+
+    expect(hashEmbedConfig(providerA)).not.toBe(hashEmbedConfig(providerB));
+  });
+
   it("hashEmbedConfig changes when voyage model identity changes", () => {
     const providerInfo = createCustomProviderInfo({
       baseUrl: "http://localhost:11434/v1",
@@ -257,11 +285,12 @@ describe("config-version", () => {
     expect(configVersion).toEqual({
       embeddingModelId: "nomic-embed-text",
       embeddingDimension: 768,
+      embeddingMaxTokens: 8192,
       embeddingProvider: "custom",
       endpointBaseUrl: "http://localhost:11434/v1",
       documentTaskType: "",
       voyageModelId: null,
-      embeddingPrefixVersion: EMBEDDING_PREFIX_VERSION,
+      embeddingPrefixVersion: EMBEDDING_INPUT_FORMAT_VERSION,
       chunkerVersion: getChunkerVersion(),
       graphExtractorVersion: getGraphExtractorVersion(),
     });
@@ -274,9 +303,10 @@ describe("config-version", () => {
       dimensions: 768,
     });
 
-    const configVersion = await getCurrentConfigVersion(providerInfo, "voyage-code-2");
+    const configVersion = await getCurrentConfigVersion(providerInfo, "voyage-code-2", 16_000);
 
     expect(configVersion.voyageModelId).toBe("voyage-code-2");
-    expect(configVersion.embeddingPrefixVersion).toBe(EMBEDDING_PREFIX_VERSION);
+    expect(configVersion.embeddingMaxTokens).toBe(8_192);
+    expect(configVersion.embeddingPrefixVersion).toBe(EMBEDDING_INPUT_FORMAT_VERSION);
   });
 });

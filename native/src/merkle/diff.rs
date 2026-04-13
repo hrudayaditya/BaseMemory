@@ -18,14 +18,7 @@ pub fn diff_snapshots(old: &MerkleSnapshot, new: &MerkleSnapshot) -> MerkleResul
     let old_children = build_child_map(&old.nodes);
     let new_children = build_child_map(&new.nodes);
     let mut diff = MerkleDiff::default();
-    diff_node(
-        "",
-        old,
-        &old_children,
-        new,
-        &new_children,
-        &mut diff,
-    )?;
+    diff_node("", old, &old_children, new, &new_children, &mut diff)?;
     diff.sort_and_dedup();
     Ok(diff)
 }
@@ -66,7 +59,12 @@ pub fn diff_from_events(
                 affected_directories.extend(ancestors_for_file(&file.path));
                 next_snapshot.nodes.insert(
                     file.path.clone(),
-                    MerkleNode::file(file.path.clone(), parent_path(&file.path), file.hash, file.size_bytes),
+                    MerkleNode::file(
+                        file.path.clone(),
+                        parent_path(&file.path),
+                        file.hash,
+                        file.size_bytes,
+                    ),
                 );
             }
             None => {
@@ -180,11 +178,7 @@ fn prune_empty_directories(
     affected_directories: &BTreeSet<String>,
 ) {
     let mut directories: Vec<String> = affected_directories.iter().cloned().collect();
-    directories.sort_by(|left, right| {
-        depth(right)
-            .cmp(&depth(left))
-            .then_with(|| left.cmp(right))
-    });
+    directories.sort_by(|left, right| depth(right).cmp(&depth(left)).then_with(|| left.cmp(right)));
 
     let mut changed = true;
     while changed {
@@ -221,11 +215,7 @@ fn recompute_affected_hashes(
     affected_directories: &BTreeSet<String>,
 ) -> MerkleResult<()> {
     let mut directories: Vec<String> = affected_directories.iter().cloned().collect();
-    directories.sort_by(|left, right| {
-        depth(right)
-            .cmp(&depth(left))
-            .then_with(|| left.cmp(right))
-    });
+    directories.sort_by(|left, right| depth(right).cmp(&depth(left)).then_with(|| left.cmp(right)));
 
     let child_map = build_child_map(nodes);
     for directory in directories {
@@ -287,11 +277,7 @@ mod tests {
                 }
             })
             .collect();
-        recompute_affected_hashes(
-            &mut snapshot.nodes,
-            &affected_directories,
-        )
-        .unwrap();
+        recompute_affected_hashes(&mut snapshot.nodes, &affected_directories).unwrap();
         snapshot.root_hash = snapshot.nodes.get("").unwrap().hash.clone();
         snapshot
     }

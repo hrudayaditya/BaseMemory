@@ -2,9 +2,9 @@ use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use ignore::{
-    Match, WalkBuilder,
     gitignore::{Gitignore, GitignoreBuilder},
     overrides::{Override, OverrideBuilder},
+    Match, WalkBuilder,
 };
 
 use super::types::{FileHash, IgnoreRules, MerkleError, MerkleResult};
@@ -49,7 +49,10 @@ impl PatternMatcher {
             return false;
         }
         if direct_exclude_match.is_none()
-            && self.exclude.matched_path_or_any_parents(path, false).is_ignore()
+            && self
+                .exclude
+                .matched_path_or_any_parents(path, false)
+                .is_ignore()
         {
             return false;
         }
@@ -195,10 +198,11 @@ pub fn scan_repo(repo_root: &Path, rules: &IgnoreRules) -> MerkleResult<Vec<File
             continue;
         }
 
-        let hash =
-            crate::hasher::xxhash_file(entry.path().to_string_lossy().as_ref()).map_err(|error| {
+        let hash = crate::hasher::xxhash_file(entry.path().to_string_lossy().as_ref()).map_err(
+            |error| {
                 MerkleError::InvalidSnapshot(format!("failed to hash {}: {error}", normalized_path))
-            })?;
+            },
+        )?;
 
         files.push(FileHash {
             path: normalized_path,
@@ -258,10 +262,9 @@ pub fn scan_single_path(
             return Ok(None);
         }
 
-        let hash =
-            crate::hasher::xxhash_file(entry.path().to_string_lossy().as_ref()).map_err(|error| {
-                MerkleError::InvalidSnapshot(format!("failed to hash {}: {error}", entry_path))
-            })?;
+        let hash = crate::hasher::xxhash_file(entry.path().to_string_lossy().as_ref()).map_err(
+            |error| MerkleError::InvalidSnapshot(format!("failed to hash {}: {error}", entry_path)),
+        )?;
 
         return Ok(Some(FileHash {
             path: entry_path,
@@ -361,7 +364,8 @@ mod tests {
 
     #[test]
     fn include_matcher_handles_double_star_patterns_from_repo_root() {
-        let matcher = build_include_matcher(Path::new("/repo"), &[String::from("**/*.ts")]).unwrap();
+        let matcher =
+            build_include_matcher(Path::new("/repo"), &[String::from("**/*.ts")]).unwrap();
         assert!(matches!(
             matcher.matched(Path::new("index.ts"), false),
             Match::Whitelist(_)

@@ -17,6 +17,7 @@ import { Logger, initializeLogger } from "../utils/logger.js";
 import { IncrementalIndexOrchestrator } from "./incremental-index-orchestrator.js";
 import {
   expandGraphContext,
+  type GraphExpansionDirection,
   type GraphExpansionEntry,
   type GraphExpansionMetadata,
   type GraphExpansionSeed,
@@ -134,6 +135,7 @@ function mapSemanticChunkType(symbolKind: string | undefined): ChunkMetadata["ch
     case "Module":
       return "module";
     case "Constant":
+      return "constant";
     default:
       return "other";
   }
@@ -169,6 +171,9 @@ export interface SearchResult {
   chunkKind?: ChunkKind;
   symbolKind?: ChunkSymbolKind;
   name?: string;
+  relation?: "caller" | "callee";
+  depth?: number;
+  viaSymbol?: string;
 }
 
 export interface GraphContextResult extends SearchResult {
@@ -181,6 +186,7 @@ export interface SearchResponse {
   primaryResults: SearchResult[];
   expandedContext: GraphContextResult[];
   taskType: SearchTaskType;
+  graphDirection: GraphExpansionDirection;
   retrieval: {
     voyageLaneConfigured: boolean;
     voyageLaneUsed: boolean;
@@ -207,6 +213,7 @@ export interface SearchOptions {
   definitionIntent?: boolean;
   taskType?: SearchTaskType;
   graphDepth?: number;
+  graphDirection?: GraphExpansionDirection;
 }
 
 export interface HealthCheckResult {
@@ -503,12 +510,18 @@ function splitNameTokens(name: string): Set<string> {
     return cache;
   }
 
-  const tokens = new Set(
-    lowered
-      .replace(/[^\w\s]/g, " ")
-      .split(/\s+/)
-      .filter((token) => token.length > 1)
-  );
+  const splitTokens = name
+    .replace(/[_./\\-]+/g, " ")
+    .replace(/[^\w\s]/g, " ")
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((token) => token.length > 1 && !STOPWORDS.has(token));
+
+  const fullToken = lowered.replace(/[^\w]/g, "");
+  const tokens = new Set([
+    ...splitTokens,
+    ...(fullToken.length > 1 && !STOPWORDS.has(fullToken) ? [fullToken] : []),
+  ]);
   setBoundedCache(rankingNameTokenCache, lowered, tokens);
   return tokens;
 }
@@ -529,6 +542,7 @@ function chunkTypeBoost(chunkType: string): number {
     case "impl":
     case "trait":
     case "module":
+    case "constant":
       return 0.1;
     default:
       return 0;
@@ -719,9 +733,149 @@ function containsTestDebugSignals(query: string): boolean {
   return false;
 }
 
+export function inferRelationshipGraphDirection(query: string): GraphExpansionDirection | null {
+  const lower = query.toLowerCase().trim();
+
+  const calleePatterns = [
+    /\bwhat\s+does\s+.+\s+call\b/,
+    /\bwhat\s+does\s+.+\s+depend\s+on\b/,
+    /\bwhat\s+does\s+.+\s+import\b/,
+    /\bcallees?\s+of\b/,
+  ];
+  if (calleePatterns.some((pattern) => pattern.test(lower))) {
+    return "callee";
+  }
+
+  const callerPatterns = [
+    /\b(?:what|who)\s+calls?\b/,
+    /\bcallers?\s+of\b/,
+    /\b(?:what|who)\s+uses?\b/,
+    /\bwhere\s+is\s+.+\s+used\b/,
+    /\bwhere\s+is\s+.+\s+called\b/,
+    /\bwhat\s+depends\s+on\b/,
+    /\bwhat\s+imports?\b/,
+    /\busages?\s+of\b/,
+    /\breferences?\s+to\b/,
+    /\bcall\s+sites?\b/,
+  ];
+  if (callerPatterns.some((pattern) => pattern.test(lower))) {
+    return "caller";
+  }
+
+  return null;
+}
+
+function cleanRelationshipTarget(rawTarget: string): string | null {
+  const trimmed = rawTarget
+    .trim()
+    .replace(/^[`"'([{<\s]+/, "")
+    .replace(/[`"')\]}>?,.;:!\s]+$/g, "");
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function inferRelationshipTarget(query: string): string | null {
+  const trimmed = query.trim();
+  const patterns = [
+    /\b(?:what|who)\s+calls?\s+(.+)$/i,
+    /\bcallers?\s+of\s+(.+)$/i,
+    /\b(?:what|who)\s+uses?\s+(.+)$/i,
+    /\bwhere\s+is\s+(.+?)\s+used$/i,
+    /\bwhere\s+is\s+(.+?)\s+called$/i,
+    /\bwhat\s+depends\s+on\s+(.+)$/i,
+    /\bwhat\s+imports?\s+(.+)$/i,
+    /\busages?\s+of\s+(.+)$/i,
+    /\breferences?\s+to\s+(.+)$/i,
+    /\bcall\s+sites?\s+(?:of|for)\s+(.+)$/i,
+    /\bwhat\s+does\s+(.+?)\s+call$/i,
+    /\bwhat\s+does\s+(.+?)\s+depend\s+on$/i,
+    /\bwhat\s+does\s+(.+?)\s+import$/i,
+    /\bcallees?\s+of\s+(.+)$/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = trimmed.match(pattern);
+    if (!match) {
+      continue;
+    }
+
+    const cleaned = cleanRelationshipTarget(match[1] ?? "");
+    if (cleaned) {
+      return cleaned;
+    }
+  }
+
+  return null;
+}
+
+function selectGraphSeedsForQuery(
+  candidates: RankedCandidate[],
+  direction: GraphExpansionDirection,
+  query: string
+): RankedCandidate[] {
+  if (direction === "both") {
+    return candidates;
+  }
+
+  const relationshipTarget = inferRelationshipTarget(query);
+  if (relationshipTarget) {
+    const normalizedTarget = relationshipTarget.toLowerCase();
+    const exactNameMatches = candidates.filter((candidate) => candidate.metadata.name?.toLowerCase() === normalizedTarget);
+    if (exactNameMatches.length > 0) {
+      return exactNameMatches;
+    }
+  }
+
+  return candidates.slice(0, 1);
+}
+
+function isCoarseFileChunk(candidate: RankedCandidate): boolean {
+  return (candidate.chunkKind ?? candidate.metadata.chunkKind) === "File";
+}
+
+function hasIdentifierAlignedSymbolAnswer(candidate: RankedCandidate, identifierHints: string[]): boolean {
+  if (isCoarseFileChunk(candidate)) {
+    return false;
+  }
+
+  const nameLower = (candidate.metadata.name ?? "").toLowerCase();
+  const pathLower = candidate.metadata.filePath.toLowerCase();
+
+  return identifierHints.some((hint) => {
+    const variants = normalizeIdentifierVariants(hint);
+    return variants.some((variant) =>
+      nameLower === variant ||
+      nameLower.includes(variant) ||
+      pathLower.includes(variant)
+    );
+  });
+}
+
+function suppressCoarseFileChunksWhenSymbolMatchesExist(
+  query: string,
+  candidates: RankedCandidate[]
+): RankedCandidate[] {
+  const identifierHints = extractIdentifierHints(query);
+  if (identifierHints.length === 0) {
+    return candidates;
+  }
+
+  const hasFineSymbolMatch = candidates.some((candidate) =>
+    hasIdentifierAlignedSymbolAnswer(candidate, identifierHints)
+  );
+  if (!hasFineSymbolMatch) {
+    return candidates;
+  }
+
+  return candidates.filter((candidate) => !isCoarseFileChunk(candidate));
+}
+
 export function inferTaskType(query: string, explicit?: SearchTaskType): SearchTaskType {
   if (explicit) {
     return explicit;
+  }
+
+  if (inferRelationshipGraphDirection(query)) {
+    return "definition";
   }
 
   if (containsTestDebugSignals(query)) {
@@ -799,6 +953,7 @@ function isImplementationChunkType(chunkType: string): boolean {
     "type",
     "enum",
     "module",
+    "constant",
   ].includes(chunkType);
 }
 
@@ -1754,6 +1909,7 @@ export class Indexer {
   private indexingLockPath: string = "";
   private indexingQueue: Promise<void> = Promise.resolve();
   private recoveredFromInterruptedIndexing = false;
+  private startupRetrievalRebuildPending = false;
   private orchestrator!: IncrementalIndexOrchestrator;
   private readonly searchReranker = new SearchReranker();
 
@@ -1784,8 +1940,8 @@ export class Indexer {
       getIndexPath: () => this.indexPath,
       getCurrentBranch: () => this.currentBranch,
       setCurrentBranch: (branch) => {
-        this.currentBranch = branch;
-        this.loadFileHashCache();
+        this.loadNativeBranchMembership(branch);
+        this.publishCurrentBranch(branch);
       },
       refreshBranchInfo: () => this.refreshBranchInfo(),
       ensureInitialized: () => this.ensureInitialized(),
@@ -1808,6 +1964,10 @@ export class Indexer {
         this.clearCallEdgesForSymbolIfUnreferenced(database, symbolId),
       removeSymbolFromGraphIfUnreferenced: (database, symbolId) =>
         this.removeSymbolFromGraphIfUnreferenced(database, symbolId),
+      syncNativeBranchMembership: (branch, chunkIds) =>
+        this.syncNativeBranchMembership(branch, chunkIds),
+      applyNativeBranchMembershipDelta: (branch, added, removed) =>
+        this.applyNativeBranchMembershipDelta(branch, added, removed),
       getProviderRateLimits: (provider) => {
         const limits = this.getProviderRateLimits(provider);
         return {
@@ -1837,6 +1997,11 @@ export class Indexer {
       return path.join(homeDir, ".opencode", "global-index");
     }
     return path.join(this.projectRoot, ".opencode", "index");
+  }
+
+  private publishCurrentBranch(branch: string): void {
+    this.currentBranch = branch;
+    this.loadFileHashCache();
   }
 
   private storePathForModel(modelId: string): string {
@@ -1898,10 +2063,14 @@ export class Indexer {
     return store;
   }
 
-  private loadAllStores(): void {
-    for (const store of this.stores.values()) {
-      store.load();
+  private loadAllStores(): string[] {
+    const recoveredModelIds: string[] = [];
+    for (const [modelId, store] of this.stores.entries()) {
+      if (store.load()) {
+        recoveredModelIds.push(modelId);
+      }
     }
+    return recoveredModelIds;
   }
 
   private saveAllStores(): void {
@@ -1914,6 +2083,101 @@ export class Indexer {
     for (const store of this.stores.values()) {
       store.clear();
     }
+  }
+
+  private getActiveBranchKey(branch: string | null = this.currentBranch): string {
+    return branch && branch.trim().length > 0 ? branch : "default";
+  }
+
+  syncNativeBranchMembership(branch: string, chunkIds: string[]): void {
+    const normalizedBranch = this.getActiveBranchKey(branch);
+    for (const store of this.stores.values()) {
+      store.setBranchMembership(normalizedBranch, chunkIds);
+    }
+    this.invertedIndex?.setBranchMembership(normalizedBranch, chunkIds);
+  }
+
+  applyNativeBranchMembershipDelta(
+    branch: string,
+    addedChunkIds: string[],
+    removedChunkIds: string[]
+  ): void {
+    if (addedChunkIds.length === 0 && removedChunkIds.length === 0) {
+      return;
+    }
+
+    const normalizedBranch = this.getActiveBranchKey(branch);
+    for (const store of this.stores.values()) {
+      store.applyBranchDelta(normalizedBranch, addedChunkIds, removedChunkIds);
+    }
+    this.invertedIndex?.applyBranchDelta(normalizedBranch, addedChunkIds, removedChunkIds);
+  }
+
+  private loadNativeBranchMembership(branch: string): void {
+    if (!this.database) {
+      return;
+    }
+
+    const normalizedBranch = this.getActiveBranchKey(branch);
+    const chunkIds = this.database.getBranchChunkIds(normalizedBranch);
+    this.syncNativeBranchMembership(normalizedBranch, chunkIds);
+  }
+
+  private validateRetrievalStartupIntegrity(loadState: {
+    recoveredModelIds: string[];
+    bm25Recovered: boolean;
+  }): void {
+    if (!this.database) {
+      return;
+    }
+
+    const branch = this.currentBranch || "default";
+    const branchChunkCount = this.database.getBranchChunkIds(branch).length;
+    if (branchChunkCount < 1) {
+      return;
+    }
+
+    const mismatchedStores = Array.from(this.stores.entries())
+      .filter(([_modelId, store]) => store.count() === 0)
+      .map(([modelId, store]) => ({ modelId, count: store.count() }));
+    const bm25Count = this.invertedIndex?.getDocumentCount() ?? 0;
+    const bm25Mismatch = bm25Count === 0;
+
+    if (
+      loadState.recoveredModelIds.length === 0 &&
+      !loadState.bm25Recovered &&
+      mismatchedStores.length === 0 &&
+      !bm25Mismatch
+    ) {
+      return;
+    }
+
+    this.logger.warn(
+      "Retrieval startup integrity check failed: retrieval artifacts are empty or recovered while the database still has indexed chunks. A full rebuild is required before search results are reliable.",
+      {
+      branch,
+      branchChunkCount,
+      recoveredModelIds: loadState.recoveredModelIds,
+      bm25Recovered: loadState.bm25Recovered,
+      storeCounts: Array.from(this.stores.entries()).map(([modelId, store]) => ({
+        modelId,
+        count: store.count(),
+      })),
+      bm25Count,
+      }
+    );
+    this.startupRetrievalRebuildPending = true;
+    this.orchestrator.requestColdStart();
+  }
+
+  private async maybeResetAfterStartupRetrievalMismatch(): Promise<boolean> {
+    if (!this.startupRetrievalRebuildPending) {
+      return false;
+    }
+
+    this.startupRetrievalRebuildPending = false;
+    await this.clearIndexInternal();
+    return true;
   }
 
   private totalVectorCount(): number {
@@ -2235,12 +2499,13 @@ export class Indexer {
       });
     }
 
-    this.loadAllStores();
+    const recoveredModelIds = this.loadAllStores();
 
     const invertedIndexPath = path.join(this.indexPath, "inverted-index.json");
     this.invertedIndex = new InvertedIndex(invertedIndexPath);
+    let bm25Recovered = false;
     try {
-      this.invertedIndex.load();
+      bm25Recovered = this.invertedIndex.load();
     } catch {
       if (existsSync(invertedIndexPath)) {
         await fsPromises.unlink(invertedIndexPath);
@@ -2283,8 +2548,15 @@ export class Indexer {
       await this.recoverFromInterruptedIndexing(existingLock);
     }
 
+    this.validateRetrievalStartupIntegrity({
+      recoveredModelIds,
+      bm25Recovered,
+    });
+    this.loadNativeBranchMembership(this.currentBranch);
+
     if (dbIsNew && primaryStore.count() > 0) {
       this.migrateFromLegacyIndex();
+      this.loadNativeBranchMembership(this.currentBranch);
     }
 
     this.indexCompatibility = this.validateIndexCompatibility(this.configuredProviderInfo);
@@ -2555,7 +2827,7 @@ export class Indexer {
         );
 
         const chunks = semanticChunks
-          .filter((chunk) => chunk.granularity === "Fine")
+          .filter((chunk) => chunk.granularity === "Fine" || chunk.chunkKind === "File")
           .map((chunk) => ({
             content: chunk.text,
             startLine: chunk.startLine,
@@ -2598,7 +2870,11 @@ export class Indexer {
     for (const parsed of parsedFiles) {
       const fileSymbols: Array<SymbolData & { startByte: number; endByte: number }> = [];
       for (const chunk of parsed.chunks) {
-        if (!chunk.name || !CALL_GRAPH_SYMBOL_CHUNK_TYPES.has(chunk.chunkType)) {
+        if (
+          chunk.chunkKind === "File" ||
+          !chunk.name ||
+          !CALL_GRAPH_SYMBOL_CHUNK_TYPES.has(chunk.chunkType)
+        ) {
           continue;
         }
 
@@ -2825,6 +3101,11 @@ export class Indexer {
   private async handleFileChangesInternal(
     changes: Array<{ type: "add" | "change" | "unlink"; path: string }>
   ): Promise<void> {
+    if (await this.maybeResetAfterStartupRetrievalMismatch()) {
+      await this.orchestrator.coldStart();
+      return;
+    }
+
     try {
       const { database } = await this.ensureInitialized();
       this.refreshBranchInfo();
@@ -2885,6 +3166,7 @@ export class Indexer {
   }
 
   private async handleBranchChangeInternal(_oldBranch: string | null, newBranch: string): Promise<void> {
+    await this.maybeResetAfterStartupRetrievalMismatch();
     await this.orchestrator.handleBranchChange(_oldBranch, newBranch);
   }
 
@@ -2893,9 +3175,12 @@ export class Indexer {
     nextSnapshot?: string,
     baseSnapshot: string | null = null
   ): Promise<IndexStats> {
-    return this.runSerializedIndexOperation(() =>
-      this.orchestrator.hotUpdate(diff, nextSnapshot, baseSnapshot)
-    );
+    return this.runSerializedIndexOperation(async () => {
+      if (await this.maybeResetAfterStartupRetrievalMismatch()) {
+        return this.orchestrator.coldStart();
+      }
+      return this.orchestrator.hotUpdate(diff, nextSnapshot, baseSnapshot);
+    });
   }
 
   async estimateCost(): Promise<CostEstimate> {
@@ -2912,7 +3197,10 @@ export class Indexer {
   }
 
   async index(onProgress?: ProgressCallback): Promise<IndexStats> {
-    return this.runSerializedIndexOperation(() => this.orchestrator.coldStart(onProgress));
+    return this.runSerializedIndexOperation(async () => {
+      await this.maybeResetAfterStartupRetrievalMismatch();
+      return this.orchestrator.coldStart(onProgress);
+    });
   }
 
   private getQueryEmbeddingCacheKey(modelId: string, query: string): string {
@@ -3274,7 +3562,35 @@ export class Indexer {
     options?: SearchOptions
   ): Promise<SearchResult[]> {
     const result = await this.searchDetailed(query, limit, options);
-    return result.primaryResults;
+    if (result.graphDirection === "both") {
+      return result.primaryResults;
+    }
+
+    const merged: SearchResult[] = result.primaryResults.map((entry) => ({ ...entry }));
+    const indexByIdentity = new Map(
+      merged.map((entry, index) => [
+        `${entry.filePath}:${entry.startLine}:${entry.endLine}:${entry.name ?? ""}:${entry.chunkType}`,
+        index,
+      ])
+    );
+
+    for (const entry of result.expandedContext) {
+      const identity = `${entry.filePath}:${entry.startLine}:${entry.endLine}:${entry.name ?? ""}:${entry.chunkType}`;
+      const existingIndex = indexByIdentity.get(identity);
+      if (existingIndex !== undefined) {
+        merged[existingIndex] = {
+          ...merged[existingIndex],
+          relation: entry.relation,
+          depth: entry.depth,
+          viaSymbol: entry.viaSymbol,
+        };
+        continue;
+      }
+      indexByIdentity.set(identity, merged.length);
+      merged.push(entry);
+    }
+
+    return merged;
   }
 
   async searchDetailed(
@@ -3282,6 +3598,7 @@ export class Indexer {
     limit?: number,
     options?: SearchOptions
   ): Promise<SearchResponse> {
+    const branch = this.currentBranch;
     const {
       store,
       provider,
@@ -3298,6 +3615,7 @@ export class Indexer {
         primaryResults: [],
         expandedContext: [],
         taskType,
+        graphDirection: options?.graphDirection ?? "both",
         retrieval: {
           voyageLaneConfigured,
           voyageLaneUsed: false,
@@ -3325,6 +3643,7 @@ export class Indexer {
         primaryResults: [],
         expandedContext: [],
         taskType,
+        graphDirection: options?.graphDirection ?? "both",
         retrieval: {
           voyageLaneConfigured,
           voyageLaneUsed: false,
@@ -3359,23 +3678,22 @@ export class Indexer {
           ? 0
           : recipe.finalRerankTopN;
     const prefilterStartTime = performance.now();
-    const allowedChunkIds = this.buildAllowedChunkIds(store, database, {
-      filterByBranch,
+    const metadataAllowedChunkIds = this.buildAllowedChunkIds(store, {
       fileType: options?.fileType,
       directory: options?.directory,
       chunkType: options?.chunkType,
     });
     const prefilterMs = performance.now() - prefilterStartTime;
 
-    if (allowedChunkIds && allowedChunkIds.size === 0) {
+    if (metadataAllowedChunkIds && metadataAllowedChunkIds.size === 0) {
       this.logger.search("debug", "Search has no candidates after hard filtering", {
         query,
-        branch: filterByBranch ? this.currentBranch : undefined,
       });
       return {
         primaryResults: [],
         expandedContext: [],
         taskType,
+        graphDirection: options?.graphDirection ?? "both",
         retrieval: {
           voyageLaneConfigured,
           voyageLaneUsed: false,
@@ -3387,8 +3705,11 @@ export class Indexer {
       };
     }
 
-    const allowedChunkIdList = allowedChunkIds ? Array.from(allowedChunkIds) : null;
+    const branchFilter = filterByBranch ? this.getActiveBranchKey(branch) : null;
     const retrievalLimit = resolveRetrievalCandidateLimit(maxResults);
+    const laneRetrievalLimit = metadataAllowedChunkIds
+      ? Math.max(retrievalLimit * 5, 100)
+      : retrievalLimit;
 
     const embeddingStartTime = performance.now();
     const embeddingQuery = stripFilePathHint(query);
@@ -3461,9 +3782,9 @@ export class Indexer {
           return { results: [] as RankedCandidate[], ms: performance.now() - started };
         }
 
-        const results = allowedChunkIdList
-          ? store.searchFiltered(arcticQueryVector, allowedChunkIdList, retrievalLimit)
-          : store.search(arcticQueryVector, retrievalLimit);
+        const results = branchFilter
+          ? store.searchOnBranch(arcticQueryVector, branchFilter, laneRetrievalLimit)
+          : store.search(arcticQueryVector, laneRetrievalLimit);
         return { results, ms: performance.now() - started };
       }).catch((error) => {
         this.logger.search("warn", "Arctic dense search failed; continuing without primary dense lane", {
@@ -3479,9 +3800,9 @@ export class Indexer {
           return { results: [] as RankedCandidate[], ms: performance.now() - started };
         }
 
-        const results = allowedChunkIdList
-          ? voyageStore.searchFiltered(rawVoyageQueryVector, allowedChunkIdList, retrievalLimit)
-          : voyageStore.search(rawVoyageQueryVector, retrievalLimit);
+        const results = branchFilter
+          ? voyageStore.searchOnBranch(rawVoyageQueryVector, branchFilter, laneRetrievalLimit)
+          : voyageStore.search(rawVoyageQueryVector, laneRetrievalLimit);
         return { results, ms: performance.now() - started };
       }).catch((error) => {
         this.logger.search("warn", "Voyage dense search failed; continuing without Voyage lane", {
@@ -3493,7 +3814,7 @@ export class Indexer {
       }),
       Promise.resolve().then(async () => {
         const started = performance.now();
-        const results = await this.keywordSearch(query, retrievalLimit, allowedChunkIdList);
+        const results = await this.keywordSearch(query, laneRetrievalLimit, branchFilter);
         return { results, ms: performance.now() - started };
       }).catch((error) => {
         this.logger.search("warn", "BM25 search failed; continuing with dense lanes only", {
@@ -3504,9 +3825,18 @@ export class Indexer {
       }),
     ]);
     const vectorMs = performance.now() - vectorStartTime;
-    const semanticCandidates = semanticLane.results;
-    const voyageCandidates = voyageLane.results;
-    const keywordCandidates = keywordLane.results;
+    const semanticCandidates = this.filterCandidatesByChunkIds(
+      semanticLane.results,
+      metadataAllowedChunkIds
+    );
+    const voyageCandidates = this.filterCandidatesByChunkIds(
+      voyageLane.results,
+      metadataAllowedChunkIds
+    );
+    const keywordCandidates = this.filterCandidatesByChunkIds(
+      keywordLane.results,
+      metadataAllowedChunkIds
+    );
     const keywordMs = keywordLane.ms;
 
     const fusionStartTime = performance.now();
@@ -3531,7 +3861,7 @@ export class Indexer {
           combined,
           [semanticCandidates, voyageCandidates, keywordCandidates],
           database,
-          allowedChunkIds,
+          metadataAllowedChunkIds,
           recipe.pathPreference,
           identifierBoost
         )
@@ -3559,12 +3889,12 @@ export class Indexer {
 
     const symbolLane = recipe.enableSymbolDefinitionLane
       ? buildSymbolDefinitionLane(
-          query,
-          database,
-          allowedChunkIds,
-          maxResults,
-          union,
-          sourceIntent
+        query,
+        database,
+        metadataAllowedChunkIds,
+        maxResults,
+        union,
+        sourceIntent
         )
       : [];
 
@@ -3581,13 +3911,12 @@ export class Indexer {
     );
 
     const candidatePoolLimit = Math.max(maxResults, finalRerankTopN);
-    const filtered = ((recipe.implementationOnlyOnCodeHints && sourceIntent && hasCodeHints && implementationOnly.length > 0)
+    const filteredBase = ((recipe.implementationOnlyOnCodeHints && sourceIntent && hasCodeHints && implementationOnly.length > 0)
       ? implementationOnly
       : baseFiltered
     ).slice(0, candidatePoolLimit);
-
-    const chunkKindMap = await this.batchFetchChunkKinds(filtered.map((candidate) => candidate.id));
-    for (const candidate of filtered) {
+    const chunkKindMap = await this.batchFetchChunkKinds(filteredBase.map((candidate) => candidate.id));
+    for (const candidate of filteredBase) {
       const enrichment = chunkKindMap.get(candidate.id);
       if (!enrichment) {
         continue;
@@ -3595,6 +3924,7 @@ export class Indexer {
       candidate.chunkKind = enrichment.chunkKind;
       candidate.symbolKind = enrichment.symbolKind;
     }
+    const filtered = suppressCoarseFileChunksWhenSymbolMatchesExist(query, filteredBase);
 
     const fileContentCache = new Map<string, string | null>();
     const rerankStartTime = performance.now();
@@ -3635,16 +3965,19 @@ export class Indexer {
     const contextLines = options?.contextLines ?? this.config.search.contextLines;
     const visiblePrimaryCandidates = reranked.ordered.slice(0, maxResults);
     let expanded: GraphExpansionEntry[] = [];
+    const graphDirection = options?.graphDirection ?? inferRelationshipGraphDirection(query) ?? "both";
     const graphDepth = Math.max(0, Math.min(2, options?.graphDepth ?? recipe.graphDepth ?? 0));
     if (graphDepth > 0) {
-      const graphSeeds: GraphExpansionSeed[] = visiblePrimaryCandidates.map((candidate) => ({
+      const graphSeedCandidates = selectGraphSeedsForQuery(visiblePrimaryCandidates, graphDirection, query);
+      const graphSeeds: GraphExpansionSeed[] = graphSeedCandidates.map((candidate) => ({
         id: candidate.id,
         metadata: candidate.metadata,
       }));
       expanded = expandGraphContext(database, graphSeeds, {
-        branch: this.currentBranch,
+        branch,
         depth: graphDepth,
-        allowedChunkIds,
+        direction: graphDirection,
+        allowedChunkIds: metadataAllowedChunkIds,
       });
     }
     const storedChunkTexts = metadataOnly
@@ -3674,6 +4007,7 @@ export class Indexer {
       primaryResults,
       expandedContext,
       taskType,
+      graphDirection,
       retrieval: {
         voyageLaneConfigured,
         voyageLaneUsed: voyageLaneAvailable,
@@ -3688,11 +4022,11 @@ export class Indexer {
   private async keywordSearch(
     query: string,
     limit: number,
-    allowedChunkIds?: string[] | null
+    branch?: string | null
   ): Promise<Array<{ id: string; score: number; metadata: ChunkMetadata }>> {
     const { store, invertedIndex } = await this.ensureInitialized();
-    const scores = allowedChunkIds
-      ? invertedIndex.searchFiltered(query, allowedChunkIds, limit)
+    const scores = branch
+      ? invertedIndex.searchOnBranch(query, branch, limit)
       : invertedIndex.search(query, limit);
 
     if (scores.size === 0) {
@@ -3742,6 +4076,7 @@ export class Indexer {
 
   private async clearIndexInternal(): Promise<void> {
     const { invertedIndex, database } = await this.ensureInitialized();
+    this.startupRetrievalRebuildPending = false;
 
     await this.runWithCrashMarker(async () => {
       this.clearAllStores();
@@ -3835,6 +4170,7 @@ export class Indexer {
       if (removedFilePaths.length > 0) {
         database.clearBranch(this.currentBranch);
         database.addChunksToBranchBatch(this.currentBranch, Array.from(currentChunkIds));
+        this.syncNativeBranchMembership(this.currentBranch, Array.from(currentChunkIds));
         database.clearBranchSymbols(this.currentBranch);
         database.addSymbolsToBranchBatch(this.currentBranch, Array.from(allSymbolIds));
         this.commitFileHashChanges(new Map<string, string>(), removedFilePaths);
@@ -3923,7 +4259,7 @@ export class Indexer {
       filterByBranch?: boolean;
     }
   ): Promise<SearchResult[]> {
-    const { store, provider, database } = await this.ensureInitialized();
+    const { store, provider } = await this.ensureInitialized();
     
     const compatibility = this.checkCompatibility();
     if (!compatibility.compatible) {
@@ -3942,8 +4278,7 @@ export class Indexer {
 
     const filterByBranch = options?.filterByBranch ?? true;
     const prefilterStartTime = performance.now();
-    const allowedChunkIds = this.buildAllowedChunkIds(store, database, {
-      filterByBranch,
+    const metadataAllowedChunkIds = this.buildAllowedChunkIds(store, {
       fileType: options?.fileType,
       directory: options?.directory,
       chunkType: options?.chunkType,
@@ -3951,15 +4286,17 @@ export class Indexer {
     });
     const prefilterMs = performance.now() - prefilterStartTime;
 
-    if (allowedChunkIds && allowedChunkIds.size === 0) {
+    if (metadataAllowedChunkIds && metadataAllowedChunkIds.size === 0) {
       this.logger.search("debug", "Find similar has no candidates after hard filtering", {
-        branch: filterByBranch ? this.currentBranch : undefined,
       });
       return [];
     }
 
-    const allowedChunkIdList = allowedChunkIds ? Array.from(allowedChunkIds) : null;
+    const branchFilter = filterByBranch ? this.getActiveBranchKey() : null;
     const retrievalLimit = resolveRetrievalCandidateLimit(limit);
+    const laneRetrievalLimit = metadataAllowedChunkIds
+      ? Math.max(retrievalLimit * 5, 100)
+      : retrievalLimit;
 
     this.logger.search("debug", "Starting find similar", {
       codeLength: code.length,
@@ -3974,9 +4311,12 @@ export class Indexer {
 
     // TODO: Component 4 — add a Voyage retrieval lane for code-heavy similarity search.
     const vectorStartTime = performance.now();
-    const semanticCandidates = allowedChunkIdList
-      ? store.searchFiltered(embedding, allowedChunkIdList, retrievalLimit)
-      : store.search(embedding, retrievalLimit);
+    const semanticCandidates = this.filterCandidatesByChunkIds(
+      branchFilter
+        ? store.searchOnBranch(embedding, branchFilter, laneRetrievalLimit)
+        : store.search(embedding, laneRetrievalLimit),
+      metadataAllowedChunkIds
+    );
     const vectorMs = performance.now() - vectorStartTime;
 
     const rerankTopN = this.config.search.rerankTopN;
@@ -4041,42 +4381,17 @@ export class Indexer {
 
   private buildAllowedChunkIds(
     store: VectorStore,
-    database: Database,
-    options: HardRetrievalFilters & { filterByBranch?: boolean }
+    options: HardRetrievalFilters
   ): Set<string> | null {
-    const filterByBranch = options.filterByBranch ?? true;
-    const applyBranchFilter = filterByBranch && this.currentBranch.trim().length > 0;
     const hasMetadataFilters = Boolean(
       options.fileType || options.directory || options.chunkType || options.excludeFile
     );
 
-    if (!applyBranchFilter && !hasMetadataFilters) {
+    if (!hasMetadataFilters) {
       return null;
     }
 
-    const branchChunkIds = applyBranchFilter
-      ? new Set(database.getBranchChunkIds(this.currentBranch))
-      : null;
-
-    if (applyBranchFilter && branchChunkIds && branchChunkIds.size === 0) {
-      return new Set<string>();
-    }
-
-    if (!hasMetadataFilters) {
-      return branchChunkIds ?? new Set<string>();
-    }
-
     const allowedChunkIds = new Set<string>();
-
-    if (branchChunkIds) {
-      const metadataMap = store.getMetadataBatch(Array.from(branchChunkIds));
-      for (const [chunkId, metadata] of metadataMap) {
-        if (matchesHardRetrievalFilters(metadata, options)) {
-          allowedChunkIds.add(chunkId);
-        }
-      }
-      return allowedChunkIds;
-    }
 
     for (const { key, metadata } of store.getAllMetadata()) {
       if (matchesHardRetrievalFilters(metadata, options)) {
@@ -4085,6 +4400,17 @@ export class Indexer {
     }
 
     return allowedChunkIds;
+  }
+
+  private filterCandidatesByChunkIds<T extends { id: string }>(
+    candidates: T[],
+    allowedChunkIds: Set<string> | null
+  ): T[] {
+    if (!allowedChunkIds) {
+      return candidates;
+    }
+
+    return candidates.filter((candidate) => allowedChunkIds.has(candidate.id));
   }
 
   async getCallers(targetName: string): Promise<CallEdgeData[]> {

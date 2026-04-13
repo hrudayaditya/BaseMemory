@@ -1,10 +1,10 @@
 {
-  "generatedAt": "2026-04-09T05:10:09.594Z",
-  "projectRoot": "/Users/aady/Desktop/OpenSourceContributions/BaseMemory",
-  "datasetPath": "/Users/aady/Desktop/OpenSourceContributions/BaseMemory/benchmarks/golden/small.json",
+  "generatedAt": "2026-04-13T20:42:59.047Z",
+  "projectRoot": "/Users/onlyaady/Desktop/BaseMemory",
+  "datasetPath": "/Users/onlyaady/Desktop/BaseMemory/benchmarks/golden/small.json",
   "datasetName": "small",
-  "datasetVersion": "1.1.1",
-  "queryCount": 10,
+  "datasetVersion": "1.2.0",
+  "queryCount": 40,
   "topK": 10,
   "searchConfig": {
     "fusionStrategy": "rrf",
@@ -18,41 +18,41 @@
     "effectiveGraphDepth": -1
   },
   "metrics": {
-    "hitAt1": 0.6,
-    "hitAt3": 0.7,
-    "hitAt5": 0.7,
-    "hitAt10": 0.7,
-    "combinedRecallAt10": 0.7,
-    "expansionHitRate": 0.6,
-    "mrrAt10": 0.6333333333333334,
-    "ndcgAt10": 0.65,
+    "hitAt1": 0.5,
+    "hitAt3": 0.725,
+    "hitAt5": 0.85,
+    "hitAt10": 0.875,
+    "combinedRecallAt10": 0.875,
+    "expansionHitRate": 0.05,
+    "mrrAt10": 0.6281547619047617,
+    "ndcgAt10": 0.6757237410555551,
     "latencyMs": {
-      "p50": 395.6371459999998,
-      "p95": 878.0273268999996,
-      "p99": 1010.4099317800001
+      "p50": 1755.6558750000258,
+      "p95": 2557.8534336500015,
+      "p99": 2568.31941061999
     },
     "tokenEstimate": {
-      "queryTokens": 116,
-      "embeddingTokensUsed": 18056
+      "queryTokens": 556,
+      "embeddingTokensUsed": 1371005
     },
     "embedding": {
-      "callCount": 172,
+      "callCount": 444,
       "estimatedCostUsd": 0,
       "costPer1MTokensUsd": 0
     },
     "failureBuckets": {
-      "wrong-file": 1,
-      "wrong-symbol": 1,
-      "docs-tests-outranking-source": 0,
-      "no-relevant-hit-top-k": 3
+      "wrong-file": 7,
+      "wrong-symbol": 6,
+      "docs-tests-outranking-source": 5,
+      "no-relevant-hit-top-k": 2
     },
     "reranker": {
-      "appliedCount": 7,
+      "appliedCount": 27,
       "failureCount": 0,
       "backendUsage": {
-        "transformers-cross-encoder": 7
+        "transformers-cross-encoder": 27
       },
-      "lastMs": 553.284208
+      "lastMs": 0.0030409999890252948
     }
   }
 }

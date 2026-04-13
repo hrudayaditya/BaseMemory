@@ -1,5 +1,6 @@
 import type { ConfiguredProviderInfo } from "../embeddings/detector.js";
 import {
+  EMBEDDING_INPUT_FORMAT_VERSION,
   getChunkerVersion,
   getGraphExtractorVersion,
   hashContent,
@@ -8,6 +9,7 @@ import {
 export interface ConfigVersion {
   embeddingModelId: string;
   embeddingDimension: number;
+  embeddingMaxTokens: number;
   embeddingProvider: ConfiguredProviderInfo["provider"];
   endpointBaseUrl: string;
   documentTaskType: string;
@@ -20,14 +22,13 @@ export interface ConfigVersion {
 interface EmbedConfigIdentity {
   embeddingDimension: number;
   embeddingModelId: string;
+  embeddingMaxTokens: number;
   embeddingProvider: ConfiguredProviderInfo["provider"];
   endpointBaseUrl: string;
   documentTaskType: string;
   voyageModelId: string | null;
   embeddingPrefixVersion: number;
 }
-
-export const EMBEDDING_PREFIX_VERSION = 3;
 
 function hashSortedObject(value: Record<string, number | string | null>): string {
   return hashContent(JSON.stringify(value));
@@ -50,16 +51,24 @@ function getDocumentTaskType(configuredProviderInfo: ConfiguredProviderInfo): st
 
 function buildEmbedConfigIdentity(
   configuredProviderInfo: ConfiguredProviderInfo,
-  voyageModelId: string | null = null
+  voyageModelId: string | null = null,
+  voyageMaxTokens: number | null = null
 ): EmbedConfigIdentity {
+  const primaryMaxTokens = configuredProviderInfo.modelInfo.maxTokens;
+  const embeddingMaxTokens =
+    voyageModelId == null || voyageMaxTokens == null
+      ? primaryMaxTokens
+      : Math.min(primaryMaxTokens, voyageMaxTokens);
+
   return {
     embeddingDimension: configuredProviderInfo.modelInfo.dimensions,
     embeddingModelId: configuredProviderInfo.modelInfo.model,
+    embeddingMaxTokens,
     embeddingProvider: configuredProviderInfo.provider,
     endpointBaseUrl: normalizeBaseUrl(configuredProviderInfo.credentials.baseUrl),
     documentTaskType: getDocumentTaskType(configuredProviderInfo),
     voyageModelId,
-    embeddingPrefixVersion: EMBEDDING_PREFIX_VERSION,
+    embeddingPrefixVersion: EMBEDDING_INPUT_FORMAT_VERSION,
   };
 }
 
@@ -71,6 +80,7 @@ export function hashConfigVersion(cv: ConfigVersion): string {
   const sorted = {
     embeddingDimension: cv.embeddingDimension,
     embeddingModelId: cv.embeddingModelId,
+    embeddingMaxTokens: cv.embeddingMaxTokens,
     embeddingProvider: cv.embeddingProvider,
     endpointBaseUrl: cv.endpointBaseUrl,
     documentTaskType: cv.documentTaskType,
@@ -89,13 +99,15 @@ export function hashConfigVersion(cv: ConfigVersion): string {
  */
 export function hashEmbedConfig(
   configuredProviderInfo: ConfiguredProviderInfo,
-  voyageModelId: string | null = null
+  voyageModelId: string | null = null,
+  voyageMaxTokens: number | null = null
 ): string {
-  const identity = buildEmbedConfigIdentity(configuredProviderInfo, voyageModelId);
+  const identity = buildEmbedConfigIdentity(configuredProviderInfo, voyageModelId, voyageMaxTokens);
   const sorted = {
     documentTaskType: identity.documentTaskType,
     embeddingDimension: identity.embeddingDimension,
     embeddingModelId: identity.embeddingModelId,
+    embeddingMaxTokens: identity.embeddingMaxTokens,
     embeddingProvider: identity.embeddingProvider,
     endpointBaseUrl: identity.endpointBaseUrl,
     voyageModelId: identity.voyageModelId,
@@ -110,13 +122,19 @@ export function hashEmbedConfig(
  */
 export async function getCurrentConfigVersion(
   configuredProviderInfo: ConfiguredProviderInfo,
-  voyageModelId: string | null = null
+  voyageModelId: string | null = null,
+  voyageMaxTokens: number | null = null
 ): Promise<ConfigVersion> {
-  const embedIdentity = buildEmbedConfigIdentity(configuredProviderInfo, voyageModelId);
+  const embedIdentity = buildEmbedConfigIdentity(
+    configuredProviderInfo,
+    voyageModelId,
+    voyageMaxTokens
+  );
 
   return {
     embeddingModelId: embedIdentity.embeddingModelId,
     embeddingDimension: embedIdentity.embeddingDimension,
+    embeddingMaxTokens: embedIdentity.embeddingMaxTokens,
     embeddingProvider: embedIdentity.embeddingProvider,
     endpointBaseUrl: embedIdentity.endpointBaseUrl,
     documentTaskType: embedIdentity.documentTaskType,

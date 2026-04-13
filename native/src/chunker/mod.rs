@@ -16,6 +16,7 @@ use std::cell::RefCell;
 use tree_sitter::Parser;
 
 pub const CHUNKER_VERSION: &str = env!("CHUNKER_VERSION");
+pub(crate) const FILE_MODULE_CONTEXT_MAX_NON_WHITESPACE_CHARS: usize = 800;
 
 #[napi(string_enum)]
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -24,6 +25,7 @@ pub enum ChunkKind {
     Test,
     Doc,
     Config,
+    File,
 }
 
 #[napi(string_enum)]
@@ -186,6 +188,61 @@ fn normalize_language(file_path: &str, language: &str) -> String {
         .unwrap_or(Language::Unknown)
         .as_str()
         .to_string()
+}
+
+pub(crate) fn file_module_symbol_name(file_path: &str) -> Option<String> {
+    let stem = std::path::Path::new(file_path)
+        .file_stem()?
+        .to_str()?
+        .trim();
+    if stem.is_empty() {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
+fn append_small_file_module_chunk(
+    file_path: &str,
+    language: &str,
+    source_code: &str,
+    chunks: &mut Vec<Chunk>,
+) {
+    if language == "unknown"
+        || source_code.is_empty()
+        || non_whitespace_len(source_code) > FILE_MODULE_CONTEXT_MAX_NON_WHITESPACE_CHARS
+    {
+        return;
+    }
+
+    let Some(symbol_name) = file_module_symbol_name(file_path) else {
+        return;
+    };
+
+    let line_starts = build_line_index(source_code);
+    let candidate = Chunk {
+        file_path: file_path.to_string(),
+        language: language.to_string(),
+        symbol_name: Some(symbol_name),
+        symbol_kind: Some(SymbolKind::Module),
+        chunk_kind: ChunkKind::File,
+        granularity: Granularity::Coarse,
+        start_byte: 0,
+        end_byte: source_code.len() as u32,
+        start_line: 1,
+        end_line: line_for_byte(&line_starts, source_code.len().saturating_sub(1)).max(1),
+        text: source_code.to_string(),
+        chunk_hash: xxhash_content(source_code),
+    };
+
+    if chunks.iter().any(|chunk| {
+        chunk.start_byte == candidate.start_byte
+            && chunk.end_byte == candidate.end_byte
+            && chunk.text == candidate.text
+    }) {
+        return;
+    }
+
+    chunks.push(candidate);
 }
 
 fn ensure_non_empty_chunks(
@@ -368,13 +425,13 @@ pub(crate) fn split_range_to_max_sized_chunks(
         }
 
         for boundary in candidate_boundaries {
-            let text = source_code
-                .get(segment_start..boundary)
-                .ok_or_else(|| ChunkerError::InvalidSlice {
+            let text = source_code.get(segment_start..boundary).ok_or_else(|| {
+                ChunkerError::InvalidSlice {
                     file_path: file_path.to_string(),
                     start: segment_start,
                     end: boundary,
-                })?;
+                }
+            })?;
             if exceeds_budget(text, config) {
                 break;
             }
@@ -505,7 +562,8 @@ fn coverage_failure(
     ));
 
     let fallback_chunks = chunk_by_lines(file_path, language, source_code, config);
-    let fallback_chunks = ensure_non_empty_chunks(file_path, language, source_code, fallback_chunks);
+    let fallback_chunks =
+        ensure_non_empty_chunks(file_path, language, source_code, fallback_chunks);
     enforce_fine_chunk_max_size(file_path, language, source_code, config, fallback_chunks)
 }
 
@@ -686,13 +744,15 @@ pub fn chunk_file(
             config,
             chunks,
         )?;
-        return enforce_fine_chunk_coverage(
+        let mut chunks = enforce_fine_chunk_coverage(
             file_path,
             &normalized_language,
             source_code,
             config,
             chunks,
-        );
+        )?;
+        append_small_file_module_chunk(file_path, &normalized_language, source_code, &mut chunks);
+        return Ok(chunks);
     };
 
     let mut parser = Parser::new();
@@ -736,8 +796,10 @@ pub fn chunk_file(
     let chunks = ensure_non_empty_chunks(file_path, policy.language_name, source_code, chunks);
     let chunks =
         enforce_fine_chunk_max_size(file_path, policy.language_name, source_code, config, chunks)?;
-
-    enforce_fine_chunk_coverage(file_path, policy.language_name, source_code, config, chunks)
+    let mut chunks =
+        enforce_fine_chunk_coverage(file_path, policy.language_name, source_code, config, chunks)?;
+    append_small_file_module_chunk(file_path, policy.language_name, source_code, &mut chunks);
+    Ok(chunks)
 }
 
 #[cfg(test)]
@@ -754,8 +816,7 @@ mod tests {
         chunks
             .iter()
             .find(|chunk| {
-                chunk.symbol_name.as_deref() == Some(name)
-                    && chunk.granularity == Granularity::Fine
+                chunk.symbol_name.as_deref() == Some(name) && chunk.granularity == Granularity::Fine
             })
             .unwrap_or_else(|| panic!("missing fine chunk for {name}"))
     }
@@ -765,6 +826,15 @@ mod tests {
             .iter()
             .find(|chunk| chunk.symbol_name.as_deref() == Some(name))
             .unwrap_or_else(|| panic!("missing chunk for {name}"))
+    }
+
+    fn file_chunk<'a>(chunks: &'a [Chunk], name: &str) -> &'a Chunk {
+        chunks
+            .iter()
+            .find(|chunk| {
+                chunk.chunk_kind == ChunkKind::File && chunk.symbol_name.as_deref() == Some(name)
+            })
+            .unwrap_or_else(|| panic!("missing file chunk for {name}"))
     }
 
     #[test]
@@ -1189,7 +1259,9 @@ VALUE = 1
             .unwrap_or_else(|err| panic!("{err}"));
         let doc_chunk = chunks
             .iter()
-            .find(|chunk| chunk.chunk_kind == ChunkKind::Doc && chunk.granularity == Granularity::Fine)
+            .find(|chunk| {
+                chunk.chunk_kind == ChunkKind::Doc && chunk.granularity == Granularity::Fine
+            })
             .unwrap_or_else(|| panic!("missing module doc chunk"));
 
         assert_eq!(doc_chunk.symbol_kind, Some(SymbolKind::Block));
@@ -1363,11 +1435,14 @@ const bar = () => {
 
         let fine = fine_chunks(&chunks);
         assert!(fine.len() > 1);
-        assert!(fine.iter().all(|chunk| !exceeds_budget(&chunk.text, &ChunkConfig {
-            max_chunk_chars: 200,
-            min_chunk_chars: 20,
-            ..ChunkConfig::default()
-        })));
+        assert!(fine.iter().all(|chunk| !exceeds_budget(
+            &chunk.text,
+            &ChunkConfig {
+                max_chunk_chars: 200,
+                min_chunk_chars: 20,
+                ..ChunkConfig::default()
+            }
+        )));
     }
 
     #[test]
@@ -1387,8 +1462,8 @@ const bar = () => {
             ..ChunkConfig::default()
         };
 
-        let chunks =
-            chunk_file("huge.ts", "typescript", &source, &config).unwrap_or_else(|err| panic!("{err}"));
+        let chunks = chunk_file("huge.ts", "typescript", &source, &config)
+            .unwrap_or_else(|err| panic!("{err}"));
 
         let fine: Vec<&Chunk> = fine_chunks(&chunks)
             .into_iter()
@@ -1421,8 +1496,8 @@ const bar = () => {
             ..ChunkConfig::default()
         };
 
-        let chunks =
-            chunk_file("huge.ts", "typescript", &source, &config).unwrap_or_else(|err| panic!("{err}"));
+        let chunks = chunk_file("huge.ts", "typescript", &source, &config)
+            .unwrap_or_else(|err| panic!("{err}"));
 
         assert!(fine_chunks(&chunks).len() > 1);
         assert!(captured_logs()
@@ -1446,8 +1521,8 @@ const bar = () => {
             ..ChunkConfig::default()
         };
 
-        let chunks =
-            chunk_file("big.ts", "typescript", &source, &config).unwrap_or_else(|err| panic!("{err}"));
+        let chunks = chunk_file("big.ts", "typescript", &source, &config)
+            .unwrap_or_else(|err| panic!("{err}"));
 
         assert!(fine_chunks(&chunks).len() > 1);
         assert!(captured_logs()
@@ -1554,7 +1629,9 @@ export const codebase_search: ToolDefinition = tool({
             .unwrap_or_else(|| panic!("missing codebase_search chunk"));
         assert_eq!(codebase_search.symbol_kind, Some(SymbolKind::Function));
         assert_eq!(codebase_search.chunk_kind, ChunkKind::Code);
-        assert!(codebase_search.text.contains("export const codebase_search"));
+        assert!(codebase_search
+            .text
+            .contains("export const codebase_search"));
 
         assert!(!chunks.iter().any(|chunk| {
             chunk.symbol_name.as_deref() == Some("The code snippet to find similar code for")
@@ -1571,7 +1648,9 @@ export const codebase_search: ToolDefinition = tool({
         let chunks = chunk_file("schema.ts", "typescript", source, &ChunkConfig::default())
             .unwrap_or_else(|err| panic!("{err}"));
 
-        assert!(!chunks.iter().any(|chunk| chunk.chunk_kind == ChunkKind::Test));
+        assert!(!chunks
+            .iter()
+            .any(|chunk| chunk.chunk_kind == ChunkKind::Test));
         assert!(!chunks
             .iter()
             .any(|chunk| chunk.symbol_name.as_deref() == Some("schema description")));
@@ -1583,8 +1662,13 @@ export const codebase_search: ToolDefinition = tool({
 export const config = { key: "value" };
 "#;
 
-        let chunks = chunk_file("constants.ts", "typescript", source, &ChunkConfig::default())
-            .unwrap_or_else(|err| panic!("{err}"));
+        let chunks = chunk_file(
+            "constants.ts",
+            "typescript",
+            source,
+            &ChunkConfig::default(),
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
 
         let retries_chunk = named_fine_chunk(&chunks, "MAX_RETRIES");
         assert_eq!(retries_chunk.symbol_kind, Some(SymbolKind::Constant));
@@ -1604,8 +1688,13 @@ export const config = { key: "value" };
 });
 "#;
 
-        let chunks = chunk_file("math.test.ts", "typescript", source, &ChunkConfig::default())
-            .unwrap_or_else(|err| panic!("{err}"));
+        let chunks = chunk_file(
+            "math.test.ts",
+            "typescript",
+            source,
+            &ChunkConfig::default(),
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
 
         let describe_chunk = chunks
             .iter()
@@ -1659,8 +1748,13 @@ export const config = { key: "value" };
 }
 "#;
 
-        let chunks = chunk_file("namespace.ts", "typescript", source, &ChunkConfig::default())
-            .unwrap_or_else(|err| panic!("{err}"));
+        let chunks = chunk_file(
+            "namespace.ts",
+            "typescript",
+            source,
+            &ChunkConfig::default(),
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
 
         let namespace_chunk = chunks
             .iter()
@@ -1690,7 +1784,10 @@ export const config = { key: "value" };
         let chunks = chunk_file("barrel.ts", "typescript", source, &ChunkConfig::default())
             .unwrap_or_else(|err| panic!("{err}"));
 
-        let export_chunk = named_fine_chunk(&chunks, "export{Accordion,AccordionItem,AccordionTrigger,...}");
+        let export_chunk = named_fine_chunk(
+            &chunks,
+            "export{Accordion,AccordionItem,AccordionTrigger,...}",
+        );
         assert_eq!(export_chunk.symbol_kind, Some(SymbolKind::Module));
     }
 
@@ -1763,9 +1860,9 @@ AccordionItem.displayName = AccordionPrimitive.Item.displayName;
 
         let component_chunk = named_fine_chunk(&chunks, "AccordionItem");
         assert!(component_chunk.text.contains("AccordionItem.displayName ="));
-        assert!(!chunks.iter().any(|chunk| {
-            chunk.symbol_name.is_none() && chunk.text.contains("displayName")
-        }));
+        assert!(!chunks
+            .iter()
+            .any(|chunk| { chunk.symbol_name.is_none() && chunk.text.contains("displayName") }));
     }
 
     #[test]
@@ -1849,6 +1946,60 @@ exports.helper = helper;
     }
 
     #[test]
+    fn emits_file_module_chunk_for_small_files() {
+        let source = r#"export const ARCTIC_QUERY_PREFIX = "prefix";
+export const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-2";
+"#;
+
+        let chunks = chunk_file("provider.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let module_chunk = file_chunk(&chunks, "provider");
+        assert_eq!(module_chunk.symbol_kind, Some(SymbolKind::Module));
+        assert_eq!(module_chunk.granularity, Granularity::Coarse);
+        assert_eq!(module_chunk.start_line, 1);
+        assert_eq!(module_chunk.end_line, 2);
+        assert_eq!(module_chunk.text, source);
+
+        let arctic_chunk = named_fine_chunk(&chunks, "ARCTIC_QUERY_PREFIX");
+        let voyage_chunk = named_fine_chunk(&chunks, "VOYAGE_DEFAULT_MODEL_ID");
+        assert_eq!(arctic_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(voyage_chunk.symbol_kind, Some(SymbolKind::Constant));
+    }
+
+    #[test]
+    fn does_not_emit_file_module_chunk_for_large_files_without_small_header() {
+        let repeated = "  total += input.length;\n".repeat(120);
+        let source = format!(
+            "export function giant(input: string) {{\n  let total = 0;\n{repeated}  return total;\n}}\n"
+        );
+
+        let chunks = chunk_file("giant.ts", "typescript", &source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(!chunks.iter().any(|chunk| chunk.chunk_kind == ChunkKind::File));
+    }
+
+    #[test]
+    fn emits_file_module_header_chunk_for_large_files_with_small_constant_preamble() {
+        let repeated = "export function helper(value: string) { return value.repeat(4); }\n".repeat(80);
+        let source = format!(
+            "export const ARCTIC_QUERY_PREFIX = \"prefix\";\nexport const VOYAGE_DEFAULT_MODEL_ID = \"voyage-code-2\";\n{repeated}"
+        );
+
+        let chunks = chunk_file("provider.ts", "typescript", &source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let module_chunk = file_chunk(&chunks, "provider");
+        assert_eq!(module_chunk.symbol_kind, Some(SymbolKind::Module));
+        assert_eq!(module_chunk.granularity, Granularity::Coarse);
+        assert!(module_chunk.text.contains("ARCTIC_QUERY_PREFIX"));
+        assert!(module_chunk.text.contains("VOYAGE_DEFAULT_MODEL_ID"));
+        assert!(module_chunk.end_line < source.lines().count() as u32);
+        assert!(non_whitespace_len(&module_chunk.text) <= FILE_MODULE_CONTEXT_MAX_NON_WHITESPACE_CHARS);
+    }
+
+    #[test]
     fn preserves_small_unnamed_import_only_files_as_fallback_chunks() {
         let source = r#"import "./setup";
 "#;
@@ -1879,8 +2030,13 @@ exports.helper = helper;
 };
 "#;
 
-        let chunks = chunk_file("tailwind.config.ts", "typescript", source, &ChunkConfig::default())
-            .unwrap_or_else(|err| panic!("{err}"));
+        let chunks = chunk_file(
+            "tailwind.config.ts",
+            "typescript",
+            source,
+            &ChunkConfig::default(),
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
 
         let default_chunk = named_fine_chunk(&chunks, "<default>");
         assert_eq!(default_chunk.symbol_kind, Some(SymbolKind::Constant));
@@ -1894,8 +2050,13 @@ exports.helper = helper;
 } satisfies Config;
 "#;
 
-        let chunks = chunk_file("tailwind.config.ts", "typescript", source, &ChunkConfig::default())
-            .unwrap_or_else(|err| panic!("{err}"));
+        let chunks = chunk_file(
+            "tailwind.config.ts",
+            "typescript",
+            source,
+            &ChunkConfig::default(),
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
 
         let default_chunk = named_fine_chunk(&chunks, "<default>");
         assert_eq!(default_chunk.symbol_kind, Some(SymbolKind::Constant));
@@ -1909,8 +2070,13 @@ exports.helper = helper;
 };
 "#;
 
-        let chunks = chunk_file("postcss.config.js", "javascript", source, &ChunkConfig::default())
-            .unwrap_or_else(|err| panic!("{err}"));
+        let chunks = chunk_file(
+            "postcss.config.js",
+            "javascript",
+            source,
+            &ChunkConfig::default(),
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
 
         let default_chunk = named_fine_chunk(&chunks, "<module.exports>");
         assert_eq!(default_chunk.symbol_kind, Some(SymbolKind::Constant));
@@ -2109,8 +2275,7 @@ array_map(fn($x) => $x, $arr);
 
         assert!(!chunks.iter().any(|chunk| {
             chunk.symbol_name.as_deref() == Some("fn")
-                || chunk.text.contains("fn($x) => $x")
-                    && chunk.symbol_name.is_some()
+                || chunk.text.contains("fn($x) => $x") && chunk.symbol_name.is_some()
         }));
     }
 }

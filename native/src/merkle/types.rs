@@ -117,7 +117,9 @@ pub struct MerkleDiff {
 
 impl MerkleDiff {
     pub fn is_empty(&self) -> bool {
-        self.changed_files.is_empty() && self.added_files.is_empty() && self.removed_files.is_empty()
+        self.changed_files.is_empty()
+            && self.added_files.is_empty()
+            && self.removed_files.is_empty()
     }
 
     pub fn sort_and_dedup(&mut self) {

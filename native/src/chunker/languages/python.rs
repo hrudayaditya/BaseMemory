@@ -97,7 +97,10 @@ fn classify_python_assignment(node: Node<'_>, source: &str) -> Option<SemanticIn
 fn classify_python_type_alias(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     let left = node.child_by_field_name("left")?;
     let symbol_name = python_identifier_text(left, source)
-        .or_else(|| first_named_child_of_kind(left, "identifier").and_then(|child| python_identifier_text(child, source)))
+        .or_else(|| {
+            first_named_child_of_kind(left, "identifier")
+                .and_then(|child| python_identifier_text(child, source))
+        })
         .or_else(|| first_identifier_descendant(left, source))?;
 
     Some(SemanticInfo {

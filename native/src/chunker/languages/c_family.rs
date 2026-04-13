@@ -23,18 +23,16 @@ fn classify_csharp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         "method_declaration"
         | "constructor_declaration"
         | "property_declaration"
-        | "indexer_declaration" => {
-            Some(SemanticInfo {
-                symbol_name: if node.kind() == "indexer_declaration" {
-                    Some("this[]".to_string())
-                } else {
-                    extract_name_by_fields(node, source, &["name"])
-                },
-                symbol_kind: Some(SymbolKind::Method),
-                chunk_kind: ChunkKind::Code,
-                coarse_eligible: false,
-            })
-        }
+        | "indexer_declaration" => Some(SemanticInfo {
+            symbol_name: if node.kind() == "indexer_declaration" {
+                Some("this[]".to_string())
+            } else {
+                extract_name_by_fields(node, source, &["name"])
+            },
+            symbol_kind: Some(SymbolKind::Method),
+            chunk_kind: ChunkKind::Code,
+            coarse_eligible: false,
+        }),
         "namespace_declaration" | "file_scoped_namespace_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
             symbol_kind: Some(SymbolKind::Module),

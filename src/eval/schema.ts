@@ -8,6 +8,7 @@ import type {
   GoldenExpected,
   GoldenQuery,
   GoldenQueryType,
+  GoldenQuerySource,
 } from "./types.js";
 
 function parseJsonFile(filePath: string): unknown {
@@ -33,12 +34,15 @@ function asPositiveNumber(value: unknown, path: string): number {
 function parseQueryType(value: unknown, path: string): GoldenQueryType {
   if (
     value === "definition" ||
+    value === "identifier-heavy" ||
     value === "implementation-intent" ||
     value === "similarity" ||
     value === "keyword-heavy" ||
     value === "config-lookup" ||
+    value === "config-constant-lookup" ||
     value === "test-discovery" ||
     value === "bug-report" ||
+    value === "bug-error-lookup" ||
     value === "cross-file-relationship" ||
     value === "file-intent" ||
     value === "concept"
@@ -46,8 +50,15 @@ function parseQueryType(value: unknown, path: string): GoldenQueryType {
     return value;
   }
   throw new Error(
-    `${path} must be one of: definition, implementation-intent, similarity, keyword-heavy, config-lookup, test-discovery, bug-report, cross-file-relationship, file-intent, concept`
+    `${path} must be one of: definition, identifier-heavy, implementation-intent, similarity, keyword-heavy, config-lookup, config-constant-lookup, test-discovery, bug-report, bug-error-lookup, cross-file-relationship, file-intent, concept`
   );
+}
+
+function parseSource(value: unknown, path: string): GoldenQuerySource {
+  if (value === "curated" || value === "generated") {
+    return value;
+  }
+  throw new Error(`${path} must be one of: curated, generated`);
 }
 
 function parseTaskType(value: unknown, path: string) {
@@ -118,7 +129,9 @@ function parseQuery(input: unknown, index: number): GoldenQuery {
 
   const id = input.id;
   const query = input.query;
-  const queryType = input.queryType;
+  const queryType = input.queryType ?? input.query_type;
+  const source = input.source;
+  const heuristic = input.heuristic ?? input.generationHeuristic ?? input.generation_heuristic;
   const taskType = input.taskType ?? input.type;
   const expected = input.expected;
 
@@ -130,11 +143,24 @@ function parseQuery(input: unknown, index: number): GoldenQuery {
     throw new Error(`${path}.query must be a non-empty string`);
   }
 
+  if (heuristic !== undefined && typeof heuristic !== "string") {
+    throw new Error(`${path}.heuristic must be a string when provided`);
+  }
+
+  const parsedSource =
+    source === undefined ? undefined : parseSource(source, `${path}.source`);
+
+  if (parsedSource === "generated" && (typeof heuristic !== "string" || heuristic.trim().length === 0)) {
+    throw new Error(`${path}.heuristic must be provided for generated queries`);
+  }
+
   return {
     id,
     query,
     queryType:
       queryType === undefined ? undefined : parseQueryType(queryType, `${path}.queryType`),
+    source: parsedSource,
+    heuristic: typeof heuristic === "string" ? heuristic : undefined,
     taskType:
       taskType === undefined ? undefined : parseTaskType(taskType, `${path}.taskType`),
     expected: parseExpected(expected, `${path}.expected`),

@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { createEmbeddingProvider, CustomProviderNonRetryableError } from "../src/embeddings/provider.js";
+import {
+  createEmbeddingProvider,
+  CustomProviderNonRetryableError,
+  EmbeddingTransientError,
+  EmbeddingValidationError,
+} from "../src/embeddings/provider.js";
 import { createCustomProviderInfo, type ConfiguredProviderInfo } from "../src/embeddings/detector.js";
 import { Indexer } from "../src/indexer/index.js";
 import { parseConfig } from "../src/config/schema.js";
@@ -177,10 +182,15 @@ describe("CustomEmbeddingProvider", () => {
   });
 
   it("should throw on non-OK response", async () => {
-    fetchSpy.mockResolvedValueOnce(new Response("Rate limited", { status: 429 }));
+    fetchSpy
+      .mockResolvedValueOnce(new Response("Rate limited", { status: 429 }))
+      .mockResolvedValueOnce(new Response("Rate limited", { status: 429 }))
+      .mockResolvedValueOnce(new Response("Rate limited", { status: 429 }));
 
     const provider = createProvider();
-    await expect(provider.embedQuery("test")).rejects.toThrow("Custom embedding API error: 429");
+    const error = await getRejectedError(provider.embedQuery("test"));
+    expect(error).toBeInstanceOf(EmbeddingTransientError);
+    expect(error.message).toContain("429");
   });
 
   it("should throw on unexpected response format", async () => {
@@ -189,7 +199,9 @@ describe("CustomEmbeddingProvider", () => {
     }), { status: 200 }));
 
     const provider = createProvider();
-    await expect(provider.embedQuery("test")).rejects.toThrow("unexpected response format");
+    const error = await getRejectedError(provider.embedQuery("test"));
+    expect(error).toBeInstanceOf(EmbeddingValidationError);
+    expect(error.message).toContain("malformed response");
   });
 
   it("should strip trailing slashes from baseUrl", async () => {
@@ -270,9 +282,9 @@ describe("CustomEmbeddingProvider", () => {
     }), { status: 200 }));
 
     const provider = createProvider();
-    await expect(provider.embedQuery("test")).rejects.toThrow(
-      "Dimension mismatch: customProvider.dimensions is 768, but the API returned vectors with 1024 dimensions"
-    );
+    const error = await getRejectedError(provider.embedQuery("test"));
+    expect(error).toBeInstanceOf(EmbeddingValidationError);
+    expect(error.message).toContain("expected 768 dimensions");
   });
 
   it("should always throw on dimension mismatch, even after a successful call", async () => {
@@ -292,9 +304,9 @@ describe("CustomEmbeddingProvider", () => {
     expect(result1.embedding).toHaveLength(768);
 
     // Second call throws on dimension mismatch
-    await expect(provider.embedQuery("second")).rejects.toThrow(
-      "Dimension mismatch: customProvider.dimensions is 768, but the API returned vectors with 512 dimensions"
-    );
+    const error = await getRejectedError(provider.embedQuery("second"));
+    expect(error).toBeInstanceOf(EmbeddingValidationError);
+    expect(error.message).toContain("received 512");
   });
 
   it("should use configurable timeout", async () => {
@@ -361,18 +373,26 @@ describe("CustomEmbeddingProvider", () => {
   });
 
   it("should throw retryable error on 429 rate limit", async () => {
-    fetchSpy.mockResolvedValueOnce(new Response("Rate limited", { status: 429 }));
+    fetchSpy
+      .mockResolvedValueOnce(new Response("Rate limited", { status: 429 }))
+      .mockResolvedValueOnce(new Response("Rate limited", { status: 429 }))
+      .mockResolvedValueOnce(new Response("Rate limited", { status: 429 }));
     const provider = createProvider();
     const error = await getRejectedError(provider.embedQuery("test"));
     expect(error).not.toBeInstanceOf(CustomProviderNonRetryableError);
+    expect(error).toBeInstanceOf(EmbeddingTransientError);
     expect(error.message).toContain("429");
   });
 
   it("should throw retryable error on 5xx server errors", async () => {
-    fetchSpy.mockResolvedValueOnce(new Response("Internal Server Error", { status: 500 }));
+    fetchSpy
+      .mockResolvedValueOnce(new Response("Internal Server Error", { status: 500 }))
+      .mockResolvedValueOnce(new Response("Internal Server Error", { status: 500 }))
+      .mockResolvedValueOnce(new Response("Internal Server Error", { status: 500 }));
     const provider = createProvider();
     const error = await getRejectedError(provider.embedQuery("test"));
     expect(error).not.toBeInstanceOf(CustomProviderNonRetryableError);
+    expect(error).toBeInstanceOf(EmbeddingTransientError);
     expect(error.message).toContain("500");
   });
 
@@ -411,7 +431,10 @@ describe("CustomEmbeddingProvider", () => {
   it("should throw AbortError with timeout message when fetch is aborted", async () => {
     const abortError = new Error("The operation was aborted");
     abortError.name = "AbortError";
-    fetchSpy.mockRejectedValueOnce(abortError);
+    fetchSpy
+      .mockRejectedValueOnce(abortError)
+      .mockRejectedValueOnce(abortError)
+      .mockRejectedValueOnce(abortError);
 
     const info = createCustomProviderInfo({
       baseUrl: "http://localhost:11434/v1",
@@ -421,16 +444,18 @@ describe("CustomEmbeddingProvider", () => {
     });
     const provider = createEmbeddingProvider(info);
 
-    await expect(provider.embedQuery("test")).rejects.toThrow(
-      "Custom embedding API request timed out after 5000ms for http://localhost:11434/v1/embeddings"
-    );
+    const error = await getRejectedError(provider.embedQuery("test"));
+    expect(error).toBeInstanceOf(EmbeddingTransientError);
+    expect(error.message).toContain("timed out after 5000ms");
   });
 
   it("should re-throw non-AbortError fetch failures as-is", async () => {
-    fetchSpy.mockRejectedValueOnce(new TypeError("fetch failed"));
+    fetchSpy.mockRejectedValue(new TypeError("fetch failed"));
 
     const provider = createProvider();
-    await expect(provider.embedQuery("test")).rejects.toThrow("fetch failed");
+    const error = await getRejectedError(provider.embedQuery("test"));
+    expect(error).toBeInstanceOf(EmbeddingTransientError);
+    expect(error.message).toContain("fetch failed");
   });
 
   it("should not retry on CustomProviderNonRetryableError via pRetry shouldRetry", async () => {

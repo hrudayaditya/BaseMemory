@@ -61,7 +61,7 @@ fn map_chunk(chunk: crate::chunker::Chunk) -> CodeChunk {
         Some(SymbolKind::Module) => "module",
         Some(SymbolKind::Constant) | Some(SymbolKind::Block) | None => match chunk.chunk_kind {
             ChunkKind::Test => "function",
-            ChunkKind::Code | ChunkKind::Doc | ChunkKind::Config => "other",
+            ChunkKind::Code | ChunkKind::Doc | ChunkKind::Config | ChunkKind::File => "other",
         },
     }
     .to_string();

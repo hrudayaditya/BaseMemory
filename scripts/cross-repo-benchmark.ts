@@ -604,6 +604,21 @@ function pickDistinctFiles(candidates: SymbolCandidate[], limit: number): Symbol
   return picked;
 }
 
+function generatedHeuristicForQueryType(queryType: GoldenQueryType): string {
+  switch (queryType) {
+    case "definition":
+      return "symbol-candidate-definition";
+    case "implementation-intent":
+      return "module-and-concept-from-symbol-content";
+    case "similarity":
+      return "concept-and-symbol-pattern";
+    case "keyword-heavy":
+      return "identifier-extraction-from-symbol-content";
+    default:
+      return "generated-heuristic";
+  }
+}
+
 function buildGoldenDataset(repoName: string, repoPath: string, parsedFiles: ParsedFile[]): GoldenDataset {
   const candidates = buildSymbolCandidates(parsedFiles, repoPath);
   if (candidates.length === 0) {
@@ -623,6 +638,8 @@ function buildGoldenDataset(repoName: string, repoPath: string, parsedFiles: Par
       id: `${repoName}-${queryType}-${String(counter).padStart(2, "0")}`,
       query,
       queryType,
+      source: "generated",
+      heuristic: generatedHeuristicForQueryType(queryType),
       expected,
     });
     counter += 1;
@@ -664,7 +681,7 @@ function buildGoldenDataset(repoName: string, repoPath: string, parsedFiles: Par
   }
 
   return {
-    version: "1.0.0",
+    version: "2.0.0",
     name: `cross-repo-${repoName}`,
     description: `Auto-generated cross-repo benchmark dataset for ${repoName}`,
     queries: boundedQueries,
@@ -693,6 +710,36 @@ function writeDataset(datasetPath: string, dataset: GoldenDataset): void {
   ensureDir(path.dirname(datasetPath));
   parseGoldenDataset(dataset, datasetPath);
   writeFileSync(datasetPath, JSON.stringify(dataset, null, 2), "utf-8");
+}
+
+function loadGoldenDatasetIfExists(datasetPath: string): GoldenDataset | null {
+  if (!existsSync(datasetPath)) {
+    return null;
+  }
+  const parsed = JSON.parse(readFileSync(datasetPath, "utf-8")) as unknown;
+  return parseGoldenDataset(parsed, datasetPath);
+}
+
+function mergeDatasets(repoName: string, datasets: GoldenDataset[]): GoldenDataset {
+  const mergedQueries: GoldenQuery[] = [];
+  const seenIds = new Set<string>();
+
+  for (const dataset of datasets) {
+    for (const query of dataset.queries) {
+      if (seenIds.has(query.id)) {
+        throw new Error(`Duplicate query id '${query.id}' while merging benchmark datasets for ${repoName}`);
+      }
+      seenIds.add(query.id);
+      mergedQueries.push(query);
+    }
+  }
+
+  return {
+    version: "2.0.0",
+    name: `cross-repo-${repoName}`,
+    description: `Combined benchmark dataset for ${repoName} with curated goldens plus generated smoke coverage.`,
+    queries: mergedQueries,
+  };
 }
 
 function escapeRegexLiteral(input: string): string {
@@ -833,7 +880,7 @@ async function runSgBaseline(
   totalQueryCount: number;
   queryTypeScope: GoldenQueryType[];
 }> {
-  const queryTypeScope: GoldenQueryType[] = ["definition", "keyword-heavy"];
+  const queryTypeScope: GoldenQueryType[] = ["definition", "identifier-heavy", "keyword-heavy"];
   const supportedLanguages = new Map<string, string>([
     [".ts", "typescript"],
     [".tsx", "tsx"],
@@ -1168,18 +1215,24 @@ async function runForRepo(
   options: CliOptions,
   runDir: string,
   datasetRoot: string,
-  persistentDatasetRoot: string
+  persistentDatasetRoot: string,
+  curatedDatasetRoot: string
 ): Promise<RepoBenchmarkResult> {
   const repoName = toRepoName(repoPath);
   const datasetPath = path.join(datasetRoot, `${repoName}.json`);
   const persistentDatasetPath = path.join(persistentDatasetRoot, `${repoName}.json`);
+  const curatedDatasetPath = path.join(curatedDatasetRoot, `${repoName}.json`);
 
   try {
     const { parsedFiles, collection } = collectParsedFiles(repoPath, options.maxParseFiles);
-    const dataset = buildGoldenDataset(repoName, repoPath, parsedFiles);
+    const generatedDataset = buildGoldenDataset(repoName, repoPath, parsedFiles);
+    const curatedDataset = loadGoldenDatasetIfExists(curatedDatasetPath);
+    const dataset = curatedDataset
+      ? mergeDatasets(repoName, [curatedDataset, generatedDataset])
+      : generatedDataset;
     writeDataset(datasetPath, dataset);
     if (options.persistDatasets) {
-      writeDataset(persistentDatasetPath, dataset);
+      writeDataset(persistentDatasetPath, generatedDataset);
     }
 
     const pluginOutputRoot = path.join(runDir, "plugin", repoName);
@@ -1199,7 +1252,7 @@ async function runForRepo(
     let lastSgQueryCount = 0;
     let lastSgScopedQueryCount = 0;
     let lastSgTotalQueryCount = dataset.queries.length;
-    let lastSgQueryTypeScope: GoldenQueryType[] = ["definition", "keyword-heavy"];
+    let lastSgQueryTypeScope: GoldenQueryType[] = ["definition", "identifier-heavy", "keyword-heavy"];
 
     for (let repeat = 0; repeat < options.repeats; repeat += 1) {
       const reindexApplied = options.reindex && repeat === 0;
@@ -1326,6 +1379,7 @@ async function main(): Promise<void> {
   const runDir = path.join(options.outputRoot, runTimestamp);
   const datasetRoot = path.join(runDir, "datasets");
   const persistentDatasetRoot = path.join(process.cwd(), "benchmarks", "golden", "cross-repo");
+  const curatedDatasetRoot = path.join(process.cwd(), "benchmarks", "golden", "cross-repo-curated");
 
   ensureDir(runDir);
   ensureDir(path.join(runDir, "repos"));
@@ -1347,7 +1401,8 @@ async function main(): Promise<void> {
       options,
       runDir,
       datasetRoot,
-      persistentDatasetRoot
+      persistentDatasetRoot,
+      curatedDatasetRoot
     );
     results.push(repoResult);
 

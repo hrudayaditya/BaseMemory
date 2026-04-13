@@ -1,6 +1,5 @@
 import { existsSync } from "fs";
 import { readFileSync } from "fs";
-import { rmSync } from "fs";
 import { createServer, type Server } from "http";
 import * as os from "os";
 import * as path from "path";
@@ -261,20 +260,6 @@ function loadRawConfig(projectRoot: string, configPath?: string): unknown {
   }
 
   return {};
-}
-
-function getIndexRootPath(projectRoot: string, scope: "project" | "global"): string {
-  if (scope === "global") {
-    return path.join(os.homedir(), ".opencode", "global-index");
-  }
-  return path.join(projectRoot, ".opencode", "index");
-}
-
-function clearIndexRoot(projectRoot: string, scope: "project" | "global"): void {
-  const indexRoot = getIndexRootPath(projectRoot, scope);
-  if (existsSync(indexRoot)) {
-    rmSync(indexRoot, { recursive: true, force: true });
-  }
 }
 
 function loadParsedConfig(projectRoot: string, configPath?: string) {
@@ -569,6 +554,17 @@ function applySearchConfigToIndexer(
   };
 }
 
+async function prepareEvalIndexer(
+  options: EvalRunOptions,
+  effectiveConfig: ReturnType<typeof resolveSearchConfig>
+): Promise<Indexer> {
+  const indexer = new Indexer(options.projectRoot, effectiveConfig);
+  if (options.reindex) {
+    await indexer.clearIndex();
+  }
+  return indexer;
+}
+
 export async function runEvaluation(options: EvalRunOptions): Promise<EvalRunResult> {
   const datasetPath = toAbsolute(options.projectRoot, options.datasetPath);
   const againstPath = options.againstPath ? toAbsolute(options.projectRoot, options.againstPath) : undefined;
@@ -577,11 +573,7 @@ export async function runEvaluation(options: EvalRunOptions): Promise<EvalRunRes
   const effectiveConfig = resolveSearchConfig(parsedConfig, options.searchOverrides);
 
   return withEvalEmbeddingEnvironment(parsedConfig, async () => {
-    if (options.reindex) {
-      clearIndexRoot(options.projectRoot, effectiveConfig.scope);
-    }
-
-    const indexer = new Indexer(options.projectRoot, effectiveConfig);
+    const indexer = await prepareEvalIndexer(options, effectiveConfig);
     const indexStats = await indexer.index();
     await assertSearchableEvalCorpus(indexer, indexStats);
 
@@ -676,10 +668,7 @@ export async function runSweep(
                           };
 
                           if (!sweepIndexer) {
-                            if (options.reindex) {
-                              clearIndexRoot(options.projectRoot, effectiveConfig.scope);
-                            }
-                            sweepIndexer = new Indexer(options.projectRoot, effectiveConfig);
+                            sweepIndexer = await prepareEvalIndexer(options, effectiveConfig);
                             const indexStats = await sweepIndexer.index();
                             await assertSearchableEvalCorpus(sweepIndexer, indexStats);
                           } else {

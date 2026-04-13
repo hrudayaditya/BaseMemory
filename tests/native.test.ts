@@ -13,6 +13,7 @@ import {
   createDynamicBatches,
   generateChunkId,
   estimateTokens,
+  prepareEmbeddingInput,
   type CodeChunk,
 } from "../src/native/index.js";
 
@@ -487,6 +488,150 @@ export const codebase_search: ToolDefinition = tool({
   });
 
   describe("createEmbeddingText", () => {
+    const LARGE_MODEL_MAX_TOKENS = 8_191;
+    const SMALL_MODEL_MAX_TOKENS = 512;
+
+    function expectEmbeddingFormatterContract(
+      fixtureName: string,
+      actual: string,
+      expected: string
+    ): void {
+      if (actual !== expected) {
+        throw new Error(
+          `Embedding formatter contract changed for ${fixtureName}. ` +
+          "If this change is intentional, bump EMBEDDING_INPUT_FORMAT_VERSION in src/native/index.ts " +
+          "and update this expected output."
+        );
+      }
+
+      expect(actual).toBe(expected);
+    }
+
+    it("keeps the formatter contract stable for representative fixtures", () => {
+      const shortPathWithSymbol = createEmbeddingText(
+        {
+          content: "export function sum(a: number, b: number): number {\n  return a + b;\n}\n",
+          startLine: 1,
+          endLine: 3,
+          chunkType: "function",
+          name: "sum",
+          symbolKind: "Function",
+          language: "typescript",
+        },
+        "/repo/src/math.ts",
+        "/repo",
+        LARGE_MODEL_MAX_TOKENS
+      );
+      expectEmbeddingFormatterContract(
+        "short-path-with-symbol",
+        shortPathWithSymbol,
+        [
+          "file: src/math.ts",
+          "symbol: sum (function)",
+          "",
+          "export function sum(a: number, b: number): number {",
+          "  return a + b;",
+          "}",
+          "",
+        ].join("\n")
+      );
+
+      const longPathWithSymbol = createEmbeddingText(
+        {
+          content: "export class HybridLane {}\n",
+          startLine: 12,
+          endLine: 12,
+          chunkType: "class",
+          name: "HybridLane",
+          symbolKind: "Class",
+          language: "typescript",
+        },
+        "/repo/packages/app/src/features/search/ranking/semantic/retrieval/hybrid/index.ts",
+        "/repo",
+        LARGE_MODEL_MAX_TOKENS
+      );
+      expectEmbeddingFormatterContract(
+        "long-path-with-symbol",
+        longPathWithSymbol,
+        [
+          "file: packages/app/src/features/search/ranking/semantic/retrieval/hybrid/index.ts",
+          "symbol: HybridLane (class) terms: hybrid lane",
+          "",
+          "export class HybridLane {}",
+          "",
+        ].join("\n")
+      );
+
+      const noSymbol = createEmbeddingText(
+        {
+          content: "import \"./setup\";\n",
+          startLine: 1,
+          endLine: 1,
+          chunkType: "other",
+          language: "typescript",
+        },
+        "/repo/src/bootstrap.ts",
+        "/repo",
+        LARGE_MODEL_MAX_TOKENS
+      );
+      expectEmbeddingFormatterContract(
+        "no-symbol",
+        noSymbol,
+        [
+          "file: src/bootstrap.ts",
+          "",
+          "import \"./setup\";",
+          "",
+        ].join("\n")
+      );
+
+      const truncationHeader = "file: src/truncate.ts\n\n";
+      const truncatedContentLength = 1_497;
+      const truncated = createEmbeddingText(
+        {
+          content: "x".repeat(3_000),
+          startLine: 1,
+          endLine: 1,
+          chunkType: "other",
+          language: "typescript",
+        },
+        "/repo/src/truncate.ts",
+        "/repo",
+        SMALL_MODEL_MAX_TOKENS
+      );
+      expectEmbeddingFormatterContract(
+        "truncation",
+        truncated,
+        `${truncationHeader}${"x".repeat(truncatedContentLength)}\n... [truncated]`
+      );
+
+      const nonAsciiPath = createEmbeddingText(
+        {
+          content: "export const cafe = true;\n",
+          startLine: 1,
+          endLine: 1,
+          chunkType: "other",
+          name: "cafe",
+          symbolKind: "Constant",
+          language: "typescript",
+        },
+        "/repo/src/café/naïve.ts",
+        "/repo",
+        LARGE_MODEL_MAX_TOKENS
+      );
+      expectEmbeddingFormatterContract(
+        "non-ascii-path",
+        nonAsciiPath,
+        [
+          "file: src/café/naïve.ts",
+          "symbol: cafe (constant)",
+          "",
+          "export const cafe = true;",
+          "",
+        ].join("\n")
+      );
+    });
+
     it("creates embedding text with a structured file and symbol prefix", () => {
       const chunk: CodeChunk = {
         content: "function test() { return 1; }",
@@ -501,7 +646,8 @@ export const codebase_search: ToolDefinition = tool({
       const text = createEmbeddingText(
         chunk,
         "/repo/src/utils/helper.ts",
-        "/repo"
+        "/repo",
+        LARGE_MODEL_MAX_TOKENS
       );
 
       expect(text).toContain("file: src/utils/helper.ts");
@@ -520,7 +666,12 @@ export const codebase_search: ToolDefinition = tool({
         language: "typescript",
       };
 
-      const text = createEmbeddingText(chunk, "/repo/src/config.ts", "/repo");
+      const text = createEmbeddingText(
+        chunk,
+        "/repo/src/config.ts",
+        "/repo",
+        LARGE_MODEL_MAX_TOKENS
+      );
 
       expect(text).toContain("file: src/config.ts");
       expect(text).not.toContain("<default>");
@@ -536,7 +687,12 @@ export const codebase_search: ToolDefinition = tool({
         language: "typescript",
       };
 
-      const text = createEmbeddingText(chunk, "/repo/src/main.ts", "/repo");
+      const text = createEmbeddingText(
+        chunk,
+        "/repo/src/main.ts",
+        "/repo",
+        LARGE_MODEL_MAX_TOKENS
+      );
 
       expect(text).toContain("file: src/main.ts");
       expect(text).not.toContain("symbol:");
@@ -554,12 +710,55 @@ export const codebase_search: ToolDefinition = tool({
           language: "typescript",
         },
         "/repo/src/config/api.ts",
-        "/repo"
+        "/repo",
+        LARGE_MODEL_MAX_TOKENS
       );
 
       expect(text).toContain("file: src/config/api.ts");
       expect(text).toContain("symbol: API_BASE_URL (constant) terms: api base url");
       expect(text).toContain("export const API_BASE_URL = 'http://localhost:3001';");
+    });
+
+    it("keeps embedding input within a small model token cap", () => {
+      const { text } = prepareEmbeddingInput(
+        {
+          content: "x".repeat(8_000),
+          startLine: 1,
+          endLine: 1,
+          chunkType: "other",
+          language: "typescript",
+        },
+        "/repo/src/small-cap.ts",
+        "/repo",
+        SMALL_MODEL_MAX_TOKENS
+      );
+
+      expect(estimateTokens(text)).toBeLessThanOrEqual(SMALL_MODEL_MAX_TOKENS);
+    });
+
+    it("accounts for header overhead by shrinking content instead of dropping the header", () => {
+      const { text } = prepareEmbeddingInput(
+        {
+          content: "y".repeat(8_000),
+          startLine: 1,
+          endLine: 1,
+          chunkType: "function",
+          name: "SuperLongSymbolNameForHeaderBudgetTestingAndIdentifierExpansion",
+          symbolKind: "Function",
+          language: "typescript",
+        },
+        "/repo/packages/app/src/features/search/ranking/semantic/retrieval/header/overhead/super-long-file-name-for-budget-check.ts",
+        "/repo",
+        SMALL_MODEL_MAX_TOKENS
+      );
+
+      expect(text).toContain(
+        "file: packages/app/src/features/search/ranking/semantic/retrieval/header/overhead/super-long-file-name-for-budget-check.ts"
+      );
+      expect(text).toContain(
+        "symbol: SuperLongSymbolNameForHeaderBudgetTestingAndIdentifierExpansion (function)"
+      );
+      expect(estimateTokens(text)).toBeLessThanOrEqual(SMALL_MODEL_MAX_TOKENS);
     });
   });
 
@@ -571,14 +770,14 @@ export const codebase_search: ToolDefinition = tool({
         { text: "c".repeat(1000), id: "3" },
       ];
 
-      const batches = createDynamicBatches(chunks);
+      const batches = createDynamicBatches(chunks, 8_191);
 
       expect(batches.length).toBeGreaterThanOrEqual(1);
       expect(batches.flat().length).toBe(3);
     });
 
     it("should handle empty input", () => {
-      const batches = createDynamicBatches([]);
+      const batches = createDynamicBatches([], 8_191);
 
       expect(batches.length).toBe(0);
     });
@@ -589,9 +788,31 @@ export const codebase_search: ToolDefinition = tool({
         { text: "b".repeat(30000), id: "2" },
       ];
 
-      const batches = createDynamicBatches(chunks);
+      const batches = createDynamicBatches(chunks, 8_191);
 
       expect(batches.length).toBe(2);
+    });
+
+    it("sizes batches according to the active model token limit", () => {
+      const chunks = Array.from({ length: 6 }, (_value, index) => ({
+        id: String(index + 1),
+        text: "z".repeat(400),
+      }));
+
+      const smallModelBatches = createDynamicBatches(chunks, 512);
+      const largeModelBatches = createDynamicBatches(chunks, 8_192);
+
+      expect(smallModelBatches.length).toBeGreaterThan(largeModelBatches.length);
+      expect(
+        smallModelBatches.every((batch) =>
+          batch.reduce((sum, chunk) => sum + estimateTokens(chunk.text), 0) <= 512
+        )
+      ).toBe(true);
+      expect(
+        largeModelBatches.every((batch) =>
+          batch.reduce((sum, chunk) => sum + estimateTokens(chunk.text), 0) <= 8_192
+        )
+      ).toBe(true);
     });
   });
 

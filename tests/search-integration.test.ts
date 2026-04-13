@@ -213,6 +213,181 @@ export async function handleEvalCommand(): Promise<void> {
     expect(results[0]?.symbolKind).toBe("Function");
   });
 
+  it("preserves retrieval correctness across clearIndex and rebuild", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const before = await indexer.search("where is rankHybridResults implementation", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+    });
+    expect(before[0]?.filePath).toContain("/app/indexer/index.ts");
+
+    await indexer.clearIndex();
+
+    const afterClear = await indexer.search("where is rankHybridResults implementation", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+    });
+    expect(afterClear).toEqual([]);
+
+    await indexer.index();
+
+    const afterRebuild = await indexer.search("where is rankHybridResults implementation", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+    });
+    expect(afterRebuild[0]?.filePath).toContain("/app/indexer/index.ts");
+    expect(afterRebuild[0]?.name).toBe("rankHybridResults");
+  });
+
+  it("indexes a coarse file/module chunk for small constant files and retrieves them in the top results", async () => {
+    fs.mkdirSync(path.join(tempDir, "src", "config"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, "src", "config", "provider.ts"),
+      `export const ARCTIC_QUERY_PREFIX = "Represent this sentence for searching relevant passages: ";
+export const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-2";
+`,
+      "utf-8"
+    );
+
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const indexedFilePath = fs.realpathSync(path.join(tempDir, "src", "config", "provider.ts"));
+    const database = new Database(path.join(tempDir, ".opencode", "index", "codebase.db"));
+    const chunkRows = database.getChunksByFile(indexedFilePath);
+    expect(
+      chunkRows.some(
+        (chunk) =>
+          chunk.chunkKind === "File" &&
+          chunk.symbolKind === "Module" &&
+          chunk.name === "provider"
+      )
+    ).toBe(true);
+
+    const results = await indexer.search("arctic query prefix", 3, {
+      metadataOnly: true,
+      filterByBranch: false,
+    });
+
+    expect(results.slice(0, 3).some((result) => result.filePath === indexedFilePath)).toBe(true);
+    expect(results.slice(0, 3).some((result) => result.name === "ARCTIC_QUERY_PREFIX")).toBe(true);
+  });
+
+  it("re-emits coarse file/module chunks when a small constant file changes and is reindexed", async () => {
+    fs.mkdirSync(path.join(tempDir, "src", "config"), { recursive: true });
+    const filePath = path.join(tempDir, "src", "config", "provider.ts");
+    fs.writeFileSync(
+      filePath,
+      `export const ARCTIC_QUERY_PREFIX = "Represent this sentence for searching relevant passages: ";
+export const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-2";
+`,
+      "utf-8"
+    );
+
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const indexedFilePath = fs.realpathSync(filePath);
+    const database = new Database(path.join(tempDir, ".opencode", "index", "codebase.db"));
+    const initialModuleChunk = database
+      .getChunksByFile(indexedFilePath)
+      .find(
+        (chunk) =>
+          chunk.chunkKind === "File" &&
+          chunk.symbolKind === "Module" &&
+          chunk.name === "provider"
+      );
+    expect(initialModuleChunk).toBeDefined();
+
+    fs.writeFileSync(
+      filePath,
+      `export const OCEAN_QUERY_PREFIX = "Represent this sentence for searching ocean passages: ";
+export const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-2";
+`,
+      "utf-8"
+    );
+
+    await indexer.index();
+
+    const updatedModuleChunk = database
+      .getChunksByFile(indexedFilePath)
+      .find(
+        (chunk) =>
+          chunk.chunkKind === "File" &&
+          chunk.symbolKind === "Module" &&
+          chunk.name === "provider"
+      );
+    expect(updatedModuleChunk).toBeDefined();
+    expect(updatedModuleChunk?.chunkId).not.toBe(initialModuleChunk?.chunkId);
+    expect(updatedModuleChunk?.embeddingInputHash).not.toBe(initialModuleChunk?.embeddingInputHash);
+
+    const results = await indexer.search("ocean query prefix", 3, {
+      metadataOnly: true,
+      filterByBranch: false,
+    });
+    expect(results.slice(0, 3).some((result) => result.filePath === indexedFilePath)).toBe(true);
+    expect(results.slice(0, 3).some((result) => result.name === "OCEAN_QUERY_PREFIX")).toBe(true);
+  });
+
   it("rewrites definition-search scores through the reranker promoted block and preserves chunk metadata", async () => {
     const config = parseConfig({
       embeddingProvider: "custom",
@@ -758,16 +933,25 @@ steps to reproduce:
     const database = new Database(path.join(tempDir, ".opencode", "index", "codebase.db"));
     const mainChunkIds = database.getBranchChunkIds("main");
     expect(mainChunkIds.length).toBeGreaterThan(0);
+    const mainSymbolIds = database.getBranchSymbolIds("main");
 
     database.clearBranch("main");
     database.addChunksToBranch("feature/test", mainChunkIds);
+    database.clearBranchSymbols("main");
+    database.addSymbolsToBranchBatch("feature/test", mainSymbolIds);
+    (indexer as unknown as { syncNativeBranchMembership: (branch: string, chunkIds: string[]) => void })
+      .syncNativeBranchMembership("main", database.getBranchChunkIds("main"));
+    (indexer as unknown as { syncNativeBranchMembership: (branch: string, chunkIds: string[]) => void })
+      .syncNativeBranchMembership("feature/test", database.getBranchChunkIds("feature/test"));
 
-    const results = await indexer.search("rankHybridResults", 5, {
-      metadataOnly: true,
-      filterByBranch: true,
-    });
-
-    expect(results).toEqual([]);
+    const internals = indexer as unknown as {
+      stores: Map<string, { searchOnBranch: (queryVector: number[], branch: string, limit?: number) => unknown[] }>;
+      invertedIndex: { searchOnBranch: (query: string, branch: string, limit?: number) => Map<string, number> };
+    };
+    const primaryStore = internals.stores.get("mock-embedding-model");
+    expect(primaryStore).toBeTruthy();
+    expect(primaryStore!.searchOnBranch(Array(8).fill(0), "main", 5)).toEqual([]);
+    expect(Array.from(internals.invertedIndex.searchOnBranch("rankHybridResults", "main", 5).keys())).toEqual([]);
   });
 
   it("keeps branch filtering active on a real branch named default", async () => {
@@ -798,16 +982,25 @@ steps to reproduce:
     const database = new Database(path.join(tempDir, ".opencode", "index", "codebase.db"));
     const defaultChunkIds = database.getBranchChunkIds("default");
     expect(defaultChunkIds.length).toBeGreaterThan(0);
+    const defaultSymbolIds = database.getBranchSymbolIds("default");
 
     database.clearBranch("default");
     database.addChunksToBranch("feature/test", defaultChunkIds);
+    database.clearBranchSymbols("default");
+    database.addSymbolsToBranchBatch("feature/test", defaultSymbolIds);
+    (indexer as unknown as { syncNativeBranchMembership: (branch: string, chunkIds: string[]) => void })
+      .syncNativeBranchMembership("default", database.getBranchChunkIds("default"));
+    (indexer as unknown as { syncNativeBranchMembership: (branch: string, chunkIds: string[]) => void })
+      .syncNativeBranchMembership("feature/test", database.getBranchChunkIds("feature/test"));
 
-    const results = await indexer.search("rankHybridResults", 5, {
-      metadataOnly: true,
-      filterByBranch: true,
-    });
-
-    expect(results).toEqual([]);
+    const internals = indexer as unknown as {
+      stores: Map<string, { searchOnBranch: (queryVector: number[], branch: string, limit?: number) => unknown[] }>;
+      invertedIndex: { searchOnBranch: (query: string, branch: string, limit?: number) => Map<string, number> };
+    };
+    const primaryStore = internals.stores.get("mock-embedding-model");
+    expect(primaryStore).toBeTruthy();
+    expect(primaryStore!.searchOnBranch(Array(8).fill(0), "default", 5)).toEqual([]);
+    expect(Array.from(internals.invertedIndex.searchOnBranch("rankHybridResults", "default", 5).keys())).toEqual([]);
   });
 
   it("returns an empty result for an empty query without error", async () => {
@@ -866,14 +1059,14 @@ steps to reproduce:
 
     const internals = indexer as unknown as {
       ensureInitialized: () => Promise<{
-        store: { searchFiltered: (...args: unknown[]) => unknown };
-        invertedIndex: { searchFiltered: (...args: unknown[]) => unknown };
+        store: { search: (...args: unknown[]) => unknown };
+        invertedIndex: { search: (...args: unknown[]) => unknown };
       }>;
     };
     const { store, invertedIndex } = await internals.ensureInitialized();
 
-    const vectorSpy = vi.spyOn(store, "searchFiltered");
-    const keywordSpy = vi.spyOn(invertedIndex, "searchFiltered");
+    const vectorSpy = vi.spyOn(store, "search");
+    const keywordSpy = vi.spyOn(invertedIndex, "search");
 
     await indexer.search("rankHybridResults", 5, {
       metadataOnly: true,
@@ -883,8 +1076,8 @@ steps to reproduce:
 
     expect(vectorSpy).toHaveBeenCalled();
     expect(keywordSpy).toHaveBeenCalled();
-    expect(vectorSpy.mock.calls[0]?.[2]).toBe(50);
-    expect(keywordSpy.mock.calls[0]?.[2]).toBe(50);
+    expect(vectorSpy.mock.calls[0]?.[1]).toBe(250);
+    expect(keywordSpy.mock.calls[0]?.[1]).toBe(250);
   });
 
   it("returns identical primary results for explicit general task type", async () => {
@@ -1140,5 +1333,512 @@ export function searchEntry(query: string) { return rerankResults(query) + "!"; 
     expect(expandedNames).toContain("searchEntry");
     expect(new Set(response.expandedContext.map((entry) => entry.relation))).toEqual(new Set(["caller", "callee"]));
     expect(response.expandedContext.every((entry) => entry.chunkKind === "Code")).toBe(true);
+  });
+
+  it("keeps the seed result and returns partial graph context when inbound caller edges are unresolved", async () => {
+    fs.writeFileSync(
+      path.join(tempDir, "app", "indexer", "partial.ts"),
+      `export function partialLeafExact(query: string) { return query.length; }
+export function partialMidExact(query: string) { return partialLeafExact(query); }
+export function partialEntryExact(query: string) { return partialMidExact(query); }
+`,
+      "utf-8"
+    );
+
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const database = new Database(path.join(tempDir, ".opencode", "index", "codebase.db"));
+    const filePath = fs.realpathSync(path.join(tempDir, "app", "indexer", "partial.ts"));
+    const targetSymbol = database.getSymbolByName("partialMidExact", filePath);
+    expect(targetSymbol).not.toBeNull();
+
+    database.unresolveCallEdgesByTargetSymbolForBranch(targetSymbol!.id, "main");
+
+    const response = await indexer.searchDetailed("where is partialMidExact implementation", 1, {
+      metadataOnly: true,
+      filterByBranch: false,
+      taskType: "definition",
+      graphDepth: 1,
+    });
+
+    expect(response.primaryResults[0]?.name).toBe("partialMidExact");
+    const expandedNames = response.expandedContext.map((entry) => entry.name);
+    expect(expandedNames).toContain("partialLeafExact");
+    expect(expandedNames).not.toContain("partialEntryExact");
+  });
+
+  it("uses branch-native search APIs instead of marshaling branch chunk allowlists per query", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const primaryStore = (indexer as unknown as {
+      stores: Map<string, { searchFiltered: (...args: unknown[]) => unknown; searchOnBranch: (...args: unknown[]) => unknown }>;
+      invertedIndex: { searchFiltered: (...args: unknown[]) => unknown; searchOnBranch: (...args: unknown[]) => unknown };
+    }).stores.get("mock-embedding-model");
+    expect(primaryStore).toBeTruthy();
+
+    const denseFilteredSpy = vi.spyOn(primaryStore!, "searchFiltered");
+    const denseBranchSpy = vi.spyOn(primaryStore!, "searchOnBranch");
+    const bm25FilteredSpy = vi.spyOn((indexer as unknown as { invertedIndex: { searchFiltered: (...args: unknown[]) => unknown; searchOnBranch: (...args: unknown[]) => unknown } }).invertedIndex, "searchFiltered");
+    const bm25BranchSpy = vi.spyOn((indexer as unknown as { invertedIndex: { searchFiltered: (...args: unknown[]) => unknown; searchOnBranch: (...args: unknown[]) => unknown } }).invertedIndex, "searchOnBranch");
+
+    await indexer.search("rankHybridResults", 5, {
+      metadataOnly: true,
+      filterByBranch: true,
+    });
+
+    expect(denseFilteredSpy).not.toHaveBeenCalled();
+    expect(bm25FilteredSpy).not.toHaveBeenCalled();
+    expect(denseBranchSpy).toHaveBeenCalledWith(expect.any(Array), "main", expect.any(Number));
+    expect(bm25BranchSpy).toHaveBeenCalledWith("rankHybridResults", "main", expect.any(Number));
+  });
+
+  it("switches native branch filter state correctly across git branch changes", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const targetFile = path.join(tempDir, "app", "indexer", "index.ts");
+    fs.writeFileSync(
+      targetFile,
+      `export function mainBranchOnlySymbol(query: string) { return query.length; }
+export function rerankResults(query: string) { return mainBranchOnlySymbol(query); }
+export function searchEntry(query: string) { return rerankResults(query); }
+`,
+      "utf-8"
+    );
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: tempDir, stdio: "ignore" });
+    execFileSync("git", ["config", "user.name", "Test User"], { cwd: tempDir, stdio: "ignore" });
+    execFileSync("git", ["add", "."], { cwd: tempDir, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "initial main snapshot"], { cwd: tempDir, stdio: "ignore" });
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const mainResults = await indexer.search("mainBranchOnlySymbol", 5, {
+      metadataOnly: true,
+      filterByBranch: true,
+    });
+    expect(mainResults[0]?.name).toBe("mainBranchOnlySymbol");
+
+    execFileSync("git", ["checkout", "-b", "feature"], { cwd: tempDir, stdio: "ignore" });
+    fs.writeFileSync(
+      targetFile,
+      `export function featureBranchOnlySymbol(query: string) { return query.toUpperCase(); }
+export function featureSearchEntry(query: string) { return featureBranchOnlySymbol(query); }
+`,
+      "utf-8"
+    );
+    await indexer.handleBranchChange("main", "feature");
+
+    const featureResults = await indexer.search("featureBranchOnlySymbol", 5, {
+      metadataOnly: true,
+      filterByBranch: true,
+    });
+    expect(featureResults[0]?.name).toBe("featureBranchOnlySymbol");
+
+    execFileSync("git", ["checkout", "-f", "main"], { cwd: tempDir, stdio: "ignore" });
+    fs.writeFileSync(
+      targetFile,
+      `export function mainBranchOnlySymbol(query: string) { return query.length; }
+export function rerankResults(query: string) { return mainBranchOnlySymbol(query); }
+export function searchEntry(query: string) { return rerankResults(query); }
+`,
+      "utf-8"
+    );
+    await indexer.handleBranchChange("feature", "main");
+
+    const mainResultsAfterSwitchBack = await indexer.search("mainBranchOnlySymbol", 5, {
+      metadataOnly: true,
+      filterByBranch: true,
+    });
+    expect(mainResultsAfterSwitchBack[0]?.name).toBe("mainBranchOnlySymbol");
+
+  });
+
+  it("keeps query branch context consistent when a branch switch is in progress after publication", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const targetFile = path.join(tempDir, "app", "indexer", "index.ts");
+    fs.writeFileSync(
+      targetFile,
+      `export function mainBranchOnlySymbol(query: string) { return query.length; }
+export function rerankResults(query: string) { return mainBranchOnlySymbol(query); }
+export function searchEntry(query: string) { return rerankResults(query); }
+`,
+      "utf-8"
+    );
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: tempDir, stdio: "ignore" });
+    execFileSync("git", ["config", "user.name", "Test User"], { cwd: tempDir, stdio: "ignore" });
+    execFileSync("git", ["add", "."], { cwd: tempDir, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "initial main snapshot"], { cwd: tempDir, stdio: "ignore" });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const publishDeferred = Promise.withResolvers<void>();
+    const finishSwitchDeferred = Promise.withResolvers<void>();
+    const originalPublishCurrentBranch = (
+      indexer as unknown as { publishCurrentBranch: (branch: string) => void }
+    ).publishCurrentBranch.bind(indexer);
+    const publishSpy = vi.spyOn(
+      indexer as unknown as { publishCurrentBranch: (branch: string) => void },
+      "publishCurrentBranch"
+    ).mockImplementation((branch: string) => {
+      originalPublishCurrentBranch(branch);
+      publishDeferred.resolve();
+    });
+    const orchestrator = (indexer as unknown as {
+      orchestrator: {
+        coldStart: () => Promise<void>;
+      };
+    }).orchestrator;
+    const coldStartSpy = vi
+      .spyOn(orchestrator, "coldStart")
+      .mockImplementation(async () => {
+        await finishSwitchDeferred.promise;
+      });
+    const stores = (indexer as unknown as {
+      stores: Map<string, { searchOnBranch: (queryVector: number[], branch: string, limit?: number) => unknown[] }>;
+      invertedIndex: { searchOnBranch: (query: string, branch: string, limit?: number) => Map<string, number> };
+    }).stores;
+    const primaryStore = stores.get("mock-embedding-model");
+    expect(primaryStore).toBeTruthy();
+    const denseBranchSpy = vi.spyOn(primaryStore!, "searchOnBranch");
+    const bm25BranchSpy = vi.spyOn(
+      (indexer as unknown as {
+        invertedIndex: { searchOnBranch: (query: string, branch: string, limit?: number) => Map<string, number> };
+      }).invertedIndex,
+      "searchOnBranch"
+    );
+
+    execFileSync("git", ["checkout", "-b", "feature"], { cwd: tempDir, stdio: "ignore" });
+    fs.writeFileSync(
+      targetFile,
+      `export function featureBranchOnlySymbol(query: string) { return query.toUpperCase(); }
+export function featureSearchEntry(query: string) { return featureBranchOnlySymbol(query); }
+`,
+      "utf-8"
+    );
+    const switchPromise = indexer.handleBranchChange("main", "feature");
+    await publishDeferred.promise;
+
+    const response = await indexer.searchDetailed("featureBranchOnlySymbol", 5, {
+      metadataOnly: true,
+      filterByBranch: true,
+    });
+
+    expect(response.primaryResults).toEqual([]);
+    expect(denseBranchSpy.mock.calls.every((call) => call[1] === "feature")).toBe(true);
+    expect(bm25BranchSpy.mock.calls.every((call) => call[1] === "feature")).toBe(true);
+
+    finishSwitchDeferred.resolve();
+    await switchPromise;
+    coldStartSpy.mockRestore();
+    publishSpy.mockRestore();
+  });
+
+  it("snapshots the branch once at query start and ignores mid-query branch changes", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const targetFile = path.join(tempDir, "app", "indexer", "index.ts");
+    fs.writeFileSync(
+      targetFile,
+      `export function mainBranchOnlySymbol(query: string) { return query.length; }
+export function rerankResults(query: string) { return mainBranchOnlySymbol(query); }
+export function searchEntry(query: string) { return rerankResults(query); }
+`,
+      "utf-8"
+    );
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: tempDir, stdio: "ignore" });
+    execFileSync("git", ["config", "user.name", "Test User"], { cwd: tempDir, stdio: "ignore" });
+    execFileSync("git", ["add", "."], { cwd: tempDir, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "initial main snapshot"], { cwd: tempDir, stdio: "ignore" });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    execFileSync("git", ["checkout", "-b", "feature"], { cwd: tempDir, stdio: "ignore" });
+    fs.writeFileSync(
+      targetFile,
+      `export function featureBranchOnlySymbol(query: string) { return query.toUpperCase(); }
+export function featureSearchEntry(query: string) { return featureBranchOnlySymbol(query); }
+`,
+      "utf-8"
+    );
+    await indexer.handleBranchChange("main", "feature");
+
+    execFileSync("git", ["checkout", "-f", "main"], { cwd: tempDir, stdio: "ignore" });
+    fs.writeFileSync(
+      targetFile,
+      `export function mainBranchOnlySymbol(query: string) { return query.length; }
+export function rerankResults(query: string) { return mainBranchOnlySymbol(query); }
+export function searchEntry(query: string) { return rerankResults(query); }
+`,
+      "utf-8"
+    );
+    await indexer.handleBranchChange("feature", "main");
+
+    let branchReadCount = 0;
+    let currentBranchValue = (indexer as unknown as { currentBranch: string }).currentBranch;
+    Object.defineProperty(indexer, "currentBranch", {
+      configurable: true,
+      get() {
+        branchReadCount += 1;
+        return currentBranchValue;
+      },
+      set(value: string) {
+        currentBranchValue = value;
+      },
+    });
+
+    const embeddingDeferred = Promise.withResolvers<void>();
+    const originalGetQueryEmbedding = (
+      indexer as unknown as {
+        getQueryEmbedding: (query: string, provider: unknown) => Promise<number[] | null>;
+      }
+    ).getQueryEmbedding.bind(indexer);
+    const getQueryEmbeddingSpy = vi
+      .spyOn(
+        indexer as unknown as {
+          getQueryEmbedding: (query: string, provider: unknown) => Promise<number[] | null>;
+        },
+        "getQueryEmbedding"
+      )
+      .mockImplementation(async (query: string, provider: unknown) => {
+        await embeddingDeferred.promise;
+        return originalGetQueryEmbedding(query, provider);
+      });
+
+    const primaryStore = (indexer as unknown as {
+      stores: Map<string, { searchOnBranch: (queryVector: number[], branch: string, limit?: number) => unknown[] }>;
+    }).stores.get("mock-embedding-model");
+    expect(primaryStore).toBeTruthy();
+    const denseBranchSpy = vi.spyOn(primaryStore!, "searchOnBranch");
+    const bm25BranchSpy = vi.spyOn(
+      (indexer as unknown as {
+        invertedIndex: { searchOnBranch: (query: string, branch: string, limit?: number) => Map<string, number> };
+      }).invertedIndex,
+      "searchOnBranch"
+    );
+
+    const searchPromise = indexer.searchDetailed("mainBranchOnlySymbol", 5, {
+      metadataOnly: true,
+      filterByBranch: true,
+      graphDepth: 1,
+    });
+
+    await Promise.resolve();
+    (indexer as unknown as { currentBranch: string }).currentBranch = "feature";
+    embeddingDeferred.resolve();
+
+    const response = await searchPromise;
+
+    expect(branchReadCount).toBe(1);
+    expect(response.primaryResults[0]?.name).toBe("mainBranchOnlySymbol");
+    expect(denseBranchSpy.mock.calls.every((call) => call[1] === "main")).toBe(true);
+    expect(bm25BranchSpy.mock.calls.every((call) => call[1] === "main")).toBe(true);
+
+    getQueryEmbeddingSpy.mockRestore();
+    Object.defineProperty(indexer, "currentBranch", {
+      configurable: true,
+      writable: true,
+      value: currentBranchValue,
+    });
+  });
+
+  it("expands only callers for caller queries and only callees for callee queries", async () => {
+    fs.mkdirSync(path.join(tempDir, "app", "graph"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, "app", "graph", "helper.ts"),
+      `export function graphTargetHelper(value: string) { return value.length; }
+`,
+      "utf-8"
+    );
+    fs.writeFileSync(
+      path.join(tempDir, "app", "graph", "caller.ts"),
+      `import { graphTargetHelper } from "./helper";
+
+export function graphCallHelper(value: string) { return graphTargetHelper(value); }
+export function graphOuterCaller(value: string) { return graphCallHelper(value); }
+`,
+      "utf-8"
+    );
+
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const callerResponse = await indexer.searchDetailed("what calls graphTargetHelper", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+    });
+    expect(callerResponse.taskType).toBe("definition");
+    expect(callerResponse.graphDirection).toBe("caller");
+    expect(callerResponse.expandedContext.map((entry) => entry.name)).toContain("graphCallHelper");
+    expect(callerResponse.expandedContext.every((entry) => entry.relation === "caller")).toBe(true);
+    expect(callerResponse.expandedContext.map((entry) => entry.name)).not.toContain("graphOuterCaller");
+
+    const calleeResponse = await indexer.searchDetailed("what does graphCallHelper call", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+    });
+    expect(calleeResponse.taskType).toBe("definition");
+    expect(calleeResponse.graphDirection).toBe("callee");
+    expect(calleeResponse.expandedContext.map((entry) => entry.name)).toContain("graphTargetHelper");
+    expect(calleeResponse.expandedContext.every((entry) => entry.relation === "callee")).toBe(true);
+    expect(calleeResponse.expandedContext.map((entry) => entry.name)).not.toContain("graphOuterCaller");
+  });
+
+  it("returns caller chunks from search() for relationship queries instead of discarding expanded context", async () => {
+    fs.mkdirSync(path.join(tempDir, "app", "graph"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, "app", "graph", "helper.ts"),
+      `export function graphTargetHelper(value: string) { return value.length; }
+`,
+      "utf-8"
+    );
+    fs.writeFileSync(
+      path.join(tempDir, "app", "graph", "caller.ts"),
+      `import { graphTargetHelper } from "./helper";
+
+export function graphCallHelper(value: string) { return graphTargetHelper(value); }
+`,
+      "utf-8"
+    );
+
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const results = await indexer.search("what calls graphTargetHelper", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+    });
+
+    expect(results.some((entry) => entry.name === "graphCallHelper" && entry.relation === "caller")).toBe(true);
   });
 });

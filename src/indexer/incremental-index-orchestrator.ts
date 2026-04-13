@@ -134,6 +134,8 @@ export interface IncrementalIndexOrchestratorHost {
   ): boolean;
   clearCallEdgesForSymbolIfUnreferenced(database: Database, symbolId: string): boolean;
   removeSymbolFromGraphIfUnreferenced(database: Database, symbolId: string): boolean;
+  syncNativeBranchMembership(branch: string, chunkIds: string[]): void;
+  applyNativeBranchMembershipDelta(branch: string, added: string[], removed: string[]): void;
   getProviderRateLimits(provider: string): {
     concurrency: number;
     intervalCap: number;
@@ -604,10 +606,42 @@ export class IncrementalIndexOrchestrator {
 
   constructor(private readonly host: IncrementalIndexOrchestratorHost) {}
 
+  private getActiveVoyageMaxTokens(resources: {
+    voyageProvider: VoyageEmbeddingProvider | null;
+    voyageStore: VectorStore | null;
+    voyageModelId: string | null;
+  }): number | null {
+    const voyageEnabled = Boolean(
+      resources.voyageProvider && resources.voyageStore && resources.voyageModelId
+    );
+
+    return voyageEnabled ? resources.voyageProvider!.getModelInfo().maxTokens : null;
+  }
+
+  private getEffectiveEmbeddingMaxTokens(resources: {
+    configuredProviderInfo: ConfiguredProviderInfo;
+    voyageProvider: VoyageEmbeddingProvider | null;
+    voyageStore: VectorStore | null;
+    voyageModelId: string | null;
+  }): number {
+    const primaryMaxTokens = resources.configuredProviderInfo.modelInfo.maxTokens;
+    const activeVoyageMaxTokens = this.getActiveVoyageMaxTokens(resources);
+
+    if (activeVoyageMaxTokens == null) {
+      return primaryMaxTokens;
+    }
+
+    return Math.min(primaryMaxTokens, activeVoyageMaxTokens);
+  }
+
   resetStartupState(): void {
     this.startupComplete = false;
     this.forceColdStart = false;
     this.pendingHotUpdatePaths.clear();
+  }
+
+  requestColdStart(): void {
+    this.forceColdStart = true;
   }
 
   private buildConfigRebuildPlan(
@@ -893,7 +927,8 @@ export class IncrementalIndexOrchestrator {
       this.consumePendingHotUpdatePaths(branch);
       const configVersion = await getCurrentConfigVersion(
         resources.configuredProviderInfo,
-        resources.voyageModelId
+        resources.voyageModelId,
+        this.getActiveVoyageMaxTokens(resources)
       );
       const configHash = hashConfigVersion(configVersion);
       const snapshot = await buildMerkleSnapshot(
@@ -961,7 +996,8 @@ export class IncrementalIndexOrchestrator {
       const branch = this.host.getCurrentBranch();
       const configVersion = await getCurrentConfigVersion(
         resources.configuredProviderInfo,
-        resources.voyageModelId
+        resources.voyageModelId,
+        this.getActiveVoyageMaxTokens(resources)
       );
       const configHash = hashConfigVersion(configVersion);
       const preparedHotUpdate = await this.prepareHotUpdateInputs(
@@ -1022,7 +1058,8 @@ export class IncrementalIndexOrchestrator {
     const resources = await this.prepareRun();
     const currentConfig = await getCurrentConfigVersion(
       resources.configuredProviderInfo,
-      resources.voyageModelId
+      resources.voyageModelId,
+      this.getActiveVoyageMaxTokens(resources)
     );
     const currentConfigHash = hashConfigVersion(currentConfig);
     if (oldBranch) {
@@ -1093,7 +1130,8 @@ export class IncrementalIndexOrchestrator {
     const branch = this.host.getCurrentBranch();
     const currentConfig = await getCurrentConfigVersion(
       resources.configuredProviderInfo,
-      resources.voyageModelId
+      resources.voyageModelId,
+      this.getActiveVoyageMaxTokens(resources)
     );
     const currentConfigHash = hashConfigVersion(currentConfig);
     const activeConfig = this.checkpoints.getActiveConfigVersion();
@@ -1447,7 +1485,11 @@ export class IncrementalIndexOrchestrator {
       }
 
       parsedFile = parsed.parsedFiles[0] ?? null;
-      currentChunks = this.buildChunkRecords(absolutePath, parsedFile);
+      currentChunks = this.buildChunkRecords(
+        absolutePath,
+        parsedFile,
+        this.getEffectiveEmbeddingMaxTokens(context)
+      );
       const diff = this.diffChunksForFile(currentChunks, oldChunkIds, context);
       dirtyChunks = diff.dirtyChunks;
       removedChunkIds = diff.removedChunkIds;
@@ -1475,7 +1517,8 @@ export class IncrementalIndexOrchestrator {
 
     const embedConfigHash = hashEmbedConfig(
       context.configuredProviderInfo,
-      context.voyageModelId
+      context.voyageModelId,
+      this.getActiveVoyageMaxTokens(context)
     );
     const currentEmbeddingInputHashes = currentChunks.map(
       (chunk) => chunk.embeddingInputHash
@@ -1510,7 +1553,11 @@ export class IncrementalIndexOrchestrator {
         this.checkpoints.markStageFailed(context.branch, filePath, "embed", error, embedStageInputHash);
         throw new Error(error);
       }
-      currentChunks = this.buildChunkRecords(absolutePath, parsedFile);
+      currentChunks = this.buildChunkRecords(
+        absolutePath,
+        parsedFile,
+        this.getEffectiveEmbeddingMaxTokens(context)
+      );
       dirtyChunks = currentChunks.map((chunk) => this.toEmbeddingWorkChunk(chunk));
       indexNeedsUpdate = dirtyChunks.length > 0 || removedChunkIds.size > 0;
     } else if (chunkRan && embedStageIsStale && dirtyChunks.length === 0) {
@@ -1698,7 +1745,8 @@ export class IncrementalIndexOrchestrator {
           (chunk) =>
             missingArcticEmbeddings.has(chunk.embeddingInputHash) ||
             (voyageEnabled && missingVoyageEmbeddings.has(chunk.embeddingInputHash))
-        )
+        ),
+      this.getEffectiveEmbeddingMaxTokens(context)
     );
 
     for (const batch of batches) {
@@ -2011,7 +2059,8 @@ export class IncrementalIndexOrchestrator {
 
   private buildChunkRecords(
     absolutePath: string,
-    parsedFile: OrchestratorParsedFile
+    parsedFile: OrchestratorParsedFile,
+    embeddingMaxTokens: number
   ): ChunkRecord[] {
     const filteredChunks = applyChunkFilters(parsedFile.chunks, this.host.getConfig());
     return filteredChunks.map((chunk) => {
@@ -2027,7 +2076,8 @@ export class IncrementalIndexOrchestrator {
       const embeddingInput = prepareEmbeddingInput(
         embeddingChunk,
         parsedFile.path,
-        this.host.getProjectRoot()
+        this.host.getProjectRoot(),
+        embeddingMaxTokens
       );
       return {
         chunkId: generateChunkId(absolutePath, embeddingChunk),
@@ -2189,6 +2239,7 @@ export class IncrementalIndexOrchestrator {
     context: RunContext,
     onProgress?: ProgressCallback
   ): Promise<IndexStats> {
+    const previousBranchChunkIds = new Set(context.branchChunkIds);
     const staleChunkIds = Array.from(context.oldChunkIdsForTouchedFiles).filter(
       (chunkId) => !context.currentChunkIds.has(chunkId)
     );
@@ -2213,8 +2264,29 @@ export class IncrementalIndexOrchestrator {
 
     context.database.clearBranch(context.branch);
     context.database.addChunksToBranchBatch(context.branch, Array.from(context.currentChunkIds));
+    const addedBranchChunkIds = Array.from(context.currentChunkIds).filter(
+      (chunkId) => !previousBranchChunkIds.has(chunkId)
+    );
+    const removedBranchChunkIds = Array.from(previousBranchChunkIds).filter(
+      (chunkId) => !context.currentChunkIds.has(chunkId)
+    );
+    this.host.applyNativeBranchMembershipDelta(
+      context.branch,
+      addedBranchChunkIds,
+      removedBranchChunkIds
+    );
     context.database.clearBranchSymbols(context.branch);
     context.database.addSymbolsToBranchBatch(context.branch, Array.from(context.allSymbolIds));
+    const resolvedCrossFileEdges = context.database.resolveUnresolvedCallEdgesForBranch(
+      context.branch
+    );
+    if (resolvedCrossFileEdges > 0) {
+      this.host.logger.branch("debug", "Resolved unresolved call edges for branch", {
+        branch: context.branch,
+        resolvedCrossFileEdges,
+        runId: context.runId,
+      });
+    }
 
     if (staleChunkIds.length > 0) {
       // Branch membership is now authoritative for this run, so orphan GC can

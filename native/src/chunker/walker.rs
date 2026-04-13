@@ -2,7 +2,8 @@ use super::error::ChunkerError;
 use super::log_warn;
 use super::policy::{LanguagePolicy, SemanticInfo};
 use super::{
-    exceeds_budget, non_whitespace_len, Chunk, ChunkConfig, ChunkKind, Granularity, SymbolKind,
+    exceeds_budget, file_module_symbol_name, non_whitespace_len, Chunk, ChunkConfig, ChunkKind,
+    Granularity, SymbolKind, FILE_MODULE_CONTEXT_MAX_NON_WHITESPACE_CHARS,
 };
 use crate::hasher::xxhash_content;
 use tree_sitter::{Node, Tree};
@@ -334,9 +335,7 @@ fn extract_display_name_target(node: Node<'_>, source: &str) -> Option<String> {
         return None;
     }
 
-    let object_name = source
-        .get(object.start_byte()..object.end_byte())?
-        .trim();
+    let object_name = source.get(object.start_byte()..object.end_byte())?.trim();
     if object_name.is_empty() {
         return None;
     }
@@ -540,7 +539,8 @@ fn build_semantic_chunk(
     }
 
     if !info.coarse_eligible {
-        if let Some(statement_chunks) = split_oversized_leaf_node_by_statements(ctx, node, &template)
+        if let Some(statement_chunks) =
+            split_oversized_leaf_node_by_statements(ctx, node, &template)
         {
             return statement_chunks;
         }
@@ -549,7 +549,8 @@ fn build_semantic_chunk(
     }
 
     if split_children.is_empty() {
-        if let Some(statement_chunks) = split_oversized_leaf_node_by_statements(ctx, node, &template)
+        if let Some(statement_chunks) =
+            split_oversized_leaf_node_by_statements(ctx, node, &template)
         {
             return statement_chunks;
         }
@@ -722,6 +723,61 @@ fn top_level_semantic_nodes<'tree>(
     nodes
 }
 
+fn file_module_header_end_byte(ctx: &WalkerContext<'_>, root: Node<'_>) -> Option<usize> {
+    if ctx.range_non_whitespace_len(0, ctx.source.len())
+        <= FILE_MODULE_CONTEXT_MAX_NON_WHITESPACE_CHARS
+    {
+        return None;
+    }
+
+    let mut best_end = None;
+    for (node, _info) in top_level_semantic_nodes(ctx, root) {
+        let candidate_end = node.end_byte();
+        if ctx.range_non_whitespace_len(0, candidate_end)
+            <= FILE_MODULE_CONTEXT_MAX_NON_WHITESPACE_CHARS
+        {
+            best_end = Some(candidate_end);
+            continue;
+        }
+        break;
+    }
+
+    best_end
+}
+
+fn maybe_emit_file_module_header_chunk(
+    ctx: &WalkerContext<'_>,
+    root: Node<'_>,
+    chunks: &mut Vec<Chunk>,
+) -> Result<(), ChunkerError> {
+    let Some(end_byte) = file_module_header_end_byte(ctx, root) else {
+        return Ok(());
+    };
+    let Some(symbol_name) = file_module_symbol_name(ctx.file_path) else {
+        return Ok(());
+    };
+
+    let candidate = ctx.finalize_chunk(PendingChunk {
+        symbol_name: Some(symbol_name),
+        symbol_kind: Some(SymbolKind::Module),
+        chunk_kind: ChunkKind::File,
+        granularity: Granularity::Coarse,
+        start_byte: 0,
+        end_byte,
+    })?;
+
+    if chunks.iter().any(|chunk| {
+        chunk.start_byte == candidate.start_byte
+            && chunk.end_byte == candidate.end_byte
+            && chunk.text == candidate.text
+    }) {
+        return Ok(());
+    }
+
+    chunks.push(candidate);
+    Ok(())
+}
+
 pub fn chunk_tree(
     file_path: &str,
     language: &str,
@@ -761,13 +817,8 @@ pub fn chunk_tree(
     for chunk in pending {
         chunks.push(ctx.finalize_chunk(chunk)?);
     }
-    let mut chunks = super::enforce_fine_chunk_max_size(
-        file_path,
-        language,
-        source,
-        config,
-        chunks,
-    )?;
+    let mut chunks =
+        super::enforce_fine_chunk_max_size(file_path, language, source, config, chunks)?;
 
     if config.emit_coarse_chunks {
         for (node, info) in top_level_semantic_nodes(&ctx, root) {
@@ -785,6 +836,8 @@ pub fn chunk_tree(
             };
             chunks.push(ctx.finalize_chunk(pending)?);
         }
+
+        maybe_emit_file_module_header_chunk(&ctx, root, &mut chunks)?;
     }
 
     chunks.sort_by(|a, b| {

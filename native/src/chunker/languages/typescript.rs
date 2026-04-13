@@ -1,6 +1,6 @@
 use super::super::policy::{
-    extract_name_by_fields, extract_string_literal, first_named_child_of_kind,
-    has_descendant_kind, node_text, LanguagePolicy, SemanticInfo,
+    extract_name_by_fields, extract_string_literal, first_named_child_of_kind, has_descendant_kind,
+    node_text, LanguagePolicy, SemanticInfo,
 };
 use super::super::{ChunkKind, SymbolKind};
 use tree_sitter::Node;
@@ -96,14 +96,8 @@ fn classify_constant_expression(node: Node<'_>, source: &str) -> Option<bool> {
     let node = unwrap_transparent_expression(node);
 
     match node.kind() {
-        "string"
-        | "string_literal"
-        | "template_string"
-        | "template_literal"
-        | "number"
-        | "true"
-        | "false"
-        | "null" => Some(false),
+        "string" | "string_literal" | "template_string" | "template_literal" | "number"
+        | "true" | "false" | "null" => Some(false),
         "object" | "array" => Some(true),
         "identifier" => node_text(node, source)
             .map(str::trim)

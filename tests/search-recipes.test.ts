@@ -70,11 +70,14 @@ describe("search recipes", () => {
 
   it("maps eval query types into explicit task recipes", () => {
     expect(mapEvalQueryTypeToTaskType("definition")).toBe("definition");
+    expect(mapEvalQueryTypeToTaskType("identifier-heavy")).toBe("general");
     expect(mapEvalQueryTypeToTaskType("implementation-intent")).toBe("definition");
     expect(mapEvalQueryTypeToTaskType("config-lookup")).toBe("definition");
+    expect(mapEvalQueryTypeToTaskType("config-constant-lookup")).toBe("definition");
     expect(mapEvalQueryTypeToTaskType("cross-file-relationship")).toBe("definition");
     expect(mapEvalQueryTypeToTaskType("test-discovery")).toBe("test_debug");
     expect(mapEvalQueryTypeToTaskType("bug-report")).toBe("bug");
+    expect(mapEvalQueryTypeToTaskType("bug-error-lookup")).toBe("bug");
     expect(mapEvalQueryTypeToTaskType("similarity")).toBe("semantic");
     expect(mapEvalQueryTypeToTaskType("file-intent")).toBe("semantic");
     expect(mapEvalQueryTypeToTaskType("concept")).toBe("semantic");
@@ -112,6 +115,23 @@ describe("search recipes", () => {
       "definition",
       "semantic",
       "semantic",
+    ]);
+  });
+
+  it("covers the canonical curated benchmark query types", () => {
+    const dataset = loadGoldenDataset(
+      path.join(process.cwd(), "benchmarks", "golden", "cross-repo-curated", "BaseMemory.json")
+    );
+    const queryTypes = Array.from(new Set(dataset.queries.flatMap((query) => {
+      return query.queryType ? [query.queryType] : [];
+    }))) as GoldenQueryType[];
+
+    expect(queryTypes).toEqual([
+      "definition",
+      "identifier-heavy",
+      "cross-file-relationship",
+      "bug-error-lookup",
+      "config-constant-lookup",
     ]);
   });
 });

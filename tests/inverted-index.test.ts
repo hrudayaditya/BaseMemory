@@ -74,6 +74,35 @@ describe("InvertedIndex", () => {
       expect(results.has("chunk2")).toBe(true);
       expect(results.has("chunk1")).toBe(false);
     });
+
+    it("retains short meaningful code tokens", () => {
+      index.addChunk("chunk1", "db fs io id ts ui");
+
+      for (const query of ["db", "fs", "io", "id", "ts", "ui"]) {
+        const results = index.search(query);
+        expect(results.has("chunk1")).toBe(true);
+      }
+    });
+
+    it("splits camelCase, snake_case, kebab-case, and path components", () => {
+      index.addChunk(
+        "chunk1",
+        "getUserId DEFAULT_FINAL_RERANK_TOP_N src/config/load-env.ts"
+      );
+
+      for (const query of ["user id", "final rerank", "load env", "config", "load-env"]) {
+        const results = index.search(query);
+        expect(results.has("chunk1")).toBe(true);
+      }
+    });
+
+    it("keeps index-time and query-time tokenization consistent", () => {
+      index.addChunk("chunk1", "function getUserId(user) { return user.id; }");
+
+      const results = index.search("user id");
+
+      expect(results.has("chunk1")).toBe(true);
+    });
   });
 
   describe("removeChunk", () => {

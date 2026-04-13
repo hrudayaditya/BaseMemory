@@ -22,14 +22,10 @@ pub use inverted_index::*;
 pub use merkle::{
     build_merkle_snapshot as build_merkle_snapshot_internal,
     diff_from_events as diff_merkle_from_events_internal,
-    diff_snapshots as diff_merkle_snapshots_internal,
-    FileHash as MerkleFileHash,
-    IgnoreRules as InternalMerkleIgnoreRules,
-    MerkleDiff as InternalMerkleDiff,
-    MerkleError as InternalMerkleError,
-    MerkleNode as InternalMerkleNode,
-    MerkleNodeKind as InternalMerkleNodeKind,
-    MerkleSnapshot as InternalMerkleSnapshot,
+    diff_snapshots as diff_merkle_snapshots_internal, FileHash as MerkleFileHash,
+    IgnoreRules as InternalMerkleIgnoreRules, MerkleDiff as InternalMerkleDiff,
+    MerkleError as InternalMerkleError, MerkleNode as InternalMerkleNode,
+    MerkleNodeKind as InternalMerkleNodeKind, MerkleSnapshot as InternalMerkleSnapshot,
 };
 pub use parser::*;
 pub use store::*;
@@ -288,12 +284,13 @@ pub fn build_merkle_snapshot(
     AsyncTask::new(BuildMerkleSnapshotTask {
         repo_root,
         branch,
-        ignore_rules: ignore_rules.unwrap_or(MerkleIgnoreRules {
-            include: Vec::new(),
-            exclude: Vec::new(),
-            max_file_size: None,
-        })
-        .into(),
+        ignore_rules: ignore_rules
+            .unwrap_or(MerkleIgnoreRules {
+                include: Vec::new(),
+                exclude: Vec::new(),
+                max_file_size: None,
+            })
+            .into(),
     })
 }
 
@@ -319,12 +316,13 @@ pub fn diff_merkle_from_events(
         old_snapshot,
         changed_paths,
         repo_root,
-        ignore_rules: ignore_rules.unwrap_or(MerkleIgnoreRules {
-            include: Vec::new(),
-            exclude: Vec::new(),
-            max_file_size: None,
-        })
-        .into(),
+        ignore_rules: ignore_rules
+            .unwrap_or(MerkleIgnoreRules {
+                include: Vec::new(),
+                exclude: Vec::new(),
+                max_file_size: None,
+            })
+            .into(),
     })
 }
 
@@ -389,6 +387,19 @@ impl VectorStore {
     }
 
     #[napi]
+    pub fn search_on_branch(
+        &self,
+        query_vector: Vec<f64>,
+        limit: u32,
+        branch: String,
+    ) -> Result<Vec<SearchResult>> {
+        let query_f32: Vec<f32> = query_vector.iter().map(|&x| x as f32).collect();
+        self.inner
+            .search_on_branch(&query_f32, limit as usize, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
     pub fn remove(&mut self, id: String) -> Result<bool> {
         self.inner
             .remove(&id)
@@ -403,7 +414,7 @@ impl VectorStore {
     }
 
     #[napi]
-    pub fn load(&mut self) -> Result<()> {
+    pub fn load(&mut self) -> Result<bool> {
         self.inner
             .load()
             .map_err(|e| Error::from_reason(e.to_string()))
@@ -419,6 +430,26 @@ impl VectorStore {
         self.inner
             .clear()
             .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn set_branch_membership(&mut self, branch: String, chunk_ids: Vec<String>) {
+        self.inner.set_branch_membership(&branch, &chunk_ids);
+    }
+
+    #[napi]
+    pub fn apply_branch_delta(&mut self, branch: String, added: Vec<String>, removed: Vec<String>) {
+        self.inner.apply_branch_delta(&branch, &added, &removed);
+    }
+
+    #[napi]
+    pub fn clear_branch_membership(&mut self, branch: String) {
+        self.inner.clear_branch_membership(&branch);
+    }
+
+    #[napi]
+    pub fn clear_all_branch_memberships(&mut self) {
+        self.inner.clear_all_branch_memberships();
     }
 
     #[napi]
@@ -526,6 +557,28 @@ pub struct CallEdgeData {
 }
 
 #[napi(object)]
+pub struct CallEdgeFrontierBatchData {
+    pub callers: Vec<CallEdgeData>,
+    pub callees: Vec<CallEdgeData>,
+}
+
+#[napi(object)]
+pub struct SymbolChunkData {
+    pub symbol_id: String,
+    pub chunk_id: String,
+    pub content_hash: String,
+    pub embedding_input_hash: String,
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub node_type: Option<String>,
+    pub name: Option<String>,
+    pub chunk_kind: Option<String>,
+    pub symbol_kind: Option<String>,
+    pub language: String,
+}
+
+#[napi(object)]
 pub struct KeywordSearchResult {
     pub chunk_id: String,
     pub score: f64,
@@ -545,7 +598,7 @@ impl InvertedIndex {
     }
 
     #[napi]
-    pub fn load(&mut self) -> Result<()> {
+    pub fn load(&mut self) -> Result<bool> {
         self.inner
             .load()
             .map_err(|e| Error::from_reason(e.to_string()))
@@ -597,6 +650,17 @@ impl InvertedIndex {
     }
 
     #[napi]
+    pub fn search_on_branch(&self, query: String, branch: String, limit: Option<u32>) -> Vec<KeywordSearchResult> {
+        let results = self.inner.search_on_branch(&query, &branch);
+        let limit = limit.unwrap_or(100) as usize;
+        results
+            .into_iter()
+            .take(limit)
+            .map(|(chunk_id, score)| KeywordSearchResult { chunk_id, score })
+            .collect()
+    }
+
+    #[napi]
     pub fn has_chunk(&self, chunk_id: String) -> bool {
         self.inner.has_chunk(&chunk_id)
     }
@@ -604,6 +668,26 @@ impl InvertedIndex {
     #[napi]
     pub fn clear(&mut self) {
         self.inner.clear();
+    }
+
+    #[napi]
+    pub fn set_branch_membership(&mut self, branch: String, chunk_ids: Vec<String>) {
+        self.inner.set_branch_membership(&branch, &chunk_ids);
+    }
+
+    #[napi]
+    pub fn apply_branch_delta(&mut self, branch: String, added: Vec<String>, removed: Vec<String>) {
+        self.inner.apply_branch_delta(&branch, &added, &removed);
+    }
+
+    #[napi]
+    pub fn clear_branch_membership(&mut self, branch: String) {
+        self.inner.clear_branch_membership(&branch);
+    }
+
+    #[napi]
+    pub fn clear_all_branch_memberships(&mut self) {
+        self.inner.clear_all_branch_memberships();
     }
 
     #[napi]
@@ -962,6 +1046,43 @@ impl Database {
     }
 
     #[napi]
+    pub fn get_chunks_for_symbols_batch(
+        &self,
+        symbol_ids: Vec<String>,
+        branch: String,
+        allowed_chunk_ids: Option<Vec<String>>,
+    ) -> Result<Vec<SymbolChunkData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows = db::get_chunks_for_symbols_batch(
+            &conn,
+            &symbol_ids,
+            &branch,
+            allowed_chunk_ids.as_deref(),
+        )
+        .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| SymbolChunkData {
+                symbol_id: row.symbol_id,
+                chunk_id: row.chunk_id,
+                content_hash: row.content_hash,
+                embedding_input_hash: row.embedding_input_hash,
+                file_path: row.file_path,
+                start_line: row.start_line,
+                end_line: row.end_line,
+                node_type: row.node_type,
+                name: row.name,
+                chunk_kind: row.chunk_kind,
+                symbol_kind: row.symbol_kind,
+                language: row.language,
+            })
+            .collect())
+    }
+
+    #[napi]
     pub fn get_chunks_by_name(&self, name: String) -> Result<Vec<ChunkData>> {
         let conn = self
             .conn
@@ -1165,11 +1286,7 @@ impl Database {
     }
 
     #[napi]
-    pub fn chunk_exists_on_other_branches(
-        &self,
-        branch: String,
-        chunk_id: String,
-    ) -> Result<bool> {
+    pub fn chunk_exists_on_other_branches(&self, branch: String, chunk_id: String) -> Result<bool> {
         let conn = self
             .conn
             .lock()
@@ -1222,9 +1339,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let snapshot = merkle::store::load_snapshot(&conn, &branch)
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        snapshot
-            .map(|value| serialize_snapshot(&value))
-            .transpose()
+        snapshot.map(|value| serialize_snapshot(&value)).transpose()
     }
 
     #[napi]
@@ -1254,8 +1369,7 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        merkle::store::clear_all_snapshots(&conn)
-            .map_err(|e| Error::from_reason(e.to_string()))
+        merkle::store::clear_all_snapshots(&conn).map_err(|e| Error::from_reason(e.to_string()))
     }
 
     #[napi]
@@ -1356,8 +1470,7 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        db::get_known_pipeline_files(&conn, &branch)
-            .map_err(|e| Error::from_reason(e.to_string()))
+        db::get_known_pipeline_files(&conn, &branch).map_err(|e| Error::from_reason(e.to_string()))
     }
 
     #[napi]
@@ -1440,7 +1553,9 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        retry_busy_write(|| db::update_pipeline_run_status(&conn, &run_id, &status, completed_at as i64))
+        retry_busy_write(|| {
+            db::update_pipeline_run_status(&conn, &run_id, &status, completed_at as i64)
+        })
     }
 
     #[napi]
@@ -1449,8 +1564,8 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        let result = db::get_pipeline_run(&conn, &run_id)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let result =
+            db::get_pipeline_run(&conn, &run_id).map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(result.map(|row| PipelineRunData {
             run_id: row.run_id,
             branch: row.branch,
@@ -1468,7 +1583,9 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        let count = retry_busy_write(|| db::cancel_active_pipeline_runs(&conn, &branch, cancelled_at as i64))?;
+        let count = retry_busy_write(|| {
+            db::cancel_active_pipeline_runs(&conn, &branch, cancelled_at as i64)
+        })?;
         Ok(count as u32)
     }
 
@@ -1545,8 +1662,8 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        let result = db::get_active_config_version(&conn)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let result =
+            db::get_active_config_version(&conn).map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(result.map(|row| ConfigVersionData {
             config_hash: row.config_hash,
             embedding_model_id: row.embedding_model_id,
@@ -1581,7 +1698,10 @@ impl Database {
     }
 
     #[napi]
-    pub fn get_branch_config_version(&self, branch: String) -> Result<Option<BranchConfigVersionData>> {
+    pub fn get_branch_config_version(
+        &self,
+        branch: String,
+    ) -> Result<Option<BranchConfigVersionData>> {
         let conn = self
             .conn
             .lock()
@@ -1764,6 +1884,34 @@ impl Database {
             end_col: r.end_col,
             language: r.language,
         }))
+    }
+
+    #[napi]
+    pub fn get_symbols_by_ids_on_branch(
+        &self,
+        symbol_ids: Vec<String>,
+        branch: String,
+    ) -> Result<Vec<SymbolData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows = db::get_symbols_by_ids_on_branch(&conn, &symbol_ids, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SymbolData {
+                id: r.id,
+                file_path: r.file_path,
+                name: r.name,
+                kind: r.kind,
+                start_line: r.start_line,
+                start_col: r.start_col,
+                end_line: r.end_line,
+                end_col: r.end_col,
+                language: r.language,
+            })
+            .collect())
     }
 
     #[napi]
@@ -2081,21 +2229,22 @@ impl Database {
             .map(|r| {
                 let from_symbol_file_path = r.from_symbol_file_path;
                 CallEdgeData {
-                id: r.id,
-                branch: branch.clone(),
-                from_symbol_id: r.from_symbol_id,
-                from_symbol_name: Some(r.from_symbol_name),
-                from_symbol_file_path: Some(from_symbol_file_path.clone()),
-                caller_file_path: Some(from_symbol_file_path),
-                target_name: r.target_name,
-                target_file_path: r.target_file_path,
-                target_kind: r.target_kind,
-                to_symbol_id: r.to_symbol_id,
-                call_type: r.call_type,
-                line: r.line,
-                col: r.col,
-                is_resolved: r.is_resolved,
-            }})
+                    id: r.id,
+                    branch: branch.clone(),
+                    from_symbol_id: r.from_symbol_id,
+                    from_symbol_name: Some(r.from_symbol_name),
+                    from_symbol_file_path: Some(from_symbol_file_path.clone()),
+                    caller_file_path: Some(from_symbol_file_path),
+                    target_name: r.target_name,
+                    target_file_path: r.target_file_path,
+                    target_kind: r.target_kind,
+                    to_symbol_id: r.to_symbol_id,
+                    call_type: r.call_type,
+                    line: r.line,
+                    col: r.col,
+                    is_resolved: r.is_resolved,
+                }
+            })
             .collect())
     }
 
@@ -2109,29 +2258,90 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        let rows = db::get_callers_with_context_by_target_symbol_id(&conn, &target_symbol_id, &branch)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows =
+            db::get_callers_with_context_by_target_symbol_id(&conn, &target_symbol_id, &branch)
+                .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(rows
             .into_iter()
             .map(|r| {
                 let from_symbol_file_path = r.from_symbol_file_path;
                 CallEdgeData {
-                id: r.id,
-                branch: branch.clone(),
-                from_symbol_id: r.from_symbol_id,
-                from_symbol_name: Some(r.from_symbol_name),
-                from_symbol_file_path: Some(from_symbol_file_path.clone()),
-                caller_file_path: Some(from_symbol_file_path),
-                target_name: r.target_name,
-                target_file_path: r.target_file_path,
-                target_kind: r.target_kind,
-                to_symbol_id: r.to_symbol_id,
-                call_type: r.call_type,
-                line: r.line,
-                col: r.col,
-                is_resolved: r.is_resolved,
-            }})
+                    id: r.id,
+                    branch: branch.clone(),
+                    from_symbol_id: r.from_symbol_id,
+                    from_symbol_name: Some(r.from_symbol_name),
+                    from_symbol_file_path: Some(from_symbol_file_path.clone()),
+                    caller_file_path: Some(from_symbol_file_path),
+                    target_name: r.target_name,
+                    target_file_path: r.target_file_path,
+                    target_kind: r.target_kind,
+                    to_symbol_id: r.to_symbol_id,
+                    call_type: r.call_type,
+                    line: r.line,
+                    col: r.col,
+                    is_resolved: r.is_resolved,
+                }
+            })
             .collect())
+    }
+
+    #[napi]
+    pub fn get_call_edge_frontier_batch(
+        &self,
+        symbol_ids: Vec<String>,
+        branch: String,
+    ) -> Result<CallEdgeFrontierBatchData> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows = db::get_call_edge_frontier_batch(&conn, &symbol_ids, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(CallEdgeFrontierBatchData {
+            callers: rows
+                .callers
+                .into_iter()
+                .map(|r| {
+                    let from_symbol_file_path = r.from_symbol_file_path;
+                    CallEdgeData {
+                        id: r.id,
+                        branch: branch.clone(),
+                        from_symbol_id: r.from_symbol_id,
+                        from_symbol_name: Some(r.from_symbol_name),
+                        from_symbol_file_path: Some(from_symbol_file_path.clone()),
+                        caller_file_path: Some(from_symbol_file_path),
+                        target_name: r.target_name,
+                        target_file_path: r.target_file_path,
+                        target_kind: r.target_kind,
+                        to_symbol_id: r.to_symbol_id,
+                        call_type: r.call_type,
+                        line: r.line,
+                        col: r.col,
+                        is_resolved: r.is_resolved,
+                    }
+                })
+                .collect(),
+            callees: rows
+                .callees
+                .into_iter()
+                .map(|r| CallEdgeData {
+                    id: r.id,
+                    branch: r.branch,
+                    from_symbol_id: r.from_symbol_id,
+                    from_symbol_name: None,
+                    from_symbol_file_path: None,
+                    caller_file_path: r.caller_file_path,
+                    target_name: r.target_name,
+                    target_file_path: r.target_file_path,
+                    target_kind: r.target_kind,
+                    to_symbol_id: r.to_symbol_id,
+                    call_type: r.call_type,
+                    line: r.line,
+                    col: r.col,
+                    is_resolved: r.is_resolved,
+                })
+                .collect(),
+        })
     }
 
     #[napi]
@@ -2181,8 +2391,9 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        let count = db::unresolve_call_edges_by_target_symbol_for_branch(&conn, &symbol_id, &branch)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count =
+            db::unresolve_call_edges_by_target_symbol_for_branch(&conn, &symbol_id, &branch)
+                .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(count as u32)
     }
 
@@ -2218,7 +2429,18 @@ impl Database {
             target_file_path.as_deref(),
             target_kind.as_deref(),
         )
-            .map_err(|e| Error::from_reason(e.to_string()))
+        .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn resolve_unresolved_call_edges_for_branch(&self, branch: String) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count =
+            retry_busy_write(|| db::resolve_unresolved_call_edges_for_branch(&conn, &branch))?;
+        Ok(count as u32)
     }
 
     // ── Branch Symbol methods ────────────────────────────────────────
@@ -2272,8 +2494,8 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        let count = db::clear_all_branch_symbols(&conn)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count =
+            db::clear_all_branch_symbols(&conn).map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(count as u32)
     }
 

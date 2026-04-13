@@ -239,6 +239,8 @@ export function buildPerQueryResult(
     id: query.id,
     query: query.query,
     queryType: query.queryType,
+    source: query.source,
+    heuristic: query.heuristic,
     effectiveTaskType: effective?.effectiveTaskType,
     effectiveFinalRerankTopN: effective?.effectiveFinalRerankTopN,
     effectiveGraphDepth: effective?.effectiveGraphDepth,

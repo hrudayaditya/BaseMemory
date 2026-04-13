@@ -74,11 +74,7 @@ pub fn recompute_directory_hashes_for_paths(
 ) -> MerkleResult<()> {
     let child_map = build_child_map(nodes);
     let mut directories: Vec<String> = affected_directories.iter().cloned().collect();
-    directories.sort_by(|left, right| {
-        depth(right)
-            .cmp(&depth(left))
-            .then_with(|| left.cmp(right))
-    });
+    directories.sort_by(|left, right| depth(right).cmp(&depth(left)).then_with(|| left.cmp(right)));
 
     for directory in directories {
         let Some(node) = nodes.get(&directory) else {
@@ -143,10 +139,7 @@ pub fn compute_directory_hash(
     Ok(crate::hasher::xxhash_content(&payload))
 }
 
-pub fn ensure_parent_directories(
-    nodes: &mut BTreeMap<String, MerkleNode>,
-    file_path: &str,
-) {
+pub fn ensure_parent_directories(nodes: &mut BTreeMap<String, MerkleNode>, file_path: &str) {
     let mut current = String::new();
     let segments: Vec<&str> = file_path.split('/').collect();
 

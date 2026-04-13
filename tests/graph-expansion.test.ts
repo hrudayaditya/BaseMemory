@@ -6,6 +6,18 @@ import { expandGraphContext } from "../src/indexer/graph-expansion.js";
 type CallerRow = ReturnType<Database["getCallersWithContext"]>[number];
 type CalleeRow = ReturnType<Database["getCallees"]>[number];
 
+interface GraphExpansionCallCounters {
+  getSymbolByNameOnBranch: number;
+  getSymbolsByFileOnBranch: number;
+  getCallersWithContextByTargetSymbolId: number;
+  getCallees: number;
+  getSymbolByIdOnBranch: number;
+  getChunksByFileOnBranch: number;
+  getCallEdgeFrontierBatch: number;
+  getSymbolsByIdsOnBranch: number;
+  getChunksForSymbolsBatch: number;
+}
+
 function symbol(id: string, name: string, filePath: string): SymbolData {
   return {
     id,
@@ -43,6 +55,8 @@ function fakeDatabase(input: {
   callees?: CalleeRow[];
   branchSymbols?: Record<string, string[]>;
   branchChunks?: Record<string, string[]>;
+  failOnNameLookup?: boolean;
+  callCounters?: GraphExpansionCallCounters;
 }): Database {
   const symbolsById = new Map(input.symbols.map((item) => [item.id, item]));
   const branchSymbolIds = new Map(
@@ -76,22 +90,37 @@ function fakeDatabase(input: {
     return chunks.filter((item) => allowed.has(item.chunkId));
   };
 
+  const count = (key: keyof GraphExpansionCallCounters): void => {
+    if (input.callCounters) {
+      input.callCounters[key] += 1;
+    }
+  };
+
   return {
     getSymbolByNameOnBranch(name: string, filePath: string, branch: string) {
+      count("getSymbolByNameOnBranch");
       return filterSymbolsByBranch(branch, symbolsByFile.get(filePath) ?? [])
         .find((item) => item.name === name) ?? null;
     },
     getSymbolsByFileOnBranch(filePath: string, branch: string) {
+      count("getSymbolsByFileOnBranch");
       return filterSymbolsByBranch(branch, symbolsByFile.get(filePath) ?? []);
     },
     getSymbolsByNameOnBranch(name: string, branch: string) {
+      if (input.failOnNameLookup) {
+        throw new Error(`unexpected exact name lookup for ${name} on ${branch}`);
+      }
       return filterSymbolsByBranch(branch, input.symbols).filter((item) => item.name === name);
     },
     getSymbolsByNameCiOnBranch(name: string, branch: string) {
+      if (input.failOnNameLookup) {
+        throw new Error(`unexpected case-insensitive name lookup for ${name} on ${branch}`);
+      }
       return filterSymbolsByBranch(branch, input.symbols)
         .filter((item) => item.name.toLowerCase() === name.toLowerCase());
     },
     getSymbolByIdOnBranch(symbolId: string, branch: string) {
+      count("getSymbolByIdOnBranch");
       const symbol = symbolsById.get(symbolId) ?? null;
       if (symbol === null) {
         return null;
@@ -103,7 +132,59 @@ function fakeDatabase(input: {
       return symbol;
     },
     getChunksByFileOnBranch(filePath: string, branch: string) {
+      count("getChunksByFileOnBranch");
       return filterChunksByBranch(branch, chunksByFile.get(filePath) ?? []);
+    },
+    getSymbolsByIdsOnBranch(symbolIds: string[], branch: string) {
+      count("getSymbolsByIdsOnBranch");
+      const allowed = branchSymbolIds.get(branch);
+      return symbolIds
+        .map((symbolId) => symbolsById.get(symbolId) ?? null)
+        .filter((item): item is SymbolData => item !== null)
+        .filter((item) => !allowed || allowed.has(item.id));
+    },
+    getChunksForSymbolsBatch(symbolIds: string[], branch: string, allowedChunkIds?: string[]) {
+      count("getChunksForSymbolsBatch");
+      const allowedChunks = allowedChunkIds ? new Set(allowedChunkIds) : null;
+      return symbolIds.flatMap((symbolId) => {
+        const item = symbolsById.get(symbolId);
+        if (!item) {
+          return [];
+        }
+
+        const bestChunk = filterChunksByBranch(branch, chunksByFile.get(item.filePath) ?? [])
+          .filter((chunk) => !allowedChunks || allowedChunks.has(chunk.chunkId))
+          .filter((chunk) => chunk.startLine <= item.startLine && chunk.endLine >= item.endLine)
+          .sort((left, right) => {
+            const leftNameMatch = left.name === item.name ? 1 : 0;
+            const rightNameMatch = right.name === item.name ? 1 : 0;
+            if (leftNameMatch !== rightNameMatch) {
+              return rightNameMatch - leftNameMatch;
+            }
+            const leftSpan = left.endLine - left.startLine;
+            const rightSpan = right.endLine - right.startLine;
+            return leftSpan - rightSpan;
+          })[0];
+
+        if (!bestChunk) {
+          return [];
+        }
+
+        return [{
+          symbolId,
+          chunkId: bestChunk.chunkId,
+          contentHash: bestChunk.contentHash,
+          embeddingInputHash: bestChunk.embeddingInputHash,
+          filePath: bestChunk.filePath,
+          startLine: bestChunk.startLine,
+          endLine: bestChunk.endLine,
+          nodeType: bestChunk.nodeType,
+          name: bestChunk.name,
+          chunkKind: bestChunk.chunkKind,
+          symbolKind: bestChunk.symbolKind,
+          language: bestChunk.language,
+        }];
+      });
     },
     getSymbolByName(name: string, filePath: string) {
       return (symbolsByFile.get(filePath) ?? []).find((item) => item.name === name) ?? null;
@@ -130,18 +211,49 @@ function fakeDatabase(input: {
       );
     },
     getCallersWithContextByTargetSymbolId(_targetSymbolId: string, _branch: string) {
+      count("getCallersWithContextByTargetSymbolId");
       return (input.callers ?? []).filter((item) =>
         item.toSymbolId === _targetSymbolId &&
         (!("branch" in item) || item.branch === _branch)
       );
     },
     getCallees(_symbolId: string, _branch: string) {
+      count("getCallees");
       return (input.callees ?? []).filter((item) =>
         item.fromSymbolId === _symbolId &&
         (!("branch" in item) || item.branch === _branch)
       );
     },
+    getCallEdgeFrontierBatch(symbolIds: string[], branch: string) {
+      count("getCallEdgeFrontierBatch");
+      const symbolSet = new Set(symbolIds);
+      return {
+        callers: (input.callers ?? []).filter((item) =>
+          !!item.toSymbolId &&
+          symbolSet.has(item.toSymbolId) &&
+          (!("branch" in item) || item.branch === branch)
+        ),
+        callees: (input.callees ?? []).filter((item) =>
+          symbolSet.has(item.fromSymbolId) &&
+          (!("branch" in item) || item.branch === branch)
+        ),
+      };
+    },
   } as unknown as Database;
+}
+
+function createCallCounters(): GraphExpansionCallCounters {
+  return {
+    getSymbolByNameOnBranch: 0,
+    getSymbolsByFileOnBranch: 0,
+    getCallersWithContextByTargetSymbolId: 0,
+    getCallees: 0,
+    getSymbolByIdOnBranch: 0,
+    getChunksByFileOnBranch: 0,
+    getCallEdgeFrontierBatch: 0,
+    getSymbolsByIdsOnBranch: 0,
+    getChunksForSymbolsBatch: 0,
+  };
 }
 
 function meta(name: string, filePath: string): ChunkMetadata {
@@ -305,50 +417,34 @@ describe("graph expansion", () => {
     expect(depthTwo.map((item) => item.metadata.name)).toEqual(["submitCheckout", "handleRequest"]);
   });
 
-  it("scopes seed and unresolved target symbol resolution to the active branch", () => {
+  it("traverses resolved cross-file callees without falling back to name lookup", () => {
     const db = fakeDatabase({
       symbols: [
         symbol("seed-main", "processPayment", "/repo/src/payment.ts"),
-        symbol("seed-feature", "processPayment", "/repo/src/payment.ts"),
         symbol("callee-main", "saveReceipt", "/repo/src/receipt.ts"),
-        symbol("callee-feature", "saveReceipt", "/repo/src/receipt.ts"),
       ],
       chunks: [
         chunk("seedChunkMain", "processPayment", "/repo/src/payment.ts"),
-        chunk("seedChunkFeature", "processPayment", "/repo/src/payment.ts"),
         chunk("calleeChunkMain", "saveReceipt", "/repo/src/receipt.ts"),
-        chunk("calleeChunkFeature", "saveReceipt", "/repo/src/receipt.ts"),
       ],
       branchSymbols: {
         main: ["seed-main", "callee-main"],
-        feature: ["seed-feature", "callee-feature"],
       },
       branchChunks: {
         main: ["seedChunkMain", "calleeChunkMain"],
-        feature: ["seedChunkFeature", "calleeChunkFeature"],
       },
+      failOnNameLookup: true,
       callees: [{
         id: "edge-main",
         fromSymbolId: "seed-main",
         fromSymbolName: "processPayment",
         fromSymbolFilePath: "/repo/src/payment.ts",
         targetName: "saveReceipt",
-        toSymbolId: null,
+        toSymbolId: "callee-main",
         callType: "Call",
         line: 8,
         col: 2,
-        isResolved: false,
-      }, {
-        id: "edge-feature",
-        fromSymbolId: "seed-feature",
-        fromSymbolName: "processPayment",
-        fromSymbolFilePath: "/repo/src/payment.ts",
-        targetName: "saveReceipt",
-        toSymbolId: null,
-        callType: "Call",
-        line: 8,
-        col: 2,
-        isResolved: false,
+        isResolved: true,
       }],
     });
 
@@ -362,17 +458,141 @@ describe("graph expansion", () => {
     });
     expect(mainExpanded).toHaveLength(1);
     expect(mainExpanded[0]?.id).toBe("calleeChunkMain");
+  });
 
-    const featureExpanded = expandGraphContext(db, [{
-      id: "seedChunkFeature",
+  it("does not expand unresolved callees by guessing target names", () => {
+    const db = fakeDatabase({
+      symbols: [
+        symbol("seed-main", "processPayment", "/repo/src/payment.ts"),
+        symbol("callee-main", "saveReceipt", "/repo/src/receipt.ts"),
+      ],
+      chunks: [
+        chunk("seedChunkMain", "processPayment", "/repo/src/payment.ts"),
+        chunk("calleeChunkMain", "saveReceipt", "/repo/src/receipt.ts"),
+      ],
+      branchSymbols: {
+        main: ["seed-main", "callee-main"],
+      },
+      branchChunks: {
+        main: ["seedChunkMain", "calleeChunkMain"],
+      },
+      failOnNameLookup: true,
+      callees: [{
+        id: "edge-main",
+        fromSymbolId: "seed-main",
+        fromSymbolName: "processPayment",
+        fromSymbolFilePath: "/repo/src/payment.ts",
+        targetName: "saveReceipt",
+        toSymbolId: null,
+        callType: "Call",
+        line: 8,
+        col: 2,
+        isResolved: false,
+      }],
+    });
+
+    const expanded = expandGraphContext(db, [{
+      id: "seedChunkMain",
       metadata: meta("processPayment", "/repo/src/payment.ts"),
     }], {
-      branch: "feature",
+      branch: "main",
       depth: 1,
-      allowedChunkIds: new Set(["seedChunkFeature", "calleeChunkFeature"]),
+      allowedChunkIds: new Set(["seedChunkMain", "calleeChunkMain"]),
     });
-    expect(featureExpanded).toHaveLength(1);
-    expect(featureExpanded[0]?.id).toBe("calleeChunkFeature");
+
+    expect(expanded).toEqual([]);
+  });
+
+  it("returns callers only for persistently resolved cross-file targets", () => {
+    const resolvedDb = fakeDatabase({
+      symbols: [
+        symbol("target", "processPayment", "/repo/src/payment.ts"),
+        symbol("caller", "submitCheckout", "/repo/src/checkout.ts"),
+      ],
+      chunks: [
+        chunk("targetChunk", "processPayment", "/repo/src/payment.ts"),
+        chunk("callerChunk", "submitCheckout", "/repo/src/checkout.ts"),
+      ],
+      branchSymbols: {
+        main: ["target", "caller"],
+      },
+      branchChunks: {
+        main: ["targetChunk", "callerChunk"],
+      },
+      callers: [{
+        id: "edge-resolved",
+        fromSymbolId: "caller",
+        fromSymbolName: "submitCheckout",
+        fromSymbolFilePath: "/repo/src/checkout.ts",
+        targetName: "processPayment",
+        targetFilePath: "/repo/src/payment.ts",
+        targetKind: "Function",
+        toSymbolId: "target",
+        callType: "Call",
+        line: 4,
+        col: 2,
+        isResolved: true,
+      }],
+      failOnNameLookup: true,
+    });
+
+    const resolvedExpanded = expandGraphContext(resolvedDb, [{
+      id: "targetChunk",
+      metadata: meta("processPayment", "/repo/src/payment.ts"),
+    }], {
+      branch: "main",
+      depth: 1,
+      allowedChunkIds: new Set(["targetChunk", "callerChunk"]),
+    });
+
+    expect(resolvedExpanded).toHaveLength(1);
+    expect(resolvedExpanded[0]).toMatchObject({
+      id: "callerChunk",
+      relation: "caller",
+    });
+
+    const unresolvedDb = fakeDatabase({
+      symbols: [
+        symbol("target", "processPayment", "/repo/src/payment.ts"),
+        symbol("caller", "submitCheckout", "/repo/src/checkout.ts"),
+      ],
+      chunks: [
+        chunk("targetChunk", "processPayment", "/repo/src/payment.ts"),
+        chunk("callerChunk", "submitCheckout", "/repo/src/checkout.ts"),
+      ],
+      branchSymbols: {
+        main: ["target", "caller"],
+      },
+      branchChunks: {
+        main: ["targetChunk", "callerChunk"],
+      },
+      callers: [{
+        id: "edge-unresolved",
+        fromSymbolId: "caller",
+        fromSymbolName: "submitCheckout",
+        fromSymbolFilePath: "/repo/src/checkout.ts",
+        targetName: "processPayment",
+        targetFilePath: undefined,
+        targetKind: undefined,
+        toSymbolId: null,
+        callType: "Call",
+        line: 4,
+        col: 2,
+        isResolved: false,
+      }],
+      failOnNameLookup: true,
+    });
+
+    const unresolvedExpanded = expandGraphContext(unresolvedDb, [{
+      id: "targetChunk",
+      metadata: meta("processPayment", "/repo/src/payment.ts"),
+    }], {
+      branch: "main",
+      depth: 1,
+      allowedChunkIds: new Set(["targetChunk", "callerChunk"]),
+    });
+
+    expect(unresolvedExpanded).toEqual([]);
   });
 
   it("fails gracefully when a seed has no symbol record", () => {
@@ -510,5 +730,234 @@ describe("graph expansion", () => {
     });
 
     expect(expanded.map((item) => item.metadata.name)).toEqual(["invokeTool"]);
+  });
+
+  it("batches traversal lookups once per depth level instead of per frontier symbol", () => {
+    const counters = createCallCounters();
+    const db = fakeDatabase({
+      symbols: [
+        symbol("seed-1", "seedOne", "/repo/src/seed-one.ts"),
+        symbol("seed-2", "seedTwo", "/repo/src/seed-two.ts"),
+        symbol("seed-3", "seedThree", "/repo/src/seed-three.ts"),
+        symbol("seed-4", "seedFour", "/repo/src/seed-four.ts"),
+        symbol("seed-5", "seedFive", "/repo/src/seed-five.ts"),
+        symbol("caller-1", "callerOne", "/repo/src/caller-one.ts"),
+        symbol("caller-2", "callerTwo", "/repo/src/caller-two.ts"),
+        symbol("caller-3", "callerThree", "/repo/src/caller-three.ts"),
+        symbol("caller-4", "callerFour", "/repo/src/caller-four.ts"),
+        symbol("caller-5", "callerFive", "/repo/src/caller-five.ts"),
+      ],
+      chunks: [
+        chunk("seed-chunk-1", "seedOne", "/repo/src/seed-one.ts"),
+        chunk("seed-chunk-2", "seedTwo", "/repo/src/seed-two.ts"),
+        chunk("seed-chunk-3", "seedThree", "/repo/src/seed-three.ts"),
+        chunk("seed-chunk-4", "seedFour", "/repo/src/seed-four.ts"),
+        chunk("seed-chunk-5", "seedFive", "/repo/src/seed-five.ts"),
+        chunk("caller-chunk-1", "callerOne", "/repo/src/caller-one.ts"),
+        chunk("caller-chunk-2", "callerTwo", "/repo/src/caller-two.ts"),
+        chunk("caller-chunk-3", "callerThree", "/repo/src/caller-three.ts"),
+        chunk("caller-chunk-4", "callerFour", "/repo/src/caller-four.ts"),
+        chunk("caller-chunk-5", "callerFive", "/repo/src/caller-five.ts"),
+      ],
+      callers: [
+        {
+          id: "edge-1",
+          fromSymbolId: "caller-1",
+          fromSymbolName: "callerOne",
+          fromSymbolFilePath: "/repo/src/caller-one.ts",
+          targetName: "seedOne",
+          toSymbolId: "seed-1",
+          callType: "Call",
+          line: 3,
+          col: 1,
+          isResolved: true,
+        },
+        {
+          id: "edge-2",
+          fromSymbolId: "caller-2",
+          fromSymbolName: "callerTwo",
+          fromSymbolFilePath: "/repo/src/caller-two.ts",
+          targetName: "seedTwo",
+          toSymbolId: "seed-2",
+          callType: "Call",
+          line: 3,
+          col: 1,
+          isResolved: true,
+        },
+        {
+          id: "edge-3",
+          fromSymbolId: "caller-3",
+          fromSymbolName: "callerThree",
+          fromSymbolFilePath: "/repo/src/caller-three.ts",
+          targetName: "seedThree",
+          toSymbolId: "seed-3",
+          callType: "Call",
+          line: 3,
+          col: 1,
+          isResolved: true,
+        },
+        {
+          id: "edge-4",
+          fromSymbolId: "caller-4",
+          fromSymbolName: "callerFour",
+          fromSymbolFilePath: "/repo/src/caller-four.ts",
+          targetName: "seedFour",
+          toSymbolId: "seed-4",
+          callType: "Call",
+          line: 3,
+          col: 1,
+          isResolved: true,
+        },
+        {
+          id: "edge-5",
+          fromSymbolId: "caller-5",
+          fromSymbolName: "callerFive",
+          fromSymbolFilePath: "/repo/src/caller-five.ts",
+          targetName: "seedFive",
+          toSymbolId: "seed-5",
+          callType: "Call",
+          line: 3,
+          col: 1,
+          isResolved: true,
+        },
+      ],
+      callCounters: counters,
+    });
+
+    const expanded = expandGraphContext(db, [
+      { id: "seed-chunk-1", metadata: meta("seedOne", "/repo/src/seed-one.ts") },
+      { id: "seed-chunk-2", metadata: meta("seedTwo", "/repo/src/seed-two.ts") },
+      { id: "seed-chunk-3", metadata: meta("seedThree", "/repo/src/seed-three.ts") },
+      { id: "seed-chunk-4", metadata: meta("seedFour", "/repo/src/seed-four.ts") },
+      { id: "seed-chunk-5", metadata: meta("seedFive", "/repo/src/seed-five.ts") },
+    ], {
+      branch: "main",
+      depth: 1,
+      allowedChunkIds: new Set([
+        "seed-chunk-1",
+        "seed-chunk-2",
+        "seed-chunk-3",
+        "seed-chunk-4",
+        "seed-chunk-5",
+        "caller-chunk-1",
+        "caller-chunk-2",
+        "caller-chunk-3",
+        "caller-chunk-4",
+        "caller-chunk-5",
+      ]),
+    });
+
+    expect(expanded).toHaveLength(5);
+    expect(counters.getCallEdgeFrontierBatch).toBe(1);
+    expect(counters.getSymbolsByIdsOnBranch).toBe(1);
+    expect(counters.getChunksForSymbolsBatch).toBe(1);
+    expect(counters.getCallersWithContextByTargetSymbolId).toBe(0);
+    expect(counters.getCallees).toBe(0);
+    expect(counters.getSymbolByIdOnBranch).toBe(0);
+    expect(counters.getChunksByFileOnBranch).toBe(0);
+  });
+
+  it("finds wide-fanout callers in a single traversal level", () => {
+    const counters = createCallCounters();
+    const callers = Array.from({ length: 12 }, (_, index) => ({
+      id: `edge-${index}`,
+      fromSymbolId: `caller-${index}`,
+      fromSymbolName: `caller${index}`,
+      fromSymbolFilePath: `/repo/src/caller-${index}.ts`,
+      targetName: "target",
+      toSymbolId: "target",
+      callType: "Call",
+      line: 3,
+      col: 1,
+      isResolved: true,
+    }));
+
+    const db = fakeDatabase({
+      symbols: [
+        symbol("target", "target", "/repo/src/target.ts"),
+        ...Array.from({ length: 12 }, (_, index) =>
+          symbol(`caller-${index}`, `caller${index}`, `/repo/src/caller-${index}.ts`)
+        ),
+      ],
+      chunks: [
+        chunk("target-chunk", "target", "/repo/src/target.ts"),
+        ...Array.from({ length: 12 }, (_, index) =>
+          chunk(`caller-chunk-${index}`, `caller${index}`, `/repo/src/caller-${index}.ts`)
+        ),
+      ],
+      callers,
+      callCounters: counters,
+    });
+
+    const expanded = expandGraphContext(db, [{
+      id: "target-chunk",
+      metadata: meta("target", "/repo/src/target.ts"),
+    }], {
+      branch: "main",
+      depth: 1,
+      allowedChunkIds: new Set([
+        "target-chunk",
+        ...Array.from({ length: 12 }, (_, index) => `caller-chunk-${index}`),
+      ]),
+    });
+
+    expect(expanded).toHaveLength(12);
+    expect(expanded.every((entry) => entry.relation === "caller" && entry.depth === 1)).toBe(true);
+    expect(counters.getCallEdgeFrontierBatch).toBe(1);
+  });
+
+  it("skips unresolved edges while still returning resolved neighbors from the same frontier", () => {
+    const db = fakeDatabase({
+      symbols: [
+        symbol("seed", "processPayment", "/repo/src/payment.ts"),
+        symbol("resolved", "saveReceipt", "/repo/src/receipt.ts"),
+      ],
+      chunks: [
+        chunk("seed-chunk", "processPayment", "/repo/src/payment.ts"),
+        chunk("resolved-chunk", "saveReceipt", "/repo/src/receipt.ts"),
+      ],
+      callees: [
+        {
+          id: "edge-resolved",
+          fromSymbolId: "seed",
+          fromSymbolName: "processPayment",
+          fromSymbolFilePath: "/repo/src/payment.ts",
+          targetName: "saveReceipt",
+          toSymbolId: "resolved",
+          callType: "Call",
+          line: 8,
+          col: 2,
+          isResolved: true,
+        },
+        {
+          id: "edge-unresolved",
+          fromSymbolId: "seed",
+          fromSymbolName: "processPayment",
+          fromSymbolFilePath: "/repo/src/payment.ts",
+          targetName: "notifyUser",
+          toSymbolId: null,
+          callType: "Call",
+          line: 9,
+          col: 2,
+          isResolved: false,
+        },
+      ],
+    });
+
+    const expanded = expandGraphContext(db, [{
+      id: "seed-chunk",
+      metadata: meta("processPayment", "/repo/src/payment.ts"),
+    }], {
+      branch: "main",
+      depth: 1,
+      allowedChunkIds: new Set(["seed-chunk", "resolved-chunk"]),
+    });
+
+    expect(expanded).toEqual([
+      expect.objectContaining({
+        id: "resolved-chunk",
+        relation: "callee",
+      }),
+    ]);
   });
 });

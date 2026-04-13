@@ -86,7 +86,7 @@ export type ChunkSymbolKind =
   | "Module"
   | "Block";
 
-export type ChunkKind = "Code" | "Test" | "Doc" | "Config";
+export type ChunkKind = "Code" | "Test" | "Doc" | "Config" | "File";
 
 export type Granularity = "Fine" | "Coarse";
 
@@ -125,6 +125,7 @@ export type ChunkType =
   | "impl"
   | "trait"
   | "module"
+  | "constant"
   | "import"
   | "export"
   | "comment"
@@ -173,6 +174,26 @@ export interface CallEdgeData {
   line: number;
   col: number;
   isResolved: boolean;
+}
+
+export interface CallEdgeFrontierBatch {
+  callers: CallEdgeData[];
+  callees: CallEdgeData[];
+}
+
+export interface SymbolChunkData {
+  symbolId: string;
+  chunkId: string;
+  contentHash: string;
+  embeddingInputHash: string;
+  filePath: string;
+  startLine: number;
+  endLine: number;
+  nodeType?: string;
+  name?: string;
+  chunkKind?: string;
+  symbolKind?: string;
+  language: string;
 }
 
 export interface SearchResult {
@@ -419,6 +440,20 @@ export class VectorStore {
     }));
   }
 
+  searchOnBranch(queryVector: number[], branch: string, limit: number = 10): SearchResult[] {
+    if (queryVector.length !== this.dimensions) {
+      throw new Error(
+        `Query vector dimension mismatch: expected ${this.dimensions}, got ${queryVector.length}`
+      );
+    }
+    const results = this.inner.searchOnBranch(queryVector, limit, branch);
+    return results.map((r: any) => ({
+      id: r.id,
+      score: r.score,
+      metadata: JSON.parse(r.metadata) as ChunkMetadata,
+    }));
+  }
+
   remove(id: string): boolean {
     return this.inner.remove(id);
   }
@@ -427,8 +462,8 @@ export class VectorStore {
     this.inner.save();
   }
 
-  load(): void {
-    this.inner.load();
+  load(): boolean {
+    return this.inner.load();
   }
 
   count(): number {
@@ -437,6 +472,22 @@ export class VectorStore {
 
   clear(): void {
     this.inner.clear();
+  }
+
+  setBranchMembership(branch: string, chunkIds: string[]): void {
+    this.inner.setBranchMembership(branch, chunkIds);
+  }
+
+  applyBranchDelta(branch: string, added: string[], removed: string[]): void {
+    this.inner.applyBranchDelta(branch, added, removed);
+  }
+
+  clearBranchMembership(branch: string): void {
+    this.inner.clearBranchMembership(branch);
+  }
+
+  clearAllBranchMemberships(): void {
+    this.inner.clearAllBranchMemberships();
   }
 
   getDimensions(): number {
@@ -475,11 +526,57 @@ export class VectorStore {
 
 // Token estimation: ~4 chars per token for code (conservative)
 const CHARS_PER_TOKEN = 4;
-const MAX_BATCH_TOKENS = 7500; // Leave buffer under 8192 API limit
-const MAX_SINGLE_CHUNK_TOKENS = 2000; // Truncate individual chunks beyond this
+const MIN_EMBEDDING_TOKEN_SAFETY_MARGIN = 128;
+const MIN_BATCH_TOKEN_SAFETY_MARGIN = 256;
+const EMBEDDING_TOKEN_SAFETY_MARGIN_RATIO = 0.125;
+const BATCH_TOKEN_SAFETY_MARGIN_RATIO = 0.2;
 
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / CHARS_PER_TOKEN);
+}
+
+function normalizeEmbeddingMaxTokens(maxTokens: number): number {
+  if (!Number.isFinite(maxTokens)) {
+    throw new Error(`Expected a finite embedding maxTokens value, received ${maxTokens}`);
+  }
+
+  return Math.max(1, Math.floor(maxTokens));
+}
+
+function computeSafetyMargin(
+  maxTokens: number,
+  minimumMargin: number,
+  ratio: number
+): number {
+  const normalizedMaxTokens = normalizeEmbeddingMaxTokens(maxTokens);
+  return Math.min(
+    normalizedMaxTokens - 1,
+    Math.max(minimumMargin, Math.ceil(normalizedMaxTokens * ratio))
+  );
+}
+
+function getSafeEmbeddingTokenBudget(maxTokens: number): number {
+  return Math.max(
+    1,
+    normalizeEmbeddingMaxTokens(maxTokens) -
+      computeSafetyMargin(
+        maxTokens,
+        MIN_EMBEDDING_TOKEN_SAFETY_MARGIN,
+        EMBEDDING_TOKEN_SAFETY_MARGIN_RATIO
+      )
+  );
+}
+
+function getSafeBatchTokenBudget(maxTokens: number): number {
+  return Math.max(
+    1,
+    normalizeEmbeddingMaxTokens(maxTokens) -
+      computeSafetyMargin(
+        maxTokens,
+        MIN_BATCH_TOKEN_SAFETY_MARGIN,
+        BATCH_TOKEN_SAFETY_MARGIN_RATIO
+      )
+  );
 }
 
 function normalizeEmbeddingPath(filePath: string, projectRoot?: string): string {
@@ -533,31 +630,58 @@ function formatSymbolDescriptor(chunk: CodeChunk): string | null {
   return includeTerms ? `symbol: ${chunk.name} terms: ${normalizedTerms}` : `symbol: ${chunk.name}`;
 }
 
+/**
+ * Tracks the exact output contract of createEmbeddingText().
+ * Bump this whenever path normalization, symbol descriptor formatting, header
+ * layout, truncation behavior, or body ordering changes.
+ * A bump flows into hashEmbedConfig(), makes EMBED checkpoints stale, and
+ * forces affected chunks to be re-embedded on the next indexing run.
+ */
+export const EMBEDDING_INPUT_FORMAT_VERSION = 5;
+
 export function createEmbeddingText(
   chunk: CodeChunk,
   filePath: string,
-  projectRoot?: string
+  projectRoot: string | undefined,
+  maxTokens: number
 ): string {
-  const parts: string[] = [
-    `file: ${normalizeEmbeddingPath(filePath, projectRoot)}`,
-  ];
+  const parts: string[] = [`file: ${normalizeEmbeddingPath(filePath, projectRoot)}`];
   const symbolDescriptor = formatSymbolDescriptor(chunk);
   if (symbolDescriptor) {
     parts.push(symbolDescriptor);
   }
   parts.push("");
 
-  let content = chunk.content;
-  const headerLength = parts.join("\n").length;
-  const maxContentChars = (MAX_SINGLE_CHUNK_TOKENS * CHARS_PER_TOKEN) - headerLength;
-  
-  if (content.length > maxContentChars) {
-    content = content.slice(0, maxContentChars) + "\n... [truncated]";
-  }
-  
-  parts.push(content);
+  const header = `${parts.join("\n")}\n`;
+  const fullText = header + chunk.content;
+  const safeTokenBudget = getSafeEmbeddingTokenBudget(maxTokens);
 
-  return parts.join("\n");
+  if (estimateTokens(fullText) <= safeTokenBudget) {
+    return fullText;
+  }
+
+  if (estimateTokens(header) > safeTokenBudget) {
+    return header;
+  }
+
+  const truncationSuffix = "\n... [truncated]";
+  let low = 0;
+  let high = chunk.content.length;
+  let best = header;
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = header + chunk.content.slice(0, mid) + truncationSuffix;
+
+    if (estimateTokens(candidate) <= safeTokenBudget) {
+      best = candidate;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  return best;
 }
 
 export interface PreparedEmbeddingInput {
@@ -568,9 +692,10 @@ export interface PreparedEmbeddingInput {
 export function prepareEmbeddingInput(
   chunk: CodeChunk,
   filePath: string,
-  projectRoot?: string
+  projectRoot: string | undefined,
+  maxTokens: number
 ): PreparedEmbeddingInput {
-  const text = createEmbeddingText(chunk, filePath, projectRoot);
+  const text = createEmbeddingText(chunk, filePath, projectRoot, maxTokens);
   return {
     text,
     hash: hashContent(text),
@@ -580,20 +705,25 @@ export function prepareEmbeddingInput(
 export function buildEmbeddingInputHash(
   chunk: CodeChunk,
   filePath: string,
-  projectRoot?: string
+  projectRoot: string | undefined,
+  maxTokens: number
 ): string {
-  return prepareEmbeddingInput(chunk, filePath, projectRoot).hash;
+  return prepareEmbeddingInput(chunk, filePath, projectRoot, maxTokens).hash;
 }
 
-export function createDynamicBatches<T extends { text: string }>(chunks: T[]): T[][] {
+export function createDynamicBatches<T extends { text: string }>(
+  chunks: T[],
+  maxTokens: number
+): T[][] {
   const batches: T[][] = [];
   let currentBatch: T[] = [];
   let currentTokens = 0;
+  const batchTokenBudget = getSafeBatchTokenBudget(maxTokens);
   
   for (const chunk of chunks) {
     const chunkTokens = estimateTokens(chunk.text);
     
-    if (currentBatch.length > 0 && currentTokens + chunkTokens > MAX_BATCH_TOKENS) {
+    if (currentBatch.length > 0 && currentTokens + chunkTokens > batchTokenBudget) {
       batches.push(currentBatch);
       currentBatch = [];
       currentTokens = 0;
@@ -631,8 +761,8 @@ export class InvertedIndex {
     this.inner = new native.InvertedIndex(indexPath);
   }
 
-  load(): void {
-    this.inner.load();
+  load(): boolean {
+    return this.inner.load();
   }
 
   save(): void {
@@ -665,12 +795,37 @@ export class InvertedIndex {
     return map;
   }
 
+  searchOnBranch(query: string, branch: string, limit?: number): Map<string, number> {
+    const results = this.inner.searchOnBranch(query, branch, limit ?? 100);
+    const map = new Map<string, number>();
+    for (const r of results) {
+      map.set(r.chunkId, r.score);
+    }
+    return map;
+  }
+
   hasChunk(chunkId: string): boolean {
     return this.inner.hasChunk(chunkId);
   }
 
   clear(): void {
     this.inner.clear();
+  }
+
+  setBranchMembership(branch: string, chunkIds: string[]): void {
+    this.inner.setBranchMembership(branch, chunkIds);
+  }
+
+  applyBranchDelta(branch: string, added: string[], removed: string[]): void {
+    this.inner.applyBranchDelta(branch, added, removed);
+  }
+
+  clearBranchMembership(branch: string): void {
+    this.inner.clearBranchMembership(branch);
+  }
+
+  clearAllBranchMemberships(): void {
+    this.inner.clearAllBranchMemberships();
   }
 
   getDocumentCount(): number {
@@ -862,6 +1017,27 @@ export class Database {
 
   getChunksByFileOnBranch(filePath: string, branch: string): ChunkData[] {
     return this.inner.getChunksByFileOnBranch(filePath, branch);
+  }
+
+  getChunksForSymbolsBatch(
+    symbolIds: string[],
+    branch: string,
+    allowedChunkIds?: string[]
+  ): SymbolChunkData[] {
+    return this.inner.getChunksForSymbolsBatch(symbolIds, branch, allowedChunkIds ?? null).map((item: any) => ({
+      symbolId: item.symbolId ?? item.symbol_id,
+      chunkId: item.chunkId ?? item.chunk_id,
+      contentHash: item.contentHash ?? item.content_hash,
+      embeddingInputHash: item.embeddingInputHash ?? item.embedding_input_hash,
+      filePath: item.filePath ?? item.file_path,
+      startLine: item.startLine ?? item.start_line,
+      endLine: item.endLine ?? item.end_line,
+      nodeType: item.nodeType ?? item.node_type ?? undefined,
+      name: item.name ?? undefined,
+      chunkKind: item.chunkKind ?? item.chunk_kind ?? undefined,
+      symbolKind: item.symbolKind ?? item.symbol_kind ?? undefined,
+      language: item.language,
+    }));
   }
 
   getChunksByName(name: string): ChunkData[] {
@@ -1173,6 +1349,13 @@ export class Database {
     return this.inner.getSymbolByIdOnBranch(symbolId, branch) ?? null;
   }
 
+  getSymbolsByIdsOnBranch(symbolIds: string[], branch: string): SymbolData[] {
+    if (symbolIds.length === 0) {
+      return [];
+    }
+    return this.inner.getSymbolsByIdsOnBranch(symbolIds, branch);
+  }
+
   getSymbolByName(name: string, filePath: string): SymbolData | null {
     return this.inner.getSymbolByName(name, filePath) ?? null;
   }
@@ -1232,6 +1415,18 @@ export class Database {
     return this.inner.getCallersWithContextByTargetSymbolId(targetSymbolId, branch);
   }
 
+  getCallEdgeFrontierBatch(symbolIds: string[], branch: string): CallEdgeFrontierBatch {
+    if (symbolIds.length === 0) {
+      return { callers: [], callees: [] };
+    }
+
+    const result = this.inner.getCallEdgeFrontierBatch(symbolIds, branch);
+    return {
+      callers: result.callers ?? [],
+      callees: result.callees ?? [],
+    };
+  }
+
   getCallees(symbolId: string, branch: string): CallEdgeData[] {
     return this.inner.getCallees(symbolId, branch);
   }
@@ -1264,6 +1459,10 @@ export class Database {
     targetKind?: string
   ): void {
     this.inner.resolveCallEdge(edgeId, branch, toSymbolId, targetFilePath, targetKind);
+  }
+
+  resolveUnresolvedCallEdgesForBranch(branch: string): number {
+    return this.inner.resolveUnresolvedCallEdgesForBranch(branch);
   }
 
   // ── Branch Symbol methods ────────────────────────────────────────

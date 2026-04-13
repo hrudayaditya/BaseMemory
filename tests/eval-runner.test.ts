@@ -582,6 +582,26 @@ describe("eval runner", () => {
     expect(readFileSync(path.join(sweep.outputDir, "compare.json"), "utf-8")).toContain("\"runCount\"");
   });
 
+  it("uses clearIndex through the product API before a reindexed sweep", async () => {
+    const clearIndexSpy = vi.spyOn(Indexer.prototype, "clearIndex");
+
+    const sweep = await runSweep(
+      {
+        projectRoot: tempDir,
+        datasetPath: "benchmarks/golden/small.json",
+        outputRoot: "benchmarks/results",
+        ciMode: false,
+        reindex: true,
+      },
+      {
+        fusionStrategy: ["rrf", "weighted"],
+      }
+    );
+
+    expect(sweep.aggregate.runCount).toBe(2);
+    expect(clearIndexSpy).toHaveBeenCalledTimes(1);
+  });
+
   it("sweeps voyageWeight and taskType as first-class eval parameters", async () => {
     const searchDetailedSpy = vi.spyOn(Indexer.prototype, "searchDetailed").mockImplementation(
       async (_query, _limit, options) => {
@@ -810,6 +830,8 @@ describe("eval runner", () => {
       "utf-8"
     );
 
+    const clearIndexSpy = vi.spyOn(Indexer.prototype, "clearIndex");
+
     const result = await runEvaluation({
       projectRoot: tempDir,
       datasetPath: "benchmarks/golden/small.json",
@@ -821,6 +843,7 @@ describe("eval runner", () => {
     expect(result.summary.metrics.hitAt10).toBeGreaterThan(0);
     expect(result.summary.metrics.embedding.callCount).toBeGreaterThan(0);
     expect(createServerMock).toHaveBeenCalledTimes(1);
+    expect(clearIndexSpy).toHaveBeenCalledTimes(1);
   });
 
   it("fails loudly when a non-mock custom embedding endpoint is unreachable", async () => {

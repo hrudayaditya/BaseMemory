@@ -76,6 +76,33 @@ describe("eval schema", () => {
     expect(dataset.queries[0].expected.endLine).toBe(20);
   });
 
+  it("parses query provenance metadata and snake_case query_type", () => {
+    const dataset = parseGoldenDataset(
+      {
+        version: "1.0.0",
+        name: "small",
+        queries: [
+          {
+            id: "q1",
+            query: "EMBEDDING_INPUT_FORMAT_VERSION",
+            query_type: "identifier-heavy",
+            source: "generated",
+            heuristic: "identifier-extraction-from-symbol-content",
+            expected: {
+              filePath: "src/native/index.ts",
+              symbol: "EMBEDDING_INPUT_FORMAT_VERSION",
+            },
+          },
+        ],
+      },
+      "dataset.json"
+    );
+
+    expect(dataset.queries[0].queryType).toBe("identifier-heavy");
+    expect(dataset.queries[0].source).toBe("generated");
+    expect(dataset.queries[0].heuristic).toBe("identifier-extraction-from-symbol-content");
+  });
+
   it("accepts an explicit taskType alias on golden queries", () => {
     const dataset = parseGoldenDataset(
       {
@@ -142,6 +169,30 @@ describe("eval schema", () => {
         "dataset.json"
       )
     ).toThrow(/duplicate id/);
+  });
+
+  it("rejects generated queries without heuristics", () => {
+    expect(() =>
+      parseGoldenDataset(
+        {
+          version: "1.0.0",
+          name: "small",
+          queries: [
+            {
+              id: "q1",
+              query: "where is rankHybridResults implementation",
+              queryType: "definition",
+              source: "generated",
+              expected: {
+                filePath: "src/indexer/index.ts",
+                symbol: "rankHybridResults",
+              },
+            },
+          ],
+        },
+        "dataset.json"
+      )
+    ).toThrow(/heuristic must be provided for generated queries/);
   });
 
   it("parses budget and validates threshold types", () => {

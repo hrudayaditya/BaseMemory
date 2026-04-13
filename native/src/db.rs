@@ -1196,6 +1196,22 @@ pub struct ChunkKindEnrichmentRow {
     pub symbol_kind: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SymbolChunkRow {
+    pub symbol_id: String,
+    pub chunk_id: String,
+    pub content_hash: String,
+    pub embedding_input_hash: String,
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub node_type: Option<String>,
+    pub name: Option<String>,
+    pub chunk_kind: Option<String>,
+    pub symbol_kind: Option<String>,
+    pub language: String,
+}
+
 /// Get chunk_kind and symbol_kind for multiple chunk ids
 pub fn get_chunk_kinds_batch(
     conn: &Connection,
@@ -1222,6 +1238,124 @@ pub fn get_chunk_kinds_batch(
                 chunk_id: row.get(0)?,
                 chunk_kind: row.get(1)?,
                 symbol_kind: row.get(2)?,
+            })
+        })?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    Ok(results)
+}
+
+pub fn get_chunks_for_symbols_batch(
+    conn: &Connection,
+    symbol_ids: &[String],
+    branch: &str,
+    allowed_chunk_ids: Option<&[String]>,
+) -> DbResult<Vec<SymbolChunkRow>> {
+    if symbol_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    let reserved_params = 2 + allowed_chunk_ids.map_or(0, |ids| ids.len());
+    let symbol_batch_size = SQL_BIND_PARAM_BATCH_SIZE.saturating_sub(reserved_params).max(1);
+
+    for symbol_batch in symbol_ids.chunks(symbol_batch_size) {
+        let symbol_placeholders = symbol_batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let allowed_clause = allowed_chunk_ids
+            .filter(|ids| !ids.is_empty())
+            .map(|ids| {
+                format!(
+                    " AND c.chunk_id IN ({})",
+                    ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+                )
+            })
+            .unwrap_or_default();
+
+        let query = format!(
+            r#"
+            WITH ranked_chunks AS (
+                SELECT
+                    s.id AS symbol_id,
+                    c.chunk_id,
+                    c.content_hash,
+                    c.embedding_input_hash,
+                    c.file_path,
+                    c.start_line,
+                    c.end_line,
+                    c.node_type,
+                    c.name,
+                    c.chunk_kind,
+                    c.symbol_kind,
+                    c.language,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.id
+                        ORDER BY
+                            CASE WHEN c.name = s.name THEN 0 ELSE 1 END,
+                            (c.end_line - c.start_line) ASC,
+                            c.chunk_id ASC
+                    ) AS rank_in_symbol
+                FROM symbols s
+                INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
+                INNER JOIN chunks c ON c.file_path = s.file_path
+                INNER JOIN branch_chunks bc ON bc.chunk_id = c.chunk_id
+                WHERE bs.branch = ?
+                  AND bc.branch = ?
+                  AND s.id IN ({symbol_placeholders})
+                  AND c.start_line <= s.start_line
+                  AND c.end_line >= s.end_line
+                  {allowed_clause}
+            )
+            SELECT
+                symbol_id,
+                chunk_id,
+                content_hash,
+                embedding_input_hash,
+                file_path,
+                start_line,
+                end_line,
+                node_type,
+                name,
+                chunk_kind,
+                symbol_kind,
+                language
+            FROM ranked_chunks
+            WHERE rank_in_symbol = 1
+            ORDER BY symbol_id
+            "#
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> =
+            Vec::with_capacity(2 + symbol_batch.len() + allowed_chunk_ids.map_or(0, |ids| ids.len()));
+        params.push(&branch);
+        params.push(&branch);
+        for symbol_id in symbol_batch {
+            params.push(symbol_id as &dyn rusqlite::ToSql);
+        }
+        if let Some(ids) = allowed_chunk_ids {
+            for chunk_id in ids {
+                params.push(chunk_id as &dyn rusqlite::ToSql);
+            }
+        }
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(SymbolChunkRow {
+                symbol_id: row.get(0)?,
+                chunk_id: row.get(1)?,
+                content_hash: row.get(2)?,
+                embedding_input_hash: row.get(3)?,
+                file_path: row.get(4)?,
+                start_line: row.get(5)?,
+                end_line: row.get(6)?,
+                node_type: row.get(7)?,
+                name: row.get(8)?,
+                chunk_kind: row.get(9)?,
+                symbol_kind: row.get(10)?,
+                language: row.get(11)?,
             })
         })?;
 
@@ -1432,6 +1566,12 @@ pub struct CallerRow {
     pub is_resolved: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct CallEdgeFrontierBatch {
+    pub callers: Vec<CallerRow>,
+    pub callees: Vec<CallEdgeRow>,
+}
+
 /// Insert or update a symbol without deleting the existing row.
 /// Using REPLACE here would cascade-delete call edges for unchanged symbol ids.
 pub fn upsert_symbol(conn: &Connection, symbol: &SymbolRow) -> DbResult<()> {
@@ -1630,6 +1770,59 @@ pub fn get_symbol_by_id_on_branch(
         )
         .optional()?;
     Ok(result)
+}
+
+pub fn get_symbols_by_ids_on_branch(
+    conn: &Connection,
+    symbol_ids: &[String],
+    branch: &str,
+) -> DbResult<Vec<SymbolRow>> {
+    if symbol_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    let symbol_batch_size = SQL_BIND_PARAM_BATCH_SIZE.saturating_sub(1).max(1);
+
+    for symbol_batch in symbol_ids.chunks(symbol_batch_size) {
+        let placeholders = symbol_batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            r#"
+            SELECT s.id, s.file_path, s.name, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
+            FROM symbols s
+            INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
+            WHERE bs.branch = ? AND s.id IN ({})
+            "#,
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + symbol_batch.len());
+        params.push(&branch);
+        for symbol_id in symbol_batch {
+            params.push(symbol_id as &dyn rusqlite::ToSql);
+        }
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(SymbolRow {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                name: row.get(2)?,
+                kind: row.get(3)?,
+                start_line: row.get(4)?,
+                start_col: row.get(5)?,
+                end_line: row.get(6)?,
+                end_col: row.get(7)?,
+                language: row.get(8)?,
+            })
+        })?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    Ok(results)
 }
 
 /// Find a symbol by name and file path
@@ -2095,6 +2288,74 @@ pub fn get_callers_with_context_by_target_symbol_id(
     Ok(results)
 }
 
+pub fn get_callers_with_context_by_target_symbol_ids_batch(
+    conn: &Connection,
+    target_symbol_ids: &[String],
+    branch: &str,
+) -> DbResult<Vec<CallerRow>> {
+    if target_symbol_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    let symbol_batch_size = SQL_BIND_PARAM_BATCH_SIZE.saturating_sub(1).max(1);
+
+    for symbol_batch in target_symbol_ids.chunks(symbol_batch_size) {
+        let placeholders = symbol_batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            r#"
+            SELECT
+                ce.id,
+                ce.from_symbol_id,
+                s.name,
+                COALESCE(ce.caller_file_path, s.file_path),
+                ce.target_name,
+                ce.target_file_path,
+                ce.target_kind,
+                ce.to_symbol_id,
+                ce.call_type,
+                ce.line,
+                ce.col,
+                ce.is_resolved
+            FROM call_edges ce
+            INNER JOIN symbols s ON ce.from_symbol_id = s.id
+            WHERE ce.branch = ? AND ce.to_symbol_id IN ({})
+            "#,
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + symbol_batch.len());
+        params.push(&branch);
+        for symbol_id in symbol_batch {
+            params.push(symbol_id as &dyn rusqlite::ToSql);
+        }
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(CallerRow {
+                id: row.get(0)?,
+                from_symbol_id: row.get(1)?,
+                from_symbol_name: row.get(2)?,
+                from_symbol_file_path: row.get(3)?,
+                target_name: row.get(4)?,
+                target_file_path: row.get(5)?,
+                target_kind: row.get(6)?,
+                to_symbol_id: row.get(7)?,
+                call_type: row.get(8)?,
+                line: row.get(9)?,
+                col: row.get(10)?,
+                is_resolved: row.get::<_, i32>(11)? != 0,
+            })
+        })?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    Ok(results)
+}
+
 /// Get all call edges from a symbol (filtered by branch)
 pub fn get_callees(conn: &Connection, symbol_id: &str, branch: &str) -> DbResult<Vec<CallEdgeRow>> {
     let mut stmt = conn.prepare(
@@ -2141,8 +2402,90 @@ pub fn get_callees(conn: &Connection, symbol_id: &str, branch: &str) -> DbResult
     Ok(results)
 }
 
+pub fn get_callees_batch(
+    conn: &Connection,
+    symbol_ids: &[String],
+    branch: &str,
+) -> DbResult<Vec<CallEdgeRow>> {
+    if symbol_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    let symbol_batch_size = SQL_BIND_PARAM_BATCH_SIZE.saturating_sub(1).max(1);
+
+    for symbol_batch in symbol_ids.chunks(symbol_batch_size) {
+        let placeholders = symbol_batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            r#"
+            SELECT
+                ce.id,
+                ce.branch,
+                ce.from_symbol_id,
+                ce.caller_file_path,
+                ce.target_name,
+                ce.target_file_path,
+                ce.target_kind,
+                ce.to_symbol_id,
+                ce.call_type,
+                ce.line,
+                ce.col,
+                ce.is_resolved
+            FROM call_edges ce
+            WHERE ce.branch = ? AND ce.from_symbol_id IN ({})
+            "#,
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + symbol_batch.len());
+        params.push(&branch);
+        for symbol_id in symbol_batch {
+            params.push(symbol_id as &dyn rusqlite::ToSql);
+        }
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(CallEdgeRow {
+                id: row.get(0)?,
+                branch: row.get(1)?,
+                from_symbol_id: row.get(2)?,
+                caller_file_path: row.get(3)?,
+                target_name: row.get(4)?,
+                target_file_path: row.get(5)?,
+                target_kind: row.get(6)?,
+                to_symbol_id: row.get(7)?,
+                call_type: row.get(8)?,
+                line: row.get(9)?,
+                col: row.get(10)?,
+                is_resolved: row.get::<_, i32>(11)? != 0,
+            })
+        })?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    Ok(results)
+}
+
+pub fn get_call_edge_frontier_batch(
+    conn: &Connection,
+    symbol_ids: &[String],
+    branch: &str,
+) -> DbResult<CallEdgeFrontierBatch> {
+    Ok(CallEdgeFrontierBatch {
+        callers: get_callers_with_context_by_target_symbol_ids_batch(conn, symbol_ids, branch)?,
+        callees: get_callees_batch(conn, symbol_ids, branch)?,
+    })
+}
+
 /// Delete all call edges where the source symbol is in a file for a branch
-pub fn delete_call_edges_by_file(conn: &Connection, file_path: &str, branch: &str) -> DbResult<usize> {
+pub fn delete_call_edges_by_file(
+    conn: &Connection,
+    file_path: &str,
+    branch: &str,
+) -> DbResult<usize> {
     let count = conn.execute(
         r#"
         DELETE FROM call_edges
@@ -2228,6 +2571,110 @@ pub fn resolve_call_edge(
         params![to_symbol_id, target_file_path, target_kind, edge_id, branch],
     )?;
     Ok(())
+}
+
+/// Resolve unresolved call edges for a branch using the authoritative branch symbol table.
+///
+/// Resolution order:
+/// 1. Unique same-file exact match
+/// 2. Unique branch-wide exact match
+///
+/// Ambiguous matches and missing targets remain unresolved.
+pub fn resolve_unresolved_call_edges_for_branch(
+    conn: &Connection,
+    branch: &str,
+) -> DbResult<usize> {
+    let same_file_resolved = conn.execute(
+        r#"
+        WITH candidate_matches AS (
+            SELECT
+                ce.id AS edge_id,
+                MIN(target.id) AS to_symbol_id,
+                MIN(target.file_path) AS target_file_path,
+                MIN(target.kind) AS target_kind
+            FROM call_edges ce
+            INNER JOIN symbols caller ON caller.id = ce.from_symbol_id
+            INNER JOIN branch_symbols bs
+                ON bs.branch = ?
+            INNER JOIN symbols target
+                ON target.id = bs.symbol_id
+            WHERE ce.branch = ?
+              AND ce.is_resolved = 0
+              AND target.name = ce.target_name
+              AND target.file_path = COALESCE(ce.caller_file_path, caller.file_path)
+              AND (ce.target_kind IS NULL OR lower(target.kind) = lower(ce.target_kind))
+            GROUP BY ce.id
+            HAVING COUNT(*) = 1
+        )
+        UPDATE call_edges
+        SET to_symbol_id = (
+                SELECT candidate_matches.to_symbol_id
+                FROM candidate_matches
+                WHERE candidate_matches.edge_id = call_edges.id
+            ),
+            target_file_path = (
+                SELECT candidate_matches.target_file_path
+                FROM candidate_matches
+                WHERE candidate_matches.edge_id = call_edges.id
+            ),
+            target_kind = (
+                SELECT candidate_matches.target_kind
+                FROM candidate_matches
+                WHERE candidate_matches.edge_id = call_edges.id
+            ),
+            is_resolved = 1
+        WHERE branch = ?
+          AND is_resolved = 0
+          AND id IN (SELECT edge_id FROM candidate_matches)
+        "#,
+        params![branch, branch, branch],
+    )?;
+
+    let branch_unique_resolved = conn.execute(
+        r#"
+        WITH candidate_matches AS (
+            SELECT
+                ce.id AS edge_id,
+                MIN(target.id) AS to_symbol_id,
+                MIN(target.file_path) AS target_file_path,
+                MIN(target.kind) AS target_kind
+            FROM call_edges ce
+            INNER JOIN branch_symbols bs
+                ON bs.branch = ?
+            INNER JOIN symbols target
+                ON target.id = bs.symbol_id
+            WHERE ce.branch = ?
+              AND ce.is_resolved = 0
+              AND target.name = ce.target_name
+              AND (ce.target_kind IS NULL OR lower(target.kind) = lower(ce.target_kind))
+            GROUP BY ce.id
+            HAVING COUNT(*) = 1
+        )
+        UPDATE call_edges
+        SET to_symbol_id = (
+                SELECT candidate_matches.to_symbol_id
+                FROM candidate_matches
+                WHERE candidate_matches.edge_id = call_edges.id
+            ),
+            target_file_path = (
+                SELECT candidate_matches.target_file_path
+                FROM candidate_matches
+                WHERE candidate_matches.edge_id = call_edges.id
+            ),
+            target_kind = (
+                SELECT candidate_matches.target_kind
+                FROM candidate_matches
+                WHERE candidate_matches.edge_id = call_edges.id
+            ),
+            is_resolved = 1
+        WHERE branch = ?
+          AND is_resolved = 0
+          AND id IN (SELECT edge_id FROM candidate_matches)
+        "#,
+        params![branch, branch, branch],
+    )?;
+
+    Ok(same_file_resolved + branch_unique_resolved)
 }
 
 // ============================================================================
@@ -2568,7 +3015,9 @@ pub fn get_unfinished_pipeline_files(conn: &Connection, branch: &str) -> DbResul
         ORDER BY known_files.file_path
         "#,
     )?;
-    let rows = stmt.query_map(params![branch, branch, branch], |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map(params![branch, branch, branch], |row| {
+        row.get::<_, String>(0)
+    })?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -2912,7 +3361,10 @@ pub fn activate_config_version(
     config_version: &ConfigVersionRow,
 ) -> DbResult<()> {
     let tx = conn.transaction()?;
-    tx.execute("UPDATE config_versions SET active = 0 WHERE active != 0", [])?;
+    tx.execute(
+        "UPDATE config_versions SET active = 0 WHERE active != 0",
+        [],
+    )?;
     tx.execute(
         r#"
         INSERT INTO config_versions (
@@ -3108,31 +3560,36 @@ mod tests {
         let embedding = vec![1u8, 2, 3, 4];
         let voyage_embedding = vec![5u8, 6, 7, 8];
         upsert_embedding(&conn, hash, hash, &embedding, "test content", "test-model").unwrap();
-        upsert_embedding(&conn, hash, hash, &voyage_embedding, "test content", "voyage-model")
-            .unwrap();
+        upsert_embedding(
+            &conn,
+            hash,
+            hash,
+            &voyage_embedding,
+            "test content",
+            "voyage-model",
+        )
+        .unwrap();
 
         assert!(embedding_exists(&conn, hash).unwrap());
         assert!(!embedding_exists(&conn, "nonexistent").unwrap());
 
-        let retrieved = get_embedding_for_model(&conn, hash, "test-model").unwrap().unwrap();
+        let retrieved = get_embedding_for_model(&conn, hash, "test-model")
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved, embedding);
         let retrieved_voyage = get_embedding_for_model(&conn, hash, "voyage-model")
             .unwrap()
             .unwrap();
         assert_eq!(retrieved_voyage, voyage_embedding);
 
-        let batch_rows = get_embeddings_for_model_batch(
-            &conn,
-            &[hash.to_string()],
-            "voyage-model",
-        )
-        .unwrap();
+        let batch_rows =
+            get_embeddings_for_model_batch(&conn, &[hash.to_string()], "voyage-model").unwrap();
         assert_eq!(batch_rows.len(), 1);
         assert_eq!(batch_rows[0].0, hash);
         assert_eq!(batch_rows[0].1, voyage_embedding);
 
-        let chunk_texts = get_chunk_texts_batch(&conn, &[hash.to_string(), "missing".to_string()])
-            .unwrap();
+        let chunk_texts =
+            get_chunk_texts_batch(&conn, &[hash.to_string(), "missing".to_string()]).unwrap();
         assert_eq!(chunk_texts.len(), 1);
         assert_eq!(chunk_texts[0].0, hash);
         assert_eq!(chunk_texts[0].1, "test content");
@@ -3180,12 +3637,18 @@ mod tests {
         upsert_embedding(&conn, "hash2", "hash2", &[2], "c2", "m").unwrap();
         upsert_embedding(&conn, "hash3", "hash3", &[3], "c3", "m").unwrap();
 
-        upsert_chunk(&conn, "c1", "hash1", "hash1", "f1.rs", 1, 10, None, None, None, None, "rust")
-            .unwrap();
-        upsert_chunk(&conn, "c2", "hash2", "hash2", "f2.rs", 1, 10, None, None, None, None, "rust")
-            .unwrap();
-        upsert_chunk(&conn, "c3", "hash3", "hash3", "f3.rs", 1, 10, None, None, None, None, "rust")
-            .unwrap();
+        upsert_chunk(
+            &conn, "c1", "hash1", "hash1", "f1.rs", 1, 10, None, None, None, None, "rust",
+        )
+        .unwrap();
+        upsert_chunk(
+            &conn, "c2", "hash2", "hash2", "f2.rs", 1, 10, None, None, None, None, "rust",
+        )
+        .unwrap();
+        upsert_chunk(
+            &conn, "c3", "hash3", "hash3", "f3.rs", 1, 10, None, None, None, None, "rust",
+        )
+        .unwrap();
 
         // Add to branches
         add_chunks_to_branch(&conn, "main", &["c1".to_string(), "c2".to_string()]).unwrap();
@@ -3210,8 +3673,10 @@ mod tests {
         upsert_embedding(&conn, "used", "used", &[2], "used content", "m").unwrap();
 
         // Create chunk using one embedding
-        upsert_chunk(&conn, "c1", "used", "used", "f1.rs", 1, 10, None, None, None, None, "rust")
-            .unwrap();
+        upsert_chunk(
+            &conn, "c1", "used", "used", "f1.rs", 1, 10, None, None, None, None, "rust",
+        )
+        .unwrap();
         add_chunks_to_branch(&conn, "main", &["c1".to_string()]).unwrap();
 
         // GC should remove orphan
@@ -3393,7 +3858,8 @@ mod tests {
         assert_eq!(main_chunks.len(), 1);
         assert_eq!(main_chunks[0].chunk_id, "chunk_main");
 
-        let feature_symbols = get_symbols_by_name_on_branch(&conn, "processPayment", "feature").unwrap();
+        let feature_symbols =
+            get_symbols_by_name_on_branch(&conn, "processPayment", "feature").unwrap();
         assert_eq!(feature_symbols.len(), 1);
         assert_eq!(feature_symbols[0].id, "sym_feature");
 
@@ -3490,7 +3956,10 @@ mod tests {
         let callees = get_callees(&conn, "sym_main", "main").unwrap();
         assert!(callees[0].is_resolved);
         assert_eq!(callees[0].to_symbol_id, Some("sym_helper".to_string()));
-        assert_eq!(callees[0].target_file_path, Some("src/helper.ts".to_string()));
+        assert_eq!(
+            callees[0].target_file_path,
+            Some("src/helper.ts".to_string())
+        );
         assert_eq!(callees[0].target_kind, Some("function".to_string()));
 
         // Delete by file
@@ -3498,6 +3967,164 @@ mod tests {
         assert_eq!(deleted, 1);
         let callees = get_callees(&conn, "sym_main", "main").unwrap();
         assert!(callees.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_unresolved_call_edges_for_branch_resolves_unique_cross_file_targets() {
+        let (_temp_dir, mut conn) = setup_test_db();
+
+        upsert_symbols_batch(
+            &mut conn,
+            &vec![
+                SymbolRow {
+                    id: "sym_caller".to_string(),
+                    file_path: "src/caller.ts".to_string(),
+                    name: "runTask".to_string(),
+                    kind: "function".to_string(),
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 5,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+                SymbolRow {
+                    id: "sym_helper".to_string(),
+                    file_path: "src/helper.ts".to_string(),
+                    name: "helperFn".to_string(),
+                    kind: "function".to_string(),
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 5,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        add_symbols_to_branch_batch(
+            &mut conn,
+            "main",
+            &["sym_caller".to_string(), "sym_helper".to_string()],
+        )
+        .unwrap();
+
+        upsert_call_edge(
+            &conn,
+            &CallEdgeRow {
+                id: "edge_cross_file".to_string(),
+                branch: "main".to_string(),
+                from_symbol_id: "sym_caller".to_string(),
+                caller_file_path: Some("src/caller.ts".to_string()),
+                target_name: "helperFn".to_string(),
+                target_file_path: None,
+                target_kind: None,
+                to_symbol_id: None,
+                call_type: "Call".to_string(),
+                line: 3,
+                col: 2,
+                is_resolved: false,
+            },
+        )
+        .unwrap();
+
+        let changed = resolve_unresolved_call_edges_for_branch(&conn, "main").unwrap();
+        assert_eq!(changed, 1);
+
+        let callees = get_callees(&conn, "sym_caller", "main").unwrap();
+        assert_eq!(callees.len(), 1);
+        assert!(callees[0].is_resolved);
+        assert_eq!(callees[0].to_symbol_id, Some("sym_helper".to_string()));
+        assert_eq!(
+            callees[0].target_file_path,
+            Some("src/helper.ts".to_string())
+        );
+        assert_eq!(callees[0].target_kind, Some("function".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_unresolved_call_edges_for_branch_leaves_ambiguous_targets_unresolved() {
+        let (_temp_dir, mut conn) = setup_test_db();
+
+        upsert_symbols_batch(
+            &mut conn,
+            &vec![
+                SymbolRow {
+                    id: "sym_caller".to_string(),
+                    file_path: "src/caller.ts".to_string(),
+                    name: "runTask".to_string(),
+                    kind: "function".to_string(),
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 5,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+                SymbolRow {
+                    id: "sym_process_a".to_string(),
+                    file_path: "src/process-a.ts".to_string(),
+                    name: "process".to_string(),
+                    kind: "function".to_string(),
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 5,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+                SymbolRow {
+                    id: "sym_process_b".to_string(),
+                    file_path: "src/process-b.ts".to_string(),
+                    name: "process".to_string(),
+                    kind: "function".to_string(),
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 5,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        add_symbols_to_branch_batch(
+            &mut conn,
+            "main",
+            &[
+                "sym_caller".to_string(),
+                "sym_process_a".to_string(),
+                "sym_process_b".to_string(),
+            ],
+        )
+        .unwrap();
+
+        upsert_call_edge(
+            &conn,
+            &CallEdgeRow {
+                id: "edge_ambiguous_cross_file".to_string(),
+                branch: "main".to_string(),
+                from_symbol_id: "sym_caller".to_string(),
+                caller_file_path: Some("src/caller.ts".to_string()),
+                target_name: "process".to_string(),
+                target_file_path: None,
+                target_kind: None,
+                to_symbol_id: None,
+                call_type: "Call".to_string(),
+                line: 3,
+                col: 2,
+                is_resolved: false,
+            },
+        )
+        .unwrap();
+
+        let changed = resolve_unresolved_call_edges_for_branch(&conn, "main").unwrap();
+        assert_eq!(changed, 0);
+
+        let callees = get_callees(&conn, "sym_caller", "main").unwrap();
+        assert_eq!(callees.len(), 1);
+        assert!(!callees[0].is_resolved);
+        assert_eq!(callees[0].to_symbol_id, None);
+        assert_eq!(callees[0].target_file_path, None);
+        assert_eq!(callees[0].target_kind, None);
     }
 
     #[test]
@@ -3655,12 +4282,8 @@ mod tests {
             },
         ];
         upsert_symbols_batch(&mut conn, &symbols).unwrap();
-        add_symbols_to_branch(
-            &conn,
-            "main",
-            &["caller".to_string(), "target".to_string()],
-        )
-        .unwrap();
+        add_symbols_to_branch(&conn, "main", &["caller".to_string(), "target".to_string()])
+            .unwrap();
         upsert_call_edge(
             &conn,
             &CallEdgeRow {
@@ -4325,8 +4948,8 @@ mod tests {
         )
         .unwrap();
 
-        let changed = unresolve_call_edges_by_target_symbol_for_branch(&conn, "sym_target", "main")
-            .unwrap();
+        let changed =
+            unresolve_call_edges_by_target_symbol_for_branch(&conn, "sym_target", "main").unwrap();
         assert_eq!(changed, 1);
 
         let main_edges = get_callees(&conn, "sym_caller", "main").unwrap();

@@ -3,15 +3,20 @@ import type { SearchTaskType } from "../indexer/search-recipes.js";
 
 export type GoldenQueryType =
   | "definition"
+  | "identifier-heavy"
   | "implementation-intent"
   | "similarity"
   | "keyword-heavy"
   | "config-lookup"
+  | "config-constant-lookup"
   | "test-discovery"
   | "bug-report"
+  | "bug-error-lookup"
   | "cross-file-relationship"
   | "file-intent"
   | "concept";
+
+export type GoldenQuerySource = "curated" | "generated";
 
 export interface GoldenExpected {
   filePath?: string;
@@ -26,6 +31,8 @@ export interface GoldenQuery {
   id: string;
   query: string;
   queryType?: GoldenQueryType;
+  source?: GoldenQuerySource;
+  heuristic?: string;
   taskType?: SearchTaskType;
   expected: GoldenExpected;
 }
@@ -83,6 +90,8 @@ export interface PerQueryEvalResult {
   id: string;
   query: string;
   queryType?: GoldenQueryType;
+  source?: GoldenQuerySource;
+  heuristic?: string;
   effectiveTaskType?: string;
   effectiveFinalRerankTopN?: number;
   effectiveGraphDepth?: number;

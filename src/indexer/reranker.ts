@@ -2,7 +2,7 @@ import type { ChunkKind, ChunkMetadata, ChunkSymbolKind } from "../native/index.
 
 import type { SearchTaskType } from "./search-recipes.js";
 
-export const DEFAULT_LOCAL_CROSS_ENCODER_TOKENIZER = "cross-encoder/ms-marco-MiniLM-L-6-v2";
+export const DEFAULT_LOCAL_CROSS_ENCODER_TOKENIZER = "cross-encoder/ms-marco-MiniLM-L6-v2";
 // Transformers.js v2 loads ONNX weights from a compatible mirror. The Xenova
 // repo provides the quantized ONNX graph for the same cross-encoder.
 export const DEFAULT_LOCAL_CROSS_ENCODER_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2";

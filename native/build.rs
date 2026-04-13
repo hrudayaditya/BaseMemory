@@ -73,9 +73,7 @@ fn collect_graph_query_files(
     Ok(())
 }
 
-fn hash_versioned_files(
-    source_files: &[(String, PathBuf)],
-) -> Result<String, Box<dyn Error>> {
+fn hash_versioned_files(source_files: &[(String, PathBuf)]) -> Result<String, Box<dyn Error>> {
     let mut combined = Vec::new();
 
     for (relative_path, absolute_path) in source_files {

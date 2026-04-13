@@ -149,9 +149,11 @@ export function formatCodebasePeek(results: SearchResult[], query: string): stri
   }
 
   const formatted = results.map((r, idx) => {
+    const relationPrefix = r.relation ? `${r.relation} depth=${r.depth ?? 1} ` : "";
+    const provenance = r.viaSymbol ? ` via ${r.viaSymbol}` : "";
     const location = `${r.filePath}:${r.startLine}-${r.endLine}`;
     const name = r.name ? `"${r.name}"` : "(anonymous)";
-    return `[${idx + 1}] ${r.chunkType} ${name} at ${location} (score: ${r.score.toFixed(2)})`;
+    return `[${idx + 1}] ${relationPrefix}${r.chunkType} ${name} at ${location}${provenance} (score: ${r.score.toFixed(2)})`;
   });
 
   return `Found ${results.length} locations for "${query}":\n\n${formatted.join("\n")}\n\nUse Read tool to examine specific files.`;
@@ -225,9 +227,11 @@ export type ScoreFormat = "score" | "similarity";
 
 export function formatSearchResults(results: SearchResult[], scoreFormat: ScoreFormat = "similarity"): string {
   const formatted = results.map((r, idx) => {
+    const relationPrefix = r.relation ? `${r.relation} depth=${r.depth ?? 1} ` : "";
+    const provenance = r.viaSymbol ? ` via ${r.viaSymbol}` : "";
     const header = r.name
-      ? `[${idx + 1}] ${r.chunkType} "${r.name}" in ${r.filePath}:${r.startLine}-${r.endLine}`
-      : `[${idx + 1}] ${r.chunkType} in ${r.filePath}:${r.startLine}-${r.endLine}`;
+      ? `[${idx + 1}] ${relationPrefix}${r.chunkType} "${r.name}" in ${r.filePath}:${r.startLine}-${r.endLine}${provenance}`
+      : `[${idx + 1}] ${relationPrefix}${r.chunkType} in ${r.filePath}:${r.startLine}-${r.endLine}${provenance}`;
 
     const scoreLabel = scoreFormat === "similarity"
       ? `(similarity: ${(r.score * 100).toFixed(1)}%)`

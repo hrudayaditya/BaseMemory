@@ -226,6 +226,91 @@ describe("incremental index orchestrator", () => {
     return filePath;
   }
 
+  function createCrossFileCallRepo(): {
+    callerFile: string;
+    helperFile: string;
+  } {
+    const srcDir = path.join(tempDir, "src");
+    fs.mkdirSync(srcDir, { recursive: true });
+    const callerFile = path.join(srcDir, "caller.ts");
+    const helperFile = path.join(srcDir, "helper.ts");
+    fs.writeFileSync(
+      helperFile,
+      [
+        "export function helperFn(): number {",
+        "  return 1;",
+        "}",
+        "",
+      ].join("\n"),
+      "utf-8"
+    );
+    fs.writeFileSync(
+      callerFile,
+      [
+        "import { helperFn } from \"./helper\";",
+        "",
+        "export function runTask(): number {",
+        "  return helperFn();",
+        "}",
+        "",
+      ].join("\n"),
+      "utf-8"
+    );
+
+    return {
+      callerFile,
+      helperFile,
+    };
+  }
+
+  function createAmbiguousCrossFileCallRepo(): {
+    callerFile: string;
+    processAFile: string;
+    processBFile: string;
+  } {
+    const srcDir = path.join(tempDir, "src");
+    fs.mkdirSync(srcDir, { recursive: true });
+    const callerFile = path.join(srcDir, "caller.ts");
+    const processAFile = path.join(srcDir, "process-a.ts");
+    const processBFile = path.join(srcDir, "process-b.ts");
+    fs.writeFileSync(
+      processAFile,
+      [
+        "export function process(): number {",
+        "  return 1;",
+        "}",
+        "",
+      ].join("\n"),
+      "utf-8"
+    );
+    fs.writeFileSync(
+      processBFile,
+      [
+        "export function process(): number {",
+        "  return 2;",
+        "}",
+        "",
+      ].join("\n"),
+      "utf-8"
+    );
+    fs.writeFileSync(
+      callerFile,
+      [
+        "export function runTask(): number {",
+        "  return process();",
+        "}",
+        "",
+      ].join("\n"),
+      "utf-8"
+    );
+
+    return {
+      callerFile,
+      processAFile,
+      processBFile,
+    };
+  }
+
   function createBranchDivergenceRepo(): {
     mainBranch: string;
     featureBranch: string;
@@ -402,6 +487,11 @@ describe("incremental index orchestrator", () => {
     };
   }
 
+  function getStoreBasePath(indexPath: string, modelId: string): string {
+    const safeModelId = modelId.replace(/[^a-zA-Z0-9_-]/g, "-");
+    return path.join(indexPath, `vectors-${safeModelId}`);
+  }
+
   function relativeToRepo(filePath: string): string {
     return path.relative(tempDir, filePath).replace(/\\/g, "/");
   }
@@ -533,7 +623,8 @@ describe("incremental index orchestrator", () => {
         language: targetChunk.language,
       },
       filePath,
-      tempDir
+      tempDir,
+      8_192
     ).text;
   }
 
@@ -699,6 +790,7 @@ describe("incremental index orchestrator", () => {
       primaryResults: [],
       expandedContext: [],
       taskType: "general",
+      graphDirection: "both",
       reranker: {
         applied: false,
         backend: null,
@@ -1845,6 +1937,69 @@ describe("incremental index orchestrator", () => {
     expect(database.getCallers("callee", "feature")).toHaveLength(callersBefore.length);
   });
 
+  it("persistently resolves unique cross-file call edges after branch symbols become authoritative", async () => {
+    const { callerFile, helperFile } = createCrossFileCallRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const callerSymbol = database.getSymbolsByNameOnBranch("runTask", branch)[0];
+    const helperSymbol = database.getSymbolsByNameOnBranch("helperFn", branch)[0];
+
+    expect(callerSymbol).toBeTruthy();
+    expect(helperSymbol).toBeTruthy();
+    expect(path.basename(callerSymbol!.filePath)).toBe(path.basename(callerFile));
+    expect(path.basename(helperSymbol!.filePath)).toBe(path.basename(helperFile));
+
+    const helperEdge = database
+      .getCallees(callerSymbol!.id, branch)
+      .find((edge) => edge.targetName === "helperFn" && edge.callType === "Call");
+
+    expect(helperEdge?.isResolved).toBe(true);
+    expect(helperEdge?.toSymbolId).toBe(helperSymbol!.id);
+    expect(path.basename(helperEdge?.targetFilePath ?? "")).toBe(path.basename(helperFile));
+    expect(helperEdge?.targetKind).toBe("function");
+
+    const callers = database.getCallersWithContextByTargetSymbolId(helperSymbol!.id, branch);
+    expect(callers).toHaveLength(1);
+    expect(callers[0]?.fromSymbolId).toBe(callerSymbol!.id);
+    expect(path.basename(callers[0]?.fromSymbolFilePath ?? "")).toBe(path.basename(callerFile));
+    expect(callers[0]?.targetName).toBe("helperFn");
+    expect(callers[0]?.toSymbolId).toBe(helperSymbol!.id);
+    expect(callers[0]?.isResolved).toBe(true);
+  });
+
+  it("keeps ambiguous cross-file call edges unresolved after finalization", async () => {
+    const { callerFile, processAFile, processBFile } = createAmbiguousCrossFileCallRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const callerSymbol = database.getSymbolsByNameOnBranch("runTask", branch)[0];
+    const processSymbols = database.getSymbolsByNameOnBranch("process", branch);
+
+    expect(callerSymbol).toBeTruthy();
+    expect(processSymbols).toHaveLength(2);
+    expect(processSymbols.map((symbol) => path.basename(symbol.filePath)).sort()).toEqual([
+      path.basename(processAFile),
+      path.basename(processBFile),
+    ]);
+
+    const processEdge = database
+      .getCallees(callerSymbol!.id, branch)
+      .find((edge) => edge.targetName === "process" && edge.callType === "Call");
+
+    expect(processEdge?.isResolved).toBe(false);
+    expect(processEdge?.targetFilePath ?? null).toBeNull();
+    expect(processEdge?.targetKind ?? null).toBeNull();
+    expect(processEdge?.toSymbolId ?? null).toBeNull();
+    for (const processSymbol of processSymbols) {
+      expect(database.getCallersWithContextByTargetSymbolId(processSymbol.id, branch)).toEqual([]);
+    }
+  });
+
   it("reprocesses files left with index in_progress when finalization crashes before durable completion", async () => {
     const { fileA } = createRepo();
     const indexer = new Indexer(tempDir, createConfig());
@@ -2479,8 +2634,13 @@ describe("incremental index orchestrator", () => {
     const embedConfigHash = "embed-v1";
     const filePath = "/repo/src/stable.ts";
 
-    const originalEmbeddingInputHash = buildEmbeddingInputHash(baseChunk, filePath, "/repo");
-    const renamedEmbeddingInputHash = buildEmbeddingInputHash(renamedChunk, filePath, "/repo");
+    const originalEmbeddingInputHash = buildEmbeddingInputHash(baseChunk, filePath, "/repo", 8_192);
+    const renamedEmbeddingInputHash = buildEmbeddingInputHash(
+      renamedChunk,
+      filePath,
+      "/repo",
+      8_192
+    );
     expect(hashContent(baseChunk.content)).toBe(hashContent(renamedChunk.content));
     expect(originalEmbeddingInputHash).not.toBe(renamedEmbeddingInputHash);
 
@@ -2502,7 +2662,7 @@ describe("incremental index orchestrator", () => {
     ).toBe(true);
   });
 
-  it("reruns EMBED across the branch when embedding prefix version drifts without resetting CHUNK or GRAPH", async () => {
+  it("reruns EMBED across the branch when the embedding input format version drifts without resetting CHUNK or GRAPH", async () => {
     const { fileA, fileB } = createRepo();
     const indexer = new Indexer(tempDir, createConfig());
     await indexer.index();
@@ -3113,6 +3273,72 @@ describe("incremental index orchestrator", () => {
     resumeSpy.mockRestore();
   });
 
+  it("forces cold start after vector-store recovery resets persisted state to empty", async () => {
+    createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database, indexPath } = await openDatabase(indexer);
+    const branchChunkCount = database.getBranchChunkIds(branch).length;
+    const primaryModelId =
+      getIndexerInternals(indexer).primaryStoreModelId ??
+      getIndexerInternals(indexer).configuredProviderInfo.modelInfo.model;
+    const storeBasePath = getStoreBasePath(indexPath, primaryModelId!);
+    fs.rmSync(`${storeBasePath}.meta.json`);
+
+    const restartedIndexer = await createFreshIndexer();
+    const loggerWarnSpy = vi.spyOn((restartedIndexer as any).logger, "warn");
+    const coldStartSpy = vi.spyOn(getIndexerInternals(restartedIndexer).orchestrator, "coldStart");
+    await (restartedIndexer as any).ensureInitialized();
+
+    expect(getIndexerInternals(restartedIndexer).orchestrator.forceColdStart).toBe(true);
+    expect(
+      loggerWarnSpy.mock.calls.some(
+        ([message]) =>
+          message ===
+          "Retrieval startup integrity check failed: retrieval artifacts are empty or recovered while the database still has indexed chunks. A full rebuild is required before search results are reliable."
+      )
+    ).toBe(true);
+
+    await restartedIndexer.index();
+
+    const restartedStore = getIndexerInternals(restartedIndexer).stores.get(primaryModelId!);
+    expect(coldStartSpy).toHaveBeenCalled();
+    expect((restartedStore as any).count()).toBe(branchChunkCount);
+    loggerWarnSpy.mockRestore();
+    coldStartSpy.mockRestore();
+  });
+
+  it("detects DB-vs-store mismatch at startup and warns before forcing cold start", async () => {
+    createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database, indexPath } = await openDatabase(indexer);
+    expect(database.getBranchChunkIds(branch).length).toBeGreaterThan(0);
+    const primaryModelId =
+      getIndexerInternals(indexer).primaryStoreModelId ??
+      getIndexerInternals(indexer).configuredProviderInfo.modelInfo.model;
+    const storeBasePath = getStoreBasePath(indexPath, primaryModelId!);
+    fs.rmSync(storeBasePath);
+    fs.rmSync(`${storeBasePath}.meta.json`);
+
+    const restartedIndexer = await createFreshIndexer();
+    const loggerWarnSpy = vi.spyOn((restartedIndexer as any).logger, "warn");
+    await (restartedIndexer as any).ensureInitialized();
+
+    expect(getIndexerInternals(restartedIndexer).orchestrator.forceColdStart).toBe(true);
+    expect(
+      loggerWarnSpy.mock.calls.some(
+        ([message, details]) =>
+          message ===
+            "Retrieval startup integrity check failed: retrieval artifacts are empty or recovered while the database still has indexed chunks. A full rebuild is required before search results are reliable." &&
+          (details as { branchChunkCount?: number }).branchChunkCount !== undefined
+      )
+    ).toBe(true);
+    loggerWarnSpy.mockRestore();
+  });
+
   it("isolates single-file embed failures and still completes the rest of the run", async () => {
     const { fileA, fileB } = createRepo();
     fetchSpy.mockImplementation(async (_url, init) => {
@@ -3210,6 +3436,50 @@ describe("incremental index orchestrator", () => {
     for (const chunkId of oldBranchChunkIds) {
       expect(featureChunkIds.has(chunkId)).toBe(false);
     }
+  });
+
+  it("pushes only branch membership deltas to native retrieval filters on hot update", async () => {
+    createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const initialBranchChunkIds = new Set(database.getBranchChunkIds(branch));
+    const orchestrator = getIndexerInternals(indexer).orchestrator as unknown as {
+      host: {
+        applyNativeBranchMembershipDelta: (
+          branch: string,
+          addedChunkIds: string[],
+          removedChunkIds: string[]
+        ) => void;
+        syncNativeBranchMembership: (branch: string, chunkIds: string[]) => void;
+      };
+    };
+    const applyDeltaSpy = vi.spyOn(orchestrator.host, "applyNativeBranchMembershipDelta");
+    const syncMembershipSpy = vi.spyOn(orchestrator.host, "syncNativeBranchMembership");
+    applyDeltaSpy.mockClear();
+    syncMembershipSpy.mockClear();
+
+    const addedFile = path.join(tempDir, "src", "delta-added.ts");
+    fs.writeFileSync(
+      addedFile,
+      "export function deltaAddedHotUpdate(): number { return 7; }\n",
+      "utf-8"
+    );
+
+    await indexer.handleFileChanges([{ type: "add", path: addedFile }]);
+
+    const updatedBranchChunkIds = new Set(database.getBranchChunkIds(branch));
+    const addedChunkIds = Array.from(updatedBranchChunkIds).filter(
+      (chunkId) => !initialBranchChunkIds.has(chunkId)
+    );
+
+    expect(addedChunkIds.length).toBeGreaterThan(0);
+    expect(syncMembershipSpy).not.toHaveBeenCalled();
+    expect(applyDeltaSpy).toHaveBeenCalled();
+
+    applyDeltaSpy.mockRestore();
+    syncMembershipSpy.mockRestore();
   });
 
   it("uses cold start instead of hot update when switching to a branch with no prior snapshot", async () => {
