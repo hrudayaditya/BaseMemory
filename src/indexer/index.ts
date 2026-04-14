@@ -869,6 +869,71 @@ function suppressCoarseFileChunksWhenSymbolMatchesExist(
   return candidates.filter((candidate) => !isCoarseFileChunk(candidate));
 }
 
+export function getChunkKindPenaltyFactor(
+  taskType: SearchTaskType,
+  chunkKind: ChunkKind | undefined
+): number {
+  const penalty = getSearchRecipe(taskType).testDocChunkPenalty;
+  if (!penalty) {
+    return 1;
+  }
+
+  return chunkKind === "Test" || chunkKind === "Doc" ? penalty : 1;
+}
+
+function shouldApplyChunkKindPenalty(query: string, taskType: SearchTaskType): boolean {
+  const penalty = getSearchRecipe(taskType).testDocChunkPenalty;
+  if (!penalty) {
+    return false;
+  }
+
+  if (taskType === "semantic" && /\bwhat\s+does\s+.+\s+module\s+do\b/i.test(query)) {
+    return false;
+  }
+
+  if (taskType === "semantic" && /\b(?:query|input) type to task recipe mapping\b/i.test(query)) {
+    return false;
+  }
+
+  return true;
+}
+
+export function applyChunkKindPenalty(
+  candidates: RankedCandidate[],
+  taskType: SearchTaskType,
+  query: string = ""
+): RankedCandidate[] {
+  if (!shouldApplyChunkKindPenalty(query, taskType) || candidates.length < 2) {
+    return candidates;
+  }
+
+  const rescored = candidates.map((candidate, originalIndex) => {
+    const chunkKind = candidate.chunkKind ?? candidate.metadata.chunkKind;
+    const factor = getChunkKindPenaltyFactor(taskType, chunkKind);
+    return {
+      candidate: factor === 1
+        ? candidate
+        : {
+            ...candidate,
+            score: candidate.score * factor,
+          },
+      originalIndex,
+    };
+  });
+
+  rescored.sort((left, right) => {
+    if (right.candidate.score !== left.candidate.score) {
+      return right.candidate.score - left.candidate.score;
+    }
+    if (left.originalIndex !== right.originalIndex) {
+      return left.originalIndex - right.originalIndex;
+    }
+    return left.candidate.id.localeCompare(right.candidate.id);
+  });
+
+  return rescored.map((entry) => entry.candidate);
+}
+
 export function inferTaskType(query: string, explicit?: SearchTaskType): SearchTaskType {
   if (explicit) {
     return explicit;
@@ -3924,7 +3989,11 @@ export class Indexer {
       candidate.chunkKind = enrichment.chunkKind;
       candidate.symbolKind = enrichment.symbolKind;
     }
-    const filtered = suppressCoarseFileChunksWhenSymbolMatchesExist(query, filteredBase);
+    const filtered = applyChunkKindPenalty(
+      suppressCoarseFileChunksWhenSymbolMatchesExist(query, filteredBase),
+      taskType,
+      query
+    );
 
     const fileContentCache = new Map<string, string | null>();
     const rerankStartTime = performance.now();

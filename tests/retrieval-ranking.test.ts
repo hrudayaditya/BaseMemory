@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import type { ChunkMetadata } from "../src/native/index.js";
 import {
+  applyChunkKindPenalty,
   extractFilePathHint,
   fuseResultsRrf,
   fuseResultsWeighted,
+  getChunkKindPenaltyFactor,
   inferTaskType,
   matchesHardRetrievalFilters,
   rankSemanticOnlyResults,
@@ -257,6 +259,167 @@ describe("retrieval ranking", () => {
       limit: 5,
     });
     expect(similarRanked.map(r => r.id)).not.toContain("k1");
+  });
+
+  it("softly demotes test chunks for semantic source-oriented queries", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "testChunk",
+        score: 0.9,
+        metadata: meta({
+          filePath: "/repo/tests/eval-budget.test.ts",
+          name: "eval budget gate",
+          chunkType: "function",
+          chunkKind: "Test",
+        }),
+        chunkKind: "Test",
+      },
+      {
+        id: "sourceChunk",
+        score: 0.7,
+        metadata: meta({
+          filePath: "/repo/src/eval/budget.ts",
+          name: "evaluateBudgetGate",
+          chunkType: "function",
+          chunkKind: "Code",
+        }),
+        chunkKind: "Code",
+      },
+    ];
+
+    const penalized = applyChunkKindPenalty(candidates, "semantic", "where is budget enforcement handled");
+
+    expect(getChunkKindPenaltyFactor("semantic", "Test")).toBe(0.6);
+    expect(getChunkKindPenaltyFactor("semantic", "Doc")).toBe(0.6);
+    expect(penalized[0]?.id).toBe("sourceChunk");
+    expect(penalized[1]?.score).toBeCloseTo(0.54, 6);
+  });
+
+  it("does not penalize test chunks for test_debug queries", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "testChunk",
+        score: 0.9,
+        metadata: meta({
+          filePath: "/repo/tests/auth.test.ts",
+          name: "auth tests",
+          chunkType: "function",
+          chunkKind: "Test",
+        }),
+        chunkKind: "Test",
+      },
+      {
+        id: "sourceChunk",
+        score: 0.7,
+        metadata: meta({
+          filePath: "/repo/src/auth.ts",
+          name: "authenticate",
+          chunkType: "function",
+          chunkKind: "Code",
+        }),
+        chunkKind: "Code",
+      },
+    ];
+
+    const penalized = applyChunkKindPenalty(candidates, "test_debug", "what tests cover the login flow");
+
+    expect(getChunkKindPenaltyFactor("test_debug", "Test")).toBe(1);
+    expect(penalized.map((candidate) => candidate.id)).toEqual(["testChunk", "sourceChunk"]);
+  });
+
+  it("does not penalize code or constant chunks", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "constant",
+        score: 0.82,
+        metadata: meta({
+          filePath: "/repo/src/indexer/search-recipes.ts",
+          name: "DEFAULT_FINAL_RERANK_TOP_N",
+          chunkType: "constant",
+          chunkKind: "Code",
+        }),
+        chunkKind: "Code",
+      },
+      {
+        id: "function",
+        score: 0.81,
+        metadata: meta({
+          filePath: "/repo/src/indexer/index.ts",
+          name: "rankHybridResults",
+          chunkType: "function",
+          chunkKind: "Code",
+        }),
+        chunkKind: "Code",
+      },
+    ];
+
+    const penalized = applyChunkKindPenalty(candidates, "definition", "what is the default rerank window size");
+
+    expect(getChunkKindPenaltyFactor("definition", "Code")).toBe(1);
+    expect(penalized[0]?.score).toBe(0.82);
+    expect(penalized[1]?.score).toBe(0.81);
+  });
+
+  it("does not penalize semantic module-overview queries", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "testChunk",
+        score: 0.9,
+        metadata: meta({
+          filePath: "/repo/tests/eval-runner.test.ts",
+          name: "eval runner",
+          chunkType: "function",
+          chunkKind: "Test",
+        }),
+      },
+      {
+        id: "sourceChunk",
+        score: 0.7,
+        metadata: meta({
+          filePath: "/repo/src/eval/runner.ts",
+          name: "finalizeEvaluationRun",
+          chunkType: "function",
+          chunkKind: "Code",
+        }),
+      },
+    ];
+
+    const penalized = applyChunkKindPenalty(candidates, "semantic", "what does the runner pipeline module do");
+
+    expect(penalized.map((candidate) => candidate.id)).toEqual(["testChunk", "sourceChunk"]);
+  });
+
+  it("does not penalize semantic recipe-mapping queries", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "testChunk",
+        score: 0.9,
+        metadata: meta({
+          filePath: "/repo/tests/search-recipes.test.ts",
+          name: "search recipes",
+          chunkType: "function",
+          chunkKind: "Test",
+        }),
+      },
+      {
+        id: "sourceChunk",
+        score: 0.7,
+        metadata: meta({
+          filePath: "/repo/src/indexer/search-recipes.ts",
+          name: "mapEvalQueryTypeToTaskType",
+          chunkType: "function",
+          chunkKind: "Code",
+        }),
+      },
+    ];
+
+    const penalized = applyChunkKindPenalty(
+      candidates,
+      "semantic",
+      "where is input type to task recipe mapping handled"
+    );
+
+    expect(penalized.map((candidate) => candidate.id)).toEqual(["testChunk", "sourceChunk"]);
   });
 
   it("returns pre-rerank order when rerankTopN is 0", () => {

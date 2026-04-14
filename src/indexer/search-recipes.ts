@@ -25,6 +25,7 @@ export interface SearchRecipe {
   enableIdentifierDefinitionLane: boolean;
   enableSymbolDefinitionLane: boolean;
   implementationOnlyOnCodeHints: boolean;
+  testDocChunkPenalty?: number;
   finalRerankTopN: number;
 }
 
@@ -63,6 +64,7 @@ const RECIPE_BY_TASK_TYPE: Record<SearchTaskType, SearchRecipe> = {
     enableIdentifierDefinitionLane: true,
     enableSymbolDefinitionLane: true,
     implementationOnlyOnCodeHints: true,
+    testDocChunkPenalty: 0.7,
     finalRerankTopN: DEFAULT_FINAL_RERANK_TOP_N,
   },
   bug: {
@@ -113,6 +115,7 @@ const RECIPE_BY_TASK_TYPE: Record<SearchTaskType, SearchRecipe> = {
     enableIdentifierDefinitionLane: false,
     enableSymbolDefinitionLane: false,
     implementationOnlyOnCodeHints: false,
+    testDocChunkPenalty: 0.6,
     finalRerankTopN: 0,
   },
 };
