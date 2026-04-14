@@ -275,6 +275,15 @@ impl VectorStoreInner {
         Ok(())
     }
 
+    pub fn contains(&self, key: &str) -> bool {
+        self.stored
+            .key_to_id
+            .get(key)
+            .copied()
+            .map(|id| self.index.contains(id))
+            .unwrap_or(false)
+    }
+
     fn add_batch_internal(
         &mut self,
         keys: &[String],

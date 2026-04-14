@@ -426,6 +426,11 @@ impl VectorStore {
     }
 
     #[napi]
+    pub fn contains(&self, id: String) -> bool {
+        self.inner.contains(&id)
+    }
+
+    #[napi]
     pub fn clear(&mut self) -> Result<()> {
         self.inner
             .clear()

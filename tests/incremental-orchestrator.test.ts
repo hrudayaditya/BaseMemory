@@ -2342,6 +2342,212 @@ describe("incremental index orchestrator", () => {
     enqueueSpy.mockRestore();
   });
 
+  it("cancels interrupted runs on resume when the config hash changed since the run started", async () => {
+    const { fileA } = createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedPath = resolveTrackedPath(database, branch, fileA, tempDir);
+    const currentConfig = await getCurrentRuntimeConfig(indexer);
+    const orchestrator = getIndexerInternals(indexer).orchestrator;
+    const queue = orchestrator.queue as {
+      enqueue: (job: {
+        branch: string;
+        filePath: string;
+        priority: "normal";
+        trigger: "crash_resume";
+        runId: string;
+      }) => string;
+    };
+    const logger = (indexer as unknown as { logger: { info: (...args: unknown[]) => void } }).logger;
+
+    database.upsertPipelineState({
+      branch,
+      filePath: trackedPath,
+      stage: "index",
+      status: "in_progress",
+      inputHash: database.getPipelineState(branch, trackedPath, "index")?.inputHash,
+      updatedAt: Date.now(),
+    });
+    database.startPipelineRun(
+      {
+        runId: "config-mismatch-run",
+        branch,
+        runType: "resume",
+        status: "in_progress",
+        configHash: "stale-config-hash",
+        startedAt: Date.now(),
+      },
+      Date.now()
+    );
+
+    const enqueueSpy = vi.spyOn(queue, "enqueue");
+    const logSpy = vi.spyOn(logger, "info");
+    await orchestrator.resumeInterruptedRuns(branch, currentConfig, hashConfigVersion(currentConfig));
+
+    expect(database.getPipelineRun("config-mismatch-run")?.status).toBe("cancelled");
+    expect(database.getPipelineState(branch, trackedPath, "index")?.status).toBe("in_progress");
+    expect(enqueueSpy).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Cancelled interrupted run config-mismatch-run on branch"),
+      expect.objectContaining({
+        branch,
+        runId: "config-mismatch-run",
+        runConfigHash: "stale-config-hash",
+      })
+    );
+    enqueueSpy.mockRestore();
+    logSpy.mockRestore();
+  });
+
+  it("resumes interrupted runs normally when the config hash still matches", async () => {
+    const { fileA } = createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedPath = resolveTrackedPath(database, branch, fileA, tempDir);
+    const currentConfig = await getCurrentRuntimeConfig(indexer);
+    const beforeEmbed = database.getPipelineState(branch, trackedPath, "embed");
+
+    database.upsertPipelineState({
+      branch,
+      filePath: trackedPath,
+      stage: "index",
+      status: "in_progress",
+      inputHash: database.getPipelineState(branch, trackedPath, "index")?.inputHash,
+      updatedAt: Date.now(),
+    });
+    database.startPipelineRun(
+      {
+        runId: "config-match-run",
+        branch,
+        runType: "resume",
+        status: "in_progress",
+        configHash: hashConfigVersion(currentConfig),
+        startedAt: Date.now(),
+      },
+      Date.now()
+    );
+
+    const fetchCountBeforeResume = fetchSpy.mock.calls.length;
+    const orchestrator = getIndexerInternals(indexer).orchestrator;
+    await orchestrator.resumeInterruptedRuns(branch, currentConfig, hashConfigVersion(currentConfig));
+
+    expect(database.getPipelineRun("config-match-run")?.status).toBe("complete");
+    expect(database.getPipelineState(branch, trackedPath, "index")?.status).toBe("complete");
+    expect(database.getPipelineState(branch, trackedPath, "embed")?.updatedAt).toBe(
+      beforeEmbed?.updatedAt
+    );
+    expect(fetchSpy.mock.calls.length).toBe(fetchCountBeforeResume);
+  });
+
+  it("forces re-embedding during resume when the embed checkpoint is complete but live retrieval artifacts are missing", async () => {
+    const { fileA } = createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedPath = resolveTrackedPath(database, branch, fileA, tempDir);
+    const currentConfig = await getCurrentRuntimeConfig(indexer);
+    const beforeEmbed = database.getPipelineState(branch, trackedPath, "embed");
+    const internals = getIndexerInternals(indexer) as unknown as {
+      stores: Map<string, { clear: () => void; contains: (chunkId: string) => boolean }>;
+      primaryStoreModelId?: string | null;
+      configuredProviderInfo: { modelInfo: { model: string } };
+      invertedIndex: { clear: () => void; hasChunk: (chunkId: string) => boolean };
+    };
+    const primaryModelId =
+      internals.primaryStoreModelId ?? internals.configuredProviderInfo.modelInfo.model;
+    const primaryStore = internals.stores.get(primaryModelId);
+    if (!primaryStore) {
+      throw new Error(`Missing primary store for model ${primaryModelId}`);
+    }
+
+    primaryStore.clear();
+    internals.invertedIndex.clear();
+
+    database.upsertPipelineState({
+      branch,
+      filePath: trackedPath,
+      stage: "index",
+      status: "in_progress",
+      inputHash: database.getPipelineState(branch, trackedPath, "index")?.inputHash,
+      updatedAt: Date.now(),
+    });
+    database.startPipelineRun(
+      {
+        runId: "resume-missing-store-data",
+        branch,
+        runType: "resume",
+        status: "in_progress",
+        configHash: hashConfigVersion(currentConfig),
+        startedAt: Date.now(),
+      },
+      Date.now()
+    );
+
+    const fetchCountBeforeResume = fetchSpy.mock.calls.length;
+    const orchestrator = getIndexerInternals(indexer).orchestrator;
+    await orchestrator.resumeInterruptedRuns(branch, currentConfig, hashConfigVersion(currentConfig));
+
+    const restoredChunkIds = database
+      .getChunksByFileOnBranch(trackedPath, branch)
+      .map((chunk) => chunk.chunkId);
+
+    expect(database.getPipelineRun("resume-missing-store-data")?.status).toBe("complete");
+    expect(database.getPipelineState(branch, trackedPath, "embed")?.status).toBe("complete");
+    expect(database.getPipelineState(branch, trackedPath, "embed")?.updatedAt).toBeGreaterThan(
+      beforeEmbed?.updatedAt ?? 0
+    );
+    expect(fetchSpy.mock.calls.length).toBe(fetchCountBeforeResume);
+    expect(restoredChunkIds.length).toBeGreaterThan(0);
+    expect(restoredChunkIds.every((chunkId) => primaryStore.contains(chunkId))).toBe(true);
+    expect(restoredChunkIds.every((chunkId) => internals.invertedIndex.hasChunk(chunkId))).toBe(true);
+  });
+
+  it("keeps embed checkpoints trusted during resume when live retrieval artifacts are still present", async () => {
+    const { fileA } = createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedPath = resolveTrackedPath(database, branch, fileA, tempDir);
+    const currentConfig = await getCurrentRuntimeConfig(indexer);
+    const beforeEmbed = database.getPipelineState(branch, trackedPath, "embed");
+
+    database.upsertPipelineState({
+      branch,
+      filePath: trackedPath,
+      stage: "index",
+      status: "in_progress",
+      inputHash: database.getPipelineState(branch, trackedPath, "index")?.inputHash,
+      updatedAt: Date.now(),
+    });
+    database.startPipelineRun(
+      {
+        runId: "resume-valid-store-data",
+        branch,
+        runType: "resume",
+        status: "in_progress",
+        configHash: hashConfigVersion(currentConfig),
+        startedAt: Date.now(),
+      },
+      Date.now()
+    );
+
+    const fetchCountBeforeResume = fetchSpy.mock.calls.length;
+    const orchestrator = getIndexerInternals(indexer).orchestrator;
+    await orchestrator.resumeInterruptedRuns(branch, currentConfig, hashConfigVersion(currentConfig));
+
+    expect(database.getPipelineRun("resume-valid-store-data")?.status).toBe("complete");
+    expect(database.getPipelineState(branch, trackedPath, "embed")?.updatedAt).toBe(
+      beforeEmbed?.updatedAt
+    );
+    expect(fetchSpy.mock.calls.length).toBe(fetchCountBeforeResume);
+  });
+
   it("reruns CHUNK, EMBED, and GRAPH across the branch after chunker config drift", async () => {
     const { fileA, fileB } = createRepo();
     const indexer = new Indexer(tempDir, createConfig());

@@ -470,6 +470,10 @@ export class VectorStore {
     return this.inner.count();
   }
 
+  contains(id: string): boolean {
+    return this.inner.contains(id);
+  }
+
   clear(): void {
     this.inner.clear();
   }

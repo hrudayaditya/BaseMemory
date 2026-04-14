@@ -1239,12 +1239,30 @@ export class IncrementalIndexOrchestrator {
         continue;
       }
 
+      if (run.configHash !== configHash) {
+        this.checkpoints.cancelActiveRuns(run.branch);
+        this.host.logger.info(
+          `Cancelled interrupted run ${run.runId} on branch ${run.branch} because config changed since the run started. Config-migration path will handle reindexing.`,
+          {
+            branch: run.branch,
+            runId: run.runId,
+            runConfigHash: run.configHash,
+            currentConfigHash: configHash,
+          }
+        );
+        continue;
+      }
+
       const unfinishedFiles = this.checkpoints
         .getUnfinishedFiles(run.branch)
         .map((filePath) => toAbsolutePath(this.host.getProjectRoot(), filePath));
       if (unfinishedFiles.length === 0) {
         this.checkpoints.markRunComplete(run.runId);
         continue;
+      }
+
+      for (const filePath of unfinishedFiles) {
+        this.verifyResumableEmbedCheckpoint(resources, run.branch, filePath, run.runId);
       }
 
       const snapshot = this.getStoredSnapshot(resources.database, run.branch);
@@ -1281,6 +1299,47 @@ export class IncrementalIndexOrchestrator {
       await this.drainRunContext(context);
       await this.finalizeRunContext(context);
     }
+  }
+
+  private verifyResumableEmbedCheckpoint(
+    resources: InitializationResources,
+    branch: string,
+    filePath: string,
+    runId: string
+  ): void {
+    const embedState = this.checkpoints.getStageState(branch, filePath, "embed");
+    if (embedState?.status !== "complete") {
+      return;
+    }
+
+    const currentChunks = resources.database.getChunksByFileOnBranch(filePath, branch);
+    if (currentChunks.length === 0) {
+      return;
+    }
+
+    const primaryArtifactsMissing = currentChunks.some(
+      (chunk) => !resources.store.contains(chunk.chunkId) || !resources.invertedIndex.hasChunk(chunk.chunkId)
+    );
+    const voyageArtifactsMissing =
+      Boolean(resources.voyageStore && resources.voyageModelId) &&
+      currentChunks.some((chunk) => !resources.voyageStore!.contains(chunk.chunkId));
+
+    if (!primaryArtifactsMissing && !voyageArtifactsMissing) {
+      return;
+    }
+
+    this.checkpoints.markStagePending(branch, filePath, "embed");
+    this.host.logger.warn(
+      "Embed checkpoint was complete but live retrieval artifacts were missing during resume; scheduling re-embed",
+      {
+        branch,
+        filePath,
+        runId,
+        primaryArtifactsMissing,
+        voyageArtifactsMissing,
+        chunkCount: currentChunks.length,
+      }
+    );
   }
 
   private async prepareRun(): Promise<InitializationResources> {
