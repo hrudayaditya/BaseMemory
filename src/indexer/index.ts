@@ -881,13 +881,13 @@ export function getChunkKindPenaltyFactor(
   return chunkKind === "Test" || chunkKind === "Doc" ? penalty : 1;
 }
 
-function shouldApplyChunkKindPenalty(query: string, taskType: SearchTaskType): boolean {
+function shouldApplyChunkKindPenalty(_query: string, taskType: SearchTaskType): boolean {
   const penalty = getSearchRecipe(taskType).testDocChunkPenalty;
   if (!penalty) {
     return false;
   }
 
-  if (taskType === "semantic" && /\b(?:query|input) type to task recipe mapping\b/i.test(query)) {
+  if (taskType === "semantic" && /\b(?:query|input) type to task recipe mapping\b/i.test(_query)) {
     return false;
   }
 

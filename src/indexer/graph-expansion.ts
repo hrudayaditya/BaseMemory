@@ -33,6 +33,11 @@ interface QueueEntry {
   depth: number;
 }
 
+interface ResolvedUnresolvedCalleeEdge {
+  edge: CallEdgeData;
+  target: SymbolData;
+}
+
 function containsSymbolRange(
   symbol: SymbolData,
   startLine: number,
@@ -59,6 +64,69 @@ function isMoreSpecificSymbol(candidate: SymbolData, currentBest: SymbolData): b
   }
 
   return candidate.id.localeCompare(currentBest.id) < 0;
+}
+
+function isEarlierSymbol(candidate: SymbolData, currentBest: SymbolData): boolean {
+  if (candidate.startLine !== currentBest.startLine) {
+    return candidate.startLine < currentBest.startLine;
+  }
+
+  if (candidate.startCol !== currentBest.startCol) {
+    return candidate.startCol < currentBest.startCol;
+  }
+
+  return candidate.id.localeCompare(currentBest.id) < 0;
+}
+
+function matchesTargetKind(symbol: SymbolData, targetKind?: string): boolean {
+  if (!targetKind) {
+    return true;
+  }
+
+  return symbol.kind.toLowerCase() === targetKind.toLowerCase();
+}
+
+function groupSymbolsByName(symbols: SymbolData[]): Map<string, SymbolData[]> {
+  const grouped = new Map<string, SymbolData[]>();
+
+  for (const symbol of symbols) {
+    const bucket = grouped.get(symbol.name);
+    if (bucket) {
+      bucket.push(symbol);
+    } else {
+      grouped.set(symbol.name, [symbol]);
+    }
+  }
+
+  return grouped;
+}
+
+function selectCanonicalTargetSymbol(
+  edge: Pick<CallEdgeData, "targetFilePath" | "targetKind">,
+  candidates: SymbolData[]
+): SymbolData | null {
+  const kindMatched = candidates.filter((symbol) => matchesTargetKind(symbol, edge.targetKind));
+  if (kindMatched.length === 0) {
+    return null;
+  }
+
+  const targetFileCandidates = edge.targetFilePath
+    ? kindMatched.filter((symbol) => symbol.filePath === edge.targetFilePath)
+    : [];
+  const effectiveCandidates = targetFileCandidates.length > 0 ? targetFileCandidates : kindMatched;
+  const files = new Set(effectiveCandidates.map((symbol) => symbol.filePath));
+  if (files.size !== 1) {
+    return null;
+  }
+
+  let best = effectiveCandidates[0] ?? null;
+  for (const candidate of effectiveCandidates.slice(1)) {
+    if (best && isEarlierSymbol(candidate, best)) {
+      best = candidate;
+    }
+  }
+
+  return best;
 }
 
 function resolveSeedSymbol(
@@ -195,6 +263,33 @@ export function expandGraphContext(
     const callersByTarget = groupEdgesBySymbolId(edgeBatch.callers, (edge) => edge.toSymbolId);
     const calleesBySource = groupEdgesBySymbolId(edgeBatch.callees, (edge) => edge.fromSymbolId);
 
+    const unresolvedCallerTargetNames = direction === "callee"
+      ? []
+      : frontier
+          .filter((entry) => !callersByTarget.has(entry.symbol.id))
+          .map((entry) => entry.symbol.name);
+    const unresolvedCallerEdges = unresolvedCallerTargetNames.length > 0
+      ? database.getUnresolvedCallersByTargetNamesOnBranch(
+          [...new Set(unresolvedCallerTargetNames)],
+          options.branch
+        )
+      : [];
+    const unresolvedCalleeEdges = direction === "caller"
+      ? []
+      : edgeBatch.callees.filter((edge) => !edge.toSymbolId);
+    const unresolvedTargetNames = [
+      ...new Set([
+        ...unresolvedCallerEdges.map((edge) => edge.targetName),
+        ...unresolvedCalleeEdges.map((edge) => edge.targetName),
+      ]),
+    ];
+    const unresolvedTargetSymbols = unresolvedTargetNames.length > 0
+      ? database.getSymbolsByNamesOnBranch(unresolvedTargetNames, options.branch)
+      : [];
+    const unresolvedTargetSymbolsByName = groupSymbolsByName(unresolvedTargetSymbols);
+    const unresolvedCallersByTarget = new Map<string, CallEdgeData[]>();
+    const unresolvedCalleesBySource = new Map<string, ResolvedUnresolvedCalleeEdge[]>();
+
     const relatedSymbolIds = new Set<string>();
     for (const edge of edgeBatch.callers) {
       relatedSymbolIds.add(edge.fromSymbolId);
@@ -205,11 +300,54 @@ export function expandGraphContext(
       }
     }
 
+    const additionalSymbols = new Map<string, SymbolData>();
+    for (const edge of unresolvedCallerEdges) {
+      const effectiveTarget = selectCanonicalTargetSymbol(
+        edge,
+        unresolvedTargetSymbolsByName.get(edge.targetName) ?? []
+      );
+      if (!effectiveTarget) {
+        continue;
+      }
+
+      const bucket = unresolvedCallersByTarget.get(effectiveTarget.id);
+      if (bucket) {
+        bucket.push(edge);
+      } else {
+        unresolvedCallersByTarget.set(effectiveTarget.id, [edge]);
+      }
+      additionalSymbols.set(effectiveTarget.id, effectiveTarget);
+      relatedSymbolIds.add(edge.fromSymbolId);
+    }
+
+    for (const edge of unresolvedCalleeEdges) {
+      const effectiveTarget = selectCanonicalTargetSymbol(
+        edge,
+        unresolvedTargetSymbolsByName.get(edge.targetName) ?? []
+      );
+      if (!effectiveTarget) {
+        continue;
+      }
+
+      const bucket = unresolvedCalleesBySource.get(edge.fromSymbolId);
+      const resolvedEdge = { edge, target: effectiveTarget };
+      if (bucket) {
+        bucket.push(resolvedEdge);
+      } else {
+        unresolvedCalleesBySource.set(edge.fromSymbolId, [resolvedEdge]);
+      }
+      additionalSymbols.set(effectiveTarget.id, effectiveTarget);
+      relatedSymbolIds.add(effectiveTarget.id);
+    }
+
     const relatedSymbols = database.getSymbolsByIdsOnBranch([...relatedSymbolIds], options.branch);
-    const symbolsById = new Map(relatedSymbols.map((symbol) => [symbol.id, symbol]));
+    const symbolsById = new Map<string, SymbolData>([
+      ...relatedSymbols.map((symbol): [string, SymbolData] => [symbol.id, symbol]),
+      ...Array.from(additionalSymbols.values(), (symbol): [string, SymbolData] => [symbol.id, symbol]),
+    ]);
     const chunksBySymbolId = resolveChunksForSymbolsBatch(
       database,
-      relatedSymbols,
+      [...symbolsById.values()],
       options.branch,
       options.allowedChunkIds
     );
@@ -218,7 +356,10 @@ export function expandGraphContext(
 
     for (const current of frontier) {
       if (direction !== "callee") {
-        for (const edge of callersByTarget.get(current.symbol.id) ?? []) {
+        for (const edge of [
+          ...(callersByTarget.get(current.symbol.id) ?? []),
+          ...(unresolvedCallersByTarget.get(current.symbol.id) ?? []),
+        ]) {
           const callerSymbol = symbolsById.get(edge.fromSymbolId);
           if (!callerSymbol) {
             continue;
@@ -273,6 +414,27 @@ export function expandGraphContext(
           if (!seenSymbols.has(calleeSymbol.id)) {
             seenSymbols.add(calleeSymbol.id);
             nextFrontier.push({ symbol: calleeSymbol, depth: nextDepth });
+          }
+        }
+
+        for (const unresolved of unresolvedCalleesBySource.get(current.symbol.id) ?? []) {
+          const calleeChunk = chunksBySymbolId.get(unresolved.target.id);
+          if (!calleeChunk || seenChunkIds.has(calleeChunk.id)) {
+            continue;
+          }
+
+          seenChunkIds.add(calleeChunk.id);
+          expanded.push({
+            id: calleeChunk.id,
+            metadata: calleeChunk.metadata,
+            relation: "callee",
+            depth: nextDepth,
+            viaSymbol: current.symbol.name,
+          });
+
+          if (!seenSymbols.has(unresolved.target.id)) {
+            seenSymbols.add(unresolved.target.id);
+            nextFrontier.push({ symbol: unresolved.target, depth: nextDepth });
           }
         }
       }

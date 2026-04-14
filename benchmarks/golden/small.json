@@ -377,8 +377,8 @@
       "expected": {
         "filePath": "src/indexer/search-recipes.ts",
         "symbol": "mapEvalQueryTypeToTaskType",
-        "startLine": 128,
-        "endLine": 165
+        "startLine": 131,
+        "endLine": 168
       }
     },
     {

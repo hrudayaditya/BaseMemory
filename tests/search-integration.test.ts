@@ -1335,7 +1335,7 @@ export function searchEntry(query: string) { return rerankResults(query) + "!"; 
     expect(response.expandedContext.every((entry) => entry.chunkKind === "Code")).toBe(true);
   });
 
-  it("keeps the seed result and returns partial graph context when inbound caller edges are unresolved", async () => {
+  it("keeps the seed result and resolves same-file unresolved graph edges into expanded context", async () => {
     fs.writeFileSync(
       path.join(tempDir, "app", "indexer", "partial.ts"),
       `export function partialLeafExact(query: string) { return query.length; }
@@ -1384,7 +1384,7 @@ export function partialEntryExact(query: string) { return partialMidExact(query)
     expect(response.primaryResults[0]?.name).toBe("partialMidExact");
     const expandedNames = response.expandedContext.map((entry) => entry.name);
     expect(expandedNames).toContain("partialLeafExact");
-    expect(expandedNames).not.toContain("partialEntryExact");
+    expect(expandedNames).toContain("partialEntryExact");
   });
 
   it("uses branch-native search APIs instead of marshaling branch chunk allowlists per query", async () => {
@@ -1840,5 +1840,62 @@ export function graphCallHelper(value: string) { return graphTargetHelper(value)
     });
 
     expect(results.some((entry) => entry.name === "graphCallHelper" && entry.relation === "caller")).toBe(true);
+  });
+
+  it("expands callers for split function symbols after call-edge resolution canonicalizes the target", async () => {
+    fs.mkdirSync(path.join(tempDir, "app", "split-graph"), { recursive: true });
+    const repeatedBody = Array.from({ length: 220 }, (_, index) =>
+      `  const metric${index} = values[${index % 3}] ?? ${index};`
+    ).join("\n");
+    fs.writeFileSync(
+      path.join(tempDir, "app", "split-graph", "metrics.ts"),
+      `export function computeMetrics(values: number[]) {\n${repeatedBody}\n  return values.reduce((sum, value) => sum + value, 0);\n}\n`,
+      "utf-8"
+    );
+    fs.writeFileSync(
+      path.join(tempDir, "app", "split-graph", "runner.ts"),
+      `import { computeMetrics } from "./metrics";\n\nexport function runMetrics(values: number[]) {\n  return computeMetrics(values);\n}\n`,
+      "utf-8"
+    );
+
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const database = new Database(path.join(tempDir, ".opencode", "index", "codebase.db"));
+    const branch = (indexer as unknown as { currentBranch: string }).currentBranch;
+    const splitSymbols = database.getSymbolsByNameOnBranch("computeMetrics", branch);
+    expect(splitSymbols.length).toBeGreaterThan(1);
+
+    const runMetrics = database.getSymbolsByNameOnBranch("runMetrics", branch)[0];
+    expect(runMetrics).toBeDefined();
+    const callees = database.getCallees(runMetrics!.id, branch);
+    expect(callees.some((edge) => edge.targetName === "computeMetrics" && Boolean(edge.toSymbolId))).toBe(true);
+
+    const response = await indexer.searchDetailed("what calls computeMetrics", 10, {
+      metadataOnly: true,
+      filterByBranch: false,
+    });
+
+    expect(response.graphDirection).toBe("caller");
+    expect(response.expandedContext.some((entry) => entry.name === "runMetrics" && entry.relation === "caller")).toBe(true);
   });
 });

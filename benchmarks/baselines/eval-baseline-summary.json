@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-04-14T05:33:08.487Z",
+  "generatedAt": "2026-04-14T19:49:45.413Z",
   "projectRoot": "/Users/onlyaady/Desktop/BaseMemory",
   "datasetPath": "/Users/onlyaady/Desktop/BaseMemory/benchmarks/golden/small.json",
   "datasetName": "small",
@@ -18,22 +18,22 @@
     "effectiveGraphDepth": -1
   },
   "metrics": {
-    "hitAt1": 0.6,
+    "hitAt1": 0.575,
     "hitAt3": 0.75,
     "hitAt5": 0.85,
     "hitAt10": 0.9,
     "combinedRecallAt10": 0.9,
-    "expansionHitRate": 0.075,
-    "mrrAt10": 0.6988095238095238,
-    "ndcgAt10": 0.7270372376206625,
+    "expansionHitRate": 0.15,
+    "mrrAt10": 0.682142857142857,
+    "ndcgAt10": 0.7160926123030158,
     "latencyMs": {
-      "p50": 1388.7031040000147,
-      "p95": 1959.761548199975,
-      "p99": 2326.58454910993
+      "p50": 1514.208249999967,
+      "p95": 2075.5121437499824,
+      "p99": 2140.183525009968
     },
     "tokenEstimate": {
       "queryTokens": 556,
-      "embeddingTokensUsed": 1667782
+      "embeddingTokensUsed": 1687699
     },
     "embedding": {
       "callCount": 480,
@@ -42,7 +42,7 @@
     },
     "failureBuckets": {
       "wrong-file": 8,
-      "wrong-symbol": 5,
+      "wrong-symbol": 6,
       "docs-tests-outranking-source": 2,
       "no-relevant-hit-top-k": 1
     },
@@ -52,7 +52,7 @@
       "backendUsage": {
         "transformers-cross-encoder": 27
       },
-      "lastMs": 0.002374999923631549
+      "lastMs": 0.003459000028669834
     }
   }
 }

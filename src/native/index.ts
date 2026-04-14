@@ -1372,6 +1372,13 @@ export class Database {
     return this.inner.getSymbolsByNameOnBranch(name, branch);
   }
 
+  getSymbolsByNamesOnBranch(names: string[], branch: string): SymbolData[] {
+    if (names.length === 0) {
+      return [];
+    }
+    return this.inner.getSymbolsByNamesOnBranch(names, branch);
+  }
+
   getSymbolsByNameCi(name: string): SymbolData[] {
     return this.inner.getSymbolsByNameCi(name);
   }
@@ -1425,6 +1432,13 @@ export class Database {
       callers: result.callers ?? [],
       callees: result.callees ?? [],
     };
+  }
+
+  getUnresolvedCallersByTargetNamesOnBranch(targetNames: string[], branch: string): CallEdgeData[] {
+    if (targetNames.length === 0) {
+      return [];
+    }
+    return this.inner.getUnresolvedCallersByTargetNamesOnBranch(targetNames, branch) ?? [];
   }
 
   getCallees(symbolId: string, branch: string): CallEdgeData[] {

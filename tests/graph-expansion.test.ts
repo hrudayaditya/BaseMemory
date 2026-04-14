@@ -15,7 +15,9 @@ interface GraphExpansionCallCounters {
   getChunksByFileOnBranch: number;
   getCallEdgeFrontierBatch: number;
   getSymbolsByIdsOnBranch: number;
+  getSymbolsByNamesOnBranch: number;
   getChunksForSymbolsBatch: number;
+  getUnresolvedCallersByTargetNamesOnBranch: number;
 }
 
 function symbol(id: string, name: string, filePath: string): SymbolData {
@@ -111,6 +113,11 @@ function fakeDatabase(input: {
         throw new Error(`unexpected exact name lookup for ${name} on ${branch}`);
       }
       return filterSymbolsByBranch(branch, input.symbols).filter((item) => item.name === name);
+    },
+    getSymbolsByNamesOnBranch(names: string[], branch: string) {
+      count("getSymbolsByNamesOnBranch");
+      const nameSet = new Set(names);
+      return filterSymbolsByBranch(branch, input.symbols).filter((item) => nameSet.has(item.name));
     },
     getSymbolsByNameCiOnBranch(name: string, branch: string) {
       if (input.failOnNameLookup) {
@@ -217,6 +224,15 @@ function fakeDatabase(input: {
         (!("branch" in item) || item.branch === _branch)
       );
     },
+    getUnresolvedCallersByTargetNamesOnBranch(targetNames: string[], branch: string) {
+      count("getUnresolvedCallersByTargetNamesOnBranch");
+      const nameSet = new Set(targetNames);
+      return (input.callers ?? []).filter((item) =>
+        !item.toSymbolId &&
+        nameSet.has(item.targetName) &&
+        (!("branch" in item) || item.branch === branch)
+      );
+    },
     getCallees(_symbolId: string, _branch: string) {
       count("getCallees");
       return (input.callees ?? []).filter((item) =>
@@ -252,7 +268,9 @@ function createCallCounters(): GraphExpansionCallCounters {
     getChunksByFileOnBranch: 0,
     getCallEdgeFrontierBatch: 0,
     getSymbolsByIdsOnBranch: 0,
+    getSymbolsByNamesOnBranch: 0,
     getChunksForSymbolsBatch: 0,
+    getUnresolvedCallersByTargetNamesOnBranch: 0,
   };
 }
 
@@ -460,7 +478,7 @@ describe("graph expansion", () => {
     expect(mainExpanded[0]?.id).toBe("calleeChunkMain");
   });
 
-  it("does not expand unresolved callees by guessing target names", () => {
+  it("expands unresolved callees when the target name canonically resolves within one file", () => {
     const db = fakeDatabase({
       symbols: [
         symbol("seed-main", "processPayment", "/repo/src/payment.ts"),
@@ -500,7 +518,11 @@ describe("graph expansion", () => {
       allowedChunkIds: new Set(["seedChunkMain", "calleeChunkMain"]),
     });
 
-    expect(expanded).toEqual([]);
+    expect(expanded).toHaveLength(1);
+    expect(expanded[0]).toMatchObject({
+      id: "calleeChunkMain",
+      relation: "callee",
+    });
   });
 
   it("returns callers only for persistently resolved cross-file targets", () => {
@@ -553,7 +575,16 @@ describe("graph expansion", () => {
 
     const unresolvedDb = fakeDatabase({
       symbols: [
-        symbol("target", "processPayment", "/repo/src/payment.ts"),
+        {
+          ...symbol("target-head", "processPayment", "/repo/src/payment.ts"),
+          startLine: 10,
+          endLine: 40,
+        },
+        {
+          ...symbol("target-tail", "processPayment", "/repo/src/payment.ts"),
+          startLine: 41,
+          endLine: 90,
+        },
         symbol("caller", "submitCheckout", "/repo/src/checkout.ts"),
       ],
       chunks: [
@@ -561,7 +592,7 @@ describe("graph expansion", () => {
         chunk("callerChunk", "submitCheckout", "/repo/src/checkout.ts"),
       ],
       branchSymbols: {
-        main: ["target", "caller"],
+        main: ["target-head", "target-tail", "caller"],
       },
       branchChunks: {
         main: ["targetChunk", "callerChunk"],
@@ -592,7 +623,58 @@ describe("graph expansion", () => {
       allowedChunkIds: new Set(["targetChunk", "callerChunk"]),
     });
 
-    expect(unresolvedExpanded).toEqual([]);
+    expect(unresolvedExpanded).toHaveLength(1);
+    expect(unresolvedExpanded[0]).toMatchObject({
+      id: "callerChunk",
+      relation: "caller",
+    });
+  });
+
+  it("keeps unresolved same-name targets in different files ambiguous", () => {
+    const db = fakeDatabase({
+      symbols: [
+        symbol("target-a", "processPayment", "/repo/src/payment-a.ts"),
+        symbol("target-b", "processPayment", "/repo/src/payment-b.ts"),
+        symbol("caller", "submitCheckout", "/repo/src/checkout.ts"),
+      ],
+      chunks: [
+        chunk("target-a-chunk", "processPayment", "/repo/src/payment-a.ts"),
+        chunk("target-b-chunk", "processPayment", "/repo/src/payment-b.ts"),
+        chunk("callerChunk", "submitCheckout", "/repo/src/checkout.ts"),
+      ],
+      branchSymbols: {
+        main: ["target-a", "target-b", "caller"],
+      },
+      branchChunks: {
+        main: ["target-a-chunk", "target-b-chunk", "callerChunk"],
+      },
+      callers: [{
+        id: "edge-unresolved-ambiguous",
+        fromSymbolId: "caller",
+        fromSymbolName: "submitCheckout",
+        fromSymbolFilePath: "/repo/src/checkout.ts",
+        targetName: "processPayment",
+        targetFilePath: undefined,
+        targetKind: undefined,
+        toSymbolId: null,
+        callType: "Call",
+        line: 4,
+        col: 2,
+        isResolved: false,
+      }],
+      failOnNameLookup: true,
+    });
+
+    const expanded = expandGraphContext(db, [{
+      id: "target-a-chunk",
+      metadata: meta("processPayment", "/repo/src/payment-a.ts"),
+    }], {
+      branch: "main",
+      depth: 1,
+      allowedChunkIds: new Set(["target-a-chunk", "target-b-chunk", "callerChunk"]),
+    });
+
+    expect(expanded).toEqual([]);
   });
 
   it("fails gracefully when a seed has no symbol record", () => {
@@ -850,7 +932,9 @@ describe("graph expansion", () => {
     expect(expanded).toHaveLength(5);
     expect(counters.getCallEdgeFrontierBatch).toBe(1);
     expect(counters.getSymbolsByIdsOnBranch).toBe(1);
+    expect(counters.getSymbolsByNamesOnBranch).toBe(0);
     expect(counters.getChunksForSymbolsBatch).toBe(1);
+    expect(counters.getUnresolvedCallersByTargetNamesOnBranch).toBe(0);
     expect(counters.getCallersWithContextByTargetSymbolId).toBe(0);
     expect(counters.getCallees).toBe(0);
     expect(counters.getSymbolByIdOnBranch).toBe(0);
@@ -904,6 +988,7 @@ describe("graph expansion", () => {
     expect(expanded).toHaveLength(12);
     expect(expanded.every((entry) => entry.relation === "caller" && entry.depth === 1)).toBe(true);
     expect(counters.getCallEdgeFrontierBatch).toBe(1);
+    expect(counters.getUnresolvedCallersByTargetNamesOnBranch).toBe(0);
   });
 
   it("skips unresolved edges while still returning resolved neighbors from the same frontier", () => {

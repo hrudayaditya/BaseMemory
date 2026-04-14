@@ -2018,6 +2018,34 @@ impl Database {
     }
 
     #[napi]
+    pub fn get_symbols_by_names_on_branch(
+        &self,
+        names: Vec<String>,
+        branch: String,
+    ) -> Result<Vec<SymbolData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows = db::get_symbols_by_names_on_branch(&conn, &names, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SymbolData {
+                id: r.id,
+                file_path: r.file_path,
+                name: r.name,
+                kind: r.kind,
+                start_line: r.start_line,
+                start_col: r.start_col,
+                end_line: r.end_line,
+                end_col: r.end_col,
+                language: r.language,
+            })
+            .collect())
+    }
+
+    #[napi]
     pub fn get_symbols_by_name_ci(&self, name: String) -> Result<Vec<SymbolData>> {
         let conn = self
             .conn
@@ -2342,6 +2370,42 @@ impl Database {
                 })
                 .collect(),
         })
+    }
+
+    #[napi]
+    pub fn get_unresolved_callers_by_target_names_on_branch(
+        &self,
+        target_names: Vec<String>,
+        branch: String,
+    ) -> Result<Vec<CallEdgeData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows = db::get_unresolved_callers_by_target_names_on_branch(&conn, &target_names, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let from_symbol_file_path = r.from_symbol_file_path;
+                CallEdgeData {
+                    id: r.id,
+                    branch: branch.clone(),
+                    from_symbol_id: r.from_symbol_id,
+                    from_symbol_name: Some(r.from_symbol_name),
+                    from_symbol_file_path: Some(from_symbol_file_path.clone()),
+                    caller_file_path: Some(from_symbol_file_path),
+                    target_name: r.target_name,
+                    target_file_path: r.target_file_path,
+                    target_kind: r.target_kind,
+                    to_symbol_id: r.to_symbol_id,
+                    call_type: r.call_type,
+                    line: r.line,
+                    col: r.col,
+                    is_resolved: r.is_resolved,
+                }
+            })
+            .collect())
     }
 
     #[napi]
