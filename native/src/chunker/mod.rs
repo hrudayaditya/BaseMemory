@@ -951,6 +951,47 @@ struct Config {
     }
 
     #[test]
+    fn classifies_rust_inline_test_functions_as_test_chunks() {
+        let source = r#"#[test]
+fn test_busy_timeout_waits_for_transient_write_lock() {}
+"#;
+
+        let chunks = chunk_file("lib.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let test_chunk = named_fine_chunk(&chunks, "test_busy_timeout_waits_for_transient_write_lock");
+
+        assert_eq!(test_chunk.chunk_kind, ChunkKind::Test);
+        assert_eq!(test_chunk.symbol_kind, Some(SymbolKind::Test));
+    }
+
+    #[test]
+    fn classifies_descriptive_rust_inline_tests_as_test_chunks() {
+        let source = r#"#[test]
+fn captures_module_level_python_docstrings_as_doc_chunks() {}
+"#;
+
+        let chunks = chunk_file("lib.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let test_chunk = named_fine_chunk(&chunks, "captures_module_level_python_docstrings_as_doc_chunks");
+
+        assert_eq!(test_chunk.chunk_kind, ChunkKind::Test);
+        assert_eq!(test_chunk.symbol_kind, Some(SymbolKind::Test));
+    }
+
+    #[test]
+    fn keeps_non_test_rust_functions_as_code_chunks() {
+        let source = r#"fn process_data() {}
+"#;
+
+        let chunks = chunk_file("lib.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let function_chunk = named_fine_chunk(&chunks, "process_data");
+
+        assert_eq!(function_chunk.chunk_kind, ChunkKind::Code);
+        assert_eq!(function_chunk.symbol_kind, Some(SymbolKind::Function));
+    }
+
+    #[test]
     fn captures_rust_macro_definitions() {
         let source = r#"macro_rules! my_macro {
     () => {};

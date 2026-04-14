@@ -30,6 +30,8 @@ interface ScoredCandidate {
   originalIndex: number;
 }
 
+const BUG_TEST_DOC_POST_RERANK_FACTOR = 0.05;
+
 interface CrossEncoderPair {
   text: string;
   textPair: string;
@@ -178,6 +180,46 @@ function overlapCount(left: Set<string>, right: Set<string>): number {
     }
   }
   return matches;
+}
+
+function getPostRerankScoreFactor(candidate: RerankerCandidate, taskType: SearchTaskType): number {
+  if (taskType !== "bug") {
+    return 1;
+  }
+
+  return candidate.chunkKind === "Test" || candidate.chunkKind === "Doc"
+    ? BUG_TEST_DOC_POST_RERANK_FACTOR
+    : 1;
+}
+
+function applyPostRerankTaskBias(
+  candidates: RerankerCandidate[],
+  taskType: SearchTaskType
+): RerankerCandidate[] {
+  if (taskType !== "bug") {
+    return candidates;
+  }
+
+  const rescored = candidates.map((candidate, originalIndex) => ({
+    candidate,
+    score: candidate.baseScore * getPostRerankScoreFactor(candidate, taskType),
+    originalIndex,
+  }));
+
+  rescored.sort((left, right) => {
+    if (right.score !== left.score) {
+      return right.score - left.score;
+    }
+    if (right.candidate.baseScore !== left.candidate.baseScore) {
+      return right.candidate.baseScore - left.candidate.baseScore;
+    }
+    return left.originalIndex - right.originalIndex;
+  });
+
+  return rescored.map((entry) => ({
+    ...entry.candidate,
+    baseScore: entry.score,
+  }));
 }
 
 function selectPositiveLabelIndex(
@@ -440,7 +482,10 @@ export class SearchReranker {
 
     for (const backend of this.backends) {
       try {
-        const reranked = await backend.rerank(query, candidates, taskType);
+        const reranked = applyPostRerankTaskBias(
+          await backend.rerank(query, candidates, taskType),
+          taskType
+        );
         return {
           candidates: reranked,
           applied: true,

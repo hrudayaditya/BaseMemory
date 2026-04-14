@@ -558,27 +558,80 @@ export function buildGraphStageInputHash(
   return hashContent(fileContentHash + graphExtractorVersion);
 }
 
-function applyChunkFilters(
+export function applyChunkFilters(
   chunks: OrchestratorParsedChunk[],
   config: ParsedCodebaseIndexConfig
-): OrchestratorParsedChunk[] {
-  const filtered: OrchestratorParsedChunk[] = [];
-  let fileChunkCount = 0;
+): {
+  chunks: OrchestratorParsedChunk[];
+  capped: boolean;
+  eligibleCount: number;
+  droppedCount: number;
+  droppedNamedCount: number;
+  droppedAnonymousCount: number;
+} {
+  const eligible = chunks
+    .map((chunk, index) => ({ chunk, index }))
+    .filter(({ chunk }) => !(config.indexing.semanticOnly && chunk.chunkType === "other"));
+  const maxChunksPerFile = config.indexing.maxChunksPerFile;
 
-  for (const chunk of chunks) {
-    if (fileChunkCount >= config.indexing.maxChunksPerFile) {
-      break;
+  if (eligible.length <= maxChunksPerFile) {
+    return {
+      chunks: eligible.map(({ chunk }) => chunk),
+      capped: false,
+      eligibleCount: eligible.length,
+      droppedCount: 0,
+      droppedNamedCount: 0,
+      droppedAnonymousCount: 0,
+    };
+  }
+
+  const priority = (chunk: OrchestratorParsedChunk): number => {
+    const hasName = typeof chunk.name === "string" && chunk.name.trim().length > 0;
+    if (hasName) {
+      return 0;
     }
 
-    if (config.indexing.semanticOnly && chunk.chunkType === "other") {
+    return chunk.chunkType === "other" ? 2 : 1;
+  };
+
+  const selectedIndices = new Set(
+    [...eligible]
+      .sort((left, right) => {
+        const priorityDelta = priority(left.chunk) - priority(right.chunk);
+        if (priorityDelta !== 0) {
+          return priorityDelta;
+        }
+        return left.index - right.index;
+      })
+      .slice(0, maxChunksPerFile)
+      .map(({ index }) => index)
+  );
+
+  let droppedNamedCount = 0;
+  let droppedAnonymousCount = 0;
+  const filtered: OrchestratorParsedChunk[] = [];
+
+  for (const { chunk, index } of eligible) {
+    if (selectedIndices.has(index)) {
+      filtered.push(chunk);
       continue;
     }
 
-    filtered.push(chunk);
-    fileChunkCount += 1;
+    if (typeof chunk.name === "string" && chunk.name.trim().length > 0) {
+      droppedNamedCount += 1;
+    } else {
+      droppedAnonymousCount += 1;
+    }
   }
 
-  return filtered;
+  return {
+    chunks: filtered,
+    capped: true,
+    eligibleCount: eligible.length,
+    droppedCount: eligible.length - filtered.length,
+    droppedNamedCount,
+    droppedAnonymousCount,
+  };
 }
 
 function createEmptyStats(): IndexStats {
@@ -2062,8 +2115,20 @@ export class IncrementalIndexOrchestrator {
     parsedFile: OrchestratorParsedFile,
     embeddingMaxTokens: number
   ): ChunkRecord[] {
-    const filteredChunks = applyChunkFilters(parsedFile.chunks, this.host.getConfig());
-    return filteredChunks.map((chunk) => {
+    const filterResult = applyChunkFilters(parsedFile.chunks, this.host.getConfig());
+    if (filterResult.capped) {
+      this.host.logger.warn("Per-file chunk cap reached; dropping lower-priority chunks", {
+        filePath: parsedFile.path,
+        maxChunksPerFile: this.host.getConfig().indexing.maxChunksPerFile,
+        eligibleChunks: filterResult.eligibleCount,
+        keptChunks: filterResult.chunks.length,
+        droppedChunks: filterResult.droppedCount,
+        droppedNamedChunks: filterResult.droppedNamedCount,
+        droppedAnonymousChunks: filterResult.droppedAnonymousCount,
+      });
+    }
+
+    return filterResult.chunks.map((chunk) => {
       const embeddingChunk = {
         content: chunk.content,
         startLine: chunk.startLine,

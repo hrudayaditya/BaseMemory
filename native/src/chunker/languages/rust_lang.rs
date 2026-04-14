@@ -12,6 +12,14 @@ fn is_comment_kind(kind: &str) -> bool {
     matches!(kind, "line_comment" | "block_comment" | "doc_comment")
 }
 
+fn is_test_attribute_text(text: &str) -> bool {
+    let normalized: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+    normalized.starts_with("#[test]")
+        || normalized.starts_with("#[test(")
+        || normalized.contains("::test]")
+        || normalized.contains("::test(")
+}
+
 fn has_test_attribute(node: Node<'_>, source: &str) -> bool {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -20,9 +28,27 @@ fn has_test_attribute(node: Node<'_>, source: &str) -> bool {
         }
 
         if let Some(text) = node_text(child, source) {
-            if text.contains("#[test]") || text.contains("#[tokio::test]") {
+            if is_test_attribute_text(text) {
                 return true;
             }
+        }
+    }
+
+    let mut prev = node.prev_named_sibling();
+    while let Some(sibling) = prev {
+        match sibling.kind() {
+            "attribute_item" => {
+                if let Some(text) = node_text(sibling, source) {
+                    if is_test_attribute_text(text) {
+                        return true;
+                    }
+                }
+                prev = sibling.prev_named_sibling();
+            }
+            kind if is_comment_kind(kind) => {
+                prev = sibling.prev_named_sibling();
+            }
+            _ => return false,
         }
     }
 

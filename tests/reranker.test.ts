@@ -53,6 +53,18 @@ class ReverseBackend implements SearchRerankerBackend {
   }
 }
 
+class IdentityBackend implements SearchRerankerBackend {
+  readonly name = "identity";
+
+  async rerank(
+    _query: string,
+    candidates: RerankerCandidate[],
+    _taskType: SearchTaskType
+  ): Promise<RerankerCandidate[]> {
+    return candidates;
+  }
+}
+
 describe("search reranker", () => {
   it("reorders candidates by local joint score", async () => {
     const backend = new HeuristicLocalRerankerBackend();
@@ -168,6 +180,44 @@ describe("search reranker", () => {
     expect(result.backend).toBe("reverse");
     expect(result.failedBackend).toBe("throwing");
     expect(result.candidates.map((item) => item.id)).toEqual(["second", "first"]);
+  });
+
+  it("demotes test chunks after reranking for bug queries", async () => {
+    const reranker = new SearchReranker([new IdentityBackend()]);
+    const result = await reranker.rerank("sqlite lock contention", [
+      candidate("test-case", {
+        baseScore: 0.9,
+        chunkKind: "Test",
+        content: "assert retry waits through transient sqlite write contention",
+      }),
+      candidate("source", {
+        baseScore: 0.2,
+        chunkKind: "Code",
+        content: "fn retry_busy_sqlite() { /* retry loop */ }",
+      }),
+    ], "bug");
+
+    expect(result.candidates.map((item) => item.id)).toEqual(["source", "test-case"]);
+    expect(result.candidates[1]?.baseScore).toBeCloseTo(0.045, 6);
+  });
+
+  it("does not apply bug-only post-rerank dampening to test_debug queries", async () => {
+    const reranker = new SearchReranker([new IdentityBackend()]);
+    const result = await reranker.rerank("what tests cover sqlite lock contention", [
+      candidate("test-case", {
+        baseScore: 0.9,
+        chunkKind: "Test",
+        content: "assert retry waits through transient sqlite write contention",
+      }),
+      candidate("source", {
+        baseScore: 0.2,
+        chunkKind: "Code",
+        content: "fn retry_busy_sqlite() { /* retry loop */ }",
+      }),
+    ], "test_debug");
+
+    expect(result.candidates.map((item) => item.id)).toEqual(["test-case", "source"]);
+    expect(result.candidates[0]?.baseScore).toBe(0.9);
   });
 
   it("rewrites candidate scores with sigmoid-normalized cross-encoder output", async () => {

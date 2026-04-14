@@ -327,6 +327,75 @@ describe("retrieval ranking", () => {
     expect(penalized.map((candidate) => candidate.id)).toEqual(["testChunk", "sourceChunk"]);
   });
 
+  it("penalizes rust inline test chunks the same way as test files for source-oriented queries", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "rustInlineTest",
+        score: 0.85,
+        metadata: meta({
+          filePath: "/repo/native/src/db.rs",
+          name: "test_busy_timeout_waits_for_transient_write_lock",
+          chunkType: "function",
+          chunkKind: "Test",
+        }),
+        chunkKind: "Test",
+      },
+      {
+        id: "sourceChunk",
+        score: 0.7,
+        metadata: meta({
+          filePath: "/repo/native/src/db.rs",
+          name: "retry_busy_sqlite",
+          chunkType: "function",
+          chunkKind: "Code",
+        }),
+        chunkKind: "Code",
+      },
+    ];
+
+    const penalized = applyChunkKindPenalty(candidates, "definition", "sqlite busy timeout handling");
+
+    expect(getChunkKindPenaltyFactor("definition", "Test")).toBe(0.7);
+    expect(penalized[0]?.id).toBe("sourceChunk");
+    expect(penalized[1]?.score).toBeCloseTo(0.595, 6);
+  });
+
+  it("does not penalize rust inline test chunks for test_debug queries", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "rustInlineTest",
+        score: 0.85,
+        metadata: meta({
+          filePath: "/repo/native/src/db.rs",
+          name: "test_busy_timeout_waits_for_transient_write_lock",
+          chunkType: "function",
+          chunkKind: "Test",
+        }),
+        chunkKind: "Test",
+      },
+      {
+        id: "sourceChunk",
+        score: 0.7,
+        metadata: meta({
+          filePath: "/repo/native/src/db.rs",
+          name: "retry_busy_sqlite",
+          chunkType: "function",
+          chunkKind: "Code",
+        }),
+        chunkKind: "Code",
+      },
+    ];
+
+    const penalized = applyChunkKindPenalty(
+      candidates,
+      "test_debug",
+      "what tests cover sqlite busy timeout handling"
+    );
+
+    expect(getChunkKindPenaltyFactor("test_debug", "Test")).toBe(1);
+    expect(penalized.map((candidate) => candidate.id)).toEqual(["rustInlineTest", "sourceChunk"]);
+  });
+
   it("does not penalize code or constant chunks", () => {
     const candidates: Candidate[] = [
       {
@@ -360,7 +429,39 @@ describe("retrieval ranking", () => {
     expect(penalized[1]?.score).toBe(0.81);
   });
 
-  it("does not penalize semantic module-overview queries", () => {
+  it("does not penalize non-test rust functions", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "rustFunction",
+        score: 0.83,
+        metadata: meta({
+          filePath: "/repo/native/src/db.rs",
+          name: "process_data",
+          chunkType: "function",
+          chunkKind: "Code",
+        }),
+        chunkKind: "Code",
+      },
+      {
+        id: "otherSource",
+        score: 0.8,
+        metadata: meta({
+          filePath: "/repo/native/src/lib.rs",
+          name: "run",
+          chunkType: "function",
+          chunkKind: "Code",
+        }),
+        chunkKind: "Code",
+      },
+    ];
+
+    const penalized = applyChunkKindPenalty(candidates, "semantic", "data processing internals");
+
+    expect(penalized[0]?.score).toBe(0.83);
+    expect(penalized[1]?.score).toBe(0.8);
+  });
+
+  it("softly demotes test chunks for semantic module-overview queries", () => {
     const candidates: Candidate[] = [
       {
         id: "testChunk",
@@ -386,7 +487,8 @@ describe("retrieval ranking", () => {
 
     const penalized = applyChunkKindPenalty(candidates, "semantic", "what does the runner pipeline module do");
 
-    expect(penalized.map((candidate) => candidate.id)).toEqual(["testChunk", "sourceChunk"]);
+    expect(penalized.map((candidate) => candidate.id)).toEqual(["sourceChunk", "testChunk"]);
+    expect(penalized[1]?.score).toBeCloseTo(0.54, 6);
   });
 
   it("does not penalize semantic recipe-mapping queries", () => {

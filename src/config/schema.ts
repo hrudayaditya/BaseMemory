@@ -102,7 +102,7 @@ function getDefaultIndexingConfig(): IndexingConfig {
     autoIndex: false,
     watchFiles: true,
     maxFileSize: 1048576,
-    maxChunksPerFile: 100,
+    maxChunksPerFile: 300,
     semanticOnly: false,
     retries: 3,
     retryDelayMs: 1000,

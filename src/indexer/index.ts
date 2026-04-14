@@ -887,10 +887,6 @@ function shouldApplyChunkKindPenalty(query: string, taskType: SearchTaskType): b
     return false;
   }
 
-  if (taskType === "semantic" && /\bwhat\s+does\s+.+\s+module\s+do\b/i.test(query)) {
-    return false;
-  }
-
   if (taskType === "semantic" && /\b(?:query|input) type to task recipe mapping\b/i.test(query)) {
     return false;
   }

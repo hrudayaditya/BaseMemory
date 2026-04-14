@@ -7,10 +7,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseConfig } from "../src/config/schema.js";
 import { Indexer } from "../src/indexer/index.js";
 import {
+  applyChunkFilters,
   buildChunkStageInputHash,
   buildEmbedStageInputHash,
   buildGraphStageInputHash,
   TTI_TARGET_MS,
+  type OrchestratorParsedChunk,
 } from "../src/indexer/incremental-index-orchestrator.js";
 import { CheckpointManager } from "../src/indexer/checkpoint-manager.js";
 import {
@@ -1719,11 +1721,78 @@ describe("incremental index orchestrator", () => {
   });
 
   it("applies the same chunk filters as the old indexing path", async () => {
+    const config = createConfig({
+      indexing: {
+        watchFiles: false,
+        maxChunksPerFile: 2,
+      },
+    });
+    const chunks: OrchestratorParsedChunk[] = [
+      {
+        content: "anonymous prelude",
+        startLine: 1,
+        endLine: 20,
+        startByte: 0,
+        endByte: 160,
+        chunkType: "other",
+        language: "typescript",
+        chunkHash: "anon-1",
+      },
+      {
+        content: "export function namedOne() { return 1; }",
+        startLine: 21,
+        endLine: 30,
+        startByte: 161,
+        endByte: 220,
+        chunkType: "function",
+        name: "namedOne",
+        language: "typescript",
+        chunkHash: "named-1",
+      },
+      {
+        content: "another anonymous bridge",
+        startLine: 31,
+        endLine: 50,
+        startByte: 221,
+        endByte: 320,
+        chunkType: "other",
+        language: "typescript",
+        chunkHash: "anon-2",
+      },
+      {
+        content: "export const NAMED_TWO = 2;",
+        startLine: 51,
+        endLine: 55,
+        startByte: 321,
+        endByte: 360,
+        chunkType: "constant",
+        name: "NAMED_TWO",
+        language: "typescript",
+        chunkHash: "named-2",
+      },
+    ];
+
+    const filtered = applyChunkFilters(chunks, config);
+
+    expect(filtered.capped).toBe(true);
+    expect(filtered.chunks.map((chunk) => chunk.name ?? "<anonymous>")).toEqual([
+      "namedOne",
+      "NAMED_TWO",
+    ]);
+    expect(filtered.droppedNamedCount).toBe(0);
+    expect(filtered.droppedAnonymousCount).toBe(2);
+  });
+
+  it("logs a warning when the per-file chunk cap drops chunks", async () => {
     const filePath = createChunkyRepo();
     const config = createConfig({
       indexing: {
         watchFiles: false,
         maxChunksPerFile: 1,
+      },
+      debug: {
+        enabled: true,
+        logLevel: "debug",
       },
     });
     const indexer = new Indexer(tempDir, config);
@@ -1736,17 +1805,7 @@ describe("incremental index orchestrator", () => {
         hash: hashContent(fileContent),
       },
     ]).parsedFiles[0];
-
-    let expectedChunkCount = 0;
-    for (const chunk of parsed?.chunks ?? []) {
-      if (expectedChunkCount >= config.indexing.maxChunksPerFile) {
-        break;
-      }
-      if (config.indexing.semanticOnly && chunk.chunkType === "other") {
-        continue;
-      }
-      expectedChunkCount += 1;
-    }
+    const filtered = applyChunkFilters(parsed?.chunks ?? [], config);
 
     await indexer.index();
 
@@ -1757,8 +1816,22 @@ describe("incremental index orchestrator", () => {
       .getChunksByFile(trackedPath)
       .filter((chunk) => branchChunkIds.has(chunk.chunkId));
 
-    expect(branchChunksForFile).toHaveLength(expectedChunkCount);
+    expect(branchChunksForFile).toHaveLength(filtered.chunks.length);
     expect(branchChunksForFile).toHaveLength(1);
+    expect(filtered.capped).toBe(true);
+
+    const capWarnings = indexer
+      .getLogger()
+      .getLogsByLevel("warn")
+      .filter((entry) => entry.message === "Per-file chunk cap reached; dropping lower-priority chunks");
+
+    expect(capWarnings).toHaveLength(1);
+    expect(capWarnings[0]?.data).toMatchObject({
+      filePath: trackedPath,
+      maxChunksPerFile: 1,
+      eligibleChunks: parsed?.chunks.length,
+      keptChunks: 1,
+    });
   });
 
   it("commits Merkle snapshot hashes from the bytes actually processed", async () => {
