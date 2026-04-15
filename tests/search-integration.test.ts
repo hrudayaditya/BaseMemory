@@ -6,7 +6,7 @@ import { execFileSync } from "child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { parseConfig } from "../src/config/schema.js";
-import { Indexer } from "../src/indexer/index.js";
+import { Indexer, matchesHardRetrievalFilters } from "../src/indexer/index.js";
 import type { SearchTaskType } from "../src/indexer/search-recipes.js";
 import { SearchReranker, type RerankerCandidate, type SearchRerankerBackend } from "../src/indexer/reranker.js";
 import { Database } from "../src/native/index.js";
@@ -31,6 +31,24 @@ class FixedScoreBackend implements SearchRerankerBackend {
         return left.id.localeCompare(right.id);
       });
   }
+}
+
+function getPrimaryStore(indexer: Indexer): {
+  getAllMetadata: () => Array<{ key: string; metadata: { filePath: string; chunkType: string } }>;
+} {
+  const internals = indexer as unknown as {
+    stores: Map<string, {
+      getAllMetadata: () => Array<{ key: string; metadata: { filePath: string; chunkType: string } }>;
+    }>;
+    primaryStoreModelId?: string | null;
+    configuredProviderInfo: { modelInfo: { model: string } };
+  };
+  const modelId = internals.primaryStoreModelId ?? internals.configuredProviderInfo.modelInfo.model;
+  const store = internals.stores.get(modelId);
+  if (!store) {
+    throw new Error(`Missing primary store for model ${modelId}`);
+  }
+  return store;
 }
 
 describe("search integration", () => {
@@ -1078,6 +1096,238 @@ steps to reproduce:
     expect(keywordSpy).toHaveBeenCalled();
     expect(vectorSpy.mock.calls[0]?.[1]).toBe(250);
     expect(keywordSpy.mock.calls[0]?.[1]).toBe(250);
+  });
+
+  it("matches the old metadata-scan filter semantics with the SQLite-backed branch query", async () => {
+    fs.mkdirSync(path.join(tempDir, "src", "services"), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, "src", "models"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, "src", "services", "auth.ts"),
+      `export function authenticateUser(): boolean { return true; }\n`,
+      "utf-8"
+    );
+    fs.writeFileSync(
+      path.join(tempDir, "src", "services", "auth.py"),
+      `def authenticate_user() -> bool:\n    return True\n`,
+      "utf-8"
+    );
+    fs.writeFileSync(
+      path.join(tempDir, "src", "models", "user.ts"),
+      `export class UserModel {\n  name = "Ada";\n}\n`,
+      "utf-8"
+    );
+
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const status = await indexer.getStatus();
+    const database = new Database(path.join(status.indexPath, "codebase.db"));
+    const store = getPrimaryStore(indexer);
+    const authTsPath = fs.realpathSync(path.join(tempDir, "src", "services", "auth.ts"));
+
+    const cases = [
+      { fileType: "ts" },
+      { directory: "src/services" },
+      { chunkType: "function" },
+      { excludeFile: authTsPath },
+      {
+        fileType: "ts",
+        directory: "src/services",
+        chunkType: "function",
+      },
+      {
+        fileType: "ts",
+        directory: "src/services",
+        chunkType: "function",
+        excludeFile: authTsPath,
+      },
+    ];
+
+    for (const filters of cases) {
+      const oldPath = new Set(
+        store
+          .getAllMetadata()
+          .filter(({ metadata }) => matchesHardRetrievalFilters(metadata, filters))
+          .map(({ key }) => key)
+      );
+      const newPath = new Set(
+        await database.getChunkIdsByFiltersForBranch(
+          status.currentBranch,
+          filters.fileType ?? null,
+          filters.directory ?? null,
+          filters.chunkType ?? null,
+          filters.excludeFile ?? null
+        )
+      );
+
+      expect(Array.from(newPath).sort()).toEqual(Array.from(oldPath).sort());
+    }
+  });
+
+  it("returns null and skips the DB fast path when no hard filters are active", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    const internals = indexer as unknown as {
+      currentBranch: string;
+      ensureInitialized: () => Promise<{ database: Database }>;
+      buildAllowedChunkIds: (
+        database: Database,
+        branch: string,
+        options: Record<string, never>
+      ) => Promise<Set<string> | null>;
+    };
+    const { database } = await internals.ensureInitialized();
+    const dbSpy = vi.spyOn(database, "getChunkIdsByFiltersForBranch");
+
+    await expect(
+      internals.buildAllowedChunkIds(database, internals.currentBranch, {})
+    ).resolves.toBeNull();
+    expect(dbSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not call the DB hard-filter path for searches without metadata filters", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const internals = indexer as unknown as {
+      ensureInitialized: () => Promise<{ database: Database }>;
+    };
+    const { database } = await internals.ensureInitialized();
+    const dbSpy = vi.spyOn(database, "getChunkIdsByFiltersForBranch");
+
+    const response = await indexer.searchDetailed("where is rankHybridResults implementation", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+    });
+
+    expect(dbSpy).not.toHaveBeenCalled();
+    expect(response.timings?.prefilterMs ?? 0).toBeLessThan(1);
+  });
+
+  it("returns an empty Set rather than null when active filters match no chunks", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const internals = indexer as unknown as {
+      currentBranch: string;
+      ensureInitialized: () => Promise<{ database: Database }>;
+      buildAllowedChunkIds: (
+        database: Database,
+        branch: string,
+        options: { fileType?: string }
+      ) => Promise<Set<string> | null>;
+    };
+    const { database } = await internals.ensureInitialized();
+
+    const result = await internals.buildAllowedChunkIds(database, internals.currentBranch, {
+      fileType: "rs",
+    });
+
+    expect(result).toBeInstanceOf(Set);
+    expect(result?.size).toBe(0);
+  });
+
+  it("does not call getAllMetadata on the hot path when metadata filters are active", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const store = getPrimaryStore(indexer);
+    const metadataSpy = vi.spyOn(store, "getAllMetadata");
+
+    await indexer.searchDetailed("where is rankHybridResults implementation", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+      fileType: "ts",
+    });
+
+    expect(metadataSpy).not.toHaveBeenCalled();
   });
 
   it("returns identical primary results for explicit general task type", async () => {

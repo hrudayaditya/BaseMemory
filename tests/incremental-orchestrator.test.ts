@@ -833,6 +833,9 @@ describe("incremental index orchestrator", () => {
       expandedContext: [],
       taskType: "general",
       graphDirection: "both",
+      timings: {
+        prefilterMs: 0,
+      },
       reranker: {
         applied: false,
         backend: null,

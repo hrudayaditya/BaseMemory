@@ -227,7 +227,8 @@ export function buildPerQueryResult(
     "effectiveTaskType" | "effectiveFinalRerankTopN" | "effectiveGraphDepth"
   >,
   expandedResults: PerQueryEvalResult["results"] = [],
-  expandedRelations: string[] = []
+  expandedRelations: string[] = [],
+  timings?: Pick<PerQueryEvalResult, "prefilterMs">
 ): PerQueryEvalResult {
   const deduped = uniqueResultsByIdentity(results);
   const dedupedExpanded = uniqueResultsByIdentity(expandedResults);
@@ -245,6 +246,7 @@ export function buildPerQueryResult(
     effectiveFinalRerankTopN: effective?.effectiveFinalRerankTopN,
     effectiveGraphDepth: effective?.effectiveGraphDepth,
     latencyMs,
+    prefilterMs: timings?.prefilterMs,
     hitAt1: hitAt(1),
     hitAt3: hitAt(3),
     hitAt5: hitAt(5),

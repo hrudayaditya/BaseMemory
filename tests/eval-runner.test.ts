@@ -143,6 +143,10 @@ describe("eval runner", () => {
     expect(readFileSync(path.join(result.outputDir, "summary.json"), "utf-8")).toContain("\"metrics\"");
     expect(readFileSync(path.join(result.outputDir, "summary.md"), "utf-8")).toContain("# Evaluation Summary");
     expect(readFileSync(path.join(result.outputDir, "per-query.json"), "utf-8")).toContain("\"queries\"");
+    const perQueryArtifact = JSON.parse(readFileSync(path.join(result.outputDir, "per-query.json"), "utf-8")) as {
+      queries: Array<{ prefilterMs?: number }>;
+    };
+    expect(perQueryArtifact.queries[0]?.prefilterMs).toBeDefined();
   });
 
   it("uses the general task type for all eval queries when useQueryTypes is false", async () => {

@@ -96,6 +96,7 @@ export interface PerQueryEvalResult {
   effectiveFinalRerankTopN?: number;
   effectiveGraphDepth?: number;
   latencyMs: number;
+  prefilterMs?: number;
   hitAt1: boolean;
   hitAt3: boolean;
   hitAt5: boolean;

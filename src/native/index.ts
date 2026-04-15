@@ -1082,6 +1082,22 @@ export class Database {
     return this.inner.getChunksByFileOnBranch(filePath, branch);
   }
 
+  async getChunkIdsByFiltersForBranch(
+    branch: string,
+    fileType: string | null,
+    directory: string | null,
+    chunkType: string | null,
+    excludeFile: string | null,
+  ): Promise<string[]> {
+    return this.inner.getChunkIdsByFiltersForBranch(
+      branch,
+      fileType,
+      directory,
+      chunkType,
+      excludeFile
+    );
+  }
+
   getChunksForSymbolsBatch(
     symbolIds: string[],
     branch: string,

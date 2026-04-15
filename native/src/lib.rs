@@ -1157,6 +1157,30 @@ impl Database {
     }
 
     #[napi]
+    pub fn get_chunk_ids_by_filters_for_branch(
+        &self,
+        branch: String,
+        file_type: Option<String>,
+        directory: Option<String>,
+        chunk_type: Option<String>,
+        exclude_file: Option<String>,
+    ) -> Result<Vec<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        db::get_chunk_ids_by_filters_for_branch(
+            &conn,
+            &branch,
+            file_type.as_deref(),
+            directory.as_deref(),
+            chunk_type.as_deref(),
+            exclude_file.as_deref(),
+        )
+        .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
     pub fn get_chunks_for_symbols_batch(
         &self,
         symbol_ids: Vec<String>,

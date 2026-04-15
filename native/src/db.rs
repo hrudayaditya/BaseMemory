@@ -14,7 +14,7 @@ pub enum DbError {
 pub type DbResult<T> = Result<T, DbError>;
 
 /// Schema version for migrations
-const SCHEMA_VERSION: i32 = 13;
+const SCHEMA_VERSION: i32 = 14;
 
 pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const INIT_DB_BUSY_RETRY_ATTEMPTS: usize = 2;
@@ -141,6 +141,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> DbResult<()> {
             -- Indexes for fast lookups
             CREATE INDEX IF NOT EXISTS idx_chunks_content_hash ON chunks(content_hash);
             CREATE INDEX IF NOT EXISTS idx_chunks_file_path ON chunks(file_path);
+            CREATE INDEX IF NOT EXISTS idx_chunks_node_type ON chunks(node_type);
             CREATE INDEX IF NOT EXISTS idx_chunks_name ON chunks(name);
             CREATE INDEX IF NOT EXISTS idx_chunks_name_lower ON chunks(lower(name));
             CREATE INDEX IF NOT EXISTS idx_branch_chunks_branch ON branch_chunks(branch);
@@ -607,6 +608,20 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> DbResult<()> {
 
             CREATE INDEX IF NOT EXISTS idx_embedding_debt_branch_model
                 ON embedding_debt (branch, model);
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
+    if from_version < 14 {
+        conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_chunks_node_type
+                ON chunks(node_type);
             "#,
         )?;
 
@@ -1234,6 +1249,70 @@ pub fn get_chunks_by_file_on_branch(
             language: row.get(10)?,
         })
     })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn get_chunk_ids_by_filters_for_branch(
+    conn: &Connection,
+    branch: &str,
+    file_type: Option<&str>,
+    directory: Option<&str>,
+    chunk_type: Option<&str>,
+    exclude_file: Option<&str>,
+) -> DbResult<Vec<String>> {
+    let normalized_file_type = file_type
+        .map(|value| value.trim().trim_start_matches('.').to_lowercase())
+        .filter(|value| !value.is_empty());
+    let normalized_directory = directory
+        .map(|value| value.trim().trim_matches('/').replace('\\', "/"))
+        .filter(|value| !value.is_empty());
+    let file_type_pattern = normalized_file_type
+        .as_ref()
+        .map(|value| format!("%.{}", value));
+    // Mirror matchesHardRetrievalFilters():
+    // - includes(`/${dir}/`) -> %/{dir}/%
+    // - includes(`${dir}/`) at repo-relative path start -> {dir}/%
+    let directory_nested_pattern = normalized_directory
+        .as_ref()
+        .map(|value| format!("%/{}/%", value));
+    let directory_prefix_pattern = normalized_directory
+        .as_ref()
+        .map(|value| format!("{}/%", value));
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT bc.chunk_id
+        FROM branch_chunks bc
+        INNER JOIN chunks c ON c.chunk_id = bc.chunk_id
+        WHERE bc.branch = ?
+          AND (? IS NULL OR LOWER(c.file_path) LIKE ?)
+          AND (? IS NULL OR c.file_path LIKE ? OR c.file_path LIKE ?)
+          AND (? IS NULL OR c.node_type = ?)
+          AND (? IS NULL OR c.file_path != ?)
+        ORDER BY bc.chunk_id
+        "#,
+    )?;
+
+    let rows = stmt.query_map(
+        params![
+            branch,
+            normalized_file_type.as_deref(),
+            file_type_pattern.as_deref(),
+            normalized_directory.as_deref(),
+            directory_nested_pattern.as_deref(),
+            directory_prefix_pattern.as_deref(),
+            chunk_type,
+            chunk_type,
+            exclude_file,
+            exclude_file,
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -3888,7 +3967,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "13");
+        assert_eq!(version, "14");
         let busy_timeout: i64 = conn
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
@@ -5015,7 +5094,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "13");
+        assert_eq!(schema_version, "14");
 
         let on_delete: String = conn
             .query_row("PRAGMA foreign_key_list(call_edges)", [], |row| row.get(6))
@@ -5063,7 +5142,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v13_schema_exists_on_fresh_db() {
+    fn test_v14_schema_exists_on_fresh_db() {
         let (_temp_dir, conn) = setup_test_db();
 
         let schema_version: String = conn
@@ -5073,7 +5152,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "13");
+        assert_eq!(schema_version, "14");
 
         let pipeline_state_exists: String = conn
             .query_row(
@@ -5152,6 +5231,11 @@ mod tests {
         assert!(chunk_columns
             .iter()
             .any(|name| name == "embedding_input_hash"));
+
+        let chunk_indexes = index_names(&conn, "chunks");
+        assert!(chunk_indexes
+            .iter()
+            .any(|name| name == "idx_chunks_node_type"));
 
         let call_edge_columns = table_columns(&conn, "call_edges");
         assert!(call_edge_columns.iter().any(|name| name == "branch"));
@@ -5278,7 +5362,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "13");
+        assert_eq!(schema_version, "14");
 
         let pipeline_state_exists: String = conn
             .query_row(
@@ -5997,7 +6081,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "13");
+        assert_eq!(schema_version, "14");
 
         let call_edge_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM call_edges", [], |row| row.get(0))
@@ -6040,7 +6124,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v8_to_v13_migration_adds_embedding_input_hash_and_branch_config_versions() {
+    fn test_v8_to_v14_migration_adds_embedding_input_hash_and_branch_config_versions() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("migration-v8.db");
 
@@ -6193,7 +6277,12 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "13");
+        assert_eq!(schema_version, "14");
+
+        let chunk_indexes = index_names(&conn, "chunks");
+        assert!(chunk_indexes
+            .iter()
+            .any(|name| name == "idx_chunks_node_type"));
 
         let config_columns = table_columns(&conn, "config_versions");
         assert!(config_columns.iter().any(|name| name == "voyage_model_id"));

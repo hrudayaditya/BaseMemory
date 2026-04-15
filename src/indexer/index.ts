@@ -187,6 +187,9 @@ export interface SearchResponse {
   expandedContext: GraphContextResult[];
   taskType: SearchTaskType;
   graphDirection: GraphExpansionDirection;
+  timings?: {
+    prefilterMs: number;
+  };
   retrieval: {
     voyageLaneConfigured: boolean;
     voyageLaneUsed: boolean;
@@ -557,6 +560,10 @@ function normalizeDirectoryFilter(directory: string): string {
   return directory.replace(/^\/|\/$/g, "");
 }
 
+/**
+ * @internal Test-only reference implementation for hard metadata filters.
+ * The hot retrieval path uses the SQLite-backed branch query instead.
+ */
 export function matchesHardRetrievalFilters(
   metadata: ChunkMetadata,
   filters: HardRetrievalFilters
@@ -3700,6 +3707,9 @@ export class Indexer {
         expandedContext: [],
         taskType,
         graphDirection: options?.graphDirection ?? "both",
+        timings: {
+          prefilterMs: 0,
+        },
         retrieval: {
           voyageLaneConfigured,
           voyageLaneUsed: false,
@@ -3728,6 +3738,9 @@ export class Indexer {
         expandedContext: [],
         taskType,
         graphDirection: options?.graphDirection ?? "both",
+        timings: {
+          prefilterMs: 0,
+        },
         retrieval: {
           voyageLaneConfigured,
           voyageLaneUsed: false,
@@ -3762,7 +3775,7 @@ export class Indexer {
           ? 0
           : recipe.finalRerankTopN;
     const prefilterStartTime = performance.now();
-    const metadataAllowedChunkIds = this.buildAllowedChunkIds(store, {
+    const metadataAllowedChunkIds = await this.buildAllowedChunkIds(database, branch, {
       fileType: options?.fileType,
       directory: options?.directory,
       chunkType: options?.chunkType,
@@ -3778,6 +3791,9 @@ export class Indexer {
         expandedContext: [],
         taskType,
         graphDirection: options?.graphDirection ?? "both",
+        timings: {
+          prefilterMs: Math.round(prefilterMs * 100) / 100,
+        },
         retrieval: {
           voyageLaneConfigured,
           voyageLaneUsed: false,
@@ -4096,6 +4112,9 @@ export class Indexer {
       expandedContext,
       taskType,
       graphDirection,
+      timings: {
+        prefilterMs: Math.round(prefilterMs * 100) / 100,
+      },
       retrieval: {
         voyageLaneConfigured,
         voyageLaneUsed: voyageLaneAvailable,
@@ -4352,7 +4371,8 @@ export class Indexer {
       filterByBranch?: boolean;
     }
   ): Promise<SearchResult[]> {
-    const { store, provider } = await this.ensureInitialized();
+    const branch = this.currentBranch;
+    const { store, provider, database } = await this.ensureInitialized();
     
     const compatibility = this.checkCompatibility();
     if (!compatibility.compatible) {
@@ -4371,7 +4391,7 @@ export class Indexer {
 
     const filterByBranch = options?.filterByBranch ?? true;
     const prefilterStartTime = performance.now();
-    const metadataAllowedChunkIds = this.buildAllowedChunkIds(store, {
+    const metadataAllowedChunkIds = await this.buildAllowedChunkIds(database, branch, {
       fileType: options?.fileType,
       directory: options?.directory,
       chunkType: options?.chunkType,
@@ -4472,27 +4492,31 @@ export class Indexer {
     );
   }
 
-  private buildAllowedChunkIds(
-    store: VectorStore,
+  private async buildAllowedChunkIds(
+    database: Database,
+    branch: string,
     options: HardRetrievalFilters
-  ): Set<string> | null {
+  ): Promise<Set<string> | null> {
     const hasMetadataFilters = Boolean(
       options.fileType || options.directory || options.chunkType || options.excludeFile
     );
 
     if (!hasMetadataFilters) {
+      this.logger.search("debug", "Skipping hard-filter candidate prefetch because no metadata filters are active", {
+        branch,
+      });
       return null;
     }
 
-    const allowedChunkIds = new Set<string>();
-
-    for (const { key, metadata } of store.getAllMetadata()) {
-      if (matchesHardRetrievalFilters(metadata, options)) {
-        allowedChunkIds.add(key);
-      }
-    }
-
-    return allowedChunkIds;
+    return new Set(
+      await database.getChunkIdsByFiltersForBranch(
+        branch,
+        options.fileType ?? null,
+        options.directory ?? null,
+        options.chunkType ?? null,
+        options.excludeFile ?? null
+      )
+    );
   }
 
   private filterCandidatesByChunkIds<T extends { id: string }>(

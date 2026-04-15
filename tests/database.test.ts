@@ -267,6 +267,55 @@ describe("Database", () => {
       expect(delta.added).not.toContain("chunk_abc123");
       expect(delta.removed).not.toContain("chunk_abc123");
     });
+
+    it("should query chunk ids by metadata filters for a branch", async () => {
+      db.upsertChunk({
+        chunkId: "chunk-ts-function",
+        contentHash: "hash-ts-function",
+        embeddingInputHash: "hash-ts-function",
+        filePath: "src/indexer/alpha.ts",
+        startLine: 1,
+        endLine: 5,
+        nodeType: "function",
+        language: "typescript",
+      });
+      db.upsertChunk({
+        chunkId: "chunk-ts-class",
+        contentHash: "hash-ts-class",
+        embeddingInputHash: "hash-ts-class",
+        filePath: "src/models/beta.ts",
+        startLine: 1,
+        endLine: 8,
+        nodeType: "class",
+        language: "typescript",
+      });
+      db.upsertChunk({
+        chunkId: "chunk-py-function",
+        contentHash: "hash-py-function",
+        embeddingInputHash: "hash-py-function",
+        filePath: "src/indexer/gamma.py",
+        startLine: 1,
+        endLine: 4,
+        nodeType: "function",
+        language: "python",
+      });
+
+      db.addChunksToBranch("main", ["chunk-ts-function", "chunk-ts-class"]);
+      db.addChunksToBranch("feature", ["chunk-py-function"]);
+
+      await expect(
+        db.getChunkIdsByFiltersForBranch("main", "ts", "src/indexer", "function", null)
+      ).resolves.toEqual(["chunk-ts-function"]);
+      await expect(
+        db.getChunkIdsByFiltersForBranch("main", null, null, null, "src/models/beta.ts")
+      ).resolves.toEqual(["chunk-ts-function"]);
+      await expect(
+        db.getChunkIdsByFiltersForBranch("feature", "py", "src/indexer", "function", null)
+      ).resolves.toEqual(["chunk-py-function"]);
+      await expect(
+        db.getChunkIdsByFiltersForBranch("main", "rs", null, null, null)
+      ).resolves.toEqual([]);
+    });
   });
 
   describe("branch-scoped lookups", () => {

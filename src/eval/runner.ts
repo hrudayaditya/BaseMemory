@@ -451,7 +451,9 @@ async function finalizeEvaluationRun(
         effectiveTaskType: queryPlan.taskType,
         effectiveFinalRerankTopN: queryPlan.finalRerankTopN,
         effectiveGraphDepth: queryPlan.graphDepth,
-      }, expandedMaterialized, searchResponse.expandedContext.map((entry) => entry.relation))
+      }, expandedMaterialized, searchResponse.expandedContext.map((entry) => entry.relation), {
+        prefilterMs: searchResponse.timings?.prefilterMs,
+      })
     );
   }
 
