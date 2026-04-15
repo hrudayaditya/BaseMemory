@@ -105,6 +105,41 @@ describe("Database", () => {
     });
   });
 
+  describe("embedding debt", () => {
+    it("should record, query, and clear embedding debt rows", () => {
+      db.recordEmbeddingDebt("main", "/path/to/file.ts", "voyage-code-2", "provider timeout");
+      db.recordEmbeddingDebt("main", "/path/to/file.ts", "voyage-code-2", "retry failed");
+      db.recordEmbeddingDebt("main", "/path/to/other.ts", "voyage-code-2", "provider timeout");
+
+      const debt = db.getEmbeddingDebtForBranch("main");
+      expect(debt).toHaveLength(2);
+      expect(debt[0]).toMatchObject({
+        branch: "main",
+        filePath: "/path/to/file.ts",
+        model: "voyage-code-2",
+        reason: "retry failed",
+      });
+
+      db.clearEmbeddingDebt("main", "/path/to/file.ts", "voyage-code-2");
+      expect(db.getEmbeddingDebtForBranch("main")).toHaveLength(1);
+
+      db.clearEmbeddingDebtForFile("main", "/path/to/other.ts");
+      expect(db.getEmbeddingDebtForBranch("main")).toEqual([]);
+    });
+
+    it("should clear branch and global embedding debt", () => {
+      db.recordEmbeddingDebt("main", "/path/to/file.ts", "voyage-code-2", "provider timeout");
+      db.recordEmbeddingDebt("feature", "/path/to/feature.ts", "voyage-code-2", "provider timeout");
+
+      expect(db.clearEmbeddingDebtForBranch("main")).toBe(1);
+      expect(db.getEmbeddingDebtForBranch("main")).toEqual([]);
+      expect(db.getEmbeddingDebtForBranch("feature")).toHaveLength(1);
+
+      expect(db.clearAllEmbeddingDebt()).toBe(1);
+      expect(db.getEmbeddingDebtForBranch("feature")).toEqual([]);
+    });
+  });
+
   describe("chunks", () => {
     const testChunk: ChunkData = {
       chunkId: "chunk_abc123",

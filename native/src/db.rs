@@ -14,7 +14,7 @@ pub enum DbError {
 pub type DbResult<T> = Result<T, DbError>;
 
 /// Schema version for migrations
-const SCHEMA_VERSION: i32 = 12;
+const SCHEMA_VERSION: i32 = 13;
 
 pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const INIT_DB_BUSY_RETRY_ATTEMPTS: usize = 2;
@@ -593,6 +593,29 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> DbResult<()> {
         )?;
     }
 
+    if from_version < 13 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS embedding_debt (
+                branch TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                model TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (branch, file_path, model)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_embedding_debt_branch_model
+                ON embedding_debt (branch, model);
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -891,6 +914,108 @@ pub fn get_missing_embeddings_for_model(
         .filter(|h| !existing.contains(*h))
         .cloned()
         .collect())
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddingDebtRow {
+    pub branch: String,
+    pub file_path: String,
+    pub model: String,
+    pub reason: String,
+    pub created_at: i64,
+}
+
+pub fn record_embedding_debt(
+    conn: &Connection,
+    branch: &str,
+    file_path: &str,
+    model: &str,
+    reason: &str,
+) -> DbResult<()> {
+    conn.execute(
+        r#"
+        INSERT INTO embedding_debt (
+            branch,
+            file_path,
+            model,
+            reason,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, strftime('%s', 'now'))
+        ON CONFLICT(branch, file_path, model) DO UPDATE SET
+            reason = excluded.reason,
+            created_at = excluded.created_at
+        "#,
+        params![branch, file_path, model, reason],
+    )?;
+    Ok(())
+}
+
+pub fn clear_embedding_debt(
+    conn: &Connection,
+    branch: &str,
+    file_path: &str,
+    model: &str,
+) -> DbResult<()> {
+    conn.execute(
+        "DELETE FROM embedding_debt WHERE branch = ? AND file_path = ? AND model = ?",
+        params![branch, file_path, model],
+    )?;
+    Ok(())
+}
+
+pub fn clear_embedding_debt_for_file(
+    conn: &Connection,
+    branch: &str,
+    file_path: &str,
+) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM embedding_debt WHERE branch = ? AND file_path = ?",
+        params![branch, file_path],
+    )?;
+    Ok(count)
+}
+
+pub fn get_embedding_debt_for_branch(
+    conn: &Connection,
+    branch: &str,
+) -> DbResult<Vec<EmbeddingDebtRow>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT branch, file_path, model, reason, created_at
+        FROM embedding_debt
+        WHERE branch = ?
+        ORDER BY file_path ASC, model ASC
+        "#,
+    )?;
+    let rows = stmt.query_map(params![branch], |row| {
+        Ok(EmbeddingDebtRow {
+            branch: row.get(0)?,
+            file_path: row.get(1)?,
+            model: row.get(2)?,
+            reason: row.get(3)?,
+            created_at: row.get(4)?,
+        })
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn clear_embedding_debt_for_branch(conn: &Connection, branch: &str) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM embedding_debt WHERE branch = ?",
+        params![branch],
+    )?;
+    Ok(count)
+}
+
+pub fn clear_all_embedding_debt(conn: &Connection) -> DbResult<usize> {
+    let count = conn.execute("DELETE FROM embedding_debt", [])?;
+    Ok(count)
 }
 
 // ============================================================================
@@ -3763,7 +3888,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "12");
+        assert_eq!(version, "13");
         let busy_timeout: i64 = conn
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
@@ -4890,7 +5015,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "12");
+        assert_eq!(schema_version, "13");
 
         let on_delete: String = conn
             .query_row("PRAGMA foreign_key_list(call_edges)", [], |row| row.get(6))
@@ -4938,7 +5063,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v12_schema_exists_on_fresh_db() {
+    fn test_v13_schema_exists_on_fresh_db() {
         let (_temp_dir, conn) = setup_test_db();
 
         let schema_version: String = conn
@@ -4948,7 +5073,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "12");
+        assert_eq!(schema_version, "13");
 
         let pipeline_state_exists: String = conn
             .query_row(
@@ -4986,10 +5111,24 @@ mod tests {
             .unwrap();
         assert_eq!(branch_config_versions_exists, "branch_config_versions");
 
+        let embedding_debt_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'embedding_debt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(embedding_debt_exists, "embedding_debt");
+
         let branch_config_indexes = index_names(&conn, "branch_config_versions");
         assert!(branch_config_indexes
             .iter()
             .any(|name| name == "idx_branch_config_versions_config_hash"));
+
+        let embedding_debt_indexes = index_names(&conn, "embedding_debt");
+        assert!(embedding_debt_indexes
+            .iter()
+            .any(|name| name == "idx_embedding_debt_branch_model"));
 
         let config_version_columns = table_columns(&conn, "config_versions");
         assert!(config_version_columns
@@ -5139,7 +5278,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "12");
+        assert_eq!(schema_version, "13");
 
         let pipeline_state_exists: String = conn
             .query_row(
@@ -5858,7 +5997,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "12");
+        assert_eq!(schema_version, "13");
 
         let call_edge_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM call_edges", [], |row| row.get(0))
@@ -5901,7 +6040,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v8_to_v12_migration_adds_embedding_input_hash_and_branch_config_versions() {
+    fn test_v8_to_v13_migration_adds_embedding_input_hash_and_branch_config_versions() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("migration-v8.db");
 
@@ -6054,7 +6193,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "12");
+        assert_eq!(schema_version, "13");
 
         let config_columns = table_columns(&conn, "config_versions");
         assert!(config_columns.iter().any(|name| name == "voyage_model_id"));

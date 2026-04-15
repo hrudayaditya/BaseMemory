@@ -4183,6 +4183,7 @@ export class Indexer {
       database.gcOrphanEmbeddings();
       // Clear control-plane state after the data plane so any mid-reset crash
       // biases toward a fully cold rebuild instead of stale "complete" stages.
+      database.clearAllEmbeddingDebt();
       database.clearAllPipelineState();
       database.clearAllPipelineRuns();
       database.clearAllConfigVersions();

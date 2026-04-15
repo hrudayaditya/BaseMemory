@@ -16,6 +16,7 @@ import {
   type ChunkMetadata,
   type ChunkSymbolKind,
   type Database,
+  type EmbeddingDebtData,
   type InvertedIndex,
   type MerkleDiff,
   type MerkleIgnoreRules,
@@ -166,6 +167,7 @@ interface FileJobPlan {
   parsedFile: OrchestratorParsedFile | null;
   currentChunks: ChunkRecord[];
   dirtyChunks: EmbeddingWorkChunk[];
+  voyageDebtChunks: EmbeddingWorkChunk[];
   removedChunkIds: Set<string>;
   oldChunkIds: Set<string>;
   oldSymbolIds: Set<string>;
@@ -176,6 +178,7 @@ interface FileJobPlan {
   chunkRan: boolean;
   indexNeedsUpdate: boolean;
   indexStarted: boolean;
+  activeVoyageDebt: EmbeddingDebtData | null;
 }
 
 interface ChunkRecord {
@@ -251,6 +254,9 @@ interface RunContext {
   pendingIndexCompletions: Map<string, { fileContentHash: string; inputHash: string }>;
   oldChunkIdsForTouchedFiles: Set<string>;
   oldSymbolIdsForTouchedFiles: Set<string>;
+  activeVoyageDebtByFile: Map<string, EmbeddingDebtData>;
+  initialVoyageDebtFiles: Set<string>;
+  healedVoyageDebtFiles: Set<string>;
   failedFiles: Set<string>;
   deferredHotUpdatePaths: Set<string>;
   stats: IndexStats;
@@ -905,7 +911,10 @@ export class IncrementalIndexOrchestrator {
       this.processRemovedFile(context, filePath);
     }
 
-    const branchFilePaths = Array.from(fileHashes.keys());
+    const branchFilePaths = this.includeActiveVoyageDebtFiles(
+      context,
+      Array.from(fileHashes.keys())
+    );
     context.stats.totalFiles = branchFilePaths.length;
     await this.enqueueFilesForRun(context, branchFilePaths, "config_change", "normal");
     await this.drainRunContext(context);
@@ -1051,8 +1060,11 @@ export class IncrementalIndexOrchestrator {
         this.processRemovedFile(context, filePath);
       }
 
-      context.stats.totalFiles = fileHashes.size;
-      const coldStartFilePaths = Array.from(fileHashes.keys());
+      const coldStartFilePaths = this.includeActiveVoyageDebtFiles(
+        context,
+        Array.from(fileHashes.keys())
+      );
+      context.stats.totalFiles = coldStartFilePaths.length;
       await this.enqueueFilesForRun(context, coldStartFilePaths, "cold_start", "low");
       await this.drainRunContext(context);
       return this.finalizeRunContext(context, onProgress);
@@ -1106,16 +1118,6 @@ export class IncrementalIndexOrchestrator {
         this.checkpoints.ensureTrackedFile(branch, filePath);
       }
 
-      for (const filePath of touchedFiles) {
-        this.queue.enqueue({
-          branch,
-          filePath,
-          priority: "high",
-          trigger: "watcher_event",
-          runId: run.runId,
-        });
-      }
-
       const context = this.createRunContext({
         ...resources,
         branch,
@@ -1126,7 +1128,17 @@ export class IncrementalIndexOrchestrator {
         baseSnapshot: preparedHotUpdate.baseSnapshot,
         fileHashes,
       });
-      context.stats.totalFiles = touchedFiles.length;
+      const hotUpdateFilePaths = this.includeActiveVoyageDebtFiles(context, touchedFiles);
+      for (const filePath of hotUpdateFilePaths) {
+        this.queue.enqueue({
+          branch,
+          filePath,
+          priority: "high",
+          trigger: "watcher_event",
+          runId: run.runId,
+        });
+      }
+      context.stats.totalFiles = hotUpdateFilePaths.length;
       await this.drainRunContext(context);
       return this.finalizeRunContext(context);
     });
@@ -1235,6 +1247,12 @@ export class IncrementalIndexOrchestrator {
 
     const interruptedFinalizationRuns = this.checkpoints.getFinalizingRuns(branch);
     if (interruptedFinalizationRuns.length > 0) {
+      // Runs interrupted during finalization (status: 'finalizing') are intentionally
+      // cold-started rather than replayed. By the time a run reaches 'finalizing',
+      // branch catalog writes may be partially applied. Replaying into partial catalog
+      // state without rollback capability is unsafe. Cold-start rebuilds from a clean
+      // baseline. True interrupted-finalization replay would require transactional
+      // catalog writes and is deferred to a future architectural improvement.
       for (const run of interruptedFinalizationRuns) {
         this.host.logger.warn(
           `Interrupted finalization detected for run ${run.runId} on branch ${run.branch}. Forcing cold start to restore consistency.`,
@@ -1326,16 +1344,6 @@ export class IncrementalIndexOrchestrator {
         this.host.getProjectRoot(),
         currentSnapshot.snapshot
       );
-      for (const filePath of unfinishedFiles) {
-        this.queue.enqueue({
-          branch: run.branch,
-          filePath,
-          priority: "normal",
-          trigger: "crash_resume",
-          runId: run.runId,
-        });
-      }
-
       const context = this.createRunContext({
         ...resources,
         branch: run.branch,
@@ -1346,7 +1354,17 @@ export class IncrementalIndexOrchestrator {
         baseSnapshot: snapshot,
         fileHashes,
       });
-      context.stats.totalFiles = unfinishedFiles.length;
+      const resumeFilePaths = this.includeActiveVoyageDebtFiles(context, unfinishedFiles);
+      for (const filePath of resumeFilePaths) {
+        this.queue.enqueue({
+          branch: run.branch,
+          filePath,
+          priority: "normal",
+          trigger: "crash_resume",
+          runId: run.runId,
+        });
+      }
+      context.stats.totalFiles = resumeFilePaths.length;
       await this.drainRunContext(context);
       await this.finalizeRunContext(context);
     }
@@ -1538,6 +1556,7 @@ export class IncrementalIndexOrchestrator {
       this.checkpoints.markBranchConfigApplied(args.branch, args.configHash);
     }
     this.checkpoints.markRunComplete(args.runId);
+    this.applyPostFinalizationSideEffects(resources.configuredProviderInfo);
     this.host.logger.info("Replayed interrupted run finalization", {
       branch: args.branch,
       runId: args.runId,
@@ -1623,6 +1642,39 @@ export class IncrementalIndexOrchestrator {
     return resources;
   }
 
+  private getActiveVoyageDebtByFile(
+    database: Database,
+    branch: string,
+    voyageModelId: string | null
+  ): Map<string, EmbeddingDebtData> {
+    if (!voyageModelId) {
+      return new Map();
+    }
+
+    const debtRows = database.getEmbeddingDebtForBranch(branch);
+    return new Map(
+      debtRows
+        .filter((row) => row.model === voyageModelId)
+        .map((row) => [row.filePath, row] as const)
+    );
+  }
+
+  private includeActiveVoyageDebtFiles(
+    context: RunContext,
+    filePaths: string[]
+  ): string[] {
+    const combined = new Set(filePaths);
+
+    for (const [filePath] of context.activeVoyageDebtByFile) {
+      const embedState = this.checkpoints.getStageState(context.branch, filePath, "embed");
+      if (embedState?.status === "complete") {
+        combined.add(filePath);
+      }
+    }
+
+    return Array.from(combined).sort((left, right) => left.localeCompare(right));
+  }
+
   private createRunContext(args: {
     branch: string;
     runId: string;
@@ -1639,9 +1691,25 @@ export class IncrementalIndexOrchestrator {
       branchChunkIds
     );
     const branchSymbolIds = new Set(args.database.getBranchSymbolIds(args.branch));
+    const activeVoyageDebtByFile = this.getActiveVoyageDebtByFile(
+      args.database,
+      args.branch,
+      args.voyageModelId
+    );
 
     this.host.loadFileHashCache();
     this.host.logger.recordIndexingStart();
+    if (activeVoyageDebtByFile.size > 0 && args.voyageModelId) {
+      this.host.logger.info(
+        `Voyage embedding debt: ${activeVoyageDebtByFile.size} files on branch ${args.branch} will be healed this run`,
+        {
+          branch: args.branch,
+          runId: args.runId,
+          fileCount: activeVoyageDebtByFile.size,
+          model: args.voyageModelId,
+        }
+      );
+    }
 
     return {
       startTime: Date.now(),
@@ -1673,6 +1741,9 @@ export class IncrementalIndexOrchestrator {
       pendingIndexCompletions: new Map<string, { fileContentHash: string; inputHash: string }>(),
       oldChunkIdsForTouchedFiles: new Set<string>(),
       oldSymbolIdsForTouchedFiles: new Set<string>(),
+      activeVoyageDebtByFile,
+      initialVoyageDebtFiles: new Set(activeVoyageDebtByFile.keys()),
+      healedVoyageDebtFiles: new Set<string>(),
       failedFiles: new Set<string>(),
       deferredHotUpdatePaths: new Set<string>(),
       stats: createEmptyStats(),
@@ -1808,6 +1879,10 @@ export class IncrementalIndexOrchestrator {
     );
 
     try {
+      if (filePlan.voyageDebtChunks.length > 0) {
+        await this.processVoyageDebtFile(context, job.filePath, filePlan);
+        return;
+      }
       await this.processEmbedStage(context, job.filePath, filePlan);
       await this.processIndexStage(context, job.filePath, filePlan);
       await this.processGraphStage(context, job.filePath, fileContent, fileContentHash, filePlan);
@@ -1849,6 +1924,7 @@ export class IncrementalIndexOrchestrator {
     let parsedFile: OrchestratorParsedFile | null = null;
     let currentChunks: ChunkRecord[] = [];
     let dirtyChunks: EmbeddingWorkChunk[] = [];
+    let voyageDebtChunks: EmbeddingWorkChunk[] = [];
     let removedChunkIds = new Set<string>();
     let chunkRan = false;
     let indexNeedsUpdate = false;
@@ -1922,6 +1998,7 @@ export class IncrementalIndexOrchestrator {
       "embed",
       embedStageInputHash
     );
+    const activeVoyageDebt = context.activeVoyageDebtByFile.get(filePath) ?? null;
 
     if (!chunkRan && embedStageIsStale) {
       const reparsed = this.host.parseFilesForIndexing([
@@ -1948,6 +2025,8 @@ export class IncrementalIndexOrchestrator {
     } else if (chunkRan && embedStageIsStale && dirtyChunks.length === 0) {
       dirtyChunks = currentChunks.map((chunk) => this.toEmbeddingWorkChunk(chunk));
       indexNeedsUpdate = dirtyChunks.length > 0 || removedChunkIds.size > 0;
+    } else if (!chunkRan && !embedStageIsStale && activeVoyageDebt) {
+      voyageDebtChunks = this.loadVoyageDebtChunksForFile(context, filePath, currentChunks);
     }
 
     context.stats.totalChunks += currentChunks.length;
@@ -1956,6 +2035,7 @@ export class IncrementalIndexOrchestrator {
       parsedFile,
       currentChunks,
       dirtyChunks,
+      voyageDebtChunks,
       removedChunkIds,
       oldChunkIds,
       oldSymbolIds,
@@ -1966,6 +2046,7 @@ export class IncrementalIndexOrchestrator {
       chunkRan,
       indexNeedsUpdate,
       indexStarted: false,
+      activeVoyageDebt,
     };
   }
 
@@ -2018,6 +2099,11 @@ export class IncrementalIndexOrchestrator {
     const voyageStore = context.voyageStore;
     const voyageModelId = context.voyageModelId;
     const voyageEnabled = Boolean(voyageProvider && voyageStore && voyageModelId);
+    const requiredVoyageHashes = voyageEnabled
+      ? new Set(plan.dirtyChunks.map((chunk) => chunk.embeddingInputHash))
+      : new Set<string>();
+    const completedVoyageHashes = new Set<string>();
+    let voyageDebtReason: string | null = null;
     const embeddingInputHashes = plan.dirtyChunks.map(
       (chunk) => chunk.embeddingInputHash
     );
@@ -2039,7 +2125,9 @@ export class IncrementalIndexOrchestrator {
             )
           )
       : new Set<string>();
-    const embeddingQueue = new PQueue(this.host.getProviderRateLimits(context.configuredProviderInfo.provider));
+    const embeddingQueue = new PQueue(
+      this.host.getProviderRateLimits(context.configuredProviderInfo.provider)
+    );
 
     const cachedArcticHashes = context.forceFreshPrimaryEmbeddings
       ? []
@@ -2121,6 +2209,7 @@ export class IncrementalIndexOrchestrator {
           )
         );
         voyageStore.add(chunk.id, vector, chunk.metadata);
+        completedVoyageHashes.add(chunk.embeddingInputHash);
       }
     }
 
@@ -2134,18 +2223,18 @@ export class IncrementalIndexOrchestrator {
       this.getEffectiveEmbeddingMaxTokens(context)
     );
 
-    for (const batch of batches) {
-      await embeddingQueue.add(async () => {
-        const arcticBatch = batch.filter((chunk) =>
-          missingArcticEmbeddings.has(chunk.embeddingInputHash)
-        );
-        const voyageBatch = voyageEnabled
-          ? batch.filter((chunk) =>
-              missingVoyageEmbeddings.has(chunk.embeddingInputHash)
-            )
-          : [];
+    try {
+      for (const batch of batches) {
+        await embeddingQueue.add(async () => {
+          const arcticBatch = batch.filter((chunk) =>
+            missingArcticEmbeddings.has(chunk.embeddingInputHash)
+          );
+          const voyageBatch = voyageEnabled
+            ? batch.filter((chunk) =>
+                missingVoyageEmbeddings.has(chunk.embeddingInputHash)
+              )
+            : [];
 
-        try {
           const [arcticOutcome, voyageOutcome] = await Promise.allSettled([
             arcticBatch.length > 0
               ? pRetry(
@@ -2236,6 +2325,7 @@ export class IncrementalIndexOrchestrator {
                 }
               );
             } else if (!voyageOutcome.value) {
+              voyageFailure = new Error("Voyage provider returned no embeddings result");
               this.host.logger.warn(
                 "Voyage embeddings unavailable for batch; continuing with Arctic-only indexing",
                 {
@@ -2268,6 +2358,9 @@ export class IncrementalIndexOrchestrator {
                     model: voyageModelId,
                   }))
                 );
+                for (const chunk of voyageBatch) {
+                  completedVoyageHashes.add(chunk.embeddingInputHash);
+                }
                 context.stats.tokensUsed += voyageOutcome.value.totalTokensUsed;
                 this.host.logger.recordEmbeddingApiCall(voyageOutcome.value.totalTokensUsed);
               } catch (error) {
@@ -2285,26 +2378,59 @@ export class IncrementalIndexOrchestrator {
             }
           }
 
+          if (voyageFailure) {
+            voyageDebtReason = getErrorMessage(voyageFailure);
+            this.host.logger.recordEmbeddingError();
+          }
+
           if (arcticFailure) {
             throw arcticFailure;
           }
-
-          if (voyageFailure) {
-            this.host.logger.recordEmbeddingError();
-          }
-        } catch (error) {
-          this.host.logger.recordEmbeddingError();
-          this.host.addFailedBatch(batch, getErrorMessage(error));
-          this.checkpoints.markStageFailed(
-            context.branch,
+        });
+      }
+    } catch (error) {
+      this.host.logger.recordEmbeddingError();
+      this.host.addFailedBatch(
+        plan.dirtyChunks.filter(
+          (chunk) =>
+            missingArcticEmbeddings.has(chunk.embeddingInputHash) ||
+            missingVoyageEmbeddings.has(chunk.embeddingInputHash)
+        ),
+        getErrorMessage(error)
+      );
+      this.checkpoints.markStageFailed(
+        context.branch,
+        filePath,
+        "embed",
+        getErrorMessage(error),
+        plan.embedStageInputHash
+      );
+      if (voyageEnabled && voyageModelId) {
+        const voyageFileComplete =
+          completedVoyageHashes.size === requiredVoyageHashes.size;
+        if (voyageFileComplete) {
+          this.clearVoyageEmbeddingDebt(context, filePath, voyageModelId);
+        } else {
+          this.recordVoyageEmbeddingDebt(
+            context,
             filePath,
-            "embed",
-            getErrorMessage(error),
-            plan.embedStageInputHash
+            voyageModelId,
+            voyageDebtReason ??
+              "Voyage embedding incomplete because the file-level embed run exited before all Voyage batches completed"
           );
-          throw error;
         }
-      });
+      }
+      throw error;
+    }
+
+    if (voyageEnabled && voyageModelId) {
+      const voyageFileComplete =
+        completedVoyageHashes.size === requiredVoyageHashes.size;
+      if (voyageFileComplete) {
+        this.clearVoyageEmbeddingDebt(context, filePath, voyageModelId);
+      } else if (voyageDebtReason) {
+        this.recordVoyageEmbeddingDebt(context, filePath, voyageModelId, voyageDebtReason);
+      }
     }
 
     this.checkpoints.markStageComplete(
@@ -2313,6 +2439,116 @@ export class IncrementalIndexOrchestrator {
       "embed",
       plan.embedStageInputHash
     );
+  }
+
+  private async processVoyageDebtFile(
+    context: RunContext,
+    filePath: string,
+    plan: FileJobPlan
+  ): Promise<void> {
+    const voyageProvider = context.voyageProvider;
+    const voyageStore = context.voyageStore;
+    const voyageModelId = context.voyageModelId;
+    if (!voyageProvider || !voyageStore || !voyageModelId) {
+      return;
+    }
+
+    if (plan.voyageDebtChunks.length === 0) {
+      this.clearVoyageEmbeddingDebt(context, filePath, voyageModelId);
+      return;
+    }
+
+    const batches = createDynamicBatches(
+      plan.voyageDebtChunks,
+      this.getEffectiveEmbeddingMaxTokens(context)
+    );
+    const embeddingQueue = new PQueue(
+      this.host.getProviderRateLimits(context.configuredProviderInfo.provider)
+    );
+
+    try {
+      for (const batch of batches) {
+        await embeddingQueue.add(async () => {
+          let voyageResponse;
+          try {
+            voyageResponse = await voyageProvider.embedBatch(batch.map((chunk) => chunk.text));
+          } catch (error) {
+            const reason = getErrorMessage(error);
+            this.recordVoyageEmbeddingDebt(context, filePath, voyageModelId, reason);
+            this.host.logger.warn(
+              "Voyage debt healing batch failed; retaining debt for a later retry",
+              {
+                batchSize: batch.length,
+                filePath,
+                model: voyageModelId,
+                error: reason,
+              }
+            );
+            throw error;
+          }
+
+          if (!voyageResponse) {
+            const reason = "Voyage provider returned no embeddings result";
+            this.recordVoyageEmbeddingDebt(context, filePath, voyageModelId, reason);
+            this.host.logger.warn(
+              "Voyage debt healing batch returned no result; retaining debt for a later retry",
+              {
+                batchSize: batch.length,
+                filePath,
+                model: voyageModelId,
+              }
+            );
+            throw new Error(reason);
+          }
+
+          try {
+            const voyageVectors = voyageResponse.embeddings;
+            const voyageItems = batch.map((chunk, index) => {
+              const vector = voyageVectors[index];
+              if (!vector) {
+                throw new Error(`Missing Voyage embedding vector for ${chunk.id}`);
+              }
+              return {
+                id: chunk.id,
+                vector,
+                metadata: chunk.metadata,
+              };
+            });
+            voyageStore.addBatch(voyageItems);
+            context.database.upsertEmbeddingsBatch(
+              batch.map((chunk, index) => ({
+                embeddingInputHash: chunk.embeddingInputHash,
+                contentHash: chunk.contentHash,
+                embedding: Buffer.from(new Float32Array(voyageVectors[index] ?? []).buffer),
+                chunkText: chunk.content,
+                model: voyageModelId,
+              }))
+            );
+            context.stats.tokensUsed += voyageResponse.totalTokensUsed;
+            this.host.logger.recordEmbeddingApiCall(voyageResponse.totalTokensUsed);
+          } catch (error) {
+            const reason = getErrorMessage(error);
+            this.recordVoyageEmbeddingDebt(context, filePath, voyageModelId, reason);
+            this.host.logger.warn(
+              "Voyage debt healing persistence failed; retaining debt for a later retry",
+              {
+                batchSize: batch.length,
+                filePath,
+                model: voyageModelId,
+                error: reason,
+              }
+            );
+            throw error;
+          }
+        });
+      }
+    } catch (error) {
+      this.host.logger.recordEmbeddingError();
+      this.host.addFailedBatch(plan.voyageDebtChunks, getErrorMessage(error));
+      throw error;
+    }
+
+    this.clearVoyageEmbeddingDebt(context, filePath, voyageModelId);
   }
 
   private async processIndexStage(
@@ -2438,6 +2674,9 @@ export class IncrementalIndexOrchestrator {
     context.existingChunksByFile.delete(filePath);
     context.removedAbsolutePaths.add(filePath);
     context.removedRelativePaths.add(toRelativePath(this.host.getProjectRoot(), filePath));
+    context.activeVoyageDebtByFile.delete(filePath);
+    context.initialVoyageDebtFiles.delete(filePath);
+    context.healedVoyageDebtFiles.delete(filePath);
     clearWatcherEventTimestamp(filePath);
     this.checkpoints.clearFileState(context.branch, filePath);
   }
@@ -2541,6 +2780,64 @@ export class IncrementalIndexOrchestrator {
         text: chunk.name ?? chunk.chunkId,
         chunkHash: chunk.contentHash,
       }));
+  }
+
+  private loadVoyageDebtChunksForFile(
+    context: RunContext,
+    filePath: string,
+    currentChunks: ChunkRecord[]
+  ): EmbeddingWorkChunk[] {
+    if (currentChunks.length === 0) {
+      return [];
+    }
+
+    const chunkTexts = context.database.getChunkTextsBatch(
+      currentChunks.map((chunk) => chunk.embeddingInputHash)
+    );
+
+    return currentChunks.map((chunk) => {
+      const chunkText = chunkTexts.get(chunk.embeddingInputHash);
+      if (!chunkText) {
+        throw new Error(
+          `Missing stored chunk text for Voyage debt healing on ${filePath} (${chunk.embeddingInputHash})`
+        );
+      }
+
+      return this.toEmbeddingWorkChunk({
+        ...chunk,
+        embeddingText: chunkText,
+        text: chunkText,
+      });
+    });
+  }
+
+  private recordVoyageEmbeddingDebt(
+    context: RunContext,
+    filePath: string,
+    model: string,
+    reason: string
+  ): void {
+    context.database.recordEmbeddingDebt(context.branch, filePath, model, reason);
+    context.activeVoyageDebtByFile.set(filePath, {
+      branch: context.branch,
+      filePath,
+      model,
+      reason,
+      createdAt: Date.now(),
+    });
+    context.healedVoyageDebtFiles.delete(filePath);
+  }
+
+  private clearVoyageEmbeddingDebt(
+    context: RunContext,
+    filePath: string,
+    model: string
+  ): void {
+    context.database.clearEmbeddingDebt(context.branch, filePath, model);
+    context.activeVoyageDebtByFile.delete(filePath);
+    if (context.initialVoyageDebtFiles.has(filePath)) {
+      context.healedVoyageDebtFiles.add(filePath);
+    }
   }
 
   private toEmbeddingWorkChunk(chunk: ChunkRecord): EmbeddingWorkChunk {
@@ -2758,8 +3055,20 @@ export class IncrementalIndexOrchestrator {
       this.checkpoints.markRunFailed(context.runId);
     }
 
-    this.host.saveIndexMetadata(context.configuredProviderInfo);
-    this.host.markIndexCompatible();
+    if (context.initialVoyageDebtFiles.size > 0 && context.voyageModelId) {
+      this.host.logger.info(
+        `Voyage embedding debt cleared: ${context.healedVoyageDebtFiles.size}/${context.initialVoyageDebtFiles.size} files healed`,
+        {
+          branch: context.branch,
+          runId: context.runId,
+          healedFiles: context.healedVoyageDebtFiles.size,
+          totalDebtFiles: context.initialVoyageDebtFiles.size,
+          model: context.voyageModelId,
+        }
+      );
+    }
+
+    this.applyPostFinalizationSideEffects(context.configuredProviderInfo);
     context.stats.durationMs = Date.now() - context.startTime;
     if (context.failedFiles.size > 0) {
       context.stats.failedBatchesPath = this.host.getFailedBatchesPath();
@@ -2787,5 +3096,10 @@ export class IncrementalIndexOrchestrator {
     });
 
     return context.stats;
+  }
+
+  private applyPostFinalizationSideEffects(providerInfo: ConfiguredProviderInfo): void {
+    this.host.saveIndexMetadata(providerInfo);
+    this.host.markIndexCompatible();
   }
 }

@@ -2549,6 +2549,21 @@ describe("incremental index orchestrator", () => {
     const currentConfig = await getCurrentRuntimeConfig(indexer);
     const currentConfigHash = hashConfigVersion(currentConfig);
     const fileHashCachePath = getFileHashCachePath(indexPath, branch);
+    const internals = getIndexerInternals(indexer) as unknown as {
+      orchestrator: {
+        prepareRun: () => Promise<unknown>;
+        replayRunFinalization: (
+          resources: unknown,
+          args: {
+            branch: string;
+            runId: string;
+            configVersion: ConfigVersion;
+            configHash: string;
+          }
+        ) => Promise<{ replayed: boolean }>;
+      };
+      indexCompatibility?: { compatible: boolean } | null;
+    };
     const orchestrator = getIndexerInternals(indexer).orchestrator as {
       prepareRun: () => Promise<unknown>;
       replayRunFinalization: (
@@ -2578,6 +2593,15 @@ describe("incremental index orchestrator", () => {
     );
 
     const resources = await orchestrator.prepareRun();
+    database.deleteMetadata("index.version");
+    database.deleteMetadata("index.embeddingProvider");
+    database.deleteMetadata("index.embeddingModel");
+    database.deleteMetadata("index.embeddingDimensions");
+    database.deleteMetadata("index.createdAt");
+    database.deleteMetadata("index.updatedAt");
+    internals.indexCompatibility = {
+      compatible: false,
+    };
     const first = await orchestrator.replayRunFinalization(resources, {
       branch,
       runId: "resume-finalization-idempotent",
@@ -2605,6 +2629,13 @@ describe("incremental index orchestrator", () => {
     expect(snapshotAfterFirstReplay).toBeTruthy();
     expect(branchConfigAfterFirstReplay?.configHash).toBe(currentConfigHash);
     expect(cacheAfterFirstReplay.length).toBeGreaterThan(0);
+    expect(database.getMetadata("index.version")).toBeTruthy();
+    expect(database.getMetadata("index.embeddingProvider")).toBe(currentConfig.embeddingProvider);
+    expect(database.getMetadata("index.embeddingModel")).toBe(currentConfig.embeddingModelId);
+    expect(database.getMetadata("index.embeddingDimensions")).toBe(
+      currentConfig.embeddingDimension.toString()
+    );
+    expect(internals.indexCompatibility).toEqual({ compatible: true });
     void fileA;
   });
 
@@ -3329,6 +3360,18 @@ describe("incremental index orchestrator", () => {
     const trackedB = resolveTrackedPath(database, branch, fileB, tempDir);
     expect(database.getPipelineState(branch, trackedA, "embed")?.status).toBe("complete");
     expect(database.getPipelineState(branch, trackedB, "embed")?.status).toBe("complete");
+    expect(database.getEmbeddingDebtForBranch(branch)).toEqual([
+      expect.objectContaining({
+        branch,
+        filePath: trackedA,
+        model: "voyage-code-2",
+      }),
+      expect.objectContaining({
+        branch,
+        filePath: trackedB,
+        model: "voyage-code-2",
+      }),
+    ]);
 
     const chunkIds = database.getBranchChunkIds(branch);
     const voyageStore = getIndexerInternals(indexer).stores.get("voyage-code-2");
@@ -3339,6 +3382,153 @@ describe("incremental index orchestrator", () => {
       expect(database.getEmbeddingForModel(chunk!.embeddingInputHash, "mock-embedding-model")).not.toBeNull();
       expect(database.getEmbeddingForModel(chunk!.embeddingInputHash, "voyage-code-2")).toBeNull();
     }
+  });
+
+  it("clears embedding debt after a successful Voyage healing run", async () => {
+    createSingleFileRepo();
+    const indexer = new Indexer(
+      tempDir,
+      createConfig({
+        voyageApiKey: "voyage-test-key",
+      })
+    );
+    await indexer.initialize();
+
+    const voyageProvider = getIndexerInternals(indexer).voyageProvider;
+    expect(voyageProvider).toBeTruthy();
+    vi.spyOn(voyageProvider!, "embedBatch").mockResolvedValueOnce(null);
+
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    expect(database.getEmbeddingDebtForBranch(branch)).toHaveLength(1);
+
+    await indexer.index();
+
+    expect(database.getEmbeddingDebtForBranch(branch)).toEqual([]);
+  });
+
+  it("schedules unchanged debt files for Voyage-only healing on the next run", async () => {
+    createSingleFileRepo();
+    const indexer = new Indexer(
+      tempDir,
+      createConfig({
+        voyageApiKey: "voyage-test-key",
+      })
+    );
+    await indexer.initialize();
+
+    const voyageProvider = getIndexerInternals(indexer).voyageProvider;
+    expect(voyageProvider).toBeTruthy();
+    vi.spyOn(voyageProvider!, "embedBatch").mockResolvedValueOnce(null);
+
+    await indexer.index();
+    fetchSpy.mockClear();
+
+    await indexer.index();
+
+    const models = fetchSpy.mock.calls.map(([, init]) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string };
+      return body.model;
+    });
+    expect(models.length).toBeGreaterThan(0);
+    expect(models.every((model) => model === "voyage-code-2")).toBe(true);
+  });
+
+  it("heals Voyage debt without changing Arctic embeddings", async () => {
+    createSingleFileRepo();
+    const indexer = new Indexer(
+      tempDir,
+      createConfig({
+        voyageApiKey: "voyage-test-key",
+      })
+    );
+    await indexer.initialize();
+
+    const voyageProvider = getIndexerInternals(indexer).voyageProvider;
+    expect(voyageProvider).toBeTruthy();
+    vi.spyOn(voyageProvider!, "embedBatch").mockResolvedValueOnce(null);
+
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const chunkIds = database.getBranchChunkIds(branch);
+    const arcticBefore = new Map(
+      chunkIds.map((chunkId) => {
+        const chunk = database.getChunk(chunkId);
+        if (!chunk) {
+          throw new Error(`Missing chunk ${chunkId}`);
+        }
+        const embedding = database.getEmbeddingForModel(
+          chunk.embeddingInputHash,
+          "mock-embedding-model"
+        );
+        return [chunk.embeddingInputHash, embedding?.toString("hex") ?? ""];
+      })
+    );
+
+    await indexer.index();
+
+    for (const chunkId of chunkIds) {
+      const chunk = database.getChunk(chunkId);
+      expect(chunk).not.toBeNull();
+      expect(
+        database.getEmbeddingForModel(chunk!.embeddingInputHash, "mock-embedding-model")?.toString(
+          "hex"
+        )
+      ).toBe(arcticBefore.get(chunk!.embeddingInputHash));
+      expect(database.getEmbeddingForModel(chunk!.embeddingInputHash, "voyage-code-2")).not.toBeNull();
+    }
+  });
+
+  it("clears embedding debt when branch state is cleared", async () => {
+    const branch = "main";
+    const filePath = "/tmp/debt.ts";
+    const database = new Database(path.join(tempDir, "branch-debt.db"));
+    database.recordEmbeddingDebt(branch, filePath, "voyage-code-2", "provider timeout");
+    database.upsertPipelineState({
+      branch,
+      filePath,
+      stage: "embed",
+      status: "complete",
+      updatedAt: Date.now(),
+    });
+
+    const manager = new CheckpointManager(database);
+    manager.clearBranchState(branch);
+
+    expect(database.getEmbeddingDebtForBranch(branch)).toEqual([]);
+  });
+
+  it("logs Voyage debt healing summary when a run starts with outstanding debt", async () => {
+    createSingleFileRepo();
+    const indexer = new Indexer(
+      tempDir,
+      createConfig({
+        voyageApiKey: "voyage-test-key",
+      })
+    );
+    await indexer.initialize();
+
+    const voyageProvider = getIndexerInternals(indexer).voyageProvider;
+    expect(voyageProvider).toBeTruthy();
+    vi.spyOn(voyageProvider!, "embedBatch").mockResolvedValueOnce(null);
+
+    await indexer.index();
+
+    const loggerInfoSpy = vi.spyOn((indexer as any).logger, "info");
+    await indexer.index();
+
+    expect(
+      loggerInfoSpy.mock.calls.some(
+        ([message]) =>
+          typeof message === "string" &&
+          message.includes("Voyage embedding debt: 1 files") &&
+          message.includes("will be healed this run")
+      )
+    ).toBe(true);
+
+    loggerInfoSpy.mockRestore();
   });
 
   it("preserves successful Voyage embeddings when Arctic fails for a batch", async () => {

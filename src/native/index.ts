@@ -899,6 +899,14 @@ export interface PipelineRunData {
   completedAt?: number;
 }
 
+export interface EmbeddingDebtData {
+  branch: string;
+  filePath: string;
+  model: string;
+  reason: string;
+  createdAt: number;
+}
+
 export interface StoredConfigVersionData {
   configHash: string;
   embeddingModelId: string;
@@ -1008,6 +1016,49 @@ export class Database {
     model: string
   ): string[] {
     return this.inner.getMissingEmbeddingsForModel(embeddingInputHashes, model);
+  }
+
+  recordEmbeddingDebt(
+    branch: string,
+    filePath: string,
+    model: string,
+    reason: string
+  ): void {
+    this.inner.recordEmbeddingDebt(branch, filePath, model, reason);
+  }
+
+  clearEmbeddingDebt(branch: string, filePath: string, model: string): void {
+    this.inner.clearEmbeddingDebt(branch, filePath, model);
+  }
+
+  clearEmbeddingDebtForFile(branch: string, filePath: string): number {
+    return this.inner.clearEmbeddingDebtForFile(branch, filePath);
+  }
+
+  getEmbeddingDebtForBranch(branch: string): EmbeddingDebtData[] {
+    return this.inner.getEmbeddingDebtForBranch(branch).map((item: {
+      branch: string;
+      filePath?: string;
+      file_path?: string;
+      model: string;
+      reason: string;
+      createdAt?: number;
+      created_at?: number;
+    }) => ({
+      branch: item.branch,
+      filePath: item.filePath ?? item.file_path ?? "",
+      model: item.model,
+      reason: item.reason,
+      createdAt: item.createdAt ?? item.created_at ?? 0,
+    }));
+  }
+
+  clearEmbeddingDebtForBranch(branch: string): number {
+    return this.inner.clearEmbeddingDebtForBranch(branch);
+  }
+
+  clearAllEmbeddingDebt(): number {
+    return this.inner.clearAllEmbeddingDebt();
   }
 
   upsertChunk(chunk: ChunkData): void {

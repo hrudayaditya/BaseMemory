@@ -167,11 +167,15 @@ export class CheckpointManager {
   }
 
   clearBranchState(branch: string): number {
-    return this.database.clearPipelineStateForBranch(branch);
+    const cleared = this.database.clearPipelineStateForBranch(branch);
+    this.database.clearEmbeddingDebtForBranch(branch);
+    return cleared;
   }
 
   clearFileState(branch: string, filePath: string): number {
-    return this.database.clearPipelineStateForFile(branch, filePath);
+    const cleared = this.database.clearPipelineStateForFile(branch, filePath);
+    this.database.clearEmbeddingDebtForFile(branch, filePath);
+    return cleared;
   }
 
   startRun(

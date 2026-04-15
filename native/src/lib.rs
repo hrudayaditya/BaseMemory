@@ -786,6 +786,15 @@ pub struct PipelineRunData {
 }
 
 #[napi(object)]
+pub struct EmbeddingDebtData {
+    pub branch: String,
+    pub file_path: String,
+    pub model: String,
+    pub reason: String,
+    pub created_at: f64,
+}
+
+#[napi(object)]
 pub struct ConfigVersionData {
     pub config_hash: String,
     pub embedding_model_id: String,
@@ -956,6 +965,93 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         db::get_missing_embeddings_for_model(&conn, &embedding_input_hashes, &model)
             .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn record_embedding_debt(
+        &self,
+        branch: String,
+        file_path: String,
+        model: String,
+        reason: String,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        db::record_embedding_debt(&conn, &branch, &file_path, &model, &reason)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn clear_embedding_debt(
+        &self,
+        branch: String,
+        file_path: String,
+        model: String,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        db::clear_embedding_debt(&conn, &branch, &file_path, &model)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn clear_embedding_debt_for_file(&self, branch: String, file_path: String) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = db::clear_embedding_debt_for_file(&conn, &branch, &file_path)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    #[napi]
+    pub fn get_embedding_debt_for_branch(
+        &self,
+        branch: String,
+    ) -> Result<Vec<EmbeddingDebtData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows = db::get_embedding_debt_for_branch(&conn, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EmbeddingDebtData {
+                branch: row.branch,
+                file_path: row.file_path,
+                model: row.model,
+                reason: row.reason,
+                created_at: row.created_at as f64,
+            })
+            .collect())
+    }
+
+    #[napi]
+    pub fn clear_embedding_debt_for_branch(&self, branch: String) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = db::clear_embedding_debt_for_branch(&conn, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    #[napi]
+    pub fn clear_all_embedding_debt(&self) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = retry_busy_write(|| db::clear_all_embedding_debt(&conn))
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
     }
 
     #[napi]
