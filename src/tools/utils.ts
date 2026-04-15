@@ -5,6 +5,7 @@ import {
   GraphContextResult,
   HealthCheckResult,
   StatusResult,
+  IndexCoverageResult,
 } from "../indexer/index.js";
 import type { LogEntry } from "../utils/logger.js";
 
@@ -90,6 +91,32 @@ export function formatStatus(status: StatusResult): string {
     lines.push(`  Base branch: ${status.baseBranch}`);
   }
 
+  if (status.rerankerHealth) {
+    const reranker = status.rerankerHealth;
+    if (reranker.status === "healthy") {
+      lines.push(`  Reranker: ${reranker.backend} (healthy)`);
+    } else if (reranker.status === "failed") {
+      lines.push(`  Reranker: ${reranker.backend} (DEGRADED - cross-encoder failed)`);
+    } else {
+      lines.push(`  Reranker: ${reranker.backend} (${reranker.status})`);
+    }
+
+    if (reranker.model) {
+      lines.push(`  Reranker model: ${reranker.model}`);
+    }
+    if (reranker.error) {
+      lines.push(`  Last reranker error: ${reranker.error}`);
+    }
+  }
+
+  if (status.chunkCapSummary && status.chunkCapSummary.truncatedFiles > 0) {
+    lines.push(
+      `  Chunk cap: ${status.chunkCapSummary.truncatedFiles} files truncated ` +
+      `(${status.chunkCapSummary.totalDroppedChunks} chunks dropped, ` +
+      `${status.chunkCapSummary.totalDroppedNamedSymbols} named symbols invisible)`
+    );
+  }
+
   if (status.compatibility && !status.compatibility.compatible) {
     lines.push("");
     lines.push(`COMPATIBILITY WARNING: ${status.compatibility.reason}`);
@@ -105,6 +132,10 @@ export function formatStatus(status: StatusResult): string {
   }
 
   return lines.join("\n");
+}
+
+export function formatCoverageReport(report: IndexCoverageResult): string {
+  return JSON.stringify(report, null, 2);
 }
 
 export function formatProgressTitle(progress: IndexProgress): string {

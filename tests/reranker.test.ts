@@ -223,9 +223,11 @@ describe("search reranker", () => {
   });
 
   it("rewrites candidate scores with sigmoid-normalized cross-encoder output", async () => {
-    const backend = new TransformersCrossEncoderBackend(async () =>
-      async () => [10, -5]
-    );
+    const backend = new TransformersCrossEncoderBackend(async () => ({
+      scorer: async () => [10, -5],
+      model: "test-transformers-model",
+      error: null,
+    }));
 
     const reranked = await backend.rerank("find target implementation", [
       candidate("high", { content: "target implementation body" }),
@@ -239,12 +241,14 @@ describe("search reranker", () => {
 
   it("passes structured query-document pairs into the transformers backend", async () => {
     const seen: Array<{ text: string; textPair: string }> = [];
-    const backend = new TransformersCrossEncoderBackend(async () =>
-      async (pairs) => {
+    const backend = new TransformersCrossEncoderBackend(async () => ({
+      scorer: async (pairs) => {
         seen.push(...pairs);
         return pairs.map((pair) => pair.textPair.includes("target") ? 10 : -5);
-      }
-    );
+      },
+      model: "test-transformers-model",
+      error: null,
+    }));
 
     const reranked = await backend.rerank("find target implementation", [
       candidate("generic", {

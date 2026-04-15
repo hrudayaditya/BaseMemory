@@ -140,6 +140,76 @@ describe("Database", () => {
     });
   });
 
+  describe("reranker health", () => {
+    it("should persist and update singleton reranker health", () => {
+      expect(db.getRerankerHealth()).toBeNull();
+
+      db.upsertRerankerHealth(
+        "transformers-cross-encoder",
+        "healthy",
+        "Xenova/ms-marco-MiniLM-L-6-v2",
+        null
+      );
+
+      expect(db.getRerankerHealth()).toMatchObject({
+        backend: "transformers-cross-encoder",
+        status: "healthy",
+        model: "Xenova/ms-marco-MiniLM-L-6-v2",
+        error: null,
+      });
+
+      db.upsertRerankerHealth(
+        "heuristic-local",
+        "failed",
+        "Xenova/ms-marco-MiniLM-L-6-v2",
+        "boom"
+      );
+
+      expect(db.getRerankerHealth()).toMatchObject({
+        backend: "heuristic-local",
+        status: "failed",
+        model: "Xenova/ms-marco-MiniLM-L-6-v2",
+        error: "boom",
+      });
+    });
+  });
+
+  describe("chunk cap drops", () => {
+    it("should record, query, and clear chunk cap drops", () => {
+      db.upsertChunkCapDrop("main", "/repo/src/index.ts", 300, 300, 2, [
+        "rankHybridResults",
+        "fuseResultsWeighted",
+      ]);
+      db.upsertChunkCapDrop("main", "/repo/src/other.ts", 300, 300, 1, ["helper"]);
+
+      expect(db.getChunkCapDropsForBranch("main")).toEqual([
+        {
+          branch: "main",
+          filePath: "/repo/src/index.ts",
+          capLimit: 300,
+          keptCount: 300,
+          droppedCount: 2,
+          droppedNamed: ["rankHybridResults", "fuseResultsWeighted"],
+          indexedAt: expect.any(Number),
+        },
+        {
+          branch: "main",
+          filePath: "/repo/src/other.ts",
+          capLimit: 300,
+          keptCount: 300,
+          droppedCount: 1,
+          droppedNamed: ["helper"],
+          indexedAt: expect.any(Number),
+        },
+      ]);
+
+      expect(db.clearChunkCapDrop("main", "/repo/src/index.ts")).toBe(1);
+      expect(db.getChunkCapDropsForBranch("main")).toHaveLength(1);
+      expect(db.clearChunkCapDropsForBranch("main")).toBe(1);
+      expect(db.getChunkCapDropsForBranch("main")).toHaveLength(0);
+    });
+  });
+
   describe("chunks", () => {
     const testChunk: ChunkData = {
       chunkId: "chunk_abc123",

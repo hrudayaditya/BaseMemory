@@ -29,6 +29,16 @@ export interface RerankerResult {
   failedBackend?: string | null;
 }
 
+export type RerankerHealthBackend = "transformers-cross-encoder" | "heuristic-local" | "none";
+export type RerankerHealthStatus = "healthy" | "failed" | "never-loaded";
+
+export interface RerankerHealthEvent {
+  backend: RerankerHealthBackend;
+  status: RerankerHealthStatus;
+  model?: string | null;
+  error?: string | null;
+}
+
 interface ScoredCandidate {
   candidate: RerankerCandidate;
   score: number;
@@ -44,7 +54,13 @@ interface CrossEncoderPair {
 
 type CrossEncoderScorer = (pairs: CrossEncoderPair[]) => Promise<number[]>;
 
-type CrossEncoderLoader = () => Promise<CrossEncoderScorer | null>;
+interface CrossEncoderLoadResult {
+  scorer: CrossEncoderScorer | null;
+  model: string;
+  error?: string | null;
+}
+
+type CrossEncoderLoader = () => Promise<CrossEncoderLoadResult>;
 
 interface SequenceClassificationLogits {
   data: ArrayLike<number>;
@@ -98,6 +114,13 @@ interface TransformersModule {
 export interface SearchRerankerBackend {
   readonly name: string;
   rerank(query: string, candidates: RerankerCandidate[], taskType: SearchTaskType): Promise<RerankerCandidate[]>;
+}
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
 }
 
 function stableSigmoid(logit: number): number {
@@ -285,7 +308,7 @@ function extractCrossEncoderScores(
   return scores;
 }
 
-async function loadTransformersCrossEncoderScorer(): Promise<CrossEncoderScorer | null> {
+async function loadTransformersCrossEncoderScorer(): Promise<CrossEncoderLoadResult> {
   try {
     const transformersModule = await import("@xenova/transformers") as TransformersModule;
     const [config, tokenizer] = await Promise.all([
@@ -301,19 +324,26 @@ async function loadTransformersCrossEncoderScorer(): Promise<CrossEncoderScorer 
       }
     );
 
-    return async (pairs: CrossEncoderPair[]): Promise<number[]> => {
-      const texts = pairs.map((pair) => pair.text);
-      const textPairs = pairs.map((pair) => pair.textPair);
-      const modelInputs = await tokenizer(texts, {
-        text_pair: textPairs,
-        padding: true,
-        truncation: true,
-      });
-      const output = await model(modelInputs);
-      return extractCrossEncoderScores(output, model.config);
+    return {
+      model: DEFAULT_LOCAL_CROSS_ENCODER_MODEL,
+      scorer: async (pairs: CrossEncoderPair[]): Promise<number[]> => {
+        const texts = pairs.map((pair) => pair.text);
+        const textPairs = pairs.map((pair) => pair.textPair);
+        const modelInputs = await tokenizer(texts, {
+          text_pair: textPairs,
+          padding: true,
+          truncation: true,
+        });
+        const output = await model(modelInputs);
+        return extractCrossEncoderScores(output, model.config);
+      },
     };
-  } catch {
-    return null;
+  } catch (error) {
+    return {
+      model: DEFAULT_LOCAL_CROSS_ENCODER_MODEL,
+      scorer: null,
+      error: getErrorMessage(error),
+    };
   }
 }
 
@@ -410,8 +440,13 @@ export class HeuristicLocalRerankerBackend implements SearchRerankerBackend {
 export class TransformersCrossEncoderBackend implements SearchRerankerBackend {
   readonly name = "transformers-cross-encoder";
   private scorerPromise: Promise<CrossEncoderScorer | null> | null = null;
+  private lastLoadError: string | null = null;
+  private loadModel: string = DEFAULT_LOCAL_CROSS_ENCODER_MODEL;
 
-  constructor(private readonly loader: CrossEncoderLoader = loadTransformersCrossEncoderScorer) {}
+  constructor(
+    private readonly loader: CrossEncoderLoader = loadTransformersCrossEncoderScorer,
+    private readonly reportHealth?: (event: RerankerHealthEvent) => void
+  ) {}
 
   async rerank(
     query: string,
@@ -454,18 +489,48 @@ export class TransformersCrossEncoderBackend implements SearchRerankerBackend {
 
   private async getScorer(): Promise<CrossEncoderScorer | null> {
     if (!this.scorerPromise) {
-      this.scorerPromise = this.loader();
+      this.scorerPromise = this.loader().then((result) => {
+        this.loadModel = result.model;
+        this.lastLoadError = result.error ?? null;
+        if (result.scorer) {
+          this.reportHealth?.({
+            backend: "transformers-cross-encoder",
+            status: "healthy",
+            model: result.model,
+            error: null,
+          });
+        } else {
+          this.reportHealth?.({
+            backend: "heuristic-local",
+            status: "failed",
+            model: result.model,
+            error: result.error ?? "transformers backend unavailable",
+          });
+        }
+        return result.scorer;
+      });
     }
     return this.scorerPromise;
+  }
+
+  getModelId(): string {
+    return this.loadModel;
+  }
+
+  getLastLoadError(): string | null {
+    return this.lastLoadError;
   }
 }
 
 export class SearchReranker {
   private readonly backends: SearchRerankerBackend[];
 
-  constructor(backends?: SearchRerankerBackend[]) {
+  constructor(
+    backends?: SearchRerankerBackend[],
+    private readonly reportHealth?: (event: RerankerHealthEvent) => void
+  ) {
     this.backends = backends ?? [
-      new TransformersCrossEncoderBackend(),
+      new TransformersCrossEncoderBackend(loadTransformersCrossEncoderScorer, reportHealth),
       new HeuristicLocalRerankerBackend(),
     ];
   }
@@ -497,8 +562,16 @@ export class SearchReranker {
           backend: backend.name,
           failedBackend,
         };
-      } catch {
+      } catch (error) {
         failedBackend = backend.name;
+        if (backend instanceof TransformersCrossEncoderBackend) {
+          this.reportHealth?.({
+            backend: "heuristic-local",
+            status: "failed",
+            model: backend.getModelId(),
+            error: getErrorMessage(error) || backend.getLastLoadError() || "transformers backend unavailable",
+          });
+        }
       }
     }
 

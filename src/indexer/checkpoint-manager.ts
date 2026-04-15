@@ -169,12 +169,14 @@ export class CheckpointManager {
   clearBranchState(branch: string): number {
     const cleared = this.database.clearPipelineStateForBranch(branch);
     this.database.clearEmbeddingDebtForBranch(branch);
+    this.database.clearChunkCapDropsForBranch(branch);
     return cleared;
   }
 
   clearFileState(branch: string, filePath: string): number {
     const cleared = this.database.clearPipelineStateForFile(branch, filePath);
     this.database.clearEmbeddingDebtForFile(branch, filePath);
+    this.database.clearChunkCapDrop(branch, filePath);
     return cleared;
   }
 

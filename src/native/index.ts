@@ -907,6 +907,24 @@ export interface EmbeddingDebtData {
   createdAt: number;
 }
 
+export interface RerankerHealthData {
+  backend: string;
+  status: string;
+  model?: string | null;
+  error?: string | null;
+  updatedAt: number;
+}
+
+export interface ChunkCapDropData {
+  branch: string;
+  filePath: string;
+  capLimit: number;
+  keptCount: number;
+  droppedCount: number;
+  droppedNamed: string[];
+  indexedAt: number;
+}
+
 export interface StoredConfigVersionData {
   configHash: string;
   embeddingModelId: string;
@@ -1059,6 +1077,85 @@ export class Database {
 
   clearAllEmbeddingDebt(): number {
     return this.inner.clearAllEmbeddingDebt();
+  }
+
+  upsertRerankerHealth(
+    backend: string,
+    status: string,
+    model?: string | null,
+    error?: string | null
+  ): void {
+    this.inner.upsertRerankerHealth(backend, status, model ?? null, error ?? null);
+  }
+
+  getRerankerHealth(): RerankerHealthData | null {
+    const result = this.inner.getRerankerHealth();
+    if (result === null || result === undefined) {
+      return null;
+    }
+    return {
+      backend: result.backend,
+      status: result.status,
+      model: result.model ?? null,
+      error: result.error ?? null,
+      updatedAt: result.updatedAt ?? result.updated_at ?? 0,
+    };
+  }
+
+  upsertChunkCapDrop(
+    branch: string,
+    filePath: string,
+    capLimit: number,
+    keptCount: number,
+    droppedCount: number,
+    droppedNamed: string[]
+  ): void {
+    this.inner.upsertChunkCapDrop(
+      branch,
+      filePath,
+      capLimit,
+      keptCount,
+      droppedCount,
+      droppedNamed
+    );
+  }
+
+  clearChunkCapDrop(branch: string, filePath: string): number {
+    return this.inner.clearChunkCapDrop(branch, filePath);
+  }
+
+  getChunkCapDropsForBranch(branch: string): ChunkCapDropData[] {
+    return this.inner.getChunkCapDropsForBranch(branch).map((item: {
+      branch: string;
+      filePath?: string;
+      file_path?: string;
+      capLimit?: number;
+      cap_limit?: number;
+      keptCount?: number;
+      kept_count?: number;
+      droppedCount?: number;
+      dropped_count?: number;
+      droppedNamed?: string[];
+      dropped_named?: string[];
+      indexedAt?: number;
+      indexed_at?: number;
+    }) => ({
+      branch: item.branch,
+      filePath: item.filePath ?? item.file_path ?? "",
+      capLimit: item.capLimit ?? item.cap_limit ?? 0,
+      keptCount: item.keptCount ?? item.kept_count ?? 0,
+      droppedCount: item.droppedCount ?? item.dropped_count ?? 0,
+      droppedNamed: item.droppedNamed ?? item.dropped_named ?? [],
+      indexedAt: item.indexedAt ?? item.indexed_at ?? 0,
+    }));
+  }
+
+  clearChunkCapDropsForBranch(branch: string): number {
+    return this.inner.clearChunkCapDropsForBranch(branch);
+  }
+
+  clearAllChunkCapDrops(): number {
+    return this.inner.clearAllChunkCapDrops();
   }
 
   upsertChunk(chunk: ChunkData): void {

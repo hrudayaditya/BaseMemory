@@ -8,7 +8,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseConfig } from "../src/config/schema.js";
 import { Indexer, matchesHardRetrievalFilters } from "../src/indexer/index.js";
 import type { SearchTaskType } from "../src/indexer/search-recipes.js";
-import { SearchReranker, type RerankerCandidate, type SearchRerankerBackend } from "../src/indexer/reranker.js";
+import {
+  HeuristicLocalRerankerBackend,
+  SearchReranker,
+  TransformersCrossEncoderBackend,
+  type RerankerCandidate,
+  type SearchRerankerBackend,
+} from "../src/indexer/reranker.js";
 import { Database } from "../src/native/index.js";
 
 class FixedScoreBackend implements SearchRerankerBackend {
@@ -451,6 +457,177 @@ export const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-2";
     expect(reranked.primaryResults[0]?.score).not.toBe(baseline.primaryResults[0]?.score);
     expect(reranked.primaryResults[0]?.reranked).toBe(true);
     expect(reranked.primaryResults[0]?.chunkKind).toBe("Code");
+  });
+
+  it("persists healthy reranker status after a successful cross-encoder load", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const internals = indexer as unknown as {
+      searchReranker: SearchReranker;
+      recordRerankerHealth: (event: {
+        backend: "transformers-cross-encoder" | "heuristic-local" | "none";
+        status: "healthy" | "failed" | "never-loaded";
+        model?: string | null;
+        error?: string | null;
+      }) => void;
+    };
+    const reportHealth = (event: {
+      backend: "transformers-cross-encoder" | "heuristic-local" | "none";
+      status: "healthy" | "failed" | "never-loaded";
+      model?: string | null;
+      error?: string | null;
+    }) => internals.recordRerankerHealth(event);
+    internals.searchReranker = new SearchReranker([
+      new TransformersCrossEncoderBackend(
+        async () => ({
+          model: "Xenova/ms-marco-MiniLM-L-6-v2",
+          scorer: async (pairs) => pairs.map((_pair, index) => 10 - index),
+          error: null,
+        }),
+        reportHealth
+      ),
+      new HeuristicLocalRerankerBackend(),
+    ], reportHealth);
+
+    await indexer.searchDetailed("where is rankHybridResults implementation", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+      taskType: "definition",
+    });
+
+    const status = await indexer.getStatus();
+    const database = new Database(path.join(status.indexPath, "codebase.db"));
+    expect(database.getRerankerHealth()).toMatchObject({
+      backend: "transformers-cross-encoder",
+      status: "healthy",
+      model: "Xenova/ms-marco-MiniLM-L-6-v2",
+    });
+  });
+
+  it("updates persisted reranker health when falling back after backend failure", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const internals = indexer as unknown as {
+      searchReranker: SearchReranker;
+      recordRerankerHealth: (event: {
+        backend: "transformers-cross-encoder" | "heuristic-local" | "none";
+        status: "healthy" | "failed" | "never-loaded";
+        model?: string | null;
+        error?: string | null;
+      }) => void;
+    };
+    const reportHealth = (event: {
+      backend: "transformers-cross-encoder" | "heuristic-local" | "none";
+      status: "healthy" | "failed" | "never-loaded";
+      model?: string | null;
+      error?: string | null;
+    }) => internals.recordRerankerHealth(event);
+    internals.searchReranker = new SearchReranker([
+      new TransformersCrossEncoderBackend(
+        async () => ({
+          model: "Xenova/ms-marco-MiniLM-L-6-v2",
+          scorer: async () => {
+            throw new Error("cross encoder exploded");
+          },
+          error: null,
+        }),
+        reportHealth
+      ),
+      new HeuristicLocalRerankerBackend(),
+    ], reportHealth);
+
+    const response = await indexer.searchDetailed("where is rankHybridResults implementation", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+      taskType: "definition",
+    });
+
+    expect(response.reranker.backend).toBe("heuristic-local");
+    const status = await indexer.getStatus();
+    const database = new Database(path.join(status.indexPath, "codebase.db"));
+    expect(database.getRerankerHealth()).toMatchObject({
+      backend: "heuristic-local",
+      status: "failed",
+      model: "Xenova/ms-marco-MiniLM-L-6-v2",
+      error: "cross encoder exploded",
+    });
+  });
+
+  it("emits a startup warning in normal mode when persisted reranker health is degraded", async () => {
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      debug: {
+        enabled: false,
+      },
+    });
+
+    const indexDir = path.join(tempDir, ".opencode", "index");
+    fs.mkdirSync(indexDir, { recursive: true });
+    const database = new Database(path.join(indexDir, "codebase.db"));
+    database.upsertRerankerHealth(
+      "heuristic-local",
+      "failed",
+      "Xenova/ms-marco-MiniLM-L-6-v2",
+      "startup boom"
+    );
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const indexer = new Indexer(tempDir, config);
+
+    await indexer.getStatus();
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[reranker:warn] Cross-encoder reranker is degraded.")
+    );
+    warnSpy.mockRestore();
   });
 
   it("prefers documentation paths for doc-intent phrasing with 'where is'", async () => {

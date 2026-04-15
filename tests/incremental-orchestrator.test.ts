@@ -33,6 +33,7 @@ import {
   recordWatcherEventTimestamp,
   resetWatcherEventTimestamps,
 } from "../src/indexer/watcher-tti.js";
+import { formatStatus } from "../src/tools/utils.js";
 
 describe("incremental index orchestrator", () => {
   let tempDir: string;
@@ -1875,6 +1876,85 @@ describe("incremental index orchestrator", () => {
       eligibleChunks: parsed?.chunks.length,
       keptChunks: 1,
     });
+  });
+
+  it("persists chunk-cap drops and exposes them via coverage and status", async () => {
+    const filePath = createChunkyRepo();
+    const config = createConfig({
+      indexing: {
+        watchFiles: false,
+        maxChunksPerFile: 1,
+      },
+    });
+    const indexer = new Indexer(tempDir, config);
+
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedPath = resolveTrackedPath(database, branch, filePath, tempDir);
+    expect(database.getChunkCapDropsForBranch(branch)).toEqual([
+      {
+        branch,
+        filePath: trackedPath,
+        capLimit: 1,
+        keptCount: 1,
+        droppedCount: 3,
+        droppedNamed: ["second", "third", "many"],
+        indexedAt: expect.any(Number),
+      },
+    ]);
+
+    const coverage = await indexer.getCoverageReport();
+    expect(coverage).toEqual({
+      branch,
+      truncatedFiles: [
+        {
+          filePath: trackedPath,
+          capLimit: 1,
+          keptChunks: 1,
+          droppedChunks: 3,
+          droppedNamedSymbols: ["second", "third", "many"],
+          indexedAt: expect.any(Number),
+        },
+      ],
+      totalDroppedChunks: 3,
+      totalDroppedNamedSymbols: 3,
+    });
+
+    const formattedStatus = formatStatus(await indexer.getStatus());
+    expect(formattedStatus).toContain("Chunk cap: 1 files truncated (3 chunks dropped, 3 named symbols invisible)");
+  });
+
+  it("clears persisted chunk-cap drops after a clean reindex", async () => {
+    const filePath = createChunkyRepo();
+    const config = createConfig({
+      indexing: {
+        watchFiles: false,
+        maxChunksPerFile: 1,
+      },
+    });
+    const indexer = new Indexer(tempDir, config);
+
+    await indexer.index();
+
+    let { branch, database } = await openDatabase(indexer);
+    expect(database.getChunkCapDropsForBranch(branch)).toHaveLength(1);
+
+    fs.writeFileSync(
+      filePath,
+      [
+        "export function first(): number {",
+        "  return 1;",
+        "}",
+        "",
+      ].join("\n"),
+      "utf-8"
+    );
+
+    await indexer.index();
+
+    ({ branch, database } = await openDatabase(indexer));
+    expect(database.getChunkCapDropsForBranch(branch)).toEqual([]);
   });
 
   it("commits Merkle snapshot hashes from the bytes actually processed", async () => {

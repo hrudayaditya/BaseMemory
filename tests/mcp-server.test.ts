@@ -49,6 +49,22 @@ vi.mock("../src/indexer/index.js", () => {
       indexPath: "/tmp/index",
       currentBranch: "main",
       baseBranch: "main",
+      compatibility: { compatible: true },
+    });
+    getCoverageReport = vi.fn().mockResolvedValue({
+      branch: "main",
+      truncatedFiles: [
+        {
+          filePath: "src/indexer/index.ts",
+          capLimit: 300,
+          keptChunks: 300,
+          droppedChunks: 2,
+          droppedNamedSymbols: ["rankHybridResults", "fuseResultsWeighted"],
+          indexedAt: 123,
+        },
+      ],
+      totalDroppedChunks: 2,
+      totalDroppedNamedSymbols: 2,
     });
     healthCheck = vi.fn().mockResolvedValue({
       removed: 0,
@@ -119,10 +135,10 @@ describe("MCP server tools and prompts", () => {
     await client.close();
   });
 
-  it("should register all 10 tools", async () => {
+  it("should register all 11 tools", async () => {
     const tools = await client.listTools();
 
-    expect(tools.tools).toHaveLength(10);
+    expect(tools.tools).toHaveLength(11);
 
     const toolNames = tools.tools.map(t => t.name).sort();
     const expectedNames = [
@@ -132,6 +148,7 @@ describe("MCP server tools and prompts", () => {
       "find_similar",
       "implementation_lookup",
       "index_codebase",
+      "index_coverage",
       "index_health_check",
       "index_logs",
       "index_metrics",
@@ -191,6 +208,20 @@ describe("MCP server tools and prompts", () => {
     expect(content[0].type).toBe("text");
     expect(content[0].text).toContain("Index status");
     expect(content[0].text).toContain("50");
+  });
+
+  it("should execute index_coverage tool", async () => {
+    const result = await client.callTool({
+      name: "index_coverage",
+      arguments: {},
+    });
+
+    expect(result.content).toBeDefined();
+    const content = result.content as Array<{ type: string; text?: string }>;
+    expect(content).toHaveLength(1);
+    expect(content[0].type).toBe("text");
+    expect(content[0].text).toContain("\"truncatedFiles\"");
+    expect(content[0].text).toContain("rankHybridResults");
   });
 
   it("should execute index_codebase with estimateOnly", async () => {

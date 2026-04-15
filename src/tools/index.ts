@@ -16,6 +16,7 @@ import {
   formatHealthCheck,
   formatLogs,
   formatSearchResults,
+  formatCoverageReport,
 } from "./utils.js";
 import { SEARCH_TASK_TYPES } from "../indexer/search-recipes.js";
 
@@ -131,6 +132,17 @@ export const index_health_check: ToolDefinition = tool({
     const result = await indexer.healthCheck();
 
     return formatHealthCheck(result);
+  },
+});
+
+export const index_coverage: ToolDefinition = tool({
+  description:
+    "Show durable code coverage limits in the index, including files truncated by the per-file chunk cap and the named symbols currently invisible to retrieval.",
+  args: {},
+  async execute() {
+    const indexer = getIndexer();
+    const report = await indexer.getCoverageReport();
+    return formatCoverageReport(report);
   },
 });
 

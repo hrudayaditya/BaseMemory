@@ -795,6 +795,26 @@ pub struct EmbeddingDebtData {
 }
 
 #[napi(object)]
+pub struct RerankerHealthData {
+    pub backend: String,
+    pub status: String,
+    pub model: Option<String>,
+    pub error: Option<String>,
+    pub updated_at: f64,
+}
+
+#[napi(object)]
+pub struct ChunkCapDropData {
+    pub branch: String,
+    pub file_path: String,
+    pub cap_limit: u32,
+    pub kept_count: u32,
+    pub dropped_count: u32,
+    pub dropped_named: Vec<String>,
+    pub indexed_at: f64,
+}
+
+#[napi(object)]
 pub struct ConfigVersionData {
     pub config_hash: String,
     pub embedding_model_id: String,
@@ -1050,6 +1070,133 @@ impl Database {
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let count = retry_busy_write(|| db::clear_all_embedding_debt(&conn))
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    #[napi]
+    pub fn upsert_reranker_health(
+        &self,
+        backend: String,
+        status: String,
+        model: Option<String>,
+        error: Option<String>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        retry_busy_write(|| {
+            db::upsert_reranker_health(
+                &conn,
+                &backend,
+                &status,
+                model.as_deref(),
+                error.as_deref(),
+            )
+        })
+        .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn get_reranker_health(&self) -> Result<Option<RerankerHealthData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        db::get_reranker_health(&conn)
+            .map(|row| {
+                row.map(|item| RerankerHealthData {
+                    backend: item.backend,
+                    status: item.status,
+                    model: item.model,
+                    error: item.error,
+                    updated_at: item.updated_at as f64,
+                })
+            })
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn upsert_chunk_cap_drop(
+        &self,
+        branch: String,
+        file_path: String,
+        cap_limit: u32,
+        kept_count: u32,
+        dropped_count: u32,
+        dropped_named: Vec<String>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        retry_busy_write(|| {
+            db::upsert_chunk_cap_drop(
+                &conn,
+                &branch,
+                &file_path,
+                cap_limit,
+                kept_count,
+                dropped_count,
+                &dropped_named,
+            )
+        })
+        .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn clear_chunk_cap_drop(&self, branch: String, file_path: String) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = retry_busy_write(|| db::clear_chunk_cap_drop(&conn, &branch, &file_path))
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    #[napi]
+    pub fn get_chunk_cap_drops_for_branch(&self, branch: String) -> Result<Vec<ChunkCapDropData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        db::get_chunk_cap_drops_for_branch(&conn, &branch)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| ChunkCapDropData {
+                        branch: row.branch,
+                        file_path: row.file_path,
+                        cap_limit: row.cap_limit,
+                        kept_count: row.kept_count,
+                        dropped_count: row.dropped_count,
+                        dropped_named: row.dropped_named,
+                        indexed_at: row.indexed_at as f64,
+                    })
+                    .collect()
+            })
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn clear_chunk_cap_drops_for_branch(&self, branch: String) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = retry_busy_write(|| db::clear_chunk_cap_drops_for_branch(&conn, &branch))
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
+    }
+
+    #[napi]
+    pub fn clear_all_chunk_cap_drops(&self) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = retry_busy_write(|| db::clear_all_chunk_cap_drops(&conn))
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(count as u32)
     }

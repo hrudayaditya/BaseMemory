@@ -4,7 +4,7 @@ import { z } from "zod";
 import { Indexer, type IndexStats } from "./indexer/index.js";
 import { SEARCH_TASK_TYPES } from "./indexer/search-recipes.js";
 import type { ParsedCodebaseIndexConfig, LogLevel } from "./config/schema.js";
-import { formatDefinitionLookup, formatExpandedContext } from "./tools/utils.js";
+import { formatCoverageReport, formatDefinitionLookup, formatExpandedContext, formatStatus as formatToolStatus } from "./tools/utils.js";
 import { formatCostEstimate } from "./utils/cost.js";
 import type { LogEntry } from "./utils/logger.js";
 
@@ -67,35 +67,6 @@ function formatIndexStats(stats: IndexStats, verbose: boolean = false): string {
       lines.push("");
       lines.push(`Files with no extractable chunks (${stats.parseFailures.length}): ${stats.parseFailures.slice(0, 10).join(", ")}${stats.parseFailures.length > 10 ? "..." : ""}`);
     }
-  }
-
-  return lines.join("\n");
-}
-
-function formatStatus(status: {
-  indexed: boolean;
-  vectorCount: number;
-  provider: string;
-  model: string;
-  indexPath: string;
-  currentBranch: string;
-  baseBranch: string;
-}): string {
-  if (!status.indexed) {
-    return "Codebase is not indexed. Run index_codebase to create an index.";
-  }
-
-  const lines = [
-    `Index status:`,
-    `  Indexed chunks: ${status.vectorCount.toLocaleString()}`,
-    `  Provider: ${status.provider}`,
-    `  Model: ${status.model}`,
-    `  Location: ${status.indexPath}`,
-  ];
-
-  if (status.currentBranch !== "default") {
-    lines.push(`  Current branch: ${status.currentBranch}`);
-    lines.push(`  Base branch: ${status.baseBranch}`);
   }
 
   return lines.join("\n");
@@ -263,7 +234,18 @@ export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndex
     async () => {
       await ensureInitialized();
       const status = await indexer.getStatus();
-      return { content: [{ type: "text", text: formatStatus(status) }] };
+      return { content: [{ type: "text", text: formatToolStatus(status) }] };
+    },
+  );
+
+  server.tool(
+    "index_coverage",
+    "Show durable index coverage limits, including files truncated by the per-file chunk cap and the named symbols currently invisible to retrieval.",
+    {},
+    async () => {
+      await ensureInitialized();
+      const report = await indexer.getCoverageReport();
+      return { content: [{ type: "text", text: formatCoverageReport(report) }] };
     },
   );
 

@@ -601,6 +601,7 @@ export function applyChunkFilters(
   droppedCount: number;
   droppedNamedCount: number;
   droppedAnonymousCount: number;
+  droppedNamedSymbols: string[];
 } {
   const eligible = chunks
     .map((chunk, index) => ({ chunk, index }))
@@ -615,6 +616,7 @@ export function applyChunkFilters(
       droppedCount: 0,
       droppedNamedCount: 0,
       droppedAnonymousCount: 0,
+      droppedNamedSymbols: [],
     };
   }
 
@@ -642,6 +644,7 @@ export function applyChunkFilters(
 
   let droppedNamedCount = 0;
   let droppedAnonymousCount = 0;
+  const droppedNamedSymbols: string[] = [];
   const filtered: OrchestratorParsedChunk[] = [];
 
   for (const { chunk, index } of eligible) {
@@ -652,6 +655,9 @@ export function applyChunkFilters(
 
     if (typeof chunk.name === "string" && chunk.name.trim().length > 0) {
       droppedNamedCount += 1;
+      if (!droppedNamedSymbols.includes(chunk.name)) {
+        droppedNamedSymbols.push(chunk.name);
+      }
     } else {
       droppedAnonymousCount += 1;
     }
@@ -664,6 +670,7 @@ export function applyChunkFilters(
     droppedCount: eligible.length - filtered.length,
     droppedNamedCount,
     droppedAnonymousCount,
+    droppedNamedSymbols,
   };
 }
 
@@ -1949,7 +1956,11 @@ export class IncrementalIndexOrchestrator {
       currentChunks = this.buildChunkRecords(
         absolutePath,
         parsedFile,
-        this.getEffectiveEmbeddingMaxTokens(context)
+        this.getEffectiveEmbeddingMaxTokens(context),
+        {
+          branch: context.branch,
+          database: context.database,
+        }
       );
       const diff = this.diffChunksForFile(currentChunks, oldChunkIds, context);
       dirtyChunks = diff.dirtyChunks;
@@ -2018,7 +2029,11 @@ export class IncrementalIndexOrchestrator {
       currentChunks = this.buildChunkRecords(
         absolutePath,
         parsedFile,
-        this.getEffectiveEmbeddingMaxTokens(context)
+        this.getEffectiveEmbeddingMaxTokens(context),
+        {
+          branch: context.branch,
+          database: context.database,
+        }
       );
       dirtyChunks = currentChunks.map((chunk) => this.toEmbeddingWorkChunk(chunk));
       indexNeedsUpdate = dirtyChunks.length > 0 || removedChunkIds.size > 0;
@@ -2677,6 +2692,7 @@ export class IncrementalIndexOrchestrator {
     context.activeVoyageDebtByFile.delete(filePath);
     context.initialVoyageDebtFiles.delete(filePath);
     context.healedVoyageDebtFiles.delete(filePath);
+    context.database.clearChunkCapDrop(context.branch, filePath);
     clearWatcherEventTimestamp(filePath);
     this.checkpoints.clearFileState(context.branch, filePath);
   }
@@ -2684,7 +2700,11 @@ export class IncrementalIndexOrchestrator {
   private buildChunkRecords(
     absolutePath: string,
     parsedFile: OrchestratorParsedFile,
-    embeddingMaxTokens: number
+    embeddingMaxTokens: number,
+    persistence?: {
+      branch: string;
+      database: Database;
+    }
   ): ChunkRecord[] {
     const filterResult = applyChunkFilters(parsedFile.chunks, this.host.getConfig());
     if (filterResult.capped) {
@@ -2697,6 +2717,18 @@ export class IncrementalIndexOrchestrator {
         droppedNamedChunks: filterResult.droppedNamedCount,
         droppedAnonymousChunks: filterResult.droppedAnonymousCount,
       });
+      if (persistence) {
+        persistence.database.upsertChunkCapDrop(
+          persistence.branch,
+          parsedFile.path,
+          this.host.getConfig().indexing.maxChunksPerFile,
+          filterResult.chunks.length,
+          filterResult.droppedCount,
+          filterResult.droppedNamedSymbols
+        );
+      }
+    } else if (persistence) {
+      persistence.database.clearChunkCapDrop(persistence.branch, parsedFile.path);
     }
 
     return filterResult.chunks.map((chunk) => {

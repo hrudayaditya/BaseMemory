@@ -22,7 +22,13 @@ import {
   type GraphExpansionMetadata,
   type GraphExpansionSeed,
 } from "./graph-expansion.js";
-import { SearchReranker, type RerankerCandidate } from "./reranker.js";
+import {
+  SearchReranker,
+  type RerankerCandidate,
+  type RerankerHealthBackend,
+  type RerankerHealthEvent,
+  type RerankerHealthStatus,
+} from "./reranker.js";
 import { ensureWatcherEventTimestamp } from "./watcher-tti.js";
 import {
   getSearchRecipe,
@@ -41,6 +47,7 @@ import {
   diffMerkleFromEvents,
   type MerkleDiff,
   type MerkleIgnoreRules,
+  type ChunkCapDropData,
 } from "../native/index.js";
 import type { SymbolData, CallEdgeData, ChunkKind, ChunkSymbolKind } from "../native/index.js";
 import { getBranchOrDefault, getBaseBranch, isGitRepo } from "../git/index.js";
@@ -237,6 +244,32 @@ export interface StatusResult {
   currentBranch: string;
   baseBranch: string;
   compatibility: IndexCompatibility | null;
+  rerankerHealth?: {
+    backend: RerankerHealthBackend;
+    status: RerankerHealthStatus;
+    model?: string | null;
+    error?: string | null;
+    updatedAt: number;
+  } | null;
+  chunkCapSummary?: {
+    truncatedFiles: number;
+    totalDroppedChunks: number;
+    totalDroppedNamedSymbols: number;
+  } | null;
+}
+
+export interface IndexCoverageResult {
+  branch: string;
+  truncatedFiles: Array<{
+    filePath: string;
+    capLimit: number;
+    keptChunks: number;
+    droppedChunks: number;
+    droppedNamedSymbols: string[];
+    indexedAt: number;
+  }>;
+  totalDroppedChunks: number;
+  totalDroppedNamedSymbols: number;
 }
 
 export interface IndexProgress {
@@ -1979,7 +2012,9 @@ export class Indexer {
   private recoveredFromInterruptedIndexing = false;
   private startupRetrievalRebuildPending = false;
   private orchestrator!: IncrementalIndexOrchestrator;
-  private readonly searchReranker = new SearchReranker();
+  private readonly searchReranker!: SearchReranker;
+  private rerankerHealth: StatusResult["rerankerHealth"] = null;
+  private rerankerStartupWarningShown = false;
 
   constructor(projectRoot: string, config: ParsedCodebaseIndexConfig) {
     const resolvedProjectRoot = resolveIndexerProjectRoot(projectRoot);
@@ -2001,6 +2036,7 @@ export class Indexer {
     this.failedBatchesPath = path.join(this.indexPath, "failed-batches.json");
     this.indexingLockPath = path.join(this.indexPath, "indexing.lock");
     this.logger = initializeLogger(config.debug);
+    this.searchReranker = new SearchReranker(undefined, (event) => this.recordRerankerHealth(event));
     this.orchestrator = new IncrementalIndexOrchestrator({
       logger: this.logger,
       getConfig: () => this.config,
@@ -2282,6 +2318,94 @@ export class Indexer {
 
   private getActiveVoyageModelId(): string | null {
     return this.voyageProvider?.getModelInfo().model ?? null;
+  }
+
+  private ensureRerankerHealthInitialized(database: Database): void {
+    if (database.getRerankerHealth()) {
+      return;
+    }
+
+    database.upsertRerankerHealth("none", "never-loaded", null, null);
+  }
+
+  private readPersistedRerankerHealth(database: Database): StatusResult["rerankerHealth"] {
+    const persisted = database.getRerankerHealth();
+    if (!persisted) {
+      return null;
+    }
+
+    return {
+      backend: persisted.backend as RerankerHealthBackend,
+      status: persisted.status as RerankerHealthStatus,
+      model: persisted.model ?? null,
+      error: persisted.error ?? null,
+      updatedAt: persisted.updatedAt,
+    };
+  }
+
+  private recordRerankerHealth(event: RerankerHealthEvent): void {
+    const nextState: NonNullable<StatusResult["rerankerHealth"]> = {
+      backend: event.backend,
+      status: event.status,
+      model: event.model ?? null,
+      error: event.error ?? null,
+      updatedAt: Date.now(),
+    };
+
+    if (
+      this.rerankerHealth &&
+      this.rerankerHealth.backend === nextState.backend &&
+      this.rerankerHealth.status === nextState.status &&
+      (this.rerankerHealth.model ?? null) === (nextState.model ?? null) &&
+      (this.rerankerHealth.error ?? null) === (nextState.error ?? null)
+    ) {
+      return;
+    }
+
+    this.rerankerHealth = nextState;
+    if (this.database) {
+      this.database.upsertRerankerHealth(
+        nextState.backend,
+        nextState.status,
+        nextState.model ?? null,
+        nextState.error ?? null
+      );
+    }
+  }
+
+  private maybeWarnAboutPersistedRerankerDegradation(): void {
+    if (
+      this.rerankerStartupWarningShown ||
+      !this.rerankerHealth ||
+      this.rerankerHealth.status !== "failed"
+    ) {
+      return;
+    }
+
+    const errorSuffix = this.rerankerHealth.error
+      ? ` Last error: ${this.rerankerHealth.error}`
+      : "";
+    console.warn(
+      `[reranker:warn] Cross-encoder reranker is degraded. Retrieval quality may be reduced.${errorSuffix} Check reranker configuration.`
+    );
+    this.logger.search("warn", "Cross-encoder reranker is degraded. Retrieval quality may be reduced.", {
+      backend: this.rerankerHealth.backend,
+      error: this.rerankerHealth.error ?? undefined,
+      model: this.rerankerHealth.model ?? undefined,
+    });
+    this.rerankerStartupWarningShown = true;
+  }
+
+  private summarizeChunkCapDrops(rows: ChunkCapDropData[]): NonNullable<StatusResult["chunkCapSummary"]> | null {
+    if (rows.length === 0) {
+      return null;
+    }
+
+    return {
+      truncatedFiles: rows.length,
+      totalDroppedChunks: rows.reduce((sum, row) => sum + row.droppedCount, 0),
+      totalDroppedNamedSymbols: rows.reduce((sum, row) => sum + row.droppedNamed.length, 0),
+    };
   }
 
   private syncVoyageRuntime(): void {
@@ -2608,6 +2732,9 @@ export class Indexer {
     const dbPath = path.join(this.indexPath, "codebase.db");
     const dbIsNew = !existsSync(dbPath);
     this.database = new Database(dbPath);
+    this.ensureRerankerHealthInitialized(this.database);
+    this.rerankerHealth = this.readPersistedRerankerHealth(this.database);
+    this.maybeWarnAboutPersistedRerankerDegradation();
 
     let detectedBranch = "default";
     if (isGitRepo(this.projectRoot)) {
@@ -3600,14 +3727,15 @@ export class Indexer {
     const rerankerCandidates = await this.buildRerankerCandidates(head, fileContentCache, storedChunkTexts);
     const reranked = await this.searchReranker.rerank(query, rerankerCandidates, taskType);
 
-    if (!reranked.applied) {
-      if (reranked.failedBackend) {
-        this.logger.search("warn", "Search reranker backend failed; using existing order", {
-          taskType,
-          backend: reranked.failedBackend,
-        });
-      }
+    if (reranked.failedBackend) {
+      this.logger.search("warn", "Search reranker backend degraded; using fallback backend", {
+        taskType,
+        failedBackend: reranked.failedBackend,
+        activeBackend: reranked.backend ?? "existing-order",
+      });
+    }
 
+    if (!reranked.applied) {
       return {
         ordered: candidates,
         applied: false,
@@ -4158,8 +4286,10 @@ export class Indexer {
   }
 
   async getStatus(): Promise<StatusResult> {
-    const { configuredProviderInfo } = await this.ensureInitialized();
+    const { configuredProviderInfo, database } = await this.ensureInitialized();
     const vectorCount = this.totalVectorCount();
+    const chunkCapDrops = database.getChunkCapDropsForBranch(this.currentBranch);
+    this.rerankerHealth = this.readPersistedRerankerHealth(database);
 
     return {
       indexed: vectorCount > 0,
@@ -4170,6 +4300,26 @@ export class Indexer {
       currentBranch: this.currentBranch,
       baseBranch: this.baseBranch,
       compatibility: this.indexCompatibility,
+      rerankerHealth: this.rerankerHealth,
+      chunkCapSummary: this.summarizeChunkCapDrops(chunkCapDrops),
+    };
+  }
+
+  async getCoverageReport(): Promise<IndexCoverageResult> {
+    const { database } = await this.ensureInitialized();
+    const rows = database.getChunkCapDropsForBranch(this.currentBranch);
+    return {
+      branch: this.currentBranch,
+      truncatedFiles: rows.map((row) => ({
+        filePath: row.filePath,
+        capLimit: row.capLimit,
+        keptChunks: row.keptCount,
+        droppedChunks: row.droppedCount,
+        droppedNamedSymbols: row.droppedNamed,
+        indexedAt: row.indexedAt,
+      })),
+      totalDroppedChunks: rows.reduce((sum, row) => sum + row.droppedCount, 0),
+      totalDroppedNamedSymbols: rows.reduce((sum, row) => sum + row.droppedNamed.length, 0),
     };
   }
 
@@ -4203,6 +4353,7 @@ export class Indexer {
       // Clear control-plane state after the data plane so any mid-reset crash
       // biases toward a fully cold rebuild instead of stale "complete" stages.
       database.clearAllEmbeddingDebt();
+      database.clearAllChunkCapDrops();
       database.clearAllPipelineState();
       database.clearAllPipelineRuns();
       database.clearAllConfigVersions();
@@ -4273,6 +4424,8 @@ export class Indexer {
           allSymbolIds.delete(symbol.id);
           this.removeSymbolFromGraphIfUnreferenced(database, symbol.id);
         }
+
+        database.clearChunkCapDrop(this.currentBranch, filePath);
       }
 
       if (removedFilePaths.length > 0) {

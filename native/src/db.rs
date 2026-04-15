@@ -14,7 +14,7 @@ pub enum DbError {
 pub type DbResult<T> = Result<T, DbError>;
 
 /// Schema version for migrations
-const SCHEMA_VERSION: i32 = 14;
+const SCHEMA_VERSION: i32 = 15;
 
 pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const INIT_DB_BUSY_RETRY_ATTEMPTS: usize = 2;
@@ -631,6 +631,40 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> DbResult<()> {
         )?;
     }
 
+    if from_version < 15 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS reranker_health (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                backend TEXT NOT NULL,
+                status TEXT NOT NULL,
+                model TEXT,
+                error TEXT,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS chunk_cap_drops (
+                branch TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                cap_limit INTEGER NOT NULL,
+                kept_count INTEGER NOT NULL,
+                dropped_count INTEGER NOT NULL,
+                dropped_named TEXT NOT NULL,
+                indexed_at INTEGER NOT NULL,
+                PRIMARY KEY (branch, file_path)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunk_cap_drops_branch
+                ON chunk_cap_drops (branch);
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -938,6 +972,172 @@ pub struct EmbeddingDebtRow {
     pub model: String,
     pub reason: String,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RerankerHealthRow {
+    pub backend: String,
+    pub status: String,
+    pub model: Option<String>,
+    pub error: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChunkCapDropRow {
+    pub branch: String,
+    pub file_path: String,
+    pub cap_limit: u32,
+    pub kept_count: u32,
+    pub dropped_count: u32,
+    pub dropped_named: Vec<String>,
+    pub indexed_at: i64,
+}
+
+pub fn upsert_reranker_health(
+    conn: &Connection,
+    backend: &str,
+    status: &str,
+    model: Option<&str>,
+    error: Option<&str>,
+) -> DbResult<()> {
+    conn.execute(
+        r#"
+        INSERT INTO reranker_health (id, backend, status, model, error, updated_at)
+        VALUES (1, ?, ?, ?, ?, CAST(strftime('%s', 'now') AS INTEGER))
+        ON CONFLICT(id) DO UPDATE SET
+            backend = excluded.backend,
+            status = excluded.status,
+            model = excluded.model,
+            error = excluded.error,
+            updated_at = excluded.updated_at
+        "#,
+        params![backend, status, model, error],
+    )?;
+    Ok(())
+}
+
+pub fn get_reranker_health(conn: &Connection) -> DbResult<Option<RerankerHealthRow>> {
+    conn.query_row(
+        r#"
+        SELECT backend, status, model, error, updated_at
+        FROM reranker_health
+        WHERE id = 1
+        "#,
+        [],
+        |row| {
+            Ok(RerankerHealthRow {
+                backend: row.get(0)?,
+                status: row.get(1)?,
+                model: row.get(2)?,
+                error: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(DbError::from)
+}
+
+pub fn upsert_chunk_cap_drop(
+    conn: &Connection,
+    branch: &str,
+    file_path: &str,
+    cap_limit: u32,
+    kept_count: u32,
+    dropped_count: u32,
+    dropped_named: &[String],
+) -> DbResult<()> {
+    let dropped_named_json =
+        serde_json::to_string(dropped_named).map_err(|error| std::io::Error::other(error.to_string()))?;
+    conn.execute(
+        r#"
+        INSERT INTO chunk_cap_drops (
+            branch,
+            file_path,
+            cap_limit,
+            kept_count,
+            dropped_count,
+            dropped_named,
+            indexed_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, CAST(strftime('%s', 'now') AS INTEGER))
+        ON CONFLICT(branch, file_path) DO UPDATE SET
+            cap_limit = excluded.cap_limit,
+            kept_count = excluded.kept_count,
+            dropped_count = excluded.dropped_count,
+            dropped_named = excluded.dropped_named,
+            indexed_at = excluded.indexed_at
+        "#,
+        params![
+            branch,
+            file_path,
+            cap_limit,
+            kept_count,
+            dropped_count,
+            dropped_named_json,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn clear_chunk_cap_drop(
+    conn: &Connection,
+    branch: &str,
+    file_path: &str,
+) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM chunk_cap_drops WHERE branch = ? AND file_path = ?",
+        params![branch, file_path],
+    )?;
+    Ok(count)
+}
+
+pub fn get_chunk_cap_drops_for_branch(
+    conn: &Connection,
+    branch: &str,
+) -> DbResult<Vec<ChunkCapDropRow>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT branch, file_path, cap_limit, kept_count, dropped_count, dropped_named, indexed_at
+        FROM chunk_cap_drops
+        WHERE branch = ?
+        ORDER BY file_path ASC
+        "#,
+    )?;
+    let rows = stmt.query_map(params![branch], |row| {
+        let dropped_named_json: String = row.get(5)?;
+        let dropped_named = serde_json::from_str::<Vec<String>>(&dropped_named_json)
+            .unwrap_or_default();
+        Ok(ChunkCapDropRow {
+            branch: row.get(0)?,
+            file_path: row.get(1)?,
+            cap_limit: row.get(2)?,
+            kept_count: row.get(3)?,
+            dropped_count: row.get(4)?,
+            dropped_named,
+            indexed_at: row.get(6)?,
+        })
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn clear_chunk_cap_drops_for_branch(conn: &Connection, branch: &str) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM chunk_cap_drops WHERE branch = ?",
+        params![branch],
+    )?;
+    Ok(count)
+}
+
+pub fn clear_all_chunk_cap_drops(conn: &Connection) -> DbResult<usize> {
+    let count = conn.execute("DELETE FROM chunk_cap_drops", [])?;
+    Ok(count)
 }
 
 pub fn record_embedding_debt(
@@ -3967,7 +4167,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "14");
+        assert_eq!(version, "15");
         let busy_timeout: i64 = conn
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
@@ -5094,7 +5294,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "14");
+        assert_eq!(schema_version, "15");
 
         let on_delete: String = conn
             .query_row("PRAGMA foreign_key_list(call_edges)", [], |row| row.get(6))
@@ -5152,7 +5352,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "14");
+        assert_eq!(schema_version, "15");
 
         let pipeline_state_exists: String = conn
             .query_row(
@@ -5362,7 +5562,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "14");
+        assert_eq!(schema_version, "15");
 
         let pipeline_state_exists: String = conn
             .query_row(
@@ -6081,7 +6281,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "14");
+        assert_eq!(schema_version, "15");
 
         let call_edge_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM call_edges", [], |row| row.get(0))
@@ -6124,7 +6324,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v8_to_v14_migration_adds_embedding_input_hash_and_branch_config_versions() {
+    fn test_v8_to_v15_migration_adds_embedding_input_hash_branch_config_versions_and_observability_tables() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("migration-v8.db");
 
@@ -6277,7 +6477,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "14");
+        assert_eq!(schema_version, "15");
 
         let chunk_indexes = index_names(&conn, "chunks");
         assert!(chunk_indexes
@@ -6345,5 +6545,131 @@ mod tests {
         assert!(branch_config_indexes
             .iter()
             .any(|name| name == "idx_branch_config_versions_config_hash"));
+    }
+
+    #[test]
+    fn test_v14_to_v15_migration_adds_reranker_health_and_chunk_cap_drops() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("migration-v14.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE embeddings (
+                    embedding_input_hash TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    chunk_text TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (embedding_input_hash, model)
+                );
+                CREATE TABLE chunks (
+                    chunk_id TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL,
+                    embedding_input_hash TEXT NOT NULL DEFAULT '',
+                    file_path TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    node_type TEXT,
+                    name TEXT,
+                    language TEXT NOT NULL,
+                    chunk_kind TEXT,
+                    symbol_kind TEXT
+                );
+                CREATE TABLE branch_chunks (
+                    branch TEXT NOT NULL,
+                    chunk_id TEXT NOT NULL,
+                    PRIMARY KEY (branch, chunk_id)
+                );
+                CREATE TABLE pipeline_state (
+                    branch TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    input_hash TEXT,
+                    error TEXT,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (branch, file_path, stage)
+                );
+                CREATE TABLE pipeline_runs (
+                    run_id TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    run_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    config_hash TEXT NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    completed_at INTEGER,
+                    PRIMARY KEY (run_id)
+                );
+                CREATE TABLE config_versions (
+                    config_hash TEXT NOT NULL,
+                    embedding_model_id TEXT NOT NULL,
+                    embedding_dimension INTEGER NOT NULL,
+                    voyage_model_id TEXT,
+                    embedding_prefix_version INTEGER NOT NULL DEFAULT 0,
+                    chunker_version TEXT NOT NULL,
+                    graph_extractor_version TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (config_hash)
+                );
+                CREATE TABLE branch_config_versions (
+                    branch TEXT NOT NULL PRIMARY KEY,
+                    config_hash TEXT NOT NULL,
+                    applied_at INTEGER NOT NULL
+                );
+                CREATE TABLE embedding_debt (
+                    branch TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (branch, file_path, model)
+                );
+                INSERT INTO metadata (key, value) VALUES ('schema_version', '14');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let conn = init_db(&db_path).unwrap();
+
+        let schema_version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, "15");
+
+        let reranker_health_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'reranker_health'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reranker_health_exists, "reranker_health");
+
+        let chunk_cap_drops_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'chunk_cap_drops'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunk_cap_drops_exists, "chunk_cap_drops");
+
+        let chunk_cap_indexes = index_names(&conn, "chunk_cap_drops");
+        assert!(chunk_cap_indexes
+            .iter()
+            .any(|name| name == "idx_chunk_cap_drops_branch"));
     }
 }

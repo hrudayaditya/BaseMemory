@@ -176,6 +176,37 @@ describe("tools utils", () => {
       expect(result).toContain("compatible");
     });
 
+    it("should show reranker health and truncation summary when present", () => {
+      const status: StatusResult = {
+        indexed: true,
+        vectorCount: 500,
+        provider: "openai",
+        model: "text-embedding-3-small",
+        indexPath: "/tmp/index",
+        currentBranch: "default",
+        baseBranch: "default",
+        compatibility: { compatible: true },
+        rerankerHealth: {
+          backend: "heuristic-local",
+          status: "failed",
+          model: "Xenova/ms-marco-MiniLM-L-6-v2",
+          error: "boom",
+          updatedAt: 123,
+        },
+        chunkCapSummary: {
+          truncatedFiles: 3,
+          totalDroppedChunks: 42,
+          totalDroppedNamedSymbols: 7,
+        },
+      };
+      const result = formatStatus(status);
+
+      expect(result).toContain("Reranker: heuristic-local (DEGRADED");
+      expect(result).toContain("Reranker model: Xenova/ms-marco-MiniLM-L-6-v2");
+      expect(result).toContain("Last reranker error: boom");
+      expect(result).toContain("Chunk cap: 3 files truncated (42 chunks dropped, 7 named symbols invisible)");
+    });
+
     it("should show branch info when not on default branch", () => {
       const status: StatusResult = {
         indexed: true,
