@@ -520,6 +520,16 @@ impl VectorStoreInner {
         Ok(search_results)
     }
 
+    pub fn branch_contains(&self, branch: &str, chunk_id: &str) -> bool {
+        let Some(filter) = self.branch_filters.get(branch) else {
+            return false;
+        };
+        let Some(id) = self.stored.key_to_id.get(chunk_id).copied() else {
+            return false;
+        };
+        filter.keys.contains(chunk_id) && filter.ids.contains(&id)
+    }
+
     pub fn remove(&mut self, key: &str) -> Result<bool> {
         if let Some(&id) = self.stored.key_to_id.get(key) {
             self.index.remove(id)?;

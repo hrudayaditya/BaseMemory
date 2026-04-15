@@ -474,6 +474,10 @@ export class VectorStore {
     return this.inner.contains(id);
   }
 
+  branchContains(branch: string, id: string): boolean {
+    return this.inner.branchContains(branch, id);
+  }
+
   clear(): void {
     this.inner.clear();
   }
@@ -810,6 +814,10 @@ export class InvertedIndex {
 
   hasChunk(chunkId: string): boolean {
     return this.inner.hasChunk(chunkId);
+  }
+
+  branchContains(branch: string, chunkId: string): boolean {
+    return this.inner.branchContains(branch, chunkId);
   }
 
   clear(): void {
@@ -1202,7 +1210,7 @@ export class Database {
     }, cancelledAt);
   }
 
-  updatePipelineRunStatus(runId: string, status: string, completedAt: number): boolean {
+  updatePipelineRunStatus(runId: string, status: string, completedAt?: number): boolean {
     return this.inner.updatePipelineRunStatus(runId, status, completedAt);
   }
 
@@ -1228,6 +1236,19 @@ export class Database {
 
   getActivePipelineRuns(): PipelineRunData[] {
     const results = this.inner.getActivePipelineRuns();
+    return results.map((result: any) => ({
+      runId: result.runId ?? result.run_id,
+      branch: result.branch,
+      runType: result.runType ?? result.run_type,
+      status: result.status,
+      configHash: result.configHash ?? result.config_hash,
+      startedAt: result.startedAt ?? result.started_at,
+      completedAt: result.completedAt ?? result.completed_at ?? undefined,
+    }));
+  }
+
+  getPipelineRunsByStatus(status: string): PipelineRunData[] {
+    const results = this.inner.getPipelineRunsByStatus(status);
     return results.map((result: any) => ({
       runId: result.runId ?? result.run_id,
       branch: result.branch,

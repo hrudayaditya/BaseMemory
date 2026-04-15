@@ -97,8 +97,8 @@ export interface IncrementalIndexOrchestratorHost {
   getProjectRoot(): string;
   getIndexPath(): string;
   getCurrentBranch(): string;
-  setCurrentBranch(branch: string): void;
-  refreshBranchInfo(): void;
+  setCurrentBranch(branch: string): Promise<void>;
+  refreshBranchInfo(): Promise<void>;
   ensureInitialized(): Promise<InitializationResources>;
   assertIndexCompatible(): void;
   runWithCrashMarker<T>(operation: () => Promise<T>): Promise<T>;
@@ -202,6 +202,23 @@ interface EmbeddingWorkChunk {
   contentHash: string;
   embeddingInputHash: string;
   metadata: ChunkMetadata;
+}
+
+interface ReplayableFileState {
+  filePath: string;
+  fileContentHash: string;
+}
+
+interface ReplayExpectedStageHashes {
+  chunk: string;
+  embed: string;
+  index: string;
+  graph: string;
+}
+
+interface RunFinalizationReplayResult {
+  replayed: boolean;
+  reopenedFiles: string[];
 }
 
 interface RunContext {
@@ -427,6 +444,16 @@ function serializeSnapshotDocument(document: SnapshotDocument): string {
     root_hash: document.root_hash,
     nodes: sortedNodes,
   });
+}
+
+function getFilePathsFromSnapshot(snapshot: string | null): string[] {
+  if (!snapshot) {
+    return [];
+  }
+
+  return Object.values(parseSnapshotDocument(snapshot).nodes)
+    .filter((node) => node.kind === "file")
+    .map((node) => node.path);
 }
 
 function buildSnapshotFromObservedFileState(args: {
@@ -1122,7 +1149,7 @@ export class IncrementalIndexOrchestrator {
     }
     const { database } = resources;
     const storedSnapshot = database.getMerkleSnapshot(newBranch);
-    this.host.setCurrentBranch(newBranch);
+    await this.host.setCurrentBranch(newBranch);
 
     if (!storedSnapshot) {
       await this.coldStart();
@@ -1206,6 +1233,22 @@ export class IncrementalIndexOrchestrator {
       );
     }
 
+    const interruptedFinalizationRuns = this.checkpoints.getFinalizingRuns(branch);
+    if (interruptedFinalizationRuns.length > 0) {
+      for (const run of interruptedFinalizationRuns) {
+        this.host.logger.warn(
+          `Interrupted finalization detected for run ${run.runId} on branch ${run.branch}. Forcing cold start to restore consistency.`,
+          {
+            branch: run.branch,
+            runId: run.runId,
+            configHash: run.configHash,
+          }
+        );
+      }
+      this.checkpoints.cancelActiveRuns(branch);
+      this.forceColdStart = true;
+    }
+
     if (this.host.consumeRecoveredFromCrash()) {
       for (const run of this.checkpoints.getInProgressRuns()) {
         this.checkpoints.cancelActiveRuns(run.branch);
@@ -1253,12 +1296,20 @@ export class IncrementalIndexOrchestrator {
         continue;
       }
 
-      const unfinishedFiles = this.checkpoints
+      let unfinishedFiles = this.checkpoints
         .getUnfinishedFiles(run.branch)
         .map((filePath) => toAbsolutePath(this.host.getProjectRoot(), filePath));
       if (unfinishedFiles.length === 0) {
-        this.checkpoints.markRunComplete(run.runId);
-        continue;
+        const replayResult = await this.replayRunFinalization(resources, {
+          branch: run.branch,
+          runId: run.runId,
+          configVersion,
+          configHash,
+        });
+        if (replayResult.replayed) {
+          continue;
+        }
+        unfinishedFiles = replayResult.reopenedFiles;
       }
 
       for (const filePath of unfinishedFiles) {
@@ -1306,26 +1357,74 @@ export class IncrementalIndexOrchestrator {
     branch: string,
     filePath: string,
     runId: string
-  ): void {
+  ): boolean {
     const embedState = this.checkpoints.getStageState(branch, filePath, "embed");
     if (embedState?.status !== "complete") {
-      return;
+      return true;
     }
 
     const currentChunks = resources.database.getChunksByFileOnBranch(filePath, branch);
     if (currentChunks.length === 0) {
-      return;
+      return true;
     }
 
-    const primaryArtifactsMissing = currentChunks.some(
-      (chunk) => !resources.store.contains(chunk.chunkId) || !resources.invertedIndex.hasChunk(chunk.chunkId)
-    );
-    const voyageArtifactsMissing =
-      Boolean(resources.voyageStore && resources.voyageModelId) &&
-      currentChunks.some((chunk) => !resources.voyageStore!.contains(chunk.chunkId));
+    const primaryArtifactsMissing = currentChunks.some((chunk) => {
+      const chunkPresent =
+        resources.store.contains(chunk.chunkId) && resources.invertedIndex.hasChunk(chunk.chunkId);
+      if (!chunkPresent) {
+        return true;
+      }
+
+      return (
+        !resources.store.branchContains(branch, chunk.chunkId) ||
+        !resources.invertedIndex.branchContains(branch, chunk.chunkId)
+      );
+    });
+    const voyageArtifactsMissing = Boolean(resources.voyageStore && resources.voyageModelId)
+      ? currentChunks.some((chunk) => {
+          if (!resources.voyageStore!.contains(chunk.chunkId)) {
+            return true;
+          }
+          return !resources.voyageStore!.branchContains(branch, chunk.chunkId);
+        })
+      : false;
 
     if (!primaryArtifactsMissing && !voyageArtifactsMissing) {
-      return;
+      return true;
+    }
+
+    const branchChunkIds = resources.database.getBranchChunkIds(branch);
+    if (branchChunkIds.length > 0) {
+      this.host.syncNativeBranchMembership(branch, branchChunkIds);
+    }
+
+    const primaryArtifactsRecovered = currentChunks.every(
+      (chunk) =>
+        resources.store.contains(chunk.chunkId) &&
+        resources.invertedIndex.hasChunk(chunk.chunkId) &&
+        resources.store.branchContains(branch, chunk.chunkId) &&
+        resources.invertedIndex.branchContains(branch, chunk.chunkId)
+    );
+    const voyageArtifactsRecovered =
+      !resources.voyageStore ||
+      !resources.voyageModelId ||
+      currentChunks.every(
+        (chunk) =>
+          resources.voyageStore!.contains(chunk.chunkId) &&
+          resources.voyageStore!.branchContains(branch, chunk.chunkId)
+      );
+
+    if (primaryArtifactsRecovered && voyageArtifactsRecovered) {
+      this.host.logger.info(
+        "Recovered missing branch-visible retrieval state during resume by rehydrating native branch membership",
+        {
+          branch,
+          filePath,
+          runId,
+          chunkCount: currentChunks.length,
+        }
+      );
+      return true;
     }
 
     this.checkpoints.markStagePending(branch, filePath, "embed");
@@ -1340,12 +1439,186 @@ export class IncrementalIndexOrchestrator {
         chunkCount: currentChunks.length,
       }
     );
+    return false;
+  }
+
+  private async replayRunFinalization(
+    resources: InitializationResources,
+    args: {
+      branch: string;
+      runId: string;
+      configVersion: ConfigVersion;
+      configHash: string;
+    }
+  ): Promise<RunFinalizationReplayResult> {
+    await this.host.setCurrentBranch(args.branch);
+    const currentSnapshot = await buildMerkleSnapshot(
+      this.host.getProjectRoot(),
+      args.branch,
+      this.host.buildMerkleIgnoreRules()
+    );
+    const currentFileHashes = toAbsoluteFileHashes(this.host.getProjectRoot(), currentSnapshot.snapshot);
+    const replayableFiles: ReplayableFileState[] = [];
+    const filesToReopen = new Set<string>();
+    const knownFiles = this.checkpoints
+      .getKnownFiles(args.branch)
+      .map((filePath) => toAbsolutePath(this.host.getProjectRoot(), filePath));
+    const knownFileSet = new Set(knownFiles);
+
+    for (const filePath of currentFileHashes.keys()) {
+      if (!knownFileSet.has(filePath)) {
+        filesToReopen.add(filePath);
+      }
+    }
+
+    for (const filePath of knownFiles) {
+      const observedHash = currentFileHashes.get(filePath);
+      if (!observedHash || !existsSync(filePath)) {
+        filesToReopen.add(filePath);
+        continue;
+      }
+
+      const fileContent = readFileSync(filePath, "utf-8");
+      const expectedHashes = this.buildReplayExpectedStageHashes(
+        resources,
+        args.configVersion,
+        filePath,
+        fileContent,
+        observedHash
+      );
+
+      if (!expectedHashes || !this.isReplayFileStateCurrent(args.branch, filePath, expectedHashes)) {
+        filesToReopen.add(filePath);
+        continue;
+      }
+
+      replayableFiles.push({
+        filePath,
+        fileContentHash: observedHash,
+      });
+    }
+
+    if (filesToReopen.size > 0) {
+      for (const filePath of filesToReopen) {
+        this.checkpoints.ensureTrackedFile(args.branch, filePath);
+        this.checkpoints.markStagePending(args.branch, filePath, "chunk");
+      }
+
+      this.host.logger.warn(
+        "Interrupted run had no unfinished files but finalization replay was unsafe; reopened drifted files for resume",
+        {
+          branch: args.branch,
+          runId: args.runId,
+          reopenedFiles: Array.from(filesToReopen).map((filePath) =>
+            toRelativePath(this.host.getProjectRoot(), filePath)
+          ),
+        }
+      );
+
+      return {
+        replayed: false,
+        reopenedFiles: this.checkpoints
+          .getUnfinishedFiles(args.branch)
+          .map((filePath) => toAbsolutePath(this.host.getProjectRoot(), filePath)),
+      };
+    }
+
+    const previousSnapshot = this.getStoredSnapshot(resources.database, args.branch);
+    const removedAbsolutePaths = getFilePathsFromSnapshot(previousSnapshot)
+      .filter((relativePath) => !currentFileHashes.has(toAbsolutePath(this.host.getProjectRoot(), relativePath)))
+      .map((relativePath) => toAbsolutePath(this.host.getProjectRoot(), relativePath));
+
+    this.host.loadFileHashCache();
+    this.host.commitFileHashChanges(
+      new Map(replayableFiles.map((file) => [file.filePath, file.fileContentHash])),
+      removedAbsolutePaths
+    );
+    resources.database.saveMerkleSnapshot(currentSnapshot.snapshot);
+    if (this.checkpoints.getBranchConfigVersion(args.branch)?.configHash !== args.configHash) {
+      this.checkpoints.markBranchConfigApplied(args.branch, args.configHash);
+    }
+    this.checkpoints.markRunComplete(args.runId);
+    this.host.logger.info("Replayed interrupted run finalization", {
+      branch: args.branch,
+      runId: args.runId,
+      replayedFiles: replayableFiles.length,
+      removedFiles: removedAbsolutePaths.length,
+    });
+    return {
+      replayed: true,
+      reopenedFiles: [],
+    };
+  }
+
+  private buildReplayExpectedStageHashes(
+    resources: InitializationResources,
+    configVersion: ConfigVersion,
+    absolutePath: string,
+    fileContent: string,
+    fileContentHash: string
+  ): ReplayExpectedStageHashes | null {
+    const parsed = this.host.parseFilesForIndexing([
+      {
+        path: absolutePath,
+        content: fileContent,
+        hash: fileContentHash,
+      },
+    ]);
+    if (parsed.failedFilePaths.length > 0 || parsed.parsedFiles.length !== 1) {
+      return null;
+    }
+
+    const parsedFile = parsed.parsedFiles[0];
+    if (!parsedFile) {
+      return null;
+    }
+
+    const currentChunks = this.buildChunkRecords(
+      absolutePath,
+      parsedFile,
+      this.getEffectiveEmbeddingMaxTokens(resources)
+    );
+    const embedConfigHash = hashEmbedConfig(
+      resources.configuredProviderInfo,
+      resources.voyageModelId,
+      this.getActiveVoyageMaxTokens(resources)
+    );
+    const embeddingInputHashes = currentChunks.map((chunk) => chunk.embeddingInputHash);
+
+    return {
+      chunk: buildChunkStageInputHash(fileContentHash, configVersion.chunkerVersion),
+      embed: buildEmbedStageInputHash(embeddingInputHashes, embedConfigHash),
+      index: buildIndexStageInputHash(embeddingInputHashes, embedConfigHash),
+      graph: buildGraphStageInputHash(fileContentHash, configVersion.graphExtractorVersion),
+    };
+  }
+
+  private isReplayFileStateCurrent(
+    branch: string,
+    filePath: string,
+    expectedHashes: ReplayExpectedStageHashes
+  ): boolean {
+    const chunkState = this.checkpoints.getStageState(branch, filePath, "chunk");
+    const embedState = this.checkpoints.getStageState(branch, filePath, "embed");
+    const indexState = this.checkpoints.getStageState(branch, filePath, "index");
+    const graphState = this.checkpoints.getStageState(branch, filePath, "graph");
+
+    return (
+      chunkState?.status === "complete" &&
+      chunkState.inputHash === expectedHashes.chunk &&
+      embedState?.status === "complete" &&
+      embedState.inputHash === expectedHashes.embed &&
+      indexState?.status === "complete" &&
+      indexState.inputHash === expectedHashes.index &&
+      graphState?.status === "complete" &&
+      graphState.inputHash === expectedHashes.graph
+    );
   }
 
   private async prepareRun(): Promise<InitializationResources> {
     const resources = await this.host.ensureInitialized();
     this.getCheckpointManager(resources.database);
-    this.host.refreshBranchInfo();
+    await this.host.refreshBranchInfo();
     this.host.assertIndexCompatible();
     return resources;
   }
@@ -2363,6 +2636,7 @@ export class IncrementalIndexOrchestrator {
     context: RunContext,
     onProgress?: ProgressCallback
   ): Promise<IndexStats> {
+    this.checkpoints.markRunFinalizing(context.runId);
     const previousBranchChunkIds = new Set(context.branchChunkIds);
     const staleChunkIds = Array.from(context.oldChunkIdsForTouchedFiles).filter(
       (chunkId) => !context.currentChunkIds.has(chunkId)

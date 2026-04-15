@@ -12,7 +12,7 @@ import {
 export type PipelineStage = "chunk" | "embed" | "index" | "graph";
 export type PipelineStageStatus = "pending" | "in_progress" | "complete" | "failed";
 export type PipelineRunType = "cold_start" | "hot_update" | "config_change" | "resume";
-export type PipelineRunStatus = "in_progress" | "complete" | "failed" | "cancelled";
+export type PipelineRunStatus = "in_progress" | "finalizing" | "complete" | "failed" | "cancelled";
 
 export interface CheckpointManagerOptions {
   now?: () => number;
@@ -198,6 +198,10 @@ export class CheckpointManager {
     return this.database.updatePipelineRunStatus(runId, "complete", this.now());
   }
 
+  markRunFinalizing(runId: string): boolean {
+    return this.database.updatePipelineRunStatus(runId, "finalizing");
+  }
+
   markRunFailed(runId: string): boolean {
     return this.database.updatePipelineRunStatus(runId, "failed", this.now());
   }
@@ -212,6 +216,14 @@ export class CheckpointManager {
 
   getInProgressRuns(): PipelineRunData[] {
     return this.database.getActivePipelineRuns();
+  }
+
+  getFinalizingRuns(branch?: string): PipelineRunData[] {
+    const runs = this.database.getPipelineRunsByStatus("finalizing");
+    if (!branch) {
+      return runs;
+    }
+    return runs.filter((run) => run.branch === branch);
   }
 
   pruneFinishedRuns(retentionMs: number): number {

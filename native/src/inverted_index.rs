@@ -339,6 +339,13 @@ impl InvertedIndexInner {
         self.chunk_tokens.contains_key(chunk_id)
     }
 
+    pub fn branch_contains(&self, branch: &str, chunk_id: &str) -> bool {
+        self.branch_filters
+            .get(branch)
+            .map(|filter| filter.contains(chunk_id) && self.has_chunk(chunk_id))
+            .unwrap_or(false)
+    }
+
     pub fn clear(&mut self) {
         self.term_to_chunks.clear();
         self.chunk_tokens.clear();

@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import type { ChunkMetadata } from "../src/native/index.js";
 import type { SearchTaskType } from "../src/indexer/search-recipes.js";
 import {
+  DEFAULT_LOCAL_CROSS_ENCODER_MODEL,
+  DEFAULT_LOCAL_CROSS_ENCODER_TOKENIZER,
   HeuristicLocalRerankerBackend,
   SearchReranker,
   TransformersCrossEncoderBackend,
@@ -284,6 +286,10 @@ describe("search reranker", () => {
       },
     ]);
     expect(reranked.map((item) => item.id)).toEqual(["target", "generic"]);
+  });
+
+  it("uses matching tokenizer and model assets for the local cross-encoder", () => {
+    expect(DEFAULT_LOCAL_CROSS_ENCODER_TOKENIZER).toBe(DEFAULT_LOCAL_CROSS_ENCODER_MODEL);
   });
 
   it("does not inject structured prefixes into the heuristic backend content", async () => {

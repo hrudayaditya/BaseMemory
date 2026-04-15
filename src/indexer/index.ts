@@ -2000,10 +2000,7 @@ export class Indexer {
       getProjectRoot: () => this.projectRoot,
       getIndexPath: () => this.indexPath,
       getCurrentBranch: () => this.currentBranch,
-      setCurrentBranch: (branch) => {
-        this.loadNativeBranchMembership(branch);
-        this.publishCurrentBranch(branch);
-      },
+      setCurrentBranch: (branch) => this.setCurrentBranch(branch),
       refreshBranchInfo: () => this.refreshBranchInfo(),
       ensureInitialized: () => this.ensureInitialized(),
       assertIndexCompatible: () => this.assertIndexCompatible(),
@@ -2063,6 +2060,29 @@ export class Indexer {
   private publishCurrentBranch(branch: string): void {
     this.currentBranch = branch;
     this.loadFileHashCache();
+  }
+
+  private updateBaseBranch(branch: string): void {
+    if (!isGitRepo(this.projectRoot)) {
+      this.baseBranch = "default";
+      return;
+    }
+
+    this.baseBranch = getBaseBranch(this.projectRoot) || branch;
+  }
+
+  private async setCurrentBranch(
+    branch: string,
+    options: { forceReloadIfSame?: boolean } = {}
+  ): Promise<void> {
+    const normalizedBranch = this.getActiveBranchKey(branch);
+    this.updateBaseBranch(normalizedBranch);
+    if (!options.forceReloadIfSame && normalizedBranch === this.currentBranch) {
+      return;
+    }
+
+    this.loadNativeBranchMembership(normalizedBranch);
+    this.publishCurrentBranch(normalizedBranch);
   }
 
   private storePathForModel(modelId: string): string {
@@ -2199,10 +2219,13 @@ export class Indexer {
     }
 
     const mismatchedStores = Array.from(this.stores.entries())
-      .filter(([_modelId, store]) => store.count() === 0)
-      .map(([modelId, store]) => ({ modelId, count: store.count() }));
+      .map(([modelId, store]) => ({
+        modelId,
+        count: store.count(),
+      }))
+      .filter(({ count }) => count < branchChunkCount);
     const bm25Count = this.invertedIndex?.getDocumentCount() ?? 0;
-    const bm25Mismatch = bm25Count === 0;
+    const bm25Mismatch = bm25Count < branchChunkCount;
 
     if (
       loadState.recoveredModelIds.length === 0 &&
@@ -2214,17 +2237,18 @@ export class Indexer {
     }
 
     this.logger.warn(
-      "Retrieval startup integrity check failed: retrieval artifacts are empty or recovered while the database still has indexed chunks. A full rebuild is required before search results are reliable.",
+      "Retrieval startup integrity check failed: retrieval artifacts are empty, recovered, or underpopulated while the database still has indexed chunks. A full rebuild is required before search results are reliable.",
       {
-      branch,
-      branchChunkCount,
-      recoveredModelIds: loadState.recoveredModelIds,
-      bm25Recovered: loadState.bm25Recovered,
-      storeCounts: Array.from(this.stores.entries()).map(([modelId, store]) => ({
-        modelId,
-        count: store.count(),
-      })),
-      bm25Count,
+        branch,
+        branchChunkCount,
+        recoveredModelIds: loadState.recoveredModelIds,
+        bm25Recovered: loadState.bm25Recovered,
+        mismatchedStores,
+        storeCounts: Array.from(this.stores.entries()).map(([modelId, store]) => ({
+          modelId,
+          count: store.count(),
+        })),
+        bm25Count,
       }
     );
     this.startupRetrievalRebuildPending = true;
@@ -2578,18 +2602,19 @@ export class Indexer {
     const dbIsNew = !existsSync(dbPath);
     this.database = new Database(dbPath);
 
+    let detectedBranch = "default";
     if (isGitRepo(this.projectRoot)) {
-      this.currentBranch = getBranchOrDefault(this.projectRoot);
-      this.baseBranch = getBaseBranch(this.projectRoot);
+      detectedBranch = getBranchOrDefault(this.projectRoot);
+      this.updateBaseBranch(detectedBranch);
       this.logger.branch("info", "Detected git repository", {
-        currentBranch: this.currentBranch,
+        currentBranch: detectedBranch,
         baseBranch: this.baseBranch,
       });
     } else {
-      this.currentBranch = "default";
       this.baseBranch = "default";
       this.logger.branch("debug", "Not a git repository, using default branch");
     }
+    await this.setCurrentBranch(detectedBranch, { forceReloadIfSame: true });
 
     // Recover from interrupted indexing AFTER store, invertedIndex, database,
     // and branch state are all initialized. Recovery uses branch-scoped cleanup
@@ -2613,8 +2638,6 @@ export class Indexer {
       recoveredModelIds,
       bm25Recovered,
     });
-    this.loadNativeBranchMembership(this.currentBranch);
-
     if (dbIsNew && primaryStore.count() > 0) {
       this.migrateFromLegacyIndex();
       this.loadNativeBranchMembership(this.currentBranch);
@@ -3169,7 +3192,7 @@ export class Indexer {
 
     try {
       const { database } = await this.ensureInitialized();
-      this.refreshBranchInfo();
+      await this.refreshBranchInfo();
 
       const snapshot = database.getMerkleSnapshot(this.currentBranch);
       if (!snapshot) {
@@ -4187,7 +4210,7 @@ export class Indexer {
   ): Promise<HealthCheckResult> {
     const { invertedIndex, database } = await this.ensureInitialized();
     const run = async (): Promise<HealthCheckResult> => {
-      this.refreshBranchInfo();
+      await this.refreshBranchInfo();
       this.loadFileHashCache();
       this.logger.gc("info", "Starting health check", { branch: this.currentBranch });
 
@@ -4293,15 +4316,19 @@ export class Indexer {
     return this.baseBranch;
   }
 
-  refreshBranchInfo(): void {
-    if (isGitRepo(this.projectRoot)) {
-      const previousBranch = this.currentBranch;
-      this.currentBranch = getBranchOrDefault(this.projectRoot);
-      this.baseBranch = getBaseBranch(this.projectRoot);
-      if (this.currentBranch !== previousBranch) {
-        this.loadFileHashCache();
-      }
+  async refreshBranchInfo(): Promise<void> {
+    if (!isGitRepo(this.projectRoot)) {
+      this.baseBranch = "default";
+      return;
     }
+
+    const detectedBranch = this.getActiveBranchKey(getBranchOrDefault(this.projectRoot));
+    this.updateBaseBranch(detectedBranch);
+    if (detectedBranch === this.currentBranch) {
+      return;
+    }
+
+    await this.setCurrentBranch(detectedBranch);
   }
 
   async getDatabaseStats(): Promise<{ embeddingCount: number; chunkCount: number; branchChunkCount: number; branchCount: number } | null> {

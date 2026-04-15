@@ -431,6 +431,11 @@ impl VectorStore {
     }
 
     #[napi]
+    pub fn branch_contains(&self, branch: String, id: String) -> bool {
+        self.inner.branch_contains(&branch, &id)
+    }
+
+    #[napi]
     pub fn clear(&mut self) -> Result<()> {
         self.inner
             .clear()
@@ -668,6 +673,11 @@ impl InvertedIndex {
     #[napi]
     pub fn has_chunk(&self, chunk_id: String) -> bool {
         self.inner.has_chunk(&chunk_id)
+    }
+
+    #[napi]
+    pub fn branch_contains(&self, branch: String, chunk_id: String) -> bool {
+        self.inner.branch_contains(&branch, &chunk_id)
     }
 
     #[napi]
@@ -1552,14 +1562,14 @@ impl Database {
         &self,
         run_id: String,
         status: String,
-        completed_at: f64,
+        completed_at: Option<f64>,
     ) -> Result<bool> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| Error::from_reason(e.to_string()))?;
         retry_busy_write(|| {
-            db::update_pipeline_run_status(&conn, &run_id, &status, completed_at as i64)
+            db::update_pipeline_run_status(&conn, &run_id, &status, completed_at.map(|value| value as i64))
         })
     }
 
@@ -1658,7 +1668,29 @@ impl Database {
             graph_extractor_version: row.graph_extractor_version,
             active: row.active,
             created_at: row.created_at as f64,
-        }))
+            }))
+    }
+
+    #[napi]
+    pub fn get_pipeline_runs_by_status(&self, status: String) -> Result<Vec<PipelineRunData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows = db::get_pipeline_runs_by_status(&conn, &status)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PipelineRunData {
+                run_id: row.run_id,
+                branch: row.branch,
+                run_type: row.run_type,
+                status: row.status,
+                config_hash: row.config_hash,
+                started_at: row.started_at as f64,
+                completed_at: row.completed_at.map(|value| value as f64),
+            })
+            .collect())
     }
 
     #[napi]

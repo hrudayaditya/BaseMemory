@@ -14,7 +14,7 @@ pub enum DbError {
 pub type DbResult<T> = Result<T, DbError>;
 
 /// Schema version for migrations
-const SCHEMA_VERSION: i32 = 11;
+const SCHEMA_VERSION: i32 = 12;
 
 pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const INIT_DB_BUSY_RETRY_ATTEMPTS: usize = 2;
@@ -576,6 +576,17 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> DbResult<()> {
             "#,
         )?;
 
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
+    if from_version < 12 {
+        // v12 is a control-plane semantics upgrade: pipeline_runs.status now
+        // recognizes "finalizing" as an interrupted-publication marker. The
+        // table already stores status as TEXT, so this migration only advances
+        // schema_version for startup recovery logic to opt in cleanly.
         conn.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
             params![SCHEMA_VERSION.to_string()],
@@ -3351,7 +3362,7 @@ pub fn start_pipeline_run(
         UPDATE pipeline_runs
         SET status = 'cancelled',
             completed_at = ?
-        WHERE branch = ? AND status = 'in_progress'
+        WHERE branch = ? AND status IN ('in_progress', 'finalizing')
         "#,
         params![cancelled_at, run.branch],
     )?;
@@ -3379,7 +3390,7 @@ pub fn update_pipeline_run_status(
     conn: &Connection,
     run_id: &str,
     status: &str,
-    completed_at: i64,
+    completed_at: Option<i64>,
 ) -> DbResult<bool> {
     let count = conn.execute(
         r#"
@@ -3428,7 +3439,7 @@ pub fn cancel_active_pipeline_runs(
         UPDATE pipeline_runs
         SET status = 'cancelled',
             completed_at = ?
-        WHERE branch = ? AND status = 'in_progress'
+        WHERE branch = ? AND status IN ('in_progress', 'finalizing')
         "#,
         params![cancelled_at, branch],
     )?;
@@ -3445,6 +3456,37 @@ pub fn get_active_pipeline_runs(conn: &Connection) -> DbResult<Vec<PipelineRunRo
         "#,
     )?;
     let rows = stmt.query_map([], |row| {
+        Ok(PipelineRunRow {
+            run_id: row.get(0)?,
+            branch: row.get(1)?,
+            run_type: row.get(2)?,
+            status: row.get(3)?,
+            config_hash: row.get(4)?,
+            started_at: row.get(5)?,
+            completed_at: row.get(6)?,
+        })
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn get_pipeline_runs_by_status(
+    conn: &Connection,
+    status: &str,
+) -> DbResult<Vec<PipelineRunRow>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT run_id, branch, run_type, status, config_hash, started_at, completed_at
+        FROM pipeline_runs
+        WHERE status = ?
+        ORDER BY started_at, run_id
+        "#,
+    )?;
+    let rows = stmt.query_map(params![status], |row| {
         Ok(PipelineRunRow {
             run_id: row.get(0)?,
             branch: row.get(1)?,
@@ -3721,7 +3763,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
         let busy_timeout: i64 = conn
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
@@ -4848,7 +4890,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "11");
+        assert_eq!(schema_version, "12");
 
         let on_delete: String = conn
             .query_row("PRAGMA foreign_key_list(call_edges)", [], |row| row.get(6))
@@ -4896,7 +4938,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v11_schema_exists_on_fresh_db() {
+    fn test_v12_schema_exists_on_fresh_db() {
         let (_temp_dir, conn) = setup_test_db();
 
         let schema_version: String = conn
@@ -4906,7 +4948,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "11");
+        assert_eq!(schema_version, "12");
 
         let pipeline_state_exists: String = conn
             .query_row(
@@ -5097,7 +5139,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "11");
+        assert_eq!(schema_version, "12");
 
         let pipeline_state_exists: String = conn
             .query_row(
@@ -5816,7 +5858,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "11");
+        assert_eq!(schema_version, "12");
 
         let call_edge_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM call_edges", [], |row| row.get(0))
@@ -5859,7 +5901,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v8_to_v11_migration_adds_embedding_input_hash_and_branch_config_versions() {
+    fn test_v8_to_v12_migration_adds_embedding_input_hash_and_branch_config_versions() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("migration-v8.db");
 
@@ -6012,7 +6054,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "11");
+        assert_eq!(schema_version, "12");
 
         let config_columns = table_columns(&conn, "config_versions");
         assert!(config_columns.iter().any(|name| name == "voyage_model_id"));

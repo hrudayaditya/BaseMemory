@@ -160,6 +160,34 @@ describe("incremental index orchestrator", () => {
     return { fileA, fileB, fileC };
   }
 
+  function createRepoWithManyFiles(count: number): string[] {
+    const srcDir = path.join(tempDir, "src");
+    fs.mkdirSync(srcDir, { recursive: true });
+    const filePaths: string[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const filePath = path.join(srcDir, `file-${index}.ts`);
+      fs.writeFileSync(
+        filePath,
+        `export function file${index}(): number { return ${index}; }\n`,
+        "utf-8"
+      );
+      filePaths.push(filePath);
+    }
+    return filePaths;
+  }
+
+  function createGitRepoMetadata(currentBranch: string, branches: string[] = [currentBranch]): void {
+    const gitDir = path.join(tempDir, ".git");
+    const refsDir = path.join(gitDir, "refs", "heads");
+    fs.mkdirSync(refsDir, { recursive: true });
+    fs.writeFileSync(path.join(gitDir, "HEAD"), `ref: refs/heads/${currentBranch}\n`, "utf-8");
+    for (const branch of branches) {
+      const branchPath = path.join(refsDir, branch);
+      fs.mkdirSync(path.dirname(branchPath), { recursive: true });
+      fs.writeFileSync(branchPath, `${"a".repeat(39)}${branch.length % 10}\n`, "utf-8");
+    }
+  }
+
   function createMultiLanguageRepo(): Array<{
     filePath: string;
     language: "typescript" | "python" | "rust";
@@ -526,6 +554,12 @@ describe("incremental index orchestrator", () => {
   function getIndexerInternals(indexer: Indexer): {
     orchestrator: any;
     stores: Map<string, { save: () => void }>;
+    invertedIndex?: {
+      save: () => void;
+      removeChunk: (chunkId: string) => boolean;
+      setBranchMembership: (branch: string, chunkIds: string[]) => void;
+      getDocumentCount: () => number;
+    } | null;
     primaryStoreModelId?: string | null;
     config: { voyageModelId?: string | null; voyageApiKey?: string | null };
     voyageProvider?: { getModelInfo: () => { model: string } } | null;
@@ -547,6 +581,12 @@ describe("incremental index orchestrator", () => {
     return indexer as unknown as {
       orchestrator: any;
       stores: Map<string, { save: () => void }>;
+      invertedIndex?: {
+        save: () => void;
+        removeChunk: (chunkId: string) => boolean;
+        setBranchMembership: (branch: string, chunkIds: string[]) => void;
+        getDocumentCount: () => number;
+      } | null;
       primaryStoreModelId?: string | null;
       config: { voyageModelId?: string | null; voyageApiKey?: string | null };
       voyageProvider?: { getModelInfo: () => { model: string } } | null;
@@ -2073,7 +2113,7 @@ describe("incremental index orchestrator", () => {
     }
   });
 
-  it("reprocesses files left with index in_progress when finalization crashes before durable completion", async () => {
+  it("forces cold start instead of resume when finalization crashes before durable completion", async () => {
     const { fileA } = createRepo();
     const indexer = new Indexer(tempDir, createConfig());
     await indexer.index();
@@ -2108,14 +2148,22 @@ describe("incremental index orchestrator", () => {
     saveSpy.mockRestore();
 
     expect(database.getPipelineState(branch, trackedPath, "index")?.status).toBe("in_progress");
-    expect(database.getActivePipelineRuns()).toHaveLength(1);
+    const finalizingRun = database.getPipelineRunsByStatus("finalizing")[0];
+    expect(finalizingRun?.branch).toBe(branch);
 
-    const orchestrator = getIndexerInternals(indexer).orchestrator;
-    const currentConfig = await getCurrentRuntimeConfig(indexer);
-    await orchestrator.resumeInterruptedRuns(branch, currentConfig, hashConfigVersion(currentConfig));
+    const restartedIndexer = await createFreshIndexer();
+    const restartedOrchestrator = getIndexerInternals(restartedIndexer).orchestrator;
+    const coldStartSpy = vi.spyOn(restartedOrchestrator, "coldStart");
 
-    expect(database.getPipelineState(branch, trackedPath, "index")?.status).toBe("complete");
-    expect(database.getActivePipelineRuns()).toHaveLength(0);
+    await restartedIndexer.index();
+
+    const restartedDatabase = new Database(
+      path.join((await restartedIndexer.getStatus()).indexPath, "codebase.db")
+    );
+    expect(restartedDatabase.getPipelineRun(finalizingRun!.runId)?.status).toBe("cancelled");
+    expect(restartedDatabase.getPipelineState(branch, trackedPath, "index")?.status).toBe("complete");
+    expect(coldStartSpy).toHaveBeenCalled();
+    coldStartSpy.mockRestore();
   });
 
   it("reprocesses unfinished index stages during resume instead of skipping them", async () => {
@@ -2443,6 +2491,138 @@ describe("incremental index orchestrator", () => {
     expect(fetchSpy.mock.calls.length).toBe(fetchCountBeforeResume);
   });
 
+  it("replays finalization on resume when an interrupted run has zero unfinished files but durable finalization writes are missing", async () => {
+    const { fileA } = createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database, indexPath } = await openDatabase(indexer);
+    const currentConfig = await getCurrentRuntimeConfig(indexer);
+    const currentConfigHash = hashConfigVersion(currentConfig);
+    const trackedPath = resolveTrackedPath(database, branch, fileA, tempDir);
+    const fileHashCachePath = getFileHashCachePath(indexPath, branch);
+    const expectedFileHash = hashContent(fs.readFileSync(fileA, "utf-8"));
+
+    expect(database.getUnfinishedPipelineFiles(branch)).toEqual([]);
+    expect(database.deleteMerkleSnapshot(branch)).toBe(true);
+    fs.rmSync(fileHashCachePath, { force: true });
+    seedBranchAppliedConfig(database, branch, "stale-finalization-hash", currentConfig);
+    database.startPipelineRun(
+      {
+        runId: "resume-finalization-replay",
+        branch,
+        runType: "resume",
+        status: "in_progress",
+        configHash: currentConfigHash,
+        startedAt: Date.now(),
+      },
+      Date.now()
+    );
+
+    const orchestrator = getIndexerInternals(indexer).orchestrator;
+    const replaySpy = vi.spyOn(orchestrator as any, "replayRunFinalization");
+
+    await orchestrator.resumeInterruptedRuns(branch, currentConfig, currentConfigHash);
+
+    expect(replaySpy).toHaveBeenCalledWith(expect.anything(), {
+      branch,
+      runId: "resume-finalization-replay",
+      configVersion: currentConfig,
+      configHash: currentConfigHash,
+    });
+    expect(database.getPipelineRun("resume-finalization-replay")?.status).toBe("complete");
+    expect(database.getMerkleSnapshot(branch)).toBeTruthy();
+    expect(database.getBranchConfigVersion(branch)?.configHash).toBe(currentConfigHash);
+    expect(fs.existsSync(fileHashCachePath)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(fileHashCachePath, "utf-8")) as Record<string, string>).toMatchObject({
+      [trackedPath]: expectedFileHash,
+    });
+    replaySpy.mockRestore();
+  });
+
+  it("replays interrupted finalization idempotently", async () => {
+    const { fileA } = createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database, indexPath } = await openDatabase(indexer);
+    const currentConfig = await getCurrentRuntimeConfig(indexer);
+    const currentConfigHash = hashConfigVersion(currentConfig);
+    const fileHashCachePath = getFileHashCachePath(indexPath, branch);
+    const orchestrator = getIndexerInternals(indexer).orchestrator as {
+      prepareRun: () => Promise<unknown>;
+      replayRunFinalization: (
+        resources: unknown,
+        args: {
+          branch: string;
+          runId: string;
+          configVersion: ConfigVersion;
+          configHash: string;
+        }
+      ) => Promise<{ replayed: boolean }>;
+    };
+
+    expect(database.deleteMerkleSnapshot(branch)).toBe(true);
+    fs.rmSync(fileHashCachePath, { force: true });
+    seedBranchAppliedConfig(database, branch, "stale-finalization-hash", currentConfig);
+    database.startPipelineRun(
+      {
+        runId: "resume-finalization-idempotent",
+        branch,
+        runType: "resume",
+        status: "in_progress",
+        configHash: currentConfigHash,
+        startedAt: Date.now(),
+      },
+      Date.now()
+    );
+
+    const resources = await orchestrator.prepareRun();
+    const first = await orchestrator.replayRunFinalization(resources, {
+      branch,
+      runId: "resume-finalization-idempotent",
+      configVersion: currentConfig,
+      configHash: currentConfigHash,
+    });
+    const snapshotAfterFirstReplay = database.getMerkleSnapshot(branch);
+    const branchConfigAfterFirstReplay = database.getBranchConfigVersion(branch);
+    const cacheAfterFirstReplay = fs.readFileSync(fileHashCachePath, "utf-8");
+
+    const second = await orchestrator.replayRunFinalization(resources, {
+      branch,
+      runId: "resume-finalization-idempotent",
+      configVersion: currentConfig,
+      configHash: currentConfigHash,
+    });
+
+    expect(first.replayed).toBe(true);
+    expect(second.replayed).toBe(true);
+    expect(database.getPipelineRun("resume-finalization-idempotent")?.status).toBe("complete");
+    expect(database.getMerkleSnapshot(branch)).toBe(snapshotAfterFirstReplay);
+    expect(database.getBranchConfigVersion(branch)?.configHash).toBe(currentConfigHash);
+    expect(database.getBranchConfigVersion(branch)?.appliedAt).toBe(branchConfigAfterFirstReplay?.appliedAt);
+    expect(fs.readFileSync(fileHashCachePath, "utf-8")).toBe(cacheAfterFirstReplay);
+    expect(snapshotAfterFirstReplay).toBeTruthy();
+    expect(branchConfigAfterFirstReplay?.configHash).toBe(currentConfigHash);
+    expect(cacheAfterFirstReplay.length).toBeGreaterThan(0);
+    void fileA;
+  });
+
+  it("marks successful runs complete without leaving a finalizing marker behind", async () => {
+    createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const completedRuns = database
+      .getPipelineRunsByStatus("complete")
+      .filter((run) => run.branch === branch);
+
+    expect(completedRuns.length).toBeGreaterThan(0);
+    expect(completedRuns.every((run) => run.status === "complete")).toBe(true);
+    expect(database.getPipelineRunsByStatus("finalizing")).toEqual([]);
+  });
+
   it("forces re-embedding during resume when the embed checkpoint is complete but live retrieval artifacts are missing", async () => {
     const { fileA } = createRepo();
     const indexer = new Indexer(tempDir, createConfig());
@@ -2507,6 +2687,88 @@ describe("incremental index orchestrator", () => {
     expect(restoredChunkIds.every((chunkId) => internals.invertedIndex.hasChunk(chunkId))).toBe(true);
   });
 
+  it("repairs missing branch-filter state during resume when chunks still exist globally", async () => {
+    const { fileA } = createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const trackedPath = resolveTrackedPath(database, branch, fileA, tempDir);
+    const currentConfig = await getCurrentRuntimeConfig(indexer);
+    const beforeEmbed = database.getPipelineState(branch, trackedPath, "embed");
+    const internals = getIndexerInternals(indexer) as unknown as {
+      stores: Map<
+        string,
+        {
+          contains: (chunkId: string) => boolean;
+          branchContains: (branchName: string, chunkId: string) => boolean;
+          clearBranchMembership: (branchName: string) => void;
+        }
+      >;
+      primaryStoreModelId?: string | null;
+      configuredProviderInfo: { modelInfo: { model: string } };
+      invertedIndex: {
+        hasChunk: (chunkId: string) => boolean;
+        branchContains: (branchName: string, chunkId: string) => boolean;
+        clearBranchMembership: (branchName: string) => void;
+      };
+    };
+    const primaryModelId =
+      internals.primaryStoreModelId ?? internals.configuredProviderInfo.modelInfo.model;
+    const primaryStore = internals.stores.get(primaryModelId);
+    if (!primaryStore) {
+      throw new Error(`Missing primary store for model ${primaryModelId}`);
+    }
+
+    const restoredChunkIds = database
+      .getChunksByFileOnBranch(trackedPath, branch)
+      .map((chunk) => chunk.chunkId);
+    primaryStore.clearBranchMembership(branch);
+    internals.invertedIndex.clearBranchMembership(branch);
+
+    expect(restoredChunkIds.length).toBeGreaterThan(0);
+    expect(restoredChunkIds.every((chunkId) => primaryStore.contains(chunkId))).toBe(true);
+    expect(restoredChunkIds.every((chunkId) => internals.invertedIndex.hasChunk(chunkId))).toBe(true);
+    expect(restoredChunkIds.every((chunkId) => !primaryStore.branchContains(branch, chunkId))).toBe(true);
+    expect(
+      restoredChunkIds.every((chunkId) => !internals.invertedIndex.branchContains(branch, chunkId))
+    ).toBe(true);
+
+    database.upsertPipelineState({
+      branch,
+      filePath: trackedPath,
+      stage: "index",
+      status: "in_progress",
+      inputHash: database.getPipelineState(branch, trackedPath, "index")?.inputHash,
+      updatedAt: Date.now(),
+    });
+    database.startPipelineRun(
+      {
+        runId: "resume-missing-branch-filter",
+        branch,
+        runType: "resume",
+        status: "in_progress",
+        configHash: hashConfigVersion(currentConfig),
+        startedAt: Date.now(),
+      },
+      Date.now()
+    );
+
+    const fetchCountBeforeResume = fetchSpy.mock.calls.length;
+    const orchestrator = getIndexerInternals(indexer).orchestrator;
+    await orchestrator.resumeInterruptedRuns(branch, currentConfig, hashConfigVersion(currentConfig));
+
+    expect(database.getPipelineRun("resume-missing-branch-filter")?.status).toBe("complete");
+    expect(database.getPipelineState(branch, trackedPath, "embed")?.updatedAt).toBe(
+      beforeEmbed?.updatedAt
+    );
+    expect(fetchSpy.mock.calls.length).toBe(fetchCountBeforeResume);
+    expect(restoredChunkIds.every((chunkId) => primaryStore.branchContains(branch, chunkId))).toBe(true);
+    expect(
+      restoredChunkIds.every((chunkId) => internals.invertedIndex.branchContains(branch, chunkId))
+    ).toBe(true);
+  });
+
   it("keeps embed checkpoints trusted during resume when live retrieval artifacts are still present", async () => {
     const { fileA } = createRepo();
     const indexer = new Indexer(tempDir, createConfig());
@@ -2516,6 +2778,26 @@ describe("incremental index orchestrator", () => {
     const trackedPath = resolveTrackedPath(database, branch, fileA, tempDir);
     const currentConfig = await getCurrentRuntimeConfig(indexer);
     const beforeEmbed = database.getPipelineState(branch, trackedPath, "embed");
+    const internals = getIndexerInternals(indexer) as unknown as {
+      stores: Map<
+        string,
+        {
+          branchContains: (branchName: string, chunkId: string) => boolean;
+        }
+      >;
+      primaryStoreModelId?: string | null;
+      configuredProviderInfo: { modelInfo: { model: string } };
+      invertedIndex: {
+        branchContains: (branchName: string, chunkId: string) => boolean;
+      };
+    };
+    const primaryModelId =
+      internals.primaryStoreModelId ?? internals.configuredProviderInfo.modelInfo.model;
+    const primaryStore = internals.stores.get(primaryModelId);
+    if (!primaryStore) {
+      throw new Error(`Missing primary store for model ${primaryModelId}`);
+    }
+    const chunkIds = database.getChunksByFileOnBranch(trackedPath, branch).map((chunk) => chunk.chunkId);
 
     database.upsertPipelineState({
       branch,
@@ -2546,6 +2828,10 @@ describe("incremental index orchestrator", () => {
       beforeEmbed?.updatedAt
     );
     expect(fetchSpy.mock.calls.length).toBe(fetchCountBeforeResume);
+    expect(chunkIds.every((chunkId) => primaryStore.branchContains(branch, chunkId))).toBe(true);
+    expect(chunkIds.every((chunkId) => internals.invertedIndex.branchContains(branch, chunkId))).toBe(
+      true
+    );
   });
 
   it("reruns CHUNK, EMBED, and GRAPH across the branch after chunker config drift", async () => {
@@ -3575,7 +3861,7 @@ describe("incremental index orchestrator", () => {
       loggerWarnSpy.mock.calls.some(
         ([message]) =>
           message ===
-          "Retrieval startup integrity check failed: retrieval artifacts are empty or recovered while the database still has indexed chunks. A full rebuild is required before search results are reliable."
+          "Retrieval startup integrity check failed: retrieval artifacts are empty, recovered, or underpopulated while the database still has indexed chunks. A full rebuild is required before search results are reliable."
       )
     ).toBe(true);
 
@@ -3588,19 +3874,48 @@ describe("incremental index orchestrator", () => {
     coldStartSpy.mockRestore();
   });
 
-  it("detects DB-vs-store mismatch at startup and warns before forcing cold start", async () => {
-    createRepo();
+  it("detects DB-vs-store parity mismatch at startup and warns before forcing cold start", async () => {
+    createRepoWithManyFiles(50);
     const indexer = new Indexer(tempDir, createConfig());
     await indexer.index();
 
-    const { branch, database, indexPath } = await openDatabase(indexer);
-    expect(database.getBranchChunkIds(branch).length).toBeGreaterThan(0);
+    const { branch, database } = await openDatabase(indexer);
+    const branchChunkIds = database.getBranchChunkIds(branch);
+    expect(branchChunkIds.length).toBeGreaterThanOrEqual(50);
+    const retainedChunkIds = branchChunkIds.slice(0, 5);
     const primaryModelId =
       getIndexerInternals(indexer).primaryStoreModelId ??
       getIndexerInternals(indexer).configuredProviderInfo.modelInfo.model;
-    const storeBasePath = getStoreBasePath(indexPath, primaryModelId!);
-    fs.rmSync(storeBasePath);
-    fs.rmSync(`${storeBasePath}.meta.json`);
+    const primaryStore = getIndexerInternals(indexer).stores.get(primaryModelId!) as
+      | {
+          remove: (chunkId: string) => boolean;
+          save: () => void;
+          setBranchMembership: (branch: string, chunkIds: string[]) => void;
+          count: () => number;
+        }
+      | undefined;
+    const invertedIndex = getIndexerInternals(indexer).invertedIndex as
+      | {
+          removeChunk: (chunkId: string) => boolean;
+          save: () => void;
+          setBranchMembership: (branch: string, chunkIds: string[]) => void;
+          getDocumentCount: () => number;
+        }
+      | null
+      | undefined;
+    expect(primaryStore).toBeTruthy();
+    expect(invertedIndex).toBeTruthy();
+
+    for (const chunkId of branchChunkIds.slice(retainedChunkIds.length)) {
+      primaryStore!.remove(chunkId);
+      invertedIndex!.removeChunk(chunkId);
+    }
+    primaryStore!.setBranchMembership(branch, retainedChunkIds);
+    invertedIndex!.setBranchMembership(branch, retainedChunkIds);
+    primaryStore!.save();
+    invertedIndex!.save();
+    expect(primaryStore!.count()).toBe(retainedChunkIds.length);
+    expect(invertedIndex!.getDocumentCount()).toBe(retainedChunkIds.length);
 
     const restartedIndexer = await createFreshIndexer();
     const loggerWarnSpy = vi.spyOn((restartedIndexer as any).logger, "warn");
@@ -3611,10 +3926,61 @@ describe("incremental index orchestrator", () => {
       loggerWarnSpy.mock.calls.some(
         ([message, details]) =>
           message ===
-            "Retrieval startup integrity check failed: retrieval artifacts are empty or recovered while the database still has indexed chunks. A full rebuild is required before search results are reliable." &&
-          (details as { branchChunkCount?: number }).branchChunkCount !== undefined
+            "Retrieval startup integrity check failed: retrieval artifacts are empty, recovered, or underpopulated while the database still has indexed chunks. A full rebuild is required before search results are reliable." &&
+          (details as {
+            branchChunkCount?: number;
+            mismatchedStores?: Array<{ modelId: string; count: number }>;
+            bm25Count?: number;
+          }).branchChunkCount === branchChunkIds.length &&
+          (details as {
+            mismatchedStores?: Array<{ modelId: string; count: number }>;
+          }).mismatchedStores?.some((entry) => entry.count === retainedChunkIds.length) === true &&
+          (details as { bm25Count?: number }).bm25Count === retainedChunkIds.length
       )
     ).toBe(true);
+    loggerWarnSpy.mockRestore();
+  });
+
+  it("detects interrupted finalization at startup, cancels the run, and forces cold start", async () => {
+    createRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const currentConfig = await getCurrentRuntimeConfig(indexer);
+    const currentConfigHash = hashConfigVersion(currentConfig);
+    database.startPipelineRun(
+      {
+        runId: "interrupted-finalizing-run",
+        branch,
+        runType: "hot_update",
+        status: "finalizing",
+        configHash: currentConfigHash,
+        startedAt: Date.now(),
+      },
+      Date.now()
+    );
+
+    const restartedIndexer = await createFreshIndexer();
+    const restartedOrchestrator = getIndexerInternals(restartedIndexer).orchestrator;
+    const loggerWarnSpy = vi.spyOn((restartedIndexer as any).logger, "warn");
+
+    restartedOrchestrator.startupComplete = false;
+    await restartedOrchestrator.ensureStartupState();
+
+    const restartedDb = new Database(
+      path.join((await restartedIndexer.getStatus()).indexPath, "codebase.db")
+    );
+    expect(restartedDb.getPipelineRun("interrupted-finalizing-run")?.status).toBe("cancelled");
+    expect(restartedOrchestrator.forceColdStart).toBe(true);
+    expect(loggerWarnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Interrupted finalization detected for run interrupted-finalizing-run"),
+      expect.objectContaining({
+        branch,
+        runId: "interrupted-finalizing-run",
+        configHash: currentConfigHash,
+      })
+    );
     loggerWarnSpy.mockRestore();
   });
 
@@ -3827,5 +4193,62 @@ describe("incremental index orchestrator", () => {
     for (const stage of ["chunk", "embed", "index", "graph"] as const) {
       expect(database.getPipelineState(branch, trackedPath, stage)).toBeNull();
     }
+  });
+
+  it("routes refreshBranchInfo through setCurrentBranch before publishing a branch change", async () => {
+    createRepo();
+    createGitRepoMetadata("feature", ["main", "feature"]);
+    const indexer = new Indexer(tempDir, createConfig());
+    const indexerAny = indexer as any;
+    indexerAny.currentBranch = "main";
+    indexerAny.baseBranch = "main";
+
+    let membershipLoaded = false;
+    const originalPublishCurrentBranch = indexerAny.publishCurrentBranch;
+    const setCurrentBranchSpy = vi.spyOn(indexerAny, "setCurrentBranch");
+    const loadMembershipSpy = vi
+      .spyOn(indexerAny, "loadNativeBranchMembership")
+      .mockImplementation((branchName: string) => {
+        membershipLoaded = true;
+        expect(branchName).toBe("feature");
+      });
+    const publishBranchSpy = vi
+      .spyOn(indexerAny, "publishCurrentBranch")
+      .mockImplementation(function (this: any, branchName: string): void {
+        expect(branchName).toBe("feature");
+        expect(membershipLoaded).toBe(true);
+        expect(this.currentBranch).toBe("main");
+        originalPublishCurrentBranch.call(this, branchName);
+      });
+
+    await indexerAny.refreshBranchInfo();
+
+    expect(setCurrentBranchSpy).toHaveBeenCalledWith("feature");
+    expect(indexerAny.currentBranch).toBe("feature");
+
+    setCurrentBranchSpy.mockRestore();
+    loadMembershipSpy.mockRestore();
+    publishBranchSpy.mockRestore();
+  });
+
+  it("skips branch publication work when refreshBranchInfo sees no branch change", async () => {
+    createRepo();
+    createGitRepoMetadata("main", ["main", "feature"]);
+    const indexer = new Indexer(tempDir, createConfig());
+    const indexerAny = indexer as any;
+    indexerAny.currentBranch = "main";
+    indexerAny.baseBranch = "main";
+
+    const setCurrentBranchSpy = vi.spyOn(indexerAny, "setCurrentBranch");
+    const loadMembershipSpy = vi.spyOn(indexerAny, "loadNativeBranchMembership");
+
+    await indexerAny.refreshBranchInfo();
+
+    expect(setCurrentBranchSpy).not.toHaveBeenCalled();
+    expect(loadMembershipSpy).not.toHaveBeenCalled();
+    expect(indexerAny.currentBranch).toBe("main");
+
+    setCurrentBranchSpy.mockRestore();
+    loadMembershipSpy.mockRestore();
   });
 });
