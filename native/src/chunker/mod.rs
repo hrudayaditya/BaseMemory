@@ -2192,6 +2192,29 @@ export const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-2";
     }
 
     #[test]
+    fn captures_java_test_annotations() {
+        let source = r#"import org.junit.jupiter.api.Test;
+class MyServiceTest {
+  @Test
+  void testProcessPayment() {}
+
+  void helper() {}
+}
+"#;
+
+        let chunks = chunk_file("MyServiceTest.java", "java", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let test_chunk = named_fine_chunk(&chunks, "testProcessPayment");
+        assert_eq!(test_chunk.symbol_kind, Some(SymbolKind::Test));
+        assert_eq!(test_chunk.chunk_kind, ChunkKind::Test);
+
+        let helper_chunk = named_fine_chunk(&chunks, "helper");
+        assert_eq!(helper_chunk.symbol_kind, Some(SymbolKind::Method));
+        assert_eq!(helper_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
     fn captures_csharp_file_scoped_namespaces() {
         let source = r#"namespace Foo.Bar;
 
@@ -2232,6 +2255,29 @@ public class Example {}
         let indexer_chunk = named_fine_chunk(&chunks, "this[]");
         assert_eq!(indexer_chunk.symbol_kind, Some(SymbolKind::Method));
         assert_eq!(indexer_chunk.chunk_kind, ChunkKind::Code);
+    }
+
+    #[test]
+    fn captures_csharp_test_attributes() {
+        let source = r#"using Xunit;
+public class PaymentTests {
+  [Fact]
+  public void ProcessPayment_ShouldSucceed() { }
+
+  public void Helper() { }
+}
+"#;
+
+        let chunks = chunk_file("PaymentTests.cs", "csharp", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let test_chunk = named_fine_chunk(&chunks, "ProcessPayment_ShouldSucceed");
+        assert_eq!(test_chunk.symbol_kind, Some(SymbolKind::Test));
+        assert_eq!(test_chunk.chunk_kind, ChunkKind::Test);
+
+        let helper_chunk = named_fine_chunk(&chunks, "Helper");
+        assert_eq!(helper_chunk.symbol_kind, Some(SymbolKind::Method));
+        assert_eq!(helper_chunk.chunk_kind, ChunkKind::Code);
     }
 
     #[test]

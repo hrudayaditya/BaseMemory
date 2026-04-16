@@ -18,12 +18,104 @@ fn is_comment_kind(kind: &str) -> bool {
     matches!(kind, "line_comment" | "block_comment" | "comment")
 }
 
+const CSHARP_TEST_ATTRIBUTES: &[&str] = &[
+    "Fact",
+    "Theory",
+    "Test",
+    "TestCase",
+    "TestCaseSource",
+    "SetUp",
+    "TearDown",
+    "TestMethod",
+    "DataTestMethod",
+];
+
+fn csharp_attribute_terminal_name(node: Node<'_>, source: &str) -> Option<String> {
+    let name = node.child_by_field_name("name")?;
+    let text = node_text(name, source)?.trim();
+    let terminal = text.rsplit('.').next()?.trim();
+    let terminal = terminal.trim_end_matches("Attribute");
+    if terminal.is_empty() {
+        return None;
+    }
+    Some(terminal.to_string())
+}
+
+fn is_csharp_test_attribute_name(name: &str) -> bool {
+    CSHARP_TEST_ATTRIBUTES
+        .iter()
+        .any(|candidate| *candidate == name)
+}
+
+fn has_test_attribute_csharp(node: Node<'_>, source: &str) -> bool {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "attribute_list" {
+            continue;
+        }
+
+        let mut attr_cursor = child.walk();
+        for attr in child.named_children(&mut attr_cursor) {
+            if attr.kind() != "attribute" {
+                continue;
+            }
+
+            if let Some(name) = csharp_attribute_terminal_name(attr, source) {
+                if is_csharp_test_attribute_name(&name) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    let mut prev = node.prev_named_sibling();
+    while let Some(sibling) = prev {
+        match sibling.kind() {
+            "attribute_list" => {
+                let mut attr_cursor = sibling.walk();
+                for attr in sibling.named_children(&mut attr_cursor) {
+                    if attr.kind() != "attribute" {
+                        continue;
+                    }
+
+                    if let Some(name) = csharp_attribute_terminal_name(attr, source) {
+                        if is_csharp_test_attribute_name(&name) {
+                            return true;
+                        }
+                    }
+                }
+                prev = sibling.prev_named_sibling();
+            }
+            kind if is_comment_kind(kind) => {
+                prev = sibling.prev_named_sibling();
+            }
+            _ => return false,
+        }
+    }
+
+    false
+}
+
 fn classify_csharp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     match node.kind() {
-        "method_declaration"
-        | "constructor_declaration"
-        | "property_declaration"
-        | "indexer_declaration" => Some(SemanticInfo {
+        "method_declaration" | "constructor_declaration" => {
+            let is_test = has_test_attribute_csharp(node, source);
+            Some(SemanticInfo {
+                symbol_name: extract_name_by_fields(node, source, &["name"]),
+                symbol_kind: Some(if is_test {
+                    SymbolKind::Test
+                } else {
+                    SymbolKind::Method
+                }),
+                chunk_kind: if is_test {
+                    ChunkKind::Test
+                } else {
+                    ChunkKind::Code
+                },
+                coarse_eligible: false,
+            })
+        }
+        "property_declaration" | "indexer_declaration" => Some(SemanticInfo {
             symbol_name: if node.kind() == "indexer_declaration" {
                 Some("this[]".to_string())
             } else {

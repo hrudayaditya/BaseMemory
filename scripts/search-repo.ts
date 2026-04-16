@@ -13,6 +13,32 @@ const CONFIG_PATH = path.join(BASE_MEMORY_ROOT, ".opencode", "codebase-index.jso
 const RESULT_LIMIT = 5;
 const SNIPPET_LENGTH = 240;
 
+interface SearchScriptArgs {
+  repoPath: string;
+  query: string;
+}
+
+function usage(): string {
+  return 'Usage: npx tsx scripts/search-repo.ts <repo-path> "<search query>"';
+}
+
+function parseArgs(argv: string[]): SearchScriptArgs {
+  if (argv.length < 2) {
+    throw new Error(usage());
+  }
+
+  const [repoPath, ...queryParts] = argv;
+  const query = queryParts.join(" ").trim();
+  if (!query) {
+    throw new Error(usage());
+  }
+
+  return {
+    repoPath: path.resolve(process.cwd(), repoPath),
+    query,
+  };
+}
+
 function loadConfig(configPath: string) {
   if (!existsSync(configPath)) {
     throw new Error(`Config file not found: ${configPath}`);
@@ -31,29 +57,30 @@ function formatSnippet(content: string): string {
 }
 
 async function main(): Promise<void> {
-  const query = process.argv[2]?.trim();
-  const targetRepo = process.argv[3]?.trim() || BASE_MEMORY_ROOT;
+  const args = parseArgs(process.argv.slice(2));
 
-  if (!query) {
-    throw new Error('Usage: npx tsx scripts/search-repo.ts "your search query" [target-repo]');
+  if (!existsSync(args.repoPath)) {
+    throw new Error(`Repo path not found: ${args.repoPath}`);
   }
 
   const config = loadConfig(CONFIG_PATH);
-  const indexer = new Indexer(targetRepo, config);
+  const indexer = new Indexer(args.repoPath, config);
 
   console.log(`Config: ${CONFIG_PATH}`);
-  console.log(`Target repo: ${targetRepo}`);
-  console.log(`Query: ${query}`);
+  console.log(`Target repo: ${args.repoPath}`);
+  console.log(`Query: ${args.query}`);
   console.log("Initializing indexer...");
 
   await indexer.initialize();
 
   console.log("Searching...");
-  const response = await indexer.searchDetailed(query, RESULT_LIMIT);
+  const response = await indexer.searchDetailed(args.query, RESULT_LIMIT);
 
   console.log("");
   console.log(`Task type: ${response.taskType}`);
-  console.log(`Voyage lane: configured=${response.retrieval.voyageLaneConfigured} used=${response.retrieval.voyageLaneUsed}`);
+  console.log(
+    `Voyage lane: configured=${response.retrieval.voyageLaneConfigured} used=${response.retrieval.voyageLaneUsed}`
+  );
   console.log(`Final reranker applied: ${response.reranker.applied}`);
   console.log(`Final reranker backend: ${response.reranker.backend ?? "none"}`);
   console.log("");
