@@ -1464,12 +1464,24 @@ pub fn get_chunk_ids_by_filters_for_branch(
     directory: Option<&str>,
     chunk_type: Option<&str>,
     exclude_file: Option<&str>,
+    chunk_kind: Option<&str>,
+    language: Option<&str>,
+    path_glob: Option<&str>,
 ) -> DbResult<Vec<String>> {
     let normalized_file_type = file_type
         .map(|value| value.trim().trim_start_matches('.').to_lowercase())
         .filter(|value| !value.is_empty());
     let normalized_directory = directory
         .map(|value| value.trim().trim_matches('/').replace('\\', "/"))
+        .filter(|value| !value.is_empty());
+    let normalized_chunk_kind = chunk_kind
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
+    let normalized_language = language
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
+    let normalized_path_glob = path_glob
+        .map(|value| value.trim().replace('\\', "/"))
         .filter(|value| !value.is_empty());
     let file_type_pattern = normalized_file_type
         .as_ref()
@@ -1483,6 +1495,15 @@ pub fn get_chunk_ids_by_filters_for_branch(
     let directory_prefix_pattern = normalized_directory
         .as_ref()
         .map(|value| format!("{}/%", value));
+    let path_glob_absolute_pattern = normalized_path_glob
+        .as_ref()
+        .map(|value| {
+            if value.starts_with('/') {
+                value.clone()
+            } else {
+                format!("*/{}", value.trim_start_matches("./"))
+            }
+        });
 
     let mut stmt = conn.prepare(
         r#"
@@ -1494,6 +1515,9 @@ pub fn get_chunk_ids_by_filters_for_branch(
           AND (? IS NULL OR c.file_path LIKE ? OR c.file_path LIKE ?)
           AND (? IS NULL OR c.node_type = ?)
           AND (? IS NULL OR c.file_path != ?)
+          AND (? IS NULL OR LOWER(COALESCE(c.chunk_kind, '')) = ?)
+          AND (? IS NULL OR LOWER(c.language) = ?)
+          AND (? IS NULL OR c.file_path GLOB ? OR c.file_path GLOB ?)
         ORDER BY bc.chunk_id
         "#,
     )?;
@@ -1510,6 +1534,13 @@ pub fn get_chunk_ids_by_filters_for_branch(
             chunk_type,
             exclude_file,
             exclude_file,
+            normalized_chunk_kind.as_deref(),
+            normalized_chunk_kind.as_deref(),
+            normalized_language.as_deref(),
+            normalized_language.as_deref(),
+            normalized_path_glob.as_deref(),
+            normalized_path_glob.as_deref(),
+            path_glob_absolute_pattern.as_deref(),
         ],
         |row| row.get::<_, String>(0),
     )?;

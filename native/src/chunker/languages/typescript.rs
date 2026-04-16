@@ -391,6 +391,131 @@ fn is_js_test_call(node: Node<'_>, source: &str) -> bool {
     }
 }
 
+fn is_registration_method_name(name: &str) -> bool {
+    matches!(name, "tool" | "prompt" | "command" | "register")
+}
+
+fn has_registration_surface_shape(text: &str) -> bool {
+    [".tool(", ".prompt(", ".command(", ".register("]
+        .iter()
+        .any(|needle| text.contains(needle))
+        && (text.contains("=>") || text.contains("function"))
+        && (text.contains('"') || text.contains('\'') || text.contains('`'))
+}
+
+fn has_registration_tail_shape(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let has_prompt_payload_shape = (trimmed.contains("messages")
+        && trimmed.contains("role:")
+        && trimmed.contains("content:")
+        && trimmed.contains("text:"))
+        || (trimmed.contains("text:")
+            && (trimmed.contains("implementation_lookup tool")
+                || trimmed.contains("codebase_search for broader discovery")
+                || trimmed.contains("Find the definition of:")));
+    let has_tool_payload_shape = trimmed.contains("structuredContent:")
+        || trimmed.contains("content: [{ type: \"text\"")
+        || trimmed.contains("content: [{type:\"text\"");
+    let has_registration_closeout = trimmed.contains("return server;")
+        || trimmed.ends_with(");")
+        || trimmed.ends_with("}),")
+        || trimmed.ends_with("})");
+
+    (has_prompt_payload_shape || has_tool_payload_shape)
+        && has_registration_closeout
+        && (trimmed.contains('"') || trimmed.contains('\'') || trimmed.contains('`'))
+}
+
+pub(crate) fn registration_chunk_kind(text: &str, default_kind: &ChunkKind) -> ChunkKind {
+    if *default_kind == ChunkKind::Code
+        && (has_registration_surface_shape(text) || has_registration_tail_shape(text))
+    {
+        ChunkKind::Config
+    } else {
+        default_kind.clone()
+    }
+}
+
+fn registration_call_from_statement(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == "expression_statement" {
+        return first_named_child_of_kind(node, "call_expression");
+    }
+
+    if node.kind() == "call_expression" {
+        return Some(node);
+    }
+
+    None
+}
+
+fn registration_arguments_are_declarative(call: Node<'_>, _source: &str) -> bool {
+    let Some(arguments) = call.child_by_field_name("arguments") else {
+        return false;
+    };
+
+    let mut has_label = false;
+    let mut has_schema_or_handler = false;
+    let mut cursor = arguments.walk();
+    for argument in arguments.named_children(&mut cursor) {
+        let argument = unwrap_transparent_expression(argument);
+        match argument.kind() {
+            "string" | "string_literal" | "template_string" | "template_literal" => {
+                has_label = true;
+            }
+            "object" | "array" | "arrow_function" | "function" | "function_expression" => {
+                has_schema_or_handler = true;
+            }
+            "identifier"
+            | "member_expression"
+            | "subscript_expression"
+            | "number"
+            | "true"
+            | "false"
+            | "null"
+            | "undefined" => {}
+            _ => return false,
+        }
+    }
+
+    has_label && has_schema_or_handler
+}
+
+pub(crate) fn is_registration_statement(node: Node<'_>, source: &str) -> bool {
+    let statement_text = node_text(node, source)
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let has_registration_shape = statement_text
+        .map(has_registration_surface_shape)
+        .unwrap_or(false);
+
+    let Some(call) = registration_call_from_statement(node) else {
+        return has_registration_shape;
+    };
+
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+
+    let Some(method_name) = (match function.kind() {
+        "member_expression" => member_expression_property_name(function, source),
+        "identifier" | "property_identifier" => node_text(function, source)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(ToString::to_string),
+        _ => None,
+    }) else {
+        return false;
+    };
+
+    (is_registration_method_name(&method_name)
+        && registration_arguments_are_declarative(call, source))
+        || has_registration_shape
+}
+
 fn classify_commonjs_assignment(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     let assignment = if node.kind() == "expression_statement" {
         first_named_child_of_kind(node, "assignment_expression")

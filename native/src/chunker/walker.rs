@@ -1,4 +1,5 @@
 use super::error::ChunkerError;
+use super::languages::typescript::{is_registration_statement, registration_chunk_kind};
 use super::log_warn;
 use super::policy::{LanguagePolicy, SemanticInfo};
 use super::{
@@ -477,10 +478,19 @@ fn split_oversized_leaf_node_by_statements(
             .unwrap_or(template.end_byte);
 
         if index > first_statement_index && ctx.range_exceeds_budget(group_start, candidate_end) {
+            let chunk_kind = classify_statement_group_kind(
+                ctx,
+                &statements[first_statement_index..index],
+                &template.chunk_kind,
+            );
             chunks.push(PendingChunk {
                 symbol_name: template.symbol_name.clone(),
-                symbol_kind: template.symbol_kind.clone(),
-                chunk_kind: template.chunk_kind.clone(),
+                symbol_kind: if chunk_kind == ChunkKind::Config {
+                    Some(SymbolKind::Block)
+                } else {
+                    template.symbol_kind.clone()
+                },
+                chunk_kind,
                 granularity: template.granularity.clone(),
                 start_byte: group_start,
                 end_byte: statement.start_byte(),
@@ -490,10 +500,16 @@ fn split_oversized_leaf_node_by_statements(
         }
     }
 
+    let final_chunk_kind =
+        classify_statement_group_kind(ctx, &statements[first_statement_index..], &template.chunk_kind);
     let final_chunk = PendingChunk {
         symbol_name: template.symbol_name.clone(),
-        symbol_kind: template.symbol_kind.clone(),
-        chunk_kind: template.chunk_kind.clone(),
+        symbol_kind: if final_chunk_kind == ChunkKind::Config {
+            Some(SymbolKind::Block)
+        } else {
+            template.symbol_kind.clone()
+        },
+        chunk_kind: final_chunk_kind,
         granularity: template.granularity.clone(),
         start_byte: group_start,
         end_byte: template.end_byte,
@@ -506,6 +522,46 @@ fn split_oversized_leaf_node_by_statements(
     }
 
     Some(chunks)
+}
+
+fn classify_statement_group_kind(
+    ctx: &WalkerContext<'_>,
+    statements: &[Node<'_>],
+    default_kind: &ChunkKind,
+) -> ChunkKind {
+    if *default_kind != ChunkKind::Code || !is_js_like_language(ctx.language) || statements.is_empty()
+    {
+        return default_kind.clone();
+    }
+
+    let mut saw_registration = false;
+    for statement in statements {
+        if is_registration_statement(*statement, ctx.source) {
+            saw_registration = true;
+            continue;
+        }
+
+        if statement.kind() == "return_statement" {
+            continue;
+        }
+
+        return default_kind.clone();
+    }
+
+    if saw_registration {
+        let group_text = ctx
+            .slice(
+                statements[0].start_byte(),
+                statements
+                    .last()
+                    .map(|statement| statement.end_byte())
+                    .unwrap_or(statements[0].end_byte()),
+            )
+            .unwrap_or("");
+        registration_chunk_kind(group_text, default_kind)
+    } else {
+        default_kind.clone()
+    }
 }
 
 fn build_semantic_chunk(

@@ -10,8 +10,7 @@ const __dirname = path.dirname(__filename);
 
 const BASE_MEMORY_ROOT = path.resolve(__dirname, "..");
 const CONFIG_PATH = path.join(BASE_MEMORY_ROOT, ".opencode", "codebase-index.json");
-const TARGET_REPO = "/Users/aady/Documents/Get Decimal AI Projects/mirror-site-builder";
-
+const TARGET_REPO = "/Users/aditya3/Desktop/zod";
 function loadConfig(configPath: string) {
   if (!existsSync(configPath)) {
     throw new Error(`Config file not found: ${configPath}`);

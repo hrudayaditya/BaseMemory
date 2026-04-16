@@ -237,6 +237,106 @@ export async function handleEvalCommand(): Promise<void> {
     expect(results[0]?.symbolKind).toBe("Function");
   });
 
+  it("stores MCP registration chunks as config and keeps implementation-intent ranking on the real tool definition", async () => {
+    fs.mkdirSync(path.join(tempDir, "src", "tools"), { recursive: true });
+
+    fs.writeFileSync(
+      path.join(tempDir, "src", "tools", "index.ts"),
+      fs.readFileSync(path.join(process.cwd(), "src", "tools", "index.ts"), "utf-8"),
+      "utf-8"
+    );
+
+    fs.writeFileSync(
+      path.join(tempDir, "src", "mcp-server.ts"),
+      fs.readFileSync(path.join(process.cwd(), "src", "mcp-server.ts"), "utf-8"),
+      "utf-8"
+    );
+
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      voyageApiKey: "voyage-test-key",
+      voyageModelId: "voyage-code-2",
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.index();
+
+    const dbPath = path.join(tempDir, ".opencode", "index", "codebase.db");
+    const chunkRows = execFileSync(
+      "sqlite3",
+      [
+        `file:${dbPath}?mode=ro`,
+        "select chunk_kind, start_line, end_line, node_type from chunks where file_path like '%/src/mcp-server.ts' order by start_line;",
+      ],
+      { encoding: "utf-8" }
+    )
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    const parsedChunkRows = chunkRows.map((row) => {
+      const [chunkKind, startLine, endLine, nodeType] = row.split("|");
+      return {
+        chunkKind,
+        startLine: Number(startLine),
+        endLine: Number(endLine),
+        nodeType,
+      };
+    });
+    const mcpServerSource = fs.readFileSync(path.join(tempDir, "src", "mcp-server.ts"), "utf8");
+    const registrationLines = mcpServerSource
+      .split("\n")
+      .flatMap((line, index) => line.includes("server.tool(") || line.includes("server.prompt(") ? [index + 1] : []);
+    const overlappingRegistrationChunks = parsedChunkRows.filter((row) =>
+      registrationLines.some((line) => row.startLine <= line && row.endLine >= line)
+    );
+
+    expect(overlappingRegistrationChunks.length).toBeGreaterThan(0);
+    expect(overlappingRegistrationChunks.every((row) => row.chunkKind === "Config")).toBe(true);
+    expect(parsedChunkRows).toContainEqual({
+      chunkKind: "Config",
+      startLine: 794,
+      endLine: 801,
+      nodeType: "other",
+    });
+
+    const codebaseSearchResponse = await indexer.searchDetailed("find exported ToolDefinition for codebase_search", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+      taskType: "definition",
+      graphDepth: 1,
+    });
+
+    expect(codebaseSearchResponse.primaryResults[0]?.filePath).toContain("/src/tools/index.ts");
+    expect(codebaseSearchResponse.primaryResults[0]?.name).toBe("codebase_search");
+    expect(codebaseSearchResponse.primaryResults[0]?.filePath).not.toContain("/src/mcp-server.ts");
+
+    const implementationLookupResponse = await indexer.searchDetailed("find exported ToolDefinition for implementation_lookup", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+      taskType: "definition",
+      graphDepth: 1,
+    });
+
+    expect(implementationLookupResponse.primaryResults[0]?.filePath).toContain("/src/tools/index.ts");
+    expect(implementationLookupResponse.primaryResults[0]?.name).toBe("implementation_lookup");
+    expect(implementationLookupResponse.primaryResults[0]?.filePath).not.toContain("/src/mcp-server.ts");
+  });
+
   it("preserves retrieval correctness across clearIndex and rebuild", async () => {
     const config = parseConfig({
       embeddingProvider: "custom",

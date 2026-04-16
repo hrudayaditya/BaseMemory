@@ -6,6 +6,7 @@ pub mod walker;
 
 use crate::hasher::xxhash_content;
 use crate::types::Language;
+use languages::typescript::registration_chunk_kind;
 use error::ChunkerError;
 use fallback::chunk_by_lines;
 use napi_derive::napi;
@@ -459,6 +460,16 @@ pub(crate) fn split_range_to_max_sized_chunks(
                 end: segment_end,
             })?
             .to_string();
+        let chunk_kind = if matches!(language, "typescript" | "tsx" | "javascript" | "jsx") {
+            registration_chunk_kind(&text, &base_chunk.chunk_kind)
+        } else {
+            base_chunk.chunk_kind.clone()
+        };
+        let symbol_kind = if chunk_kind == ChunkKind::Config {
+            Some(SymbolKind::Block)
+        } else {
+            base_chunk.symbol_kind.clone()
+        };
 
         if exceeds_budget(&text, config) {
             return Err(ChunkerError::ChunkTooLarge {
@@ -473,8 +484,8 @@ pub(crate) fn split_range_to_max_sized_chunks(
             file_path: file_path.to_string(),
             language: language.to_string(),
             symbol_name: base_chunk.symbol_name.clone(),
-            symbol_kind: base_chunk.symbol_kind.clone(),
-            chunk_kind: base_chunk.chunk_kind.clone(),
+            symbol_kind,
+            chunk_kind,
             granularity: Granularity::Fine,
             start_byte: segment_start as u32,
             end_byte: segment_end as u32,
@@ -1678,6 +1689,34 @@ export const codebase_search: ToolDefinition = tool({
             chunk.symbol_name.as_deref() == Some("The code snippet to find similar code for")
                 || chunk.symbol_name.as_deref()
                     == Some("Natural language description of what code you're looking for.")
+        }));
+    }
+
+    #[test]
+    fn classifies_statement_split_registration_chunks_as_config() {
+        let source = include_str!("../../../src/mcp-server.ts");
+
+        let chunks = chunk_file("src/mcp-server.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let registration_chunks: Vec<&Chunk> = chunks
+            .iter()
+            .filter(|chunk| {
+                chunk.granularity == Granularity::Fine
+                    && (chunk.text.contains("server.tool(") || chunk.text.contains("server.prompt("))
+            })
+            .collect();
+
+        assert!(!registration_chunks.is_empty());
+        assert!(registration_chunks
+            .iter()
+            .all(|chunk| chunk.chunk_kind == ChunkKind::Config));
+        assert!(registration_chunks.iter().any(|chunk| chunk.text.contains("\"call_chain\"")));
+        assert!(registration_chunks.iter().any(|chunk| chunk.text.contains("\"tests_for\"")));
+        assert!(chunks.iter().any(|chunk| {
+            chunk.chunk_kind == ChunkKind::Config
+                && chunk.text.contains("Use the implementation_lookup tool")
+                && chunk.text.contains("return server;")
         }));
     }
 

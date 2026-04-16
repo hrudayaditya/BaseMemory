@@ -1311,6 +1311,9 @@ impl Database {
         directory: Option<String>,
         chunk_type: Option<String>,
         exclude_file: Option<String>,
+        chunk_kind: Option<String>,
+        language: Option<String>,
+        path_glob: Option<String>,
     ) -> Result<Vec<String>> {
         let conn = self
             .conn
@@ -1323,6 +1326,9 @@ impl Database {
             directory.as_deref(),
             chunk_type.as_deref(),
             exclude_file.as_deref(),
+            chunk_kind.as_deref(),
+            language.as_deref(),
+            path_glob.as_deref(),
         )
         .map_err(|e| Error::from_reason(e.to_string()))
     }

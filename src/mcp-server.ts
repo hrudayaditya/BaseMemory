@@ -77,6 +77,25 @@ const CHUNK_TYPE_ENUM = [
   "enum", "struct", "impl", "trait", "module", "constant", "other",
 ] as const;
 const TASK_TYPE_ENUM = [...SEARCH_TASK_TYPES] as [typeof SEARCH_TASK_TYPES[number], ...typeof SEARCH_TASK_TYPES[number][]];
+const CHUNK_KIND_FILTER_ENUM = ["code", "test", "doc", "config"] as const;
+
+function encodeCursor(offset: number): string {
+  return Buffer.from(String(offset), "utf8").toString("base64");
+}
+
+function decodeCursor(cursor: string | undefined): number {
+  if (!cursor) {
+    return 0;
+  }
+
+  try {
+    const decoded = Buffer.from(cursor, "base64").toString("utf8");
+    const parsed = Number.parseInt(decoded, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+  } catch {
+    return 0;
+  }
+}
 
 export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndexConfig): McpServer {
   const server = new McpServer({
@@ -96,57 +115,103 @@ export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndex
 
   // --- Tools ---
 
-  server.tool(
+  server.registerTool(
     "codebase_search",
-    "Search codebase by MEANING, not keywords. Returns full code content. For just finding WHERE code is (saves ~90% tokens), use codebase_peek instead.",
     {
-      query: z.string().describe("Natural language description of what code you're looking for. Describe behavior, not syntax."),
-      limit: z.number().optional().default(5).describe("Maximum number of results to return"),
-      fileType: z.string().optional().describe("Filter by file extension (e.g., 'ts', 'py', 'rs')"),
-      directory: z.string().optional().describe("Filter by directory path (e.g., 'src/utils', 'lib')"),
-      chunkType: z.enum(CHUNK_TYPE_ENUM).optional().describe("Filter by code chunk type"),
-      contextLines: z.number().optional().describe("Number of extra lines to include before/after each match (default: 0)"),
-      taskType: z.enum(TASK_TYPE_ENUM).optional().describe("Retrieval recipe to apply (default: general)"),
-      graphDepth: z.number().optional().describe("Optional call-graph expansion depth (0-2, default: 0)"),
+      description:
+        "Search codebase by MEANING, not keywords. Returns full code content. For just finding WHERE code is (saves ~90% tokens), use codebase_peek instead.",
+      inputSchema: {
+        query: z.string().describe("Natural language description of what code you're looking for. Describe behavior, not syntax."),
+        limit: z.number().optional().default(5).describe("Maximum number of results to return"),
+        fileType: z.string().optional().describe("Filter by file extension (e.g., 'ts', 'py', 'rs')"),
+        directory: z.string().optional().describe("Filter by directory path (e.g., 'src/utils', 'lib')"),
+        chunkType: z.enum(CHUNK_TYPE_ENUM).optional().describe("Filter by code chunk type"),
+        contextLines: z.number().optional().describe("Number of extra lines to include before/after each match (default: 0)"),
+        taskType: z.enum(TASK_TYPE_ENUM).optional().describe("Retrieval recipe to apply (default: general)"),
+        graphDepth: z.number().optional().describe("Optional call-graph expansion depth (0-2, default: 0)"),
+        filters: z.object({
+          chunk_type: z.enum(CHUNK_KIND_FILTER_ENUM).optional().describe("Restrict to chunks of this kind."),
+          path_glob: z.string().optional().describe("Glob pattern for file paths, e.g. 'src/**/*.ts'."),
+          language: z.string().optional().describe("Restrict to one language, e.g. 'typescript', 'rust'."),
+        }).optional().describe("Optional filters to narrow scope."),
+        include_scores: z.boolean().optional().default(false).describe("If true, include lane and reranker score per result."),
+        cursor: z.string().optional().describe("Pagination cursor from a previous response."),
+      },
+      outputSchema: {
+        results: z.array(z.object({
+          file_path: z.string(),
+          start_line: z.number(),
+          end_line: z.number(),
+          content: z.string(),
+          chunk_type: z.string(),
+          chunk_kind: z.string().nullable().optional(),
+          name: z.string().nullable().optional(),
+          lane: z.enum(["bm25", "semantic", "hybrid"]),
+          reranker_score: z.number().nullable(),
+        })),
+        cursor: z.string().nullable(),
+      },
     },
     async (args) => {
       await ensureInitialized();
-      const response = args.graphDepth && args.graphDepth > 0
-        ? await indexer.searchDetailed(args.query, args.limit ?? 5, {
-            fileType: args.fileType,
-            directory: args.directory,
-            chunkType: args.chunkType,
-            contextLines: args.contextLines,
-            taskType: args.taskType,
-            graphDepth: args.graphDepth,
-          })
-        : {
-            primaryResults: await indexer.search(args.query, args.limit ?? 5, {
-              fileType: args.fileType,
-              directory: args.directory,
-              chunkType: args.chunkType,
-              contextLines: args.contextLines,
-              taskType: args.taskType,
-            }),
-            expandedContext: [],
-          };
 
-      if (response.primaryResults.length === 0) {
-        return { content: [{ type: "text", text: "No matching code found. Try a different query or run index_codebase first." }] };
+      const pageSize = args.limit ?? 5;
+      const offset = decodeCursor(args.cursor);
+      const requestedLimit = Math.max(pageSize, offset + pageSize);
+      const graphDepth = args.graphDepth ?? 0;
+      const response = await indexer.searchDetailed(args.query, requestedLimit, {
+        fileType: args.fileType,
+        directory: args.directory,
+        chunkType: args.chunkType,
+        chunkKind: args.filters?.chunk_type,
+        language: args.filters?.language,
+        pathGlob: args.filters?.path_glob,
+        contextLines: args.contextLines,
+        taskType: args.taskType,
+        graphDepth,
+      });
+
+      if (response.primaryResults.length === 0 || offset >= response.primaryResults.length) {
+        return {
+          content: [{ type: "text", text: "No matching code found. Try a different query or run index_codebase first." }],
+          structuredContent: {
+            results: [],
+            cursor: null,
+          },
+        };
       }
 
-      const formatted = response.primaryResults.map((r, idx) => {
+      const pagedResults = response.primaryResults.slice(offset, offset + pageSize);
+      const nextOffset = offset + pagedResults.length;
+      const cursor = nextOffset < response.primaryResults.length ? encodeCursor(nextOffset) : null;
+      const formatted = pagedResults.map((r, idx) => {
         const relationPrefix = r.relation ? `${r.relation} depth=${r.depth ?? 1} ` : "";
         const provenance = r.viaSymbol ? ` via ${r.viaSymbol}` : "";
         const header = r.name
-          ? `[${idx + 1}] ${relationPrefix}${r.chunkType} "${r.name}" in ${r.filePath}:${r.startLine}-${r.endLine}${provenance}`
-          : `[${idx + 1}] ${relationPrefix}${r.chunkType} in ${r.filePath}:${r.startLine}-${r.endLine}${provenance}`;
+          ? `[${offset + idx + 1}] ${relationPrefix}${r.chunkType} "${r.name}" in ${r.filePath}:${r.startLine}-${r.endLine}${provenance}`
+          : `[${offset + idx + 1}] ${relationPrefix}${r.chunkType} in ${r.filePath}:${r.startLine}-${r.endLine}${provenance}`;
         return `${header} (score: ${r.score.toFixed(2)})\n\`\`\`\n${truncateContent(r.content)}\n\`\`\``;
       });
 
       const primary = `Found ${response.primaryResults.length} results for "${args.query}":\n\n${formatted.join("\n\n")}`;
       const expanded = formatExpandedContext(response.expandedContext);
-      return { content: [{ type: "text", text: expanded.length > 0 ? `${primary}\n\n${expanded}` : primary }] };
+      return {
+        content: [{ type: "text", text: expanded.length > 0 ? `${primary}\n\n${expanded}` : primary }],
+        structuredContent: {
+          results: pagedResults.map((result) => ({
+            file_path: result.filePath,
+            start_line: result.startLine,
+            end_line: result.endLine,
+            content: result.content,
+            chunk_type: result.chunkType,
+            chunk_kind: result.chunkKind ? result.chunkKind.toLowerCase() : null,
+            name: result.name ?? null,
+            lane: result.lane ?? "hybrid",
+            reranker_score: args.include_scores ? (result.rerankerScore ?? null) : null,
+          })),
+          cursor,
+        },
+      };
     },
   );
 
@@ -452,6 +517,200 @@ export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndex
         `[${i + 1}] \u2190 from ${e.fromSymbolName ?? "<unknown>"} in ${e.fromSymbolFilePath ?? "<unknown file>"} [${e.fromSymbolId}] (${e.callType}) at line ${e.line}${e.isResolved ? " [resolved]" : " [unresolved]"}`
       );
       return { content: [{ type: "text", text: `"${args.name}" is called by ${callers.length} function(s):\n\n${formatted.join("\n")}` }] };
+    },
+  );
+
+  server.tool(
+    "symbol_info",
+    "Return the indexed identity card for a symbol, including stable symbol id, file location, kind, signature, and chunk classification.",
+    {
+      symbol: z.string().describe("Symbol name to look up. Simple name or fully-qualified name."),
+      file_path: z.string().optional().describe("Optional relative file path to disambiguate duplicate symbol names."),
+    },
+    async (args) => {
+      await ensureInitialized();
+      const result = await indexer.getSymbolInfo(args.symbol, args.file_path);
+      const text = result.total === 0
+        ? `No symbol named '${args.symbol}' found in the current branch.`
+        : result.ambiguous
+          ? `Found ${result.total} symbols named '${args.symbol}'. Provide file_path to disambiguate.`
+          : `Symbol: ${result.symbols[0]?.name ?? args.symbol} (${result.symbols[0]?.kind ?? "unknown"}) at ${result.symbols[0]?.relativePath ?? "<unknown>"}:${result.symbols[0]?.startLine ?? 0}`;
+      return {
+        content: [{ type: "text", text }],
+        structuredContent: {
+          symbols: result.symbols.map((symbol) => ({
+            symbol_id: symbol.symbolId,
+            name: symbol.name,
+            kind: symbol.kind,
+            file_uri: symbol.fileUri,
+            relative_path: symbol.relativePath,
+            start_line: symbol.startLine,
+            end_line: symbol.endLine,
+            signature: symbol.signature,
+            chunk_kind: symbol.chunkKind,
+          })),
+          total: result.total,
+          ambiguous: result.ambiguous,
+        },
+      };
+    },
+  );
+
+  server.tool(
+    "callers",
+    "List functions that call a given symbol. Use this for impact analysis and dependency tracing.",
+    {
+      symbol: z.string().describe("Function or method name to find callers of."),
+      file_path: z.string().optional().describe("Optional relative file path to disambiguate duplicate symbol names."),
+      include_tests: z.boolean().optional().default(true).describe("If false, exclude test callers from results."),
+      max_results: z.number().int().min(1).max(100).optional().default(20).describe("Maximum callers to return."),
+      cursor: z.string().optional().describe("Opaque pagination cursor from a previous response."),
+    },
+    async (args) => {
+      await ensureInitialized();
+      const result = await indexer.getStructuralCallers({
+        symbol: args.symbol,
+        filePath: args.file_path,
+        includeTests: args.include_tests,
+        maxResults: args.max_results,
+        cursor: args.cursor,
+      });
+      const text = result.total === 0
+        ? `No callers found for '${args.symbol}' in the current branch.`
+        : `Found ${result.total} callers of '${args.symbol}'.`;
+      return {
+        content: [{ type: "text", text }],
+        structuredContent: {
+          callers: result.callers.map((caller) => ({
+            symbol_name: caller.symbolName,
+            file_uri: caller.fileUri,
+            relative_path: caller.relativePath,
+            line: caller.line,
+            chunk_kind: caller.chunkKind,
+          })),
+          total: result.total,
+          cursor: result.cursor,
+          resolved: result.resolved,
+        },
+      };
+    },
+  );
+
+  server.tool(
+    "callees",
+    "List symbols invoked by a given function or method, including unresolved graph edges.",
+    {
+      symbol: z.string().describe("Function or method name to find callees of."),
+      file_path: z.string().optional().describe("Optional relative file path to disambiguate duplicate symbol names."),
+      max_results: z.number().int().min(1).max(100).optional().default(20).describe("Maximum callees to return."),
+    },
+    async (args) => {
+      await ensureInitialized();
+      const result = await indexer.getStructuralCallees({
+        symbol: args.symbol,
+        filePath: args.file_path,
+        maxResults: args.max_results,
+      });
+      const unresolvedCount = result.callees.filter((entry) => !entry.resolved).length;
+      const text = result.total === 0
+        ? `No callees found for '${args.symbol}' in the current branch.`
+        : `Found ${result.total} callees of '${args.symbol}' (${unresolvedCount} unresolved).`;
+      return {
+        content: [{ type: "text", text }],
+        structuredContent: {
+          callees: result.callees.map((callee) => ({
+            symbol_name: callee.symbolName,
+            file_uri: callee.fileUri,
+            relative_path: callee.relativePath,
+            line: callee.line,
+            resolved: callee.resolved,
+          })),
+          total: result.total,
+          resolved: result.resolved,
+        },
+      };
+    },
+  );
+
+  server.tool(
+    "call_chain",
+    "Find the shortest call path between two symbols using the resolved call graph.",
+    {
+      from_symbol: z.string().describe("Starting function or method name."),
+      to_symbol: z.string().describe("Target function or method name."),
+      from_file: z.string().optional().describe("Optional file path to disambiguate from_symbol."),
+      to_file: z.string().optional().describe("Optional file path to disambiguate to_symbol."),
+      max_depth: z.number().int().min(1).max(15).optional().default(8).describe("Maximum hop depth before giving up."),
+    },
+    async (args) => {
+      await ensureInitialized();
+      const result = await indexer.getStructuralCallChain({
+        fromSymbol: args.from_symbol,
+        toSymbol: args.to_symbol,
+        fromFile: args.from_file,
+        toFile: args.to_file,
+        maxDepth: args.max_depth,
+      });
+      const text = result.found
+        ? `Call path from '${args.from_symbol}' to '${args.to_symbol}': ${result.depth} hops.`
+        : `No call path found from '${args.from_symbol}' to '${args.to_symbol}' within depth ${args.max_depth}.`;
+      return {
+        content: [{ type: "text", text }],
+        structuredContent: {
+          found: result.found,
+          path: result.path.map((entry) => ({
+            symbol_name: entry.symbolName,
+            file_uri: entry.fileUri,
+            relative_path: entry.relativePath,
+            line: entry.line,
+          })),
+          depth: result.depth,
+          search_depth_reached: result.searchDepthReached,
+          warning: result.warning,
+        },
+      };
+    },
+  );
+
+  server.tool(
+    "tests_for",
+    "Find test functions that cover a given symbol or file using call-graph and naming heuristics.",
+    {
+      symbol: z.string().optional().describe("Function or method name to find tests for."),
+      file_path: z.string().optional().describe("Source file path. If provided without symbol, returns tests covering any symbol in this file."),
+    },
+    async (args) => {
+      await ensureInitialized();
+      if (!args.symbol && !args.file_path) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "At least one of 'symbol' or 'file_path' is required." }],
+        };
+      }
+
+      const result = await indexer.getStructuralTests({
+        symbol: args.symbol,
+        filePath: args.file_path,
+      });
+      const callGraphCount = result.tests.filter((entry) => entry.method === "call_graph").length;
+      const namingCount = result.tests.filter((entry) => entry.method === "name_convention").length;
+      const label = args.symbol ?? args.file_path ?? "target";
+      const text = `Found ${result.total} tests covering '${label}' (${callGraphCount} via call graph, ${namingCount} via naming).`;
+      return {
+        content: [{ type: "text", text }],
+        structuredContent: {
+          tests: result.tests.map((entry) => ({
+            test_name: entry.testName,
+            file_uri: entry.fileUri,
+            relative_path: entry.relativePath,
+            line: entry.line,
+            confidence: entry.confidence,
+            method: entry.method,
+          })),
+          total: result.total,
+          symbol_resolved: result.symbolResolved,
+        },
+      };
     },
   );
 

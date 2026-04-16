@@ -343,9 +343,9 @@
       "queryType": "concept",
       "expected": {
         "filePath": "src/eval/budget.ts",
-        "symbol": "evaluateBudgetGate",
-        "startLine": 118,
-        "endLine": 258
+        "symbol": "checkGate",
+        "startLine": 16,
+        "endLine": 80
       }
     },
     {

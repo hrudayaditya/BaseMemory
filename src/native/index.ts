@@ -1185,13 +1185,19 @@ export class Database {
     directory: string | null,
     chunkType: string | null,
     excludeFile: string | null,
+    chunkKind: string | null,
+    language: string | null,
+    pathGlob: string | null,
   ): Promise<string[]> {
     return this.inner.getChunkIdsByFiltersForBranch(
       branch,
       fileType,
       directory,
       chunkType,
-      excludeFile
+      excludeFile,
+      chunkKind,
+      language,
+      pathGlob
     );
   }
 

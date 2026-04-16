@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync, promises as fsPromises } from "fs";
 import * as path from "path";
 import { performance } from "perf_hooks";
+import { pathToFileURL } from "url";
 
 import { ParsedCodebaseIndexConfig } from "../config/schema.js";
 import { detectEmbeddingProvider, ConfiguredProviderInfo, tryDetectProvider, createCustomProviderInfo } from "../embeddings/detector.js";
@@ -73,6 +74,122 @@ function getErrorMessage(error: unknown): string {
     return String((error as { message: unknown }).message);
   }
   return String(error);
+}
+
+function normalizeStoredChunkKind(
+  chunkKind: string | undefined | null
+): "code" | "test" | "doc" | "config" | null {
+  if (!chunkKind) {
+    return null;
+  }
+
+  switch (chunkKind.toLowerCase()) {
+    case "code":
+      return "code";
+    case "test":
+      return "test";
+    case "doc":
+      return "doc";
+    case "config":
+      return "config";
+    default:
+      return null;
+  }
+}
+
+function mergeSearchResultLane(
+  existingLane: SearchResultLane | undefined,
+  nextLane: SearchResultLane | undefined
+): SearchResultLane | undefined {
+  if (!existingLane) {
+    return nextLane;
+  }
+  if (!nextLane || existingLane === nextLane) {
+    return existingLane;
+  }
+  return "hybrid";
+}
+
+function normalizeRequestedChunkKind(
+  chunkKind: string | undefined | null
+): "code" | "test" | "doc" | "config" | null {
+  return normalizeStoredChunkKind(chunkKind);
+}
+
+function normalizeStructuralSymbolKind(
+  kind: string | undefined | null
+): "function" | "class" | "method" | "variable" | "unknown" {
+  const normalized = kind?.toLowerCase() ?? "";
+  if (normalized === "function" || normalized === "test") {
+    return "function";
+  }
+  if (normalized === "method") {
+    return "method";
+  }
+  if (
+    normalized === "class" ||
+    normalized === "interface" ||
+    normalized === "struct" ||
+    normalized === "trait" ||
+    normalized === "type" ||
+    normalized === "module"
+  ) {
+    return "class";
+  }
+  if (normalized === "constant" || normalized === "variable") {
+    return "variable";
+  }
+  return "unknown";
+}
+
+function extractStoredChunkSignature(chunkText: string | null | undefined): string | null {
+  if (!chunkText) {
+    return null;
+  }
+
+  const lines = chunkText.split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) {
+      continue;
+    }
+    if (
+      trimmed.startsWith("//") ||
+      trimmed.startsWith("#") ||
+      trimmed.startsWith("/*") ||
+      trimmed.startsWith("*") ||
+      trimmed.startsWith("*/") ||
+      trimmed.startsWith("<!--")
+    ) {
+      continue;
+    }
+    return trimmed;
+  }
+
+  return null;
+}
+
+function looksLikeTestFilePath(filePath: string | undefined | null): boolean {
+  if (!filePath) {
+    return false;
+  }
+
+  const normalized = filePath.replace(/\\/g, "/").toLowerCase();
+  return (
+    normalized.includes("/test/") ||
+    normalized.includes("/tests/") ||
+    normalized.includes("__tests__") ||
+    normalized.endsWith(".test.ts") ||
+    normalized.endsWith(".test.tsx") ||
+    normalized.endsWith(".test.js") ||
+    normalized.endsWith(".test.jsx") ||
+    normalized.endsWith(".spec.ts") ||
+    normalized.endsWith(".spec.tsx") ||
+    normalized.endsWith(".spec.js") ||
+    normalized.endsWith(".spec.jsx") ||
+    normalized.endsWith("_test.py") ||
+    normalized.endsWith("test.py")
+  );
 }
 
 function buildLineStartByteOffsets(content: string): number[] {
@@ -174,6 +291,8 @@ export interface SearchResult {
   content: string;
   score: number;
   reranked?: boolean;
+  rerankerScore?: number | null;
+  lane?: "bm25" | "semantic" | "hybrid";
   chunkType: string;
   chunkKind?: ChunkKind;
   symbolKind?: ChunkSymbolKind;
@@ -217,6 +336,9 @@ export interface SearchOptions {
   fileType?: string;
   directory?: string;
   chunkType?: string;
+  chunkKind?: "code" | "test" | "doc" | "config";
+  language?: string;
+  pathGlob?: string;
   contextLines?: number;
   filterByBranch?: boolean;
   metadataOnly?: boolean;
@@ -224,6 +346,83 @@ export interface SearchOptions {
   taskType?: SearchTaskType;
   graphDepth?: number;
   graphDirection?: GraphExpansionDirection;
+}
+
+export interface StructuralSymbolInfoEntry {
+  symbolId: string;
+  name: string;
+  kind: "function" | "class" | "method" | "variable" | "unknown";
+  fileUri: string;
+  relativePath: string;
+  startLine: number;
+  endLine: number;
+  signature: string | null;
+  chunkKind: "code" | "test" | "doc" | "config" | null;
+}
+
+export interface StructuralSymbolInfoResult {
+  symbols: StructuralSymbolInfoEntry[];
+  total: number;
+  ambiguous: boolean;
+}
+
+export interface StructuralCallerEntry {
+  symbolName: string;
+  fileUri: string;
+  relativePath: string;
+  line: number;
+  chunkKind: "code" | "test" | "doc" | "config";
+}
+
+export interface StructuralCallersResult {
+  callers: StructuralCallerEntry[];
+  total: number;
+  cursor: string | null;
+  resolved: boolean;
+}
+
+export interface StructuralCalleeEntry {
+  symbolName: string;
+  fileUri: string | null;
+  relativePath: string | null;
+  line: number | null;
+  resolved: boolean;
+}
+
+export interface StructuralCalleesResult {
+  callees: StructuralCalleeEntry[];
+  total: number;
+  resolved: boolean;
+}
+
+export interface StructuralCallChainEntry {
+  symbolName: string;
+  fileUri: string;
+  relativePath: string;
+  line: number;
+}
+
+export interface StructuralCallChainResult {
+  found: boolean;
+  path: StructuralCallChainEntry[];
+  depth: number;
+  searchDepthReached: boolean;
+  warning: string | null;
+}
+
+export interface StructuralTestEntry {
+  testName: string;
+  fileUri: string;
+  relativePath: string;
+  line: number;
+  confidence: number;
+  method: "call_graph" | "name_convention" | "file_convention";
+}
+
+export interface StructuralTestsResult {
+  tests: StructuralTestEntry[];
+  total: number;
+  symbolResolved: boolean;
 }
 
 export interface HealthCheckResult {
@@ -328,11 +527,13 @@ interface FailedBatch {
 }
 
 type RetrievalChunkMetadata = GraphExpansionMetadata;
+type SearchResultLane = "bm25" | "semantic" | "hybrid";
 
 type RankedCandidate = {
   id: string;
   score: number;
   metadata: RetrievalChunkMetadata;
+  lane?: SearchResultLane;
   relation?: "caller" | "callee";
   chunkKind?: ChunkKind;
   symbolKind?: ChunkSymbolKind;
@@ -382,6 +583,9 @@ interface HardRetrievalFilters {
   directory?: string;
   chunkType?: string;
   excludeFile?: string;
+  chunkKind?: "code" | "test" | "doc" | "config";
+  language?: string;
+  pathGlob?: string;
 }
 
 interface IndexMetadata {
@@ -1245,7 +1449,11 @@ export function fuseResultsWeighted(
   lanes: FusionLane[],
   limit: number
 ): RankedCandidate[] {
-  const fusedScores = new Map<string, { score: number; metadata: RetrievalChunkMetadata }>();
+  const fusedScores = new Map<string, {
+    score: number;
+    metadata: RetrievalChunkMetadata;
+    lane?: SearchResultLane;
+  }>();
 
   for (const lane of lanes) {
     if (lane.weight <= 0 || lane.results.length === 0) {
@@ -1256,10 +1464,12 @@ export function fuseResultsWeighted(
       const existing = fusedScores.get(result.id);
       if (existing) {
         existing.score += result.score * lane.weight;
+        existing.lane = mergeSearchResultLane(existing.lane, result.lane);
       } else {
         fusedScores.set(result.id, {
           score: result.score * lane.weight,
           metadata: result.metadata,
+          lane: result.lane,
         });
       }
     }
@@ -1269,6 +1479,7 @@ export function fuseResultsWeighted(
     id,
     score: data.score,
     metadata: data.metadata,
+    lane: data.lane,
   }));
 
   results.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
@@ -1287,6 +1498,7 @@ export function fuseResultsRrf(
 
   const maxPossibleRaw = activeLanes.reduce((sum, lane) => sum + lane.weight, 0) / (rrfK + 1);
   const metadataById = new Map<string, RetrievalChunkMetadata>();
+  const laneById = new Map<string, SearchResultLane | undefined>();
   const allIds = new Set<string>();
   const rankMaps = activeLanes.map((lane) => {
     const rankById = new Map<string, number>();
@@ -1296,6 +1508,7 @@ export function fuseResultsRrf(
       if (!metadataById.has(result.id)) {
         metadataById.set(result.id, result.metadata);
       }
+      laneById.set(result.id, mergeSearchResultLane(laneById.get(result.id), result.lane));
     });
     return {
       weight: lane.weight,
@@ -1321,6 +1534,7 @@ export function fuseResultsRrf(
       id,
       score: maxPossibleRaw > 0 ? rawScore / maxPossibleRaw : 0,
       metadata,
+      lane: laneById.get(id),
     });
   }
 
@@ -1964,8 +2178,19 @@ function unionCandidates(...candidateSets: RankedCandidate[][]): RankedCandidate
   for (const candidateSet of candidateSets) {
     for (const candidate of candidateSet) {
       const existing = byId.get(candidate.id);
-      if (!existing || candidate.score > existing.score) {
+      if (!existing) {
         byId.set(candidate.id, candidate);
+        continue;
+      }
+
+      const mergedLane = mergeSearchResultLane(existing.lane, candidate.lane);
+      if (candidate.score > existing.score) {
+        byId.set(candidate.id, {
+          ...candidate,
+          lane: mergedLane,
+        });
+      } else {
+        existing.lane = mergedLane;
       }
     }
   }
@@ -3663,6 +3888,8 @@ export class Indexer {
           content,
           score: candidate.score,
           reranked: candidate.reranked,
+          rerankerScore: candidate.reranked ? candidate.score : null,
+          lane: candidate.lane ?? "hybrid",
           chunkType: candidate.metadata.chunkType,
           chunkKind: candidate.chunkKind ?? candidate.metadata.chunkKind,
           symbolKind: candidate.symbolKind ?? candidate.metadata.symbolKind,
@@ -3697,6 +3924,7 @@ export class Indexer {
           relation: entry.relation,
           depth: entry.depth,
           viaSymbol: entry.viaSymbol,
+          lane: materialized.lane ?? "hybrid",
         };
       })
     );
@@ -3907,6 +4135,9 @@ export class Indexer {
       fileType: options?.fileType,
       directory: options?.directory,
       chunkType: options?.chunkType,
+      chunkKind: options?.chunkKind,
+      language: options?.language,
+      pathGlob: options?.pathGlob,
     });
     const prefilterMs = performance.now() - prefilterStartTime;
 
@@ -4054,15 +4285,15 @@ export class Indexer {
     ]);
     const vectorMs = performance.now() - vectorStartTime;
     const semanticCandidates = this.filterCandidatesByChunkIds(
-      semanticLane.results,
+      semanticLane.results.map((candidate) => ({ ...candidate, lane: "semantic" as const })),
       metadataAllowedChunkIds
     );
     const voyageCandidates = this.filterCandidatesByChunkIds(
-      voyageLane.results,
+      voyageLane.results.map((candidate) => ({ ...candidate, lane: "semantic" as const })),
       metadataAllowedChunkIds
     );
     const keywordCandidates = this.filterCandidatesByChunkIds(
-      keywordLane.results,
+      keywordLane.results.map((candidate) => ({ ...candidate, lane: "bm25" as const })),
       metadataAllowedChunkIds
     );
     const keywordMs = keywordLane.ms;
@@ -4513,6 +4744,596 @@ export class Indexer {
     return this.logger;
   }
 
+  private resolveStoredFilePath(filePath: string): string {
+    return path.isAbsolute(filePath) ? path.normalize(filePath) : path.resolve(this.projectRoot, filePath);
+  }
+
+  private toRelativeProjectPath(filePath: string): string {
+    const absolutePath = this.resolveStoredFilePath(filePath);
+    const relativePath = path.relative(this.projectRoot, absolutePath).replace(/\\/g, "/");
+    if (
+      relativePath.length > 0 &&
+      relativePath !== ".." &&
+      !relativePath.startsWith("../") &&
+      !path.isAbsolute(relativePath)
+    ) {
+      return relativePath;
+    }
+
+    return filePath.replace(/\\/g, "/");
+  }
+
+  private buildFileUri(filePath: string): string {
+    return pathToFileURL(this.resolveStoredFilePath(filePath)).toString();
+  }
+
+  private matchesRequestedFilePath(candidatePath: string, requestedPath: string): boolean {
+    const normalizedRequested = requestedPath.replace(/\\/g, "/");
+    const requestedAbsolute = path.resolve(this.projectRoot, requestedPath);
+    const candidateAbsolute = this.resolveStoredFilePath(candidatePath);
+    const candidateRelative = this.toRelativeProjectPath(candidatePath);
+
+    return (
+      candidateAbsolute === path.normalize(requestedAbsolute) ||
+      candidateRelative === normalizedRequested ||
+      candidatePath.replace(/\\/g, "/") === normalizedRequested
+    );
+  }
+
+  private encodeCursor(offset: number): string {
+    return Buffer.from(String(offset), "utf8").toString("base64");
+  }
+
+  private decodeCursor(cursor: string | undefined): number {
+    if (!cursor) {
+      return 0;
+    }
+
+    try {
+      const decoded = Buffer.from(cursor, "base64").toString("utf8");
+      const parsed = Number.parseInt(decoded, 10);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private async resolveStructuralSymbols(
+    symbol: string,
+    filePath?: string
+  ): Promise<SymbolData[]> {
+    const { database } = await this.ensureInitialized();
+    const branch = this.currentBranch;
+
+    const filterMatches = (symbols: SymbolData[]): SymbolData[] => {
+      if (!filePath) {
+        return symbols;
+      }
+      return symbols.filter((candidate) => this.matchesRequestedFilePath(candidate.filePath, filePath));
+    };
+
+    const exactMatches = filterMatches(database.getSymbolsByNameOnBranch(symbol, branch));
+    if (exactMatches.length > 0) {
+      return exactMatches;
+    }
+
+    return filterMatches(database.getSymbolsByNameCiOnBranch(symbol, branch));
+  }
+
+  private async getChunkDetailsForSymbols(
+    symbolIds: string[]
+  ): Promise<Map<string, { chunkKind: "code" | "test" | "doc" | "config" | null; signature: string | null }>> {
+    const details = new Map<string, { chunkKind: "code" | "test" | "doc" | "config" | null; signature: string | null }>();
+    if (symbolIds.length === 0) {
+      return details;
+    }
+
+    const { database } = await this.ensureInitialized();
+    const rows = database.getChunksForSymbolsBatch(symbolIds, this.currentBranch);
+    const embeddingHashes = [...new Set(rows.map((row) => row.embeddingInputHash))];
+    const chunkTextByHash = database.getChunkTextsBatch(embeddingHashes);
+
+    for (const row of rows) {
+      details.set(row.symbolId, {
+        chunkKind: normalizeStoredChunkKind(row.chunkKind),
+        signature: extractStoredChunkSignature(chunkTextByHash.get(row.embeddingInputHash) ?? null),
+      });
+    }
+
+    return details;
+  }
+
+  private async getStructuralSymbolsForFile(filePath: string): Promise<SymbolData[]> {
+    const { database } = await this.ensureInitialized();
+    const branch = this.currentBranch;
+    const requestedCandidates = [
+      this.resolveStoredFilePath(filePath),
+      filePath.replace(/\\/g, "/"),
+    ];
+    const seen = new Set<string>();
+    const matches: SymbolData[] = [];
+
+    for (const candidatePath of requestedCandidates) {
+      if (seen.has(candidatePath)) {
+        continue;
+      }
+      seen.add(candidatePath);
+      for (const symbol of database.getSymbolsByFileOnBranch(candidatePath, branch)) {
+        if (matches.some((existing) => existing.id === symbol.id)) {
+          continue;
+        }
+        matches.push(symbol);
+      }
+    }
+
+    return matches.filter((symbol) => this.matchesRequestedFilePath(symbol.filePath, filePath));
+  }
+
+  private async collectStructuralCallersFromMatches(matches: SymbolData[]): Promise<StructuralCallerEntry[]> {
+    if (matches.length === 0) {
+      return [];
+    }
+
+    const { database } = await this.ensureInitialized();
+    const branch = this.currentBranch;
+    const callers = (
+      await Promise.all(
+        matches.map((match) => Promise.resolve(database.getCallersWithContextByTargetSymbolId(match.id, branch)))
+      )
+    ).flat();
+
+    const callerSymbolIds = [...new Set(callers.map((caller) => caller.fromSymbolId))];
+    const chunkDetails = await this.getChunkDetailsForSymbols(callerSymbolIds);
+
+    return Array.from(
+      new Map(
+        callers.map((caller) => {
+          const callerPath = caller.fromSymbolFilePath ?? caller.callerFilePath;
+          const inferredChunkKind = chunkDetails.get(caller.fromSymbolId)?.chunkKind ?? null;
+          const chunkKind =
+            inferredChunkKind === "test" || looksLikeTestFilePath(callerPath)
+              ? "test"
+              : inferredChunkKind ?? "code";
+          return [
+            `${caller.id}:${caller.fromSymbolId}:${caller.line}:${caller.col}`,
+            {
+              symbolName: caller.fromSymbolName ?? "<unknown>",
+              fileUri: this.buildFileUri(callerPath ?? this.projectRoot),
+              relativePath: this.toRelativeProjectPath(callerPath ?? this.projectRoot),
+              line: caller.line,
+              chunkKind,
+            } satisfies StructuralCallerEntry,
+          ];
+        })
+      ).values()
+    );
+  }
+
+  private async getStructuralTestsByCallGraph(matches: SymbolData[]): Promise<StructuralTestEntry[]> {
+    const callers = await this.collectStructuralCallersFromMatches(matches);
+    return callers
+      .filter((caller) => caller.chunkKind === "test")
+      .map((caller) => ({
+        testName: caller.symbolName,
+        fileUri: caller.fileUri,
+        relativePath: caller.relativePath,
+        line: caller.line,
+        confidence: 0.95,
+        method: "call_graph",
+      }));
+  }
+
+  private async getStructuralTestsByNameConvention(symbol: string): Promise<StructuralTestEntry[]> {
+    const base = symbol.trim();
+    if (base.length === 0) {
+      return [];
+    }
+
+    const { database } = await this.ensureInitialized();
+    const branch = this.currentBranch;
+    const variants = [
+      `test_${base}`,
+      `test${base}`,
+      `${base}_test`,
+      `${base}Test`,
+      `${base}Spec`,
+    ];
+    const seenNames = new Set<string>();
+    const matches: SymbolData[] = [];
+
+    for (const variant of variants) {
+      const normalized = variant.toLowerCase();
+      if (seenNames.has(normalized)) {
+        continue;
+      }
+      seenNames.add(normalized);
+      matches.push(...database.getSymbolsByNameCiOnBranch(variant, branch));
+    }
+
+    const uniqueMatches = Array.from(new Map(matches.map((match) => [match.id, match])).values());
+    const chunkDetails = await this.getChunkDetailsForSymbols(uniqueMatches.map((match) => match.id));
+
+    return uniqueMatches
+      .filter((match) => {
+        const chunkKind = chunkDetails.get(match.id)?.chunkKind ?? null;
+        return chunkKind === "test" || looksLikeTestFilePath(match.filePath);
+      })
+      .map((match) => ({
+        testName: match.name,
+        fileUri: this.buildFileUri(match.filePath),
+        relativePath: this.toRelativeProjectPath(match.filePath),
+        line: match.startLine,
+        confidence: 0.7,
+        method: "name_convention" as const,
+      }));
+  }
+
+  private async getStructuralTestsByFileConvention(filePath: string): Promise<StructuralTestEntry[]> {
+    const requestedRelative = this.toRelativeProjectPath(filePath);
+    const normalizedRelative = requestedRelative.replace(/\\/g, "/");
+    const extension = path.extname(normalizedRelative);
+    const baseWithoutExtension = extension.length > 0
+      ? normalizedRelative.slice(0, -extension.length)
+      : normalizedRelative;
+    const fileCandidates =
+      extension === ".rs"
+        ? [normalizedRelative]
+        : [
+            `${baseWithoutExtension}.test${extension}`,
+            `${baseWithoutExtension}.spec${extension}`,
+            `${baseWithoutExtension}_test${extension}`,
+            extension === ".py" ? `${path.posix.dirname(baseWithoutExtension) === "." ? "" : `${path.posix.dirname(baseWithoutExtension)}/`}test_${path.posix.basename(baseWithoutExtension)}${extension}` : null,
+          ].filter((candidate): candidate is string => Boolean(candidate));
+
+    const symbols = (
+      await Promise.all(fileCandidates.map((candidate) => this.getStructuralSymbolsForFile(candidate)))
+    ).flat();
+    const uniqueSymbols = Array.from(new Map(symbols.map((symbol) => [symbol.id, symbol])).values());
+    const chunkDetails = await this.getChunkDetailsForSymbols(uniqueSymbols.map((symbol) => symbol.id));
+
+    return uniqueSymbols
+      .filter((symbol) => {
+        const chunkKind = chunkDetails.get(symbol.id)?.chunkKind ?? null;
+        return chunkKind === "test" || looksLikeTestFilePath(symbol.filePath);
+      })
+      .map((symbol) => ({
+        testName: symbol.name,
+        fileUri: this.buildFileUri(symbol.filePath),
+        relativePath: this.toRelativeProjectPath(symbol.filePath),
+        line: symbol.startLine,
+        confidence: 0.5,
+        method: "file_convention" as const,
+      }));
+  }
+
+  private buildStructuralCallChainEntry(symbol: SymbolData): StructuralCallChainEntry {
+    return {
+      symbolName: symbol.name,
+      fileUri: this.buildFileUri(symbol.filePath),
+      relativePath: this.toRelativeProjectPath(symbol.filePath),
+      line: symbol.startLine,
+    };
+  }
+
+  async getSymbolInfo(
+    symbol: string,
+    filePath?: string
+  ): Promise<StructuralSymbolInfoResult> {
+    const matches = await this.resolveStructuralSymbols(symbol, filePath);
+    const chunkDetails = await this.getChunkDetailsForSymbols(matches.map((match) => match.id));
+
+    return {
+      symbols: matches.map((match) => {
+        const details = chunkDetails.get(match.id);
+        return {
+          symbolId: match.id,
+          name: match.name,
+          kind: normalizeStructuralSymbolKind(match.kind),
+          fileUri: this.buildFileUri(match.filePath),
+          relativePath: this.toRelativeProjectPath(match.filePath),
+          startLine: match.startLine,
+          endLine: match.endLine,
+          signature: details?.signature ?? null,
+          chunkKind: details?.chunkKind ?? null,
+        };
+      }),
+      total: matches.length,
+      ambiguous: !filePath && matches.length > 1,
+    };
+  }
+
+  async getStructuralCallers(options: {
+    symbol: string;
+    filePath?: string;
+    includeTests?: boolean;
+    maxResults?: number;
+    cursor?: string;
+  }): Promise<StructuralCallersResult> {
+    const includeTests = options.includeTests ?? true;
+    const maxResults = Math.min(Math.max(options.maxResults ?? 20, 1), 100);
+    const offset = this.decodeCursor(options.cursor);
+    const matches = await this.resolveStructuralSymbols(options.symbol, options.filePath);
+    if (matches.length === 0) {
+      return { callers: [], total: 0, cursor: null, resolved: true };
+    }
+
+    const merged = (await this.collectStructuralCallersFromMatches(matches))
+      .filter((caller) => includeTests || caller.chunkKind !== "test")
+      .sort((left, right) => {
+        if (left.relativePath !== right.relativePath) {
+          return left.relativePath.localeCompare(right.relativePath);
+        }
+        if (left.line !== right.line) {
+          return left.line - right.line;
+        }
+        return left.symbolName.localeCompare(right.symbolName);
+      });
+
+    const page = merged.slice(offset, offset + maxResults);
+    const nextOffset = offset + page.length;
+
+    return {
+      callers: page,
+      total: merged.length,
+      cursor: nextOffset < merged.length ? this.encodeCursor(nextOffset) : null,
+      resolved: Boolean(options.filePath) || matches.length <= 1,
+    };
+  }
+
+  async getStructuralCallees(options: {
+    symbol: string;
+    filePath?: string;
+    maxResults?: number;
+  }): Promise<StructuralCalleesResult> {
+    const maxResults = Math.min(Math.max(options.maxResults ?? 20, 1), 100);
+    const matches = await this.resolveStructuralSymbols(options.symbol, options.filePath);
+    if (matches.length === 0) {
+      return { callees: [], total: 0, resolved: true };
+    }
+
+    const { database } = await this.ensureInitialized();
+    const branch = this.currentBranch;
+    const callees = (
+      await Promise.all(matches.map((match) => Promise.resolve(database.getCallees(match.id, branch))))
+    ).flat();
+
+    const targetSymbolIds = [...new Set(callees.flatMap((callee) => (callee.toSymbolId ? [callee.toSymbolId] : [])))];
+    const targetSymbols = new Map(
+      database
+        .getSymbolsByIdsOnBranch(targetSymbolIds, branch)
+        .map((symbol): [string, SymbolData] => [symbol.id, symbol])
+    );
+
+    const merged = Array.from(
+      new Map(
+        callees.map((callee) => {
+          const targetSymbol = callee.toSymbolId ? targetSymbols.get(callee.toSymbolId) : undefined;
+          const effectiveFilePath = targetSymbol?.filePath ?? callee.targetFilePath ?? null;
+          return [
+            `${callee.id}:${callee.fromSymbolId}:${callee.targetName}:${callee.line}:${callee.col}`,
+            {
+              symbolName: targetSymbol?.name ?? callee.targetName,
+              fileUri: effectiveFilePath ? this.buildFileUri(effectiveFilePath) : null,
+              relativePath: effectiveFilePath ? this.toRelativeProjectPath(effectiveFilePath) : null,
+              line: targetSymbol?.startLine ?? null,
+              resolved: Boolean(callee.toSymbolId),
+            } satisfies StructuralCalleeEntry,
+          ];
+        })
+      ).values()
+    ).sort((left, right) => {
+      if (left.resolved !== right.resolved) {
+        return Number(right.resolved) - Number(left.resolved);
+      }
+      if ((left.relativePath ?? "") !== (right.relativePath ?? "")) {
+        return (left.relativePath ?? "").localeCompare(right.relativePath ?? "");
+      }
+      if ((left.line ?? Number.MAX_SAFE_INTEGER) !== (right.line ?? Number.MAX_SAFE_INTEGER)) {
+        return (left.line ?? Number.MAX_SAFE_INTEGER) - (right.line ?? Number.MAX_SAFE_INTEGER);
+      }
+      return left.symbolName.localeCompare(right.symbolName);
+    });
+
+    return {
+      callees: merged.slice(0, maxResults),
+      total: merged.length,
+      resolved: Boolean(options.filePath) || matches.length <= 1,
+    };
+  }
+
+  async getStructuralCallChain(options: {
+    fromSymbol: string;
+    toSymbol: string;
+    fromFile?: string;
+    toFile?: string;
+    maxDepth?: number;
+  }): Promise<StructuralCallChainResult> {
+    const maxDepth = Math.min(Math.max(options.maxDepth ?? 8, 1), 15);
+    const fromMatches = await this.resolveStructuralSymbols(options.fromSymbol, options.fromFile);
+    const toMatches = await this.resolveStructuralSymbols(options.toSymbol, options.toFile);
+    if (fromMatches.length === 0 || toMatches.length === 0) {
+      return {
+        found: false,
+        path: [],
+        depth: 0,
+        searchDepthReached: false,
+        warning: null,
+      };
+    }
+
+    const warnings: string[] = [];
+    if (!options.fromFile && fromMatches.length > 1) {
+      warnings.push(`from_symbol '${options.fromSymbol}' was ambiguous; used the first match.`);
+    }
+    if (!options.toFile && toMatches.length > 1) {
+      warnings.push(`to_symbol '${options.toSymbol}' was ambiguous; used the first match.`);
+    }
+
+    const source = fromMatches[0]!;
+    const target = toMatches[0]!;
+    if (source.id === target.id) {
+      return {
+        found: true,
+        path: [this.buildStructuralCallChainEntry(source)],
+        depth: 0,
+        searchDepthReached: false,
+        warning: warnings.length > 0 ? warnings.join(" ") : null,
+      };
+    }
+
+    const { database } = await this.ensureInitialized();
+    const branch = this.currentBranch;
+    const parentBySymbolId = new Map<string, string | null>([[source.id, null]]);
+    const symbolsById = new Map<string, SymbolData>([
+      [source.id, source],
+      [target.id, target],
+    ]);
+    const visited = new Set<string>([source.id]);
+    let frontier = [source.id];
+    let found = false;
+    let searchDepthReached = false;
+
+    for (let depth = 0; depth < maxDepth && frontier.length > 0; depth += 1) {
+      if (frontier.length > 500) {
+        warnings.push("Call-chain search stopped early because graph fan-out exceeded 500 symbols.");
+        searchDepthReached = true;
+        break;
+      }
+
+      const edgeBatch = database.getCallEdgeFrontierBatch(frontier, branch);
+      const candidateIds = Array.from(
+        new Set(
+          edgeBatch.callees
+            .flatMap((edge) => edge.toSymbolId ? [edge.toSymbolId] : [])
+            .filter((symbolId) => !visited.has(symbolId))
+        )
+      );
+      if (candidateIds.length === 0) {
+        frontier = [];
+        break;
+      }
+
+      if (candidateIds.length > 500) {
+        warnings.push("Call-chain search stopped early because graph fan-out exceeded 500 symbols.");
+        searchDepthReached = true;
+        break;
+      }
+
+      const fetchedSymbols = database.getSymbolsByIdsOnBranch(candidateIds, branch);
+      const fetchedById = new Map(fetchedSymbols.map((symbol): [string, SymbolData] => [symbol.id, symbol]));
+      const nextFrontier: string[] = [];
+
+      for (const edge of edgeBatch.callees) {
+        const childId = edge.toSymbolId;
+        if (!childId || visited.has(childId)) {
+          continue;
+        }
+        const childSymbol = fetchedById.get(childId);
+        if (!childSymbol) {
+          continue;
+        }
+        visited.add(childId);
+        parentBySymbolId.set(childId, edge.fromSymbolId);
+        symbolsById.set(childId, childSymbol);
+        nextFrontier.push(childId);
+        if (childId === target.id) {
+          found = true;
+          break;
+        }
+      }
+
+      frontier = Array.from(new Set(nextFrontier));
+      if (found) {
+        break;
+      }
+    }
+
+    if (!found) {
+      if (frontier.length > 0) {
+        searchDepthReached = true;
+      }
+      return {
+        found: false,
+        path: [],
+        depth: 0,
+        searchDepthReached,
+        warning: warnings.length > 0 ? warnings.join(" ") : null,
+      };
+    }
+
+    const pathIds: string[] = [];
+    let cursor: string | null | undefined = target.id;
+    while (cursor) {
+      pathIds.push(cursor);
+      cursor = parentBySymbolId.get(cursor) ?? null;
+    }
+    pathIds.reverse();
+
+    return {
+      found: true,
+      path: pathIds
+        .map((symbolId) => symbolsById.get(symbolId))
+        .filter((symbol): symbol is SymbolData => Boolean(symbol))
+        .map((symbol) => this.buildStructuralCallChainEntry(symbol)),
+      depth: Math.max(0, pathIds.length - 1),
+      searchDepthReached: false,
+      warning: warnings.length > 0 ? warnings.join(" ") : null,
+    };
+  }
+
+  async getStructuralTests(options: {
+    symbol?: string;
+    filePath?: string;
+  }): Promise<StructuralTestsResult> {
+    let symbolResolved = true;
+    let targetSymbols: SymbolData[] = [];
+
+    if (options.symbol) {
+      targetSymbols = await this.resolveStructuralSymbols(options.symbol, options.filePath);
+      symbolResolved = Boolean(options.filePath) || targetSymbols.length <= 1;
+    } else if (options.filePath) {
+      targetSymbols = await this.getStructuralSymbolsForFile(options.filePath);
+    }
+
+    const callGraphTests = targetSymbols.length > 0
+      ? await this.getStructuralTestsByCallGraph(targetSymbols)
+      : [];
+    const nameConventionTests = options.symbol
+      ? await this.getStructuralTestsByNameConvention(options.symbol)
+      : [];
+    const fileConventionTests = options.filePath
+      ? await this.getStructuralTestsByFileConvention(options.filePath)
+      : [];
+
+    const deduped = new Map<string, StructuralTestEntry>();
+    for (const entry of [...callGraphTests, ...nameConventionTests, ...fileConventionTests]) {
+      const key = `${entry.testName}:${entry.fileUri}`;
+      const existing = deduped.get(key);
+      if (!existing || entry.confidence > existing.confidence) {
+        deduped.set(key, entry);
+      }
+    }
+
+    const tests = Array.from(deduped.values()).sort((left, right) => {
+      if (right.confidence !== left.confidence) {
+        return right.confidence - left.confidence;
+      }
+      if (left.relativePath !== right.relativePath) {
+        return left.relativePath.localeCompare(right.relativePath);
+      }
+      if (left.line !== right.line) {
+        return left.line - right.line;
+      }
+      return left.testName.localeCompare(right.testName);
+    });
+
+    return {
+      tests,
+      total: tests.length,
+      symbolResolved,
+    };
+  }
+
   async findSimilar(
     code: string,
     limit: number = this.config.search.maxResults,
@@ -4651,7 +5472,13 @@ export class Indexer {
     options: HardRetrievalFilters
   ): Promise<Set<string> | null> {
     const hasMetadataFilters = Boolean(
-      options.fileType || options.directory || options.chunkType || options.excludeFile
+      options.fileType ||
+      options.directory ||
+      options.chunkType ||
+      options.excludeFile ||
+      options.chunkKind ||
+      options.language ||
+      options.pathGlob
     );
 
     if (!hasMetadataFilters) {
@@ -4667,7 +5494,10 @@ export class Indexer {
         options.fileType ?? null,
         options.directory ?? null,
         options.chunkType ?? null,
-        options.excludeFile ?? null
+        options.excludeFile ?? null,
+        normalizeRequestedChunkKind(options.chunkKind) ?? null,
+        options.language ?? null,
+        options.pathGlob ?? null
       )
     );
   }

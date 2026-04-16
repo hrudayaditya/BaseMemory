@@ -7,6 +7,35 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 vi.mock("../src/indexer/index.js", () => {
   class MockIndexer {
     initialize = vi.fn().mockResolvedValue(undefined);
+    searchDetailed = vi.fn().mockResolvedValue({
+      primaryResults: [
+        {
+          filePath: "src/auth.ts",
+          startLine: 10,
+          endLine: 25,
+          name: "validateToken",
+          chunkType: "function",
+          chunkKind: "Code",
+          content: "function validateToken(token: string) {\n  return token.length > 0;\n}",
+          score: 0.95,
+          lane: "semantic",
+          reranked: true,
+          rerankerScore: 0.95,
+        },
+      ],
+      expandedContext: [],
+      taskType: "general",
+      graphDirection: "both",
+      timings: { prefilterMs: 0 },
+      retrieval: {
+        voyageLaneConfigured: false,
+        voyageLaneUsed: false,
+      },
+      reranker: {
+        applied: true,
+        backend: "transformers-cross-encoder",
+      },
+    });
     search = vi.fn().mockResolvedValue([
       {
         filePath: "src/auth.ts",
@@ -65,6 +94,84 @@ vi.mock("../src/indexer/index.js", () => {
       ],
       totalDroppedChunks: 2,
       totalDroppedNamedSymbols: 2,
+    });
+    getSymbolInfo = vi.fn().mockResolvedValue({
+      symbols: [
+        {
+          symbolId: "sym_validateToken",
+          name: "validateToken",
+          kind: "function",
+          fileUri: "file:///tmp/test-project/src/auth.ts",
+          relativePath: "src/auth.ts",
+          startLine: 10,
+          endLine: 25,
+          signature: "function validateToken(token: string) {",
+          chunkKind: "code",
+        },
+      ],
+      total: 1,
+      ambiguous: false,
+    });
+    getStructuralCallers = vi.fn().mockResolvedValue({
+      callers: [
+        {
+          symbolName: "handleRequest",
+          fileUri: "file:///tmp/test-project/src/server.ts",
+          relativePath: "src/server.ts",
+          line: 42,
+          chunkKind: "code",
+        },
+      ],
+      total: 1,
+      cursor: null,
+      resolved: true,
+    });
+    getStructuralCallees = vi.fn().mockResolvedValue({
+      callees: [
+        {
+          symbolName: "parseToken",
+          fileUri: "file:///tmp/test-project/src/auth.ts",
+          relativePath: "src/auth.ts",
+          line: 5,
+          resolved: true,
+        },
+      ],
+      total: 1,
+      resolved: true,
+    });
+    getStructuralCallChain = vi.fn().mockResolvedValue({
+      found: true,
+      path: [
+        {
+          symbolName: "entrypoint",
+          fileUri: "file:///tmp/test-project/src/server.ts",
+          relativePath: "src/server.ts",
+          line: 12,
+        },
+        {
+          symbolName: "validateToken",
+          fileUri: "file:///tmp/test-project/src/auth.ts",
+          relativePath: "src/auth.ts",
+          line: 10,
+        },
+      ],
+      depth: 1,
+      searchDepthReached: false,
+      warning: null,
+    });
+    getStructuralTests = vi.fn().mockResolvedValue({
+      tests: [
+        {
+          testName: "testValidateToken",
+          fileUri: "file:///tmp/test-project/tests/auth.test.ts",
+          relativePath: "tests/auth.test.ts",
+          line: 5,
+          confidence: 0.95,
+          method: "call_graph",
+        },
+      ],
+      total: 1,
+      symbolResolved: true,
     });
     healthCheck = vi.fn().mockResolvedValue({
       removed: 0,
@@ -135,14 +242,17 @@ describe("MCP server tools and prompts", () => {
     await client.close();
   });
 
-  it("should register all 11 tools", async () => {
+  it("should register all 16 tools", async () => {
     const tools = await client.listTools();
 
-    expect(tools.tools).toHaveLength(11);
+    expect(tools.tools).toHaveLength(16);
 
     const toolNames = tools.tools.map(t => t.name).sort();
     const expectedNames = [
       "call_graph",
+      "call_chain",
+      "callers",
+      "callees",
       "codebase_peek",
       "codebase_search",
       "find_similar",
@@ -153,6 +263,8 @@ describe("MCP server tools and prompts", () => {
       "index_logs",
       "index_metrics",
       "index_status",
+      "symbol_info",
+      "tests_for",
     ].sort();
 
     expect(toolNames).toEqual(expectedNames);
@@ -172,7 +284,7 @@ describe("MCP server tools and prompts", () => {
   it("should execute codebase_search tool", async () => {
     const result = await client.callTool({
       name: "codebase_search",
-      arguments: { query: "test query" },
+      arguments: { query: "test query", filters: { chunk_type: "test" }, include_scores: true },
     });
 
     expect(result.content).toBeDefined();
@@ -181,6 +293,9 @@ describe("MCP server tools and prompts", () => {
     expect(content[0].type).toBe("text");
     expect(content[0].text).toContain("Found 1 results");
     expect(content[0].text).toContain("validateToken");
+    const structured = (result as { structuredContent?: { results?: Array<{ lane?: string; reranker_score?: number | null }> } }).structuredContent;
+    expect(structured?.results?.[0]?.lane).toBe("semantic");
+    expect(structured?.results?.[0]?.reranker_score).toBe(0.95);
   });
 
   it("should execute codebase_peek tool", async () => {
@@ -275,6 +390,65 @@ describe("MCP server tools and prompts", () => {
     expect(content[0].type).toBe("text");
     expect(content[0].text).toContain("Definition found");
     expect(content[0].text).toContain("validateToken");
+  });
+
+  it("should execute symbol_info tool", async () => {
+    const result = await client.callTool({
+      name: "symbol_info",
+      arguments: { symbol: "validateToken" },
+    });
+
+    expect(result.content).toBeDefined();
+    const content = result.content as Array<{ type: string; text?: string }>;
+    expect(content[0]?.text).toContain("Symbol: validateToken");
+    expect((result as { structuredContent?: { total?: number } }).structuredContent?.total).toBe(1);
+  });
+
+  it("should execute callers tool", async () => {
+    const result = await client.callTool({
+      name: "callers",
+      arguments: { symbol: "validateToken" },
+    });
+
+    expect(result.content).toBeDefined();
+    const content = result.content as Array<{ type: string; text?: string }>;
+    expect(content[0]?.text).toContain("Found 1 callers");
+    expect((result as { structuredContent?: { total?: number } }).structuredContent?.total).toBe(1);
+  });
+
+  it("should execute callees tool", async () => {
+    const result = await client.callTool({
+      name: "callees",
+      arguments: { symbol: "validateToken" },
+    });
+
+    expect(result.content).toBeDefined();
+    const content = result.content as Array<{ type: string; text?: string }>;
+    expect(content[0]?.text).toContain("Found 1 callees");
+    expect((result as { structuredContent?: { total?: number } }).structuredContent?.total).toBe(1);
+  });
+
+  it("should execute call_chain tool", async () => {
+    const result = await client.callTool({
+      name: "call_chain",
+      arguments: { from_symbol: "entrypoint", to_symbol: "validateToken" },
+    });
+
+    const content = result.content as Array<{ type: string; text?: string }>;
+    expect(content[0]?.text).toContain("Call path from");
+    expect((result as { structuredContent?: { found?: boolean; depth?: number } }).structuredContent?.found).toBe(true);
+    expect((result as { structuredContent?: { found?: boolean; depth?: number } }).structuredContent?.depth).toBe(1);
+  });
+
+  it("should execute tests_for tool", async () => {
+    const result = await client.callTool({
+      name: "tests_for",
+      arguments: { symbol: "validateToken" },
+    });
+
+    const content = result.content as Array<{ type: string; text?: string }>;
+    expect(content[0]?.text).toContain("Found 1 tests covering");
+    expect((result as { structuredContent?: { total?: number } }).structuredContent?.total).toBe(1);
   });
 
   it("should get search prompt", async () => {
