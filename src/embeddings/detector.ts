@@ -107,6 +107,26 @@ export async function tryDetectProvider(): Promise<ConfiguredProviderInfo> {
   );
 }
 
+export function createVoyageProviderInfo(config: {
+  voyageApiKey: string;
+  voyageModelId?: string;
+}): ConfiguredProviderInfo {
+  const modelId = config.voyageModelId?.trim() || "voyage-code-2";
+  const modelInfo = EMBEDDING_MODELS.voyage[modelId as keyof typeof EMBEDDING_MODELS.voyage];
+  if (!modelInfo) {
+    throw new Error(`Voyage model '${modelId}' is not supported`);
+  }
+
+  return {
+    provider: "voyage",
+    credentials: {
+      provider: "voyage",
+      apiKey: config.voyageApiKey.trim(),
+    },
+    modelInfo,
+  };
+}
+
 async function getProviderCredentials(
   provider: EmbeddingProvider
 ): Promise<ProviderCredentials | null> {
@@ -119,6 +139,8 @@ async function getProviderCredentials(
       return getGoogleCredentials();
     case "ollama":
       return getOllamaCredentials();
+    case "voyage":
+      return null;
     default:
       return null;
   }
@@ -223,6 +245,8 @@ export function getProviderDisplayName(provider: EmbeddingProvider | 'custom'): 
       return "Google (Gemini)";
     case "ollama":
       return "Ollama (Local)";
+    case "voyage":
+      return "Voyage";
     case "custom":
       return "Custom (OpenAI-compatible)";
     default:

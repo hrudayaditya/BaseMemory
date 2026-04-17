@@ -255,18 +255,28 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
   let embeddingProvider: EmbeddingProvider | 'custom' | 'auto';
   let embeddingModel: EmbeddingModelName | undefined = undefined;
   let customProvider: CustomProviderConfig | undefined = undefined;
-  
-  if (embeddingProviderValue === 'custom') {
-    embeddingProvider = 'custom';
+
+  if (embeddingProviderValue === 'custom' || embeddingProviderValue === 'voyage') {
     const rawCustom = (input.customProvider && typeof input.customProvider === 'object' ? input.customProvider : null) as Record<string, unknown> | null;
     const baseUrlValue = getResolvedString(rawCustom?.baseUrl, "$root.customProvider.baseUrl");
     const modelValue = getResolvedString(rawCustom?.model, "$root.customProvider.model");
     const apiKeyValue = getResolvedString(rawCustom?.apiKey, "$root.customProvider.apiKey");
-    if (rawCustom && typeof baseUrlValue === 'string' && baseUrlValue.trim().length > 0 && typeof modelValue === 'string' && modelValue.trim().length > 0 && typeof rawCustom.dimensions === 'number' && Number.isInteger(rawCustom.dimensions) && rawCustom.dimensions > 0) {
-      customProvider = {
+    const dimensionsValue = typeof rawCustom?.dimensions === 'number' ? rawCustom.dimensions : null;
+    const hasValidCustomProvider =
+      rawCustom &&
+      typeof baseUrlValue === 'string' &&
+      baseUrlValue.trim().length > 0 &&
+      typeof modelValue === 'string' &&
+      modelValue.trim().length > 0 &&
+      typeof dimensionsValue === 'number' &&
+      Number.isInteger(dimensionsValue) &&
+      dimensionsValue > 0;
+
+    if (hasValidCustomProvider) {
+      const parsedCustomProvider: CustomProviderConfig = {
         baseUrl: baseUrlValue.trim().replace(/\/+$/, ''),
         model: modelValue,
-        dimensions: rawCustom.dimensions,
+        dimensions: dimensionsValue,
         apiKey: apiKeyValue,
         maxTokens: typeof rawCustom.maxTokens === 'number' ? rawCustom.maxTokens : undefined,
         timeoutMs: typeof rawCustom.timeoutMs === 'number' ? Math.max(1000, rawCustom.timeoutMs) : undefined,
@@ -275,19 +285,23 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
         maxBatchSize: typeof rawCustom.maxBatchSize === 'number'
           ? Math.max(1, Math.floor(rawCustom.maxBatchSize))
           : typeof rawCustom.max_batch_size === 'number'
-            ? Math.max(1, Math.floor(rawCustom.max_batch_size))
+          ? Math.max(1, Math.floor(rawCustom.max_batch_size))
             : undefined,
       };
-      // Warn if baseUrl doesn't end with an API version path like /v1.
-      // Note: using console.warn here because Logger isn't initialized yet at config parse time.
-      if (!/\/v\d+\/?$/.test(customProvider.baseUrl)) {
+      customProvider = parsedCustomProvider;
+      if (!/\/v\d+\/?$/.test(parsedCustomProvider.baseUrl)) {
         console.warn(
-          `[codebase-index] Warning: customProvider.baseUrl ("${customProvider.baseUrl}") does not end with an API version path like /v1. ` +
-          `The plugin appends /embeddings automatically, so the full URL will be "${customProvider.baseUrl}/embeddings". ` +
-          `If your provider expects /v1/embeddings, set baseUrl to "${customProvider.baseUrl}/v1".`
+          `[codebase-index] Warning: customProvider.baseUrl ("${parsedCustomProvider.baseUrl}") does not end with an API version path like /v1. ` +
+          `The plugin appends /embeddings automatically, so the full URL will be "${parsedCustomProvider.baseUrl}/embeddings". ` +
+          `If your provider expects /v1/embeddings, set baseUrl to "${parsedCustomProvider.baseUrl}/v1".`
         );
       }
-    } else {
+    }
+  }
+
+  if (embeddingProviderValue === 'custom') {
+    embeddingProvider = 'custom';
+    if (!customProvider) {
       throw new Error(
         "embeddingProvider is 'custom' but customProvider config is missing or invalid. " +
         "Required fields: baseUrl (string), model (string), dimensions (positive integer)."

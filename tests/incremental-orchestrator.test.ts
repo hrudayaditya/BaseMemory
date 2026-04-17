@@ -132,6 +132,22 @@ describe("incremental index orchestrator", () => {
     });
   }
 
+  function createVoyagePrimaryConfig(overrides: Record<string, unknown> = {}) {
+    const overrideRecord = overrides as {
+      indexing?: Record<string, unknown>;
+    };
+    return parseConfig({
+      embeddingProvider: "voyage",
+      voyageApiKey: "voyage-test-key",
+      voyageModelId: "voyage-code-2",
+      indexing: {
+        watchFiles: false,
+        ...(overrideRecord.indexing ?? {}),
+      },
+      ...overrides,
+    });
+  }
+
   function createRepo(): {
     fileA: string;
     fileB: string;
@@ -188,6 +204,35 @@ describe("incremental index orchestrator", () => {
       filePaths.push(filePath);
     }
     return filePaths;
+  }
+
+  function createRepoWithManyMultiChunkFiles(
+    fileCount: number,
+    chunksPerFile: number
+  ): string[] {
+    const srcDir = path.join(tempDir, "src");
+    fs.mkdirSync(srcDir, { recursive: true });
+    const filePaths: string[] = [];
+    for (let fileIndex = 0; fileIndex < fileCount; fileIndex += 1) {
+      const filePath = path.join(srcDir, `multi-${fileIndex}.ts`);
+      const body = Array.from({ length: chunksPerFile }, (_, chunkIndex) =>
+        `export function file${fileIndex}Chunk${chunkIndex}(): number { return ${chunkIndex}; }`
+      ).join("\n");
+      fs.writeFileSync(filePath, `${body}\n`, "utf-8");
+      filePaths.push(filePath);
+    }
+    return filePaths;
+  }
+
+  function createLargeSingleFileRepo(chunks: number): string {
+    const srcDir = path.join(tempDir, "src");
+    fs.mkdirSync(srcDir, { recursive: true });
+    const filePath = path.join(srcDir, "large.ts");
+    const body = Array.from({ length: chunks }, (_, index) =>
+      `export function largeChunk${index}(): number { return ${index}; }`
+    ).join("\n");
+    fs.writeFileSync(filePath, `${body}\n`, "utf-8");
+    return filePath;
   }
 
   function createGitRepoMetadata(currentBranch: string, branches: string[] = [currentBranch]): void {
@@ -323,6 +368,134 @@ describe("incremental index orchestrator", () => {
 
     releaseEmbedding.resolve();
     await waitForCondition(() => !indexer.isBackgroundEmbeddingRunning());
+  });
+
+  it("dispatches cross-file Voyage background batches at 128-chunk capacity", async () => {
+    createRepoWithManyMultiChunkFiles(30, 10);
+    const config = createVoyagePrimaryConfig();
+    const indexer = new Indexer(tempDir, config);
+
+    const foreground = await indexer.indexForeground();
+    await waitForCondition(() => !indexer.isBackgroundEmbeddingRunning(), 10_000);
+
+    const voyageCalls = fetchSpy.mock.calls.filter(([, init]) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string; input?: string[] };
+      return body.model === "voyage-code-2" && Array.isArray(body.input);
+    });
+    const expectedBatches = Math.ceil(foreground.embeddingProgress.total / 128);
+
+    expect(foreground.embeddingProgress.total).toBeGreaterThan(128);
+    expect(voyageCalls).toHaveLength(expectedBatches);
+    expect(voyageCalls.every(([, init], index) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[] };
+      const inputLength = Array.isArray(body.input) ? body.input.length : 0;
+      if (index < voyageCalls.length - 1) {
+        return inputLength === 128;
+      }
+      return inputLength > 0 && inputLength <= 128;
+    })).toBe(true);
+  });
+
+  it("continues background batching after a middle Voyage batch failure and records debt rows", async () => {
+    const filePaths = createRepoWithManyFiles(300);
+    const orderedFilePaths = [...filePaths].sort();
+    const seenVoyagePayloads = new Set<string>();
+    let failedPayload: string | null = null;
+    fetchSpy.mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[]; model?: string };
+      if (body.model === "voyage-code-2" && Array.isArray(body.input) && body.input.length > 0) {
+        const payloadKey = JSON.stringify(body.input);
+        if (!seenVoyagePayloads.has(payloadKey)) {
+          seenVoyagePayloads.add(payloadKey);
+          if (seenVoyagePayloads.size === 2) {
+            failedPayload = payloadKey;
+          }
+        }
+        if (failedPayload === payloadKey) {
+          throw new Error("synthetic voyage batch failure");
+        }
+      }
+      return createMockEmbeddingResponse(init);
+    });
+
+    const config = createVoyagePrimaryConfig();
+    const indexer = new Indexer(tempDir, config);
+    const foreground = await indexer.indexForeground();
+    expect(foreground.embeddingProgress.total).toBeGreaterThan(256);
+    await waitForCondition(() => !indexer.isBackgroundEmbeddingRunning(), 10_000);
+
+    const status = await indexer.getStatus();
+    const database = new Database(path.join(status.indexPath, "codebase.db"));
+    const branch = status.currentBranch;
+    const trackedFirst = resolveTrackedPath(database, branch, orderedFilePaths[0]!, tempDir);
+    const trackedLast = resolveTrackedPath(
+      database,
+      branch,
+      orderedFilePaths[orderedFilePaths.length - 1]!,
+      tempDir
+    );
+
+    expect(database.getPipelineState(branch, trackedFirst, "embed")?.status).toBe("complete");
+    expect(database.getPipelineState(branch, trackedLast, "embed")?.status).toBe("complete");
+    expect(database.getEmbeddingDebtForBranch(branch)).not.toEqual([]);
+  });
+
+  it("marks a large file complete only after all cross-file Voyage batches succeed", async () => {
+    const filePath = createLargeSingleFileRepo(150);
+    const releaseSecondBatch = Promise.withResolvers<void>();
+    let voyageCallCount = 0;
+    fetchSpy.mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[]; model?: string };
+      if (body.model === "voyage-code-2" && Array.isArray(body.input) && body.input.length > 0) {
+        voyageCallCount += 1;
+        if (voyageCallCount === 2) {
+          await releaseSecondBatch.promise;
+        }
+      }
+      return createMockEmbeddingResponse(init);
+    });
+
+    const config = createVoyagePrimaryConfig();
+    const indexer = new Indexer(tempDir, config);
+
+    const foreground = await indexer.indexForeground();
+    expect(foreground.embeddingProgress.total).toBeGreaterThan(128);
+    await waitForCondition(() => indexer.isBackgroundEmbeddingRunning(), 5_000);
+
+    const statusDuring = await indexer.getStatus();
+    const databaseDuring = new Database(path.join(statusDuring.indexPath, "codebase.db"));
+    const trackedPath = resolveTrackedPath(databaseDuring, statusDuring.currentBranch, filePath, tempDir);
+    expect(databaseDuring.getPipelineState(statusDuring.currentBranch, trackedPath, "embed")?.status).not.toBe("complete");
+
+    releaseSecondBatch.resolve();
+    await waitForCondition(() => !indexer.isBackgroundEmbeddingRunning(), 10_000);
+
+    const statusAfter = await indexer.getStatus();
+    const databaseAfter = new Database(path.join(statusAfter.indexPath, "codebase.db"));
+    expect(databaseAfter.getPipelineState(statusAfter.currentBranch, trackedPath, "embed")?.status).toBe("complete");
+  });
+
+  it("keeps the hot update path on per-file embedding", async () => {
+    const filePath = createSingleFileRepo();
+    const config = createVoyagePrimaryConfig();
+    const indexer = new Indexer(tempDir, config);
+
+    await indexer.indexForeground();
+    await waitForCondition(() => !indexer.isBackgroundEmbeddingRunning(), 10_000);
+
+    fetchSpy.mockClear();
+    fs.writeFileSync(filePath, "export function only(): number { return 2; }\n", "utf-8");
+    await indexer.handleFileChanges([{ type: "change", path: filePath }]);
+
+    const voyageCalls = fetchSpy.mock.calls.filter(([, init]) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string; input?: string[] };
+      return body.model === "voyage-code-2" && Array.isArray(body.input);
+    });
+
+    expect(voyageCalls).toHaveLength(1);
+    const requestBody = JSON.parse(String(voyageCalls[0]?.[1]?.body ?? "{}")) as { input?: string[] };
+    expect(Array.isArray(requestBody.input)).toBe(true);
+    expect((requestBody.input ?? []).length).toBeGreaterThan(0);
   });
 
   function createCrossFileCallRepo(): {

@@ -481,7 +481,7 @@ describe("config schema", () => {
         warnSpy.mockRestore();
       });
 
-      it("should ignore customProvider when embeddingProvider is not 'custom'", () => {
+      it("should ignore customProvider when embeddingProvider is not 'custom' or 'voyage'", () => {
         const config = parseConfig({
           embeddingProvider: "openai",
           customProvider: {
@@ -492,6 +492,21 @@ describe("config schema", () => {
         });
         expect(config.embeddingProvider).toBe("openai");
         expect(config.customProvider).toBeUndefined();
+      });
+
+      it("should preserve customProvider when embeddingProvider is 'voyage'", () => {
+        const config = parseConfig({
+          embeddingProvider: "voyage",
+          customProvider: {
+            baseUrl: "http://localhost:11434/v1",
+            model: "snowflake-arctic-embed2",
+            dimensions: 1024,
+          },
+        });
+        expect(config.embeddingProvider).toBe("voyage");
+        expect(config.customProvider).toBeDefined();
+        expect(config.customProvider!.model).toBe("snowflake-arctic-embed2");
+        expect(config.customProvider!.dimensions).toBe(1024);
       });
 
       it("should parse custom provider with timeoutMs", () => {

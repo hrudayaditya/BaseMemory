@@ -53,6 +53,8 @@ import {
   consumeWatcherEventTimestamp,
 } from "./watcher-tti.js";
 
+type SecondaryEmbeddingProvider = EmbeddingProviderInterface | VoyageEmbeddingProvider;
+
 export interface OrchestratorParsedChunk {
   content: string;
   startLine: number;
@@ -84,7 +86,7 @@ export interface OrchestratorFileGraphData {
 export interface InitializationResources {
   store: VectorStore;
   provider: EmbeddingProviderInterface;
-  voyageProvider: VoyageEmbeddingProvider | null;
+  voyageProvider: SecondaryEmbeddingProvider | null;
   voyageStore: VectorStore | null;
   voyageModelId: string | null;
   invertedIndex: InvertedIndex;
@@ -213,6 +215,24 @@ interface ReplayableFileState {
   fileContentHash: string;
 }
 
+interface CrossFileVoyageChunkWork {
+  filePath: string;
+  chunkId: string;
+  contentHash: string;
+  embeddingInputHash: string;
+  text: string;
+  metadata: ChunkMetadata;
+}
+
+interface CrossFileVoyageFileWork {
+  filePath: string;
+  embedStageInputHash: string;
+  totalChunkCount: number;
+  successfulChunkHashes: Set<string>;
+  pendingChunkHashes: Set<string>;
+  failedReason: string | null;
+}
+
 interface ReplayExpectedStageHashes {
   chunk: string;
   embed: string;
@@ -235,7 +255,7 @@ interface RunContext {
   configHash: string;
   store: VectorStore;
   provider: EmbeddingProviderInterface;
-  voyageProvider: VoyageEmbeddingProvider | null;
+  voyageProvider: SecondaryEmbeddingProvider | null;
   voyageStore: VectorStore | null;
   voyageModelId: string | null;
   invertedIndex: InvertedIndex;
@@ -297,6 +317,8 @@ const COLD_START_BATCH_SIZE = 50;
 export const TTI_TARGET_MS = 2_000;
 const RESUME_STALENESS_THRESHOLD_MS = 2 * 60 * 60 * 1000;
 const FINISHED_RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const CHUNK_TEXT_STORAGE_MODEL = "__chunk_text__";
+const VOYAGE_BACKGROUND_BATCH_CONCURRENCY = 3;
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
@@ -722,7 +744,7 @@ export class IncrementalIndexOrchestrator {
   constructor(private readonly host: IncrementalIndexOrchestratorHost) {}
 
   private getActiveVoyageMaxTokens(resources: {
-    voyageProvider: VoyageEmbeddingProvider | null;
+    voyageProvider: SecondaryEmbeddingProvider | null;
     voyageStore: VectorStore | null;
     voyageModelId: string | null;
   }): number | null {
@@ -735,7 +757,7 @@ export class IncrementalIndexOrchestrator {
 
   private getEffectiveEmbeddingMaxTokens(resources: {
     configuredProviderInfo: ConfiguredProviderInfo;
-    voyageProvider: VoyageEmbeddingProvider | null;
+    voyageProvider: SecondaryEmbeddingProvider | null;
     voyageStore: VectorStore | null;
     voyageModelId: string | null;
   }): number {
@@ -1254,7 +1276,12 @@ export class IncrementalIndexOrchestrator {
         activeRunId: run.runId,
       });
 
-      for (const filePath of unfinishedFiles) {
+      const queuedFiles = await this.runCrossFileVoyageBackgroundEmbedding(
+        context,
+        unfinishedFiles
+      );
+
+      for (const filePath of queuedFiles) {
         this.queue.enqueue({
           branch,
           filePath,
@@ -1264,7 +1291,9 @@ export class IncrementalIndexOrchestrator {
         });
       }
 
-      await this.drainRunContext(context);
+      if (queuedFiles.length > 0) {
+        await this.drainRunContext(context);
+      }
       await this.finalizeBackgroundEmbeddingRun(context);
     });
   }
@@ -2217,6 +2246,15 @@ export class IncrementalIndexOrchestrator {
         language: chunk.language,
       }));
       context.database.upsertChunksBatch(chunkRows);
+      context.database.upsertEmbeddingsBatch(
+        currentChunks.map((chunk) => ({
+          embeddingInputHash: chunk.embeddingInputHash,
+          contentHash: chunk.contentHash,
+          embedding: Buffer.alloc(0),
+          chunkText: chunk.text,
+          model: CHUNK_TEXT_STORAGE_MODEL,
+        }))
+      );
       this.checkpoints.markStageComplete(context.branch, filePath, "chunk", chunkInputHash);
       chunkRan = true;
     } else {
@@ -3081,7 +3119,343 @@ export class IncrementalIndexOrchestrator {
         embeddingText: chunkText,
         text: chunkText,
       });
+      });
+  }
+
+  private splitVoyageBatches(
+    chunks: CrossFileVoyageChunkWork[],
+    maxBatchSize: number = 128
+  ): CrossFileVoyageChunkWork[][] {
+    const batches: CrossFileVoyageChunkWork[][] = [];
+    for (let index = 0; index < chunks.length; index += maxBatchSize) {
+      batches.push(chunks.slice(index, index + maxBatchSize));
+    }
+    return batches;
+  }
+
+  private toStoredChunkWork(chunk: ChunkRecord, text: string): CrossFileVoyageChunkWork {
+    return {
+      filePath: chunk.filePath,
+      chunkId: chunk.chunkId,
+      contentHash: chunk.contentHash,
+      embeddingInputHash: chunk.embeddingInputHash,
+      text,
+      metadata: {
+        filePath: chunk.filePath,
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        chunkType: (chunk.nodeType as ChunkMetadata["chunkType"]) ?? "other",
+        name: chunk.name,
+        language: chunk.language,
+        hash: chunk.embeddingInputHash,
+      },
+    };
+  }
+
+  private materializeCachedPrimaryEmbedding(
+    context: RunContext,
+    chunk: ChunkRecord,
+    embeddingBuffer: Buffer
+  ): void {
+    const vector = Array.from(
+      new Float32Array(
+        embeddingBuffer.buffer,
+        embeddingBuffer.byteOffset,
+        embeddingBuffer.byteLength / 4
+      )
+    );
+    context.store.add(chunk.chunkId, vector, {
+      filePath: chunk.filePath,
+      startLine: chunk.startLine,
+      endLine: chunk.endLine,
+      chunkType: (chunk.nodeType as ChunkMetadata["chunkType"]) ?? "other",
+      name: chunk.name,
+      language: chunk.language,
+      hash: chunk.embeddingInputHash,
     });
+    context.stats.existingChunks += 1;
+    context.stats.indexedChunks += 1;
+  }
+
+  private updateBackgroundEmbeddingProgress(context: RunContext): void {
+    this.writeEmbeddingProgress(context.database, context.branch, {
+      status: "in_progress",
+      embedded: context.backgroundEmbeddingCompletedChunks,
+      total: context.backgroundEmbeddingTotalChunks,
+      startedAt: context.startTime,
+      updatedAt: Date.now(),
+      activeRunId: context.runId,
+    });
+  }
+
+  private async runCrossFileVoyageBackgroundEmbedding(
+    context: RunContext,
+    unfinishedFiles: string[]
+  ): Promise<string[]> {
+    if (context.mode !== "background_embed") {
+      return unfinishedFiles;
+    }
+
+    if (context.configuredProviderInfo.provider !== "voyage") {
+      return unfinishedFiles;
+    }
+
+    // Keep the existing per-file path unchanged whenever a secondary lane exists.
+    if (context.voyageProvider && context.voyageStore && context.voyageModelId) {
+      return unfinishedFiles;
+    }
+
+    const primaryModelId = context.configuredProviderInfo.modelInfo.model;
+    const embedConfigHash = hashEmbedConfig(
+      context.configuredProviderInfo,
+      context.voyageModelId,
+      this.getActiveVoyageMaxTokens(context)
+    );
+    const fallbackFiles = new Set<string>();
+    const pendingChunks: CrossFileVoyageChunkWork[] = [];
+    const fileWork = new Map<string, CrossFileVoyageFileWork>();
+    let totalTrackedChunks = 0;
+
+    for (const filePath of unfinishedFiles) {
+      const currentChunks = context.database
+        .getChunksByFileOnBranch(filePath, context.branch)
+        .map((chunk) => ({
+          chunkId: chunk.chunkId,
+          contentHash: chunk.contentHash,
+          embeddingInputHash: chunk.embeddingInputHash,
+          filePath: chunk.filePath,
+          startLine: chunk.startLine,
+          endLine: chunk.endLine,
+          nodeType: chunk.nodeType,
+          name: chunk.name,
+          chunkKind: chunk.chunkKind,
+          symbolKind: chunk.symbolKind,
+          language: chunk.language,
+          text: chunk.name ?? chunk.chunkId,
+          chunkHash: chunk.contentHash,
+        }) satisfies ChunkRecord);
+
+      if (currentChunks.length === 0) {
+        fallbackFiles.add(filePath);
+        continue;
+      }
+
+      const embeddingInputHashes = currentChunks.map((chunk) => chunk.embeddingInputHash);
+      const embedStageInputHash = buildEmbedStageInputHash(embeddingInputHashes, embedConfigHash);
+      const missingPrimaryEmbeddings = new Set(
+        context.database.getMissingEmbeddingsForModel(embeddingInputHashes, primaryModelId)
+      );
+
+      const work: CrossFileVoyageFileWork = {
+        filePath,
+        embedStageInputHash,
+        totalChunkCount: currentChunks.length,
+        successfulChunkHashes: new Set<string>(),
+        pendingChunkHashes: new Set<string>(),
+        failedReason: null,
+      };
+      totalTrackedChunks += currentChunks.length;
+
+      const cachedPrimaryChunks = currentChunks.filter(
+        (chunk) => !missingPrimaryEmbeddings.has(chunk.embeddingInputHash)
+      );
+      if (cachedPrimaryChunks.length > 0) {
+        const cachedEmbeddings = context.database.getEmbeddingsForModelBatch(
+          cachedPrimaryChunks.map((chunk) => chunk.embeddingInputHash),
+          primaryModelId
+        );
+        let cacheConsistent = true;
+        for (const chunk of cachedPrimaryChunks) {
+          const embeddingBuffer = cachedEmbeddings.get(chunk.embeddingInputHash);
+          if (!embeddingBuffer) {
+            cacheConsistent = false;
+            break;
+          }
+          this.materializeCachedPrimaryEmbedding(context, chunk, embeddingBuffer);
+          work.successfulChunkHashes.add(chunk.embeddingInputHash);
+        }
+
+        if (!cacheConsistent) {
+          fallbackFiles.add(filePath);
+          continue;
+        }
+      }
+
+      if (missingPrimaryEmbeddings.size === 0) {
+        this.clearVoyageEmbeddingDebt(context, filePath, primaryModelId);
+        this.checkpoints.markStageInProgress(
+          context.branch,
+          filePath,
+          "embed",
+          embedStageInputHash
+        );
+        this.checkpoints.markStageComplete(
+          context.branch,
+          filePath,
+          "embed",
+          embedStageInputHash
+        );
+        context.backgroundEmbeddingCompletedChunks += currentChunks.length;
+        this.updateBackgroundEmbeddingProgress(context);
+        continue;
+      }
+
+      const missingChunks = currentChunks.filter((chunk) =>
+        missingPrimaryEmbeddings.has(chunk.embeddingInputHash)
+      );
+      const chunkTexts = context.database.getChunkTextsBatch(
+        missingChunks.map((chunk) => chunk.embeddingInputHash)
+      );
+      const chunksMissingText = missingChunks.filter(
+        (chunk) => !chunkTexts.has(chunk.embeddingInputHash)
+      );
+
+      if (chunksMissingText.length > 0) {
+        fallbackFiles.add(filePath);
+        continue;
+      }
+
+      this.checkpoints.markStageInProgress(
+        context.branch,
+        filePath,
+        "embed",
+        embedStageInputHash
+      );
+      fileWork.set(filePath, work);
+
+      for (const chunk of missingChunks) {
+        const text = chunkTexts.get(chunk.embeddingInputHash);
+        if (!text) {
+          fallbackFiles.add(filePath);
+          fileWork.delete(filePath);
+          break;
+        }
+        work.pendingChunkHashes.add(chunk.embeddingInputHash);
+        pendingChunks.push(this.toStoredChunkWork(chunk, text));
+      }
+    }
+
+    if (context.backgroundEmbeddingTotalChunks === 0 && totalTrackedChunks > 0) {
+      context.backgroundEmbeddingTotalChunks = totalTrackedChunks;
+      this.updateBackgroundEmbeddingProgress(context);
+    }
+
+    const batches = this.splitVoyageBatches(pendingChunks);
+    const processBatch = async (batch: CrossFileVoyageChunkWork[]): Promise<void> => {
+      const voyageResponse = await context.provider.embedBatch(batch.map((chunk) => chunk.text));
+      const voyageVectors = voyageResponse.embeddings;
+      const voyageItems = batch.map((chunk, index) => {
+        const vector = voyageVectors[index];
+        if (!vector) {
+          throw new Error(`Missing Voyage embedding vector for ${chunk.chunkId}`);
+        }
+        return {
+          id: chunk.chunkId,
+          vector,
+          metadata: chunk.metadata,
+        };
+      });
+
+      context.store.addBatch(voyageItems);
+      context.database.upsertEmbeddingsBatch(
+        batch.map((chunk, index) => ({
+          embeddingInputHash: chunk.embeddingInputHash,
+          contentHash: chunk.contentHash,
+          embedding: Buffer.from(new Float32Array(voyageVectors[index] ?? []).buffer),
+          chunkText: chunk.text,
+          model: primaryModelId,
+        }))
+      );
+      context.stats.indexedChunks += batch.length;
+      context.stats.tokensUsed += voyageResponse.totalTokensUsed;
+      context.backgroundEmbeddingCompletedChunks += batch.length;
+      this.host.logger.recordChunksEmbedded(batch.length);
+      this.host.logger.recordEmbeddingApiCall(voyageResponse.totalTokensUsed);
+      this.updateBackgroundEmbeddingProgress(context);
+
+      for (const chunk of batch) {
+        const state = fileWork.get(chunk.filePath);
+        state?.successfulChunkHashes.add(chunk.embeddingInputHash);
+      }
+    };
+
+    for (
+      let batchIndex = 0;
+      batchIndex < batches.length;
+      batchIndex += VOYAGE_BACKGROUND_BATCH_CONCURRENCY
+    ) {
+      const concurrentBatches = batches.slice(
+        batchIndex,
+        batchIndex + VOYAGE_BACKGROUND_BATCH_CONCURRENCY
+      );
+      const results = await Promise.allSettled(
+        concurrentBatches.map(async (batch) => processBatch(batch))
+      );
+
+      for (const [resultIndex, result] of results.entries()) {
+        if (result.status === "fulfilled") {
+          continue;
+        }
+
+        const batch = concurrentBatches[resultIndex];
+        if (!batch) {
+          continue;
+        }
+
+        const reason = getErrorMessage(result.reason);
+        this.host.logger.recordEmbeddingError();
+        this.host.addFailedBatch(
+          batch.map((chunk) => ({
+            id: chunk.chunkId,
+            text: chunk.text,
+            content: chunk.text,
+            contentHash: chunk.contentHash,
+            embeddingInputHash: chunk.embeddingInputHash,
+            metadata: chunk.metadata,
+          })),
+          reason
+        );
+
+        for (const filePath of new Set(batch.map((chunk) => chunk.filePath))) {
+          const state = fileWork.get(filePath);
+          if (!state || state.failedReason) {
+            continue;
+          }
+          state.failedReason = reason;
+          context.failedFiles.add(filePath);
+          context.stats.failedChunks += 1;
+          this.recordVoyageEmbeddingDebt(context, filePath, primaryModelId, reason);
+        }
+      }
+    }
+
+    for (const [filePath, state] of fileWork) {
+      if (state.failedReason) {
+        this.checkpoints.markStageFailed(
+          context.branch,
+          filePath,
+          "embed",
+          state.failedReason,
+          state.embedStageInputHash
+        );
+        continue;
+      }
+
+      if (state.successfulChunkHashes.size === state.totalChunkCount) {
+        this.clearVoyageEmbeddingDebt(context, filePath, primaryModelId);
+        this.checkpoints.markStageComplete(
+          context.branch,
+          filePath,
+          "embed",
+          state.embedStageInputHash
+        );
+        continue;
+      }
+
+      fallbackFiles.add(filePath);
+    }
+
+    return unfinishedFiles.filter((filePath) => fallbackFiles.has(filePath));
   }
 
   private recordVoyageEmbeddingDebt(

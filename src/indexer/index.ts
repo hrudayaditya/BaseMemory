@@ -4,7 +4,13 @@ import { performance } from "perf_hooks";
 import { pathToFileURL } from "url";
 
 import { ParsedCodebaseIndexConfig } from "../config/schema.js";
-import { detectEmbeddingProvider, ConfiguredProviderInfo, tryDetectProvider, createCustomProviderInfo } from "../embeddings/detector.js";
+import {
+  detectEmbeddingProvider,
+  ConfiguredProviderInfo,
+  tryDetectProvider,
+  createCustomProviderInfo,
+  createVoyageProviderInfo,
+} from "../embeddings/detector.js";
 import {
   createEmbeddingProvider,
   EmbeddingProviderInterface,
@@ -50,6 +56,8 @@ import {
   type MerkleIgnoreRules,
   type ChunkCapDropData,
 } from "../native/index.js";
+
+type SecondaryEmbeddingProvider = EmbeddingProviderInterface | VoyageEmbeddingProvider;
 import type { SymbolData, CallEdgeData, ChunkKind, ChunkSymbolKind, ChunkType } from "../native/index.js";
 import { getBranchOrDefault, getBaseBranch, isGitRepo } from "../git/index.js";
 
@@ -2261,7 +2269,7 @@ export class Indexer {
   private invertedIndex: InvertedIndex | null = null;
   private database: Database | null = null;
   private provider: EmbeddingProviderInterface | null = null;
-  private voyageProvider: VoyageEmbeddingProvider | null = null;
+  private voyageProvider: SecondaryEmbeddingProvider | null = null;
   private configuredProviderInfo: ConfiguredProviderInfo | null = null;
   private primaryStoreModelId: string | null = null;
   private fileHashCache: Map<string, string> = new Map();
@@ -2733,6 +2741,28 @@ export class Indexer {
   }
 
   private syncVoyageRuntime(): void {
+    if (this.config.embeddingProvider === "voyage") {
+      if (!this.config.customProvider) {
+        this.voyageProvider = null;
+        return;
+      }
+
+      const secondaryProviderInfo = createCustomProviderInfo(this.config.customProvider);
+      const currentModelId = this.voyageProvider?.getModelInfo().model;
+      if (!this.voyageProvider || currentModelId !== secondaryProviderInfo.modelInfo.model) {
+        this.voyageProvider = createEmbeddingProvider(secondaryProviderInfo);
+      }
+
+      if (!this.hasStore(secondaryProviderInfo.modelInfo.model)) {
+        this.initializeStore(
+          secondaryProviderInfo.modelInfo.model,
+          secondaryProviderInfo.modelInfo.dimensions
+        );
+        this.getStore(secondaryProviderInfo.modelInfo.model).load();
+      }
+      return;
+    }
+
     const voyageApiKey = this.config.voyageApiKey?.trim();
     if (!voyageApiKey) {
       this.voyageProvider = null;
@@ -2968,6 +2998,8 @@ export class Indexer {
         return { concurrency: 5, intervalMs: 200, minRetryMs: 1000, maxRetryMs: 30000 };
       case "ollama":
         return { concurrency: 5, intervalMs: 0, minRetryMs: 500, maxRetryMs: 5000 };
+      case "voyage":
+        return { concurrency: 3, intervalMs: 200, minRetryMs: 1000, maxRetryMs: 30000 };
       case "custom": {
         // Custom providers allow user-configurable concurrency and request interval.
         // Defaults are conservative (3 concurrent, 1s interval) for cloud endpoints;
@@ -2991,6 +3023,15 @@ export class Indexer {
         throw new Error("embeddingProvider is 'custom' but customProvider config is missing.");
       }
       this.configuredProviderInfo = createCustomProviderInfo(this.config.customProvider);
+    } else if (this.config.embeddingProvider === "voyage") {
+      const voyageApiKey = this.config.voyageApiKey?.trim();
+      if (!voyageApiKey) {
+        throw new Error("embeddingProvider is 'voyage' but voyageApiKey is missing.");
+      }
+      this.configuredProviderInfo = createVoyageProviderInfo({
+        voyageApiKey,
+        voyageModelId: this.config.voyageModelId,
+      });
     } else if (this.config.embeddingProvider === 'auto') {
       this.configuredProviderInfo = await tryDetectProvider();
     } else {
@@ -2999,7 +3040,7 @@ export class Indexer {
 
     if (!this.configuredProviderInfo) {
       throw new Error(
-        "No embedding provider available. Configure GitHub Copilot, OpenAI, Google, Ollama, or a custom OpenAI-compatible endpoint."
+        "No embedding provider available. Configure GitHub Copilot, OpenAI, Google, Ollama, Voyage, or a custom OpenAI-compatible endpoint."
       );
     }
 
@@ -3269,7 +3310,7 @@ export class Indexer {
   private async ensureInitialized(): Promise<{
     store: VectorStore;
     provider: EmbeddingProviderInterface;
-    voyageProvider: VoyageEmbeddingProvider | null;
+    voyageProvider: SecondaryEmbeddingProvider | null;
     voyageStore: VectorStore | null;
     voyageModelId: string | null;
     invertedIndex: InvertedIndex;

@@ -549,6 +549,38 @@ export function createEmbeddingProvider(
       return new GoogleEmbeddingProvider(configuredProviderInfo.credentials, configuredProviderInfo.modelInfo);
     case "ollama":
       return new OllamaEmbeddingProvider(configuredProviderInfo.credentials, configuredProviderInfo.modelInfo);
+    case "voyage": {
+      const provider = new VoyageEmbeddingProvider({
+        voyageApiKey: configuredProviderInfo.credentials.apiKey,
+        voyageModelId: configuredProviderInfo.modelInfo.model,
+      });
+      return {
+        async embedQuery(query: string): Promise<EmbeddingResult> {
+          const result = await provider.embedQuery(query);
+          if (!result) {
+            throw new Error("Voyage primary provider returned no query embedding.");
+          }
+          return result;
+        },
+        async embedDocument(document: string): Promise<EmbeddingResult> {
+          const result = await provider.embedDocument(document);
+          if (!result) {
+            throw new Error("Voyage primary provider returned no document embedding.");
+          }
+          return result;
+        },
+        async embedBatch(texts: string[]): Promise<EmbeddingBatchResult> {
+          const result = await provider.embedBatch(texts);
+          if (!result) {
+            throw new Error("Voyage primary provider returned no batch embeddings.");
+          }
+          return result;
+        },
+        getModelInfo(): BaseModelInfo {
+          return provider.getModelInfo();
+        },
+      };
+    }
     case "custom":
       return new CustomEmbeddingProvider(configuredProviderInfo.credentials, configuredProviderInfo.modelInfo);
     default: {
