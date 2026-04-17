@@ -11,7 +11,7 @@ import {
 
 export type PipelineStage = "chunk" | "embed" | "index" | "graph";
 export type PipelineStageStatus = "pending" | "in_progress" | "complete" | "failed";
-export type PipelineRunType = "cold_start" | "hot_update" | "config_change" | "resume";
+export type PipelineRunType = "cold_start" | "hot_update" | "config_change" | "resume" | "background_embed";
 export type PipelineRunStatus = "in_progress" | "finalizing" | "complete" | "failed" | "cancelled";
 
 export interface CheckpointManagerOptions {

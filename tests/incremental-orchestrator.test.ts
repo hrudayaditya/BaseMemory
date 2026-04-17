@@ -85,6 +85,19 @@ describe("incremental index orchestrator", () => {
     );
   }
 
+  async function waitForCondition(
+    predicate: () => boolean,
+    timeoutMs: number = 5_000
+  ): Promise<void> {
+    const startedAt = Date.now();
+    while (!predicate()) {
+      if (Date.now() - startedAt > timeoutMs) {
+        throw new Error("Timed out waiting for condition");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "incremental-orchestrator-"));
     resetWatcherEventTimestamps();
@@ -256,6 +269,61 @@ describe("incremental index orchestrator", () => {
     );
     return filePath;
   }
+
+  it("returns foreground results before background embedding completes and suppresses duplicate background launches", async () => {
+    createSingleFileRepo();
+    const config = createConfig();
+    const releaseEmbedding = Promise.withResolvers<void>();
+    fetchSpy.mockImplementation(async (_url, init) => {
+      await releaseEmbedding.promise;
+      return createMockEmbeddingResponse(init);
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    const startedAt = Date.now();
+    const foreground = await indexer.indexForeground();
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(elapsedMs).toBeLessThan(3_000);
+    expect(foreground.bm25Ready).toBe(true);
+    expect(foreground.callGraphReady).toBe(true);
+    expect(foreground.embeddingStatus).toBe("pending");
+
+    const duplicate = await indexer.indexForeground();
+    expect(duplicate.alreadyInProgress).toBe(true);
+    expect(indexer.isBackgroundEmbeddingRunning()).toBe(true);
+
+    const statusDuring = await indexer.getStatus();
+    expect(statusDuring.indexed).toBe(true);
+    expect(statusDuring.foreground?.bm25Ready).toBe(true);
+
+    releaseEmbedding.resolve();
+    await waitForCondition(() => !indexer.isBackgroundEmbeddingRunning());
+
+    const statusAfter = await indexer.getStatus();
+    expect(statusAfter.embedding?.status).toBe("complete");
+  });
+
+  it("reports foreground readiness while background embedding is running", async () => {
+    createGraphRepo();
+    const config = createConfig();
+    const releaseEmbedding = Promise.withResolvers<void>();
+    fetchSpy.mockImplementation(async (_url, init) => {
+      await releaseEmbedding.promise;
+      return createMockEmbeddingResponse(init);
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.indexForeground();
+
+    const status = await indexer.getStatus();
+
+    expect(status.foreground?.callGraphReady).toBe(true);
+    expect(status.embedding?.status === "pending" || status.embedding?.status === "in_progress").toBe(true);
+
+    releaseEmbedding.resolve();
+    await waitForCondition(() => !indexer.isBackgroundEmbeddingRunning());
+  });
 
   function createCrossFileCallRepo(): {
     callerFile: string;

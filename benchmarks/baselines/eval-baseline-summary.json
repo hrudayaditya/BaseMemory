@@ -1,7 +1,7 @@
 {
-  "generatedAt": "2026-04-15T18:45:54.326Z",
-  "projectRoot": "/Users/aditya3/BaseMemory",
-  "datasetPath": "/Users/aditya3/BaseMemory/benchmarks/golden/small.json",
+  "generatedAt": "2026-04-17T04:07:54.720Z",
+  "projectRoot": "/Users/aady/Desktop/OpenSourceContributions/BaseMemory",
+  "datasetPath": "/Users/aady/Desktop/OpenSourceContributions/BaseMemory/benchmarks/golden/small.json",
   "datasetName": "small",
   "datasetVersion": "1.2.0",
   "queryCount": 40,
@@ -18,18 +18,18 @@
     "effectiveGraphDepth": -1
   },
   "metrics": {
-    "hitAt1": 0.575,
-    "hitAt3": 0.7,
+    "hitAt1": 0.6,
+    "hitAt3": 0.725,
     "hitAt5": 0.825,
-    "hitAt10": 0.875,
-    "combinedRecallAt10": 0.875,
+    "hitAt10": 0.85,
+    "combinedRecallAt10": 0.85,
     "expansionHitRate": 0,
-    "mrrAt10": 0.6675595238095238,
-    "ndcgAt10": 0.6948937491416937,
+    "mrrAt10": 0.6785714285714285,
+    "ndcgAt10": 0.6970779146128806,
     "latencyMs": {
-      "p50": 1116.7645624999996,
-      "p95": 1429.782072900001,
-      "p99": 1454.1393348599972
+      "p50": 1067.2703750000005,
+      "p95": 1351.9386476,
+      "p99": 1427.9328799999996
     },
     "tokenEstimate": {
       "queryTokens": 556,
@@ -41,10 +41,10 @@
       "costPer1MTokensUsd": 0
     },
     "failureBuckets": {
-      "wrong-file": 8,
-      "wrong-symbol": 7,
+      "wrong-file": 7,
+      "wrong-symbol": 6,
       "docs-tests-outranking-source": 1,
-      "no-relevant-hit-top-k": 1
+      "no-relevant-hit-top-k": 2
     },
     "reranker": {
       "appliedCount": 27,
@@ -52,7 +52,7 @@
       "backendUsage": {
         "transformers-cross-encoder": 27
       },
-      "lastMs": 0.0027919999993173406
+      "lastMs": 0.0036670000044978224
     }
   }
 }

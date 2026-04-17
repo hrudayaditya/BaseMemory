@@ -739,6 +739,20 @@ pub struct ChunkKindEnrichmentData {
 }
 
 #[napi(object)]
+pub struct ChunkMetadataLookupData {
+    pub chunk_id: String,
+    pub embedding_input_hash: String,
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub node_type: Option<String>,
+    pub name: Option<String>,
+    pub chunk_kind: Option<String>,
+    pub symbol_kind: Option<String>,
+    pub language: String,
+}
+
+#[napi(object)]
 pub struct BranchDelta {
     pub added: Vec<String>,
     pub removed: Vec<String>,
@@ -1439,6 +1453,34 @@ impl Database {
                 chunk_id: row.chunk_id,
                 chunk_kind: row.chunk_kind,
                 symbol_kind: row.symbol_kind,
+            })
+            .collect())
+    }
+
+    #[napi]
+    pub fn get_chunk_metadata_batch(
+        &self,
+        chunk_ids: Vec<String>,
+    ) -> Result<Vec<ChunkMetadataLookupData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows = db::get_chunk_metadata_batch(&conn, &chunk_ids)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ChunkMetadataLookupData {
+                chunk_id: row.chunk_id,
+                embedding_input_hash: row.embedding_input_hash,
+                file_path: row.file_path,
+                start_line: row.start_line,
+                end_line: row.end_line,
+                node_type: row.node_type,
+                name: row.name,
+                chunk_kind: row.chunk_kind,
+                symbol_kind: row.symbol_kind,
+                language: row.language,
             })
             .collect())
     }

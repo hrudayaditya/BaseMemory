@@ -50,7 +50,7 @@ import {
   type MerkleIgnoreRules,
   type ChunkCapDropData,
 } from "../native/index.js";
-import type { SymbolData, CallEdgeData, ChunkKind, ChunkSymbolKind } from "../native/index.js";
+import type { SymbolData, CallEdgeData, ChunkKind, ChunkSymbolKind, ChunkType } from "../native/index.js";
 import { getBranchOrDefault, getBaseBranch, isGitRepo } from "../git/index.js";
 
 const CALL_GRAPH_LANGUAGES = new Set(["typescript", "tsx", "javascript", "jsx", "python", "go", "rust", "php"]);
@@ -455,6 +455,37 @@ export interface StatusResult {
     totalDroppedChunks: number;
     totalDroppedNamedSymbols: number;
   } | null;
+  foreground?: {
+    bm25Ready: boolean;
+    callGraphReady: boolean;
+  } | null;
+  embedding?: {
+    status: "pending" | "in_progress" | "complete" | "partial" | "failed";
+    embedded: number;
+    total: number;
+    startedAt?: number | null;
+    updatedAt?: number | null;
+    failed?: string | null;
+  } | null;
+}
+
+export interface ForegroundIndexResult {
+  filesProcessed: number;
+  totalChunks: number;
+  chunksIndexed: number;
+  removedChunks: number;
+  durationMs: number;
+  bm25Ready: boolean;
+  callGraphReady: boolean;
+  embeddingStatus: "pending" | "in_progress" | "complete" | "partial" | "failed";
+  embeddingProgress: {
+    embedded: number;
+    total: number;
+    startedAt?: number | null;
+    updatedAt?: number | null;
+    failed?: string | null;
+  };
+  alreadyInProgress?: boolean;
 }
 
 export interface IndexCoverageResult {
@@ -570,6 +601,18 @@ interface QueryEmbeddingCacheEntry {
   embedding: number[];
   timestamp: number;
 }
+
+interface EmbeddingProgressState {
+  status: "pending" | "in_progress" | "complete" | "partial" | "failed";
+  embedded: number;
+  total: number;
+  startedAt?: number | null;
+  updatedAt?: number | null;
+  failed?: string | null;
+  activeRunId?: string | null;
+}
+
+const EMBEDDING_PROGRESS_METADATA_PREFIX = "index.embedding_progress.";
 
 interface SemanticRankOptions {
   rerankTopN: number;
@@ -2237,6 +2280,7 @@ export class Indexer {
   private recoveredFromInterruptedIndexing = false;
   private startupRetrievalRebuildPending = false;
   private orchestrator!: IncrementalIndexOrchestrator;
+  private readonly backgroundEmbeddingRuns = new Map<string, Promise<void>>();
   private readonly searchReranker!: SearchReranker;
   private rerankerHealth: StatusResult["rerankerHealth"] = null;
   private rerankerStartupWarningShown = false;
@@ -2539,6 +2583,61 @@ export class Indexer {
       count += store.count();
     }
     return count;
+  }
+
+  private getEmbeddingProgressMetadataKey(branch: string = this.currentBranch): string {
+    return `${EMBEDDING_PROGRESS_METADATA_PREFIX}${this.getActiveBranchKey(branch)}`;
+  }
+
+  private readEmbeddingProgressState(database: Database, branch: string = this.currentBranch): EmbeddingProgressState | null {
+    const raw = database.getMetadata(this.getEmbeddingProgressMetadataKey(branch));
+    if (!raw) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(raw) as EmbeddingProgressState;
+    } catch {
+      return null;
+    }
+  }
+
+  private writeEmbeddingProgressState(
+    database: Database,
+    state: EmbeddingProgressState,
+    branch: string = this.currentBranch
+  ): void {
+    database.setMetadata(this.getEmbeddingProgressMetadataKey(branch), JSON.stringify(state));
+  }
+
+  isBackgroundEmbeddingRunning(branch: string = this.currentBranch): boolean {
+    return this.backgroundEmbeddingRuns.has(this.getActiveBranchKey(branch));
+  }
+
+  private buildForegroundIndexResult(
+    args: {
+      filesProcessed: number;
+      totalChunks: number;
+      chunksIndexed: number;
+      removedChunks: number;
+      durationMs: number;
+      embeddingStatus: ForegroundIndexResult["embeddingStatus"];
+      embeddingProgress: ForegroundIndexResult["embeddingProgress"];
+      alreadyInProgress?: boolean;
+    }
+  ): ForegroundIndexResult {
+    return {
+      filesProcessed: args.filesProcessed,
+      totalChunks: args.totalChunks,
+      chunksIndexed: args.chunksIndexed,
+      removedChunks: args.removedChunks,
+      durationMs: args.durationMs,
+      bm25Ready: true,
+      callGraphReady: true,
+      embeddingStatus: args.embeddingStatus,
+      embeddingProgress: args.embeddingProgress,
+      alreadyInProgress: args.alreadyInProgress,
+    };
   }
 
   private getActiveVoyageModelId(): string | null {
@@ -3646,6 +3745,74 @@ export class Indexer {
     });
   }
 
+  async indexForeground(onProgress?: ProgressCallback): Promise<ForegroundIndexResult> {
+    await this.refreshBranchInfo();
+    const branch = this.getActiveBranchKey(this.currentBranch);
+    const existingProgress = this.database
+      ? this.readEmbeddingProgressState(this.database, branch)
+      : null;
+
+    if (this.backgroundEmbeddingRuns.has(branch)) {
+      return this.buildForegroundIndexResult({
+        filesProcessed: 0,
+        totalChunks: existingProgress?.total ?? 0,
+        chunksIndexed: 0,
+        removedChunks: 0,
+        durationMs: 0,
+        embeddingStatus: existingProgress?.status ?? "in_progress",
+        embeddingProgress: {
+          embedded: existingProgress?.embedded ?? 0,
+          total: existingProgress?.total ?? 0,
+          startedAt: existingProgress?.startedAt ?? null,
+          updatedAt: existingProgress?.updatedAt ?? null,
+          failed: existingProgress?.failed ?? null,
+        },
+        alreadyInProgress: true,
+      });
+    }
+
+    return this.runSerializedIndexOperation(async () => {
+      await this.maybeResetAfterStartupRetrievalMismatch();
+      const result = await this.orchestrator.coldStartForeground(onProgress);
+
+      if (
+        result.embeddingStatus !== "complete" &&
+        result.embeddingProgress.total > 0 &&
+        !this.backgroundEmbeddingRuns.has(branch)
+      ) {
+        const backgroundRun = this.runSerializedIndexOperation(async () => {
+          await this.orchestrator.runBackgroundEmbedding(branch);
+        }).catch((error) => {
+          if (this.database) {
+            this.writeEmbeddingProgressState(
+              this.database,
+              {
+                status: result.embeddingProgress.embedded > 0 ? "partial" : "failed",
+                embedded: result.embeddingProgress.embedded,
+                total: result.embeddingProgress.total,
+                startedAt: result.embeddingProgress.startedAt ?? Date.now(),
+                updatedAt: Date.now(),
+                failed: error instanceof Error ? error.message : String(error),
+                activeRunId: null,
+              },
+              branch
+            );
+          }
+          this.logger.warn("Background embedding run failed", {
+            branch,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }).finally(() => {
+          this.backgroundEmbeddingRuns.delete(branch);
+        });
+
+        this.backgroundEmbeddingRuns.set(branch, backgroundRun);
+      }
+
+      return result;
+    });
+  }
+
   private getQueryEmbeddingCacheKey(modelId: string, query: string): string {
     return `${modelId}\u0000${query}`;
   }
@@ -4086,8 +4253,11 @@ export class Indexer {
     }
 
     const searchStartTime = performance.now();
+    const hasDensePrimary = store.count() > 0;
+    const hasDenseVoyage = Boolean(voyageStore && voyageStore.count() > 0);
+    const hasSparse = this.invertedIndex?.getDocumentCount() ? this.invertedIndex.getDocumentCount() > 0 : false;
 
-    if (store.count() === 0) {
+    if (!hasDensePrimary && !hasDenseVoyage && !hasSparse) {
       this.logger.search("debug", "Search on empty index", { query });
       return {
         primaryResults: [],
@@ -4173,15 +4343,17 @@ export class Indexer {
     const embeddingStartTime = performance.now();
     const embeddingQuery = stripFilePathHint(query);
     const [arcticQueryVector, rawVoyageQueryVector] = await Promise.all([
-      this.getQueryEmbedding(embeddingQuery, provider).catch((error) => {
-        this.logger.search("warn", "Primary query embedding failed; continuing without Arctic dense lane", {
-          taskType,
-          model: provider.getModelInfo().model,
-          error: getErrorMessage(error),
-        });
-        return null;
-      }),
-      voyageProvider
+      hasDensePrimary
+        ? this.getQueryEmbedding(embeddingQuery, provider).catch((error) => {
+            this.logger.search("warn", "Primary query embedding failed; continuing without Arctic dense lane", {
+              taskType,
+              model: provider.getModelInfo().model,
+              error: getErrorMessage(error),
+            });
+            return null;
+          })
+        : Promise.resolve(null),
+      hasDenseVoyage && voyageProvider
         ? this.getQueryEmbedding(embeddingQuery, voyageProvider).catch((error) => {
             this.logger.search("warn", "Voyage query embedding failed; continuing without Voyage dense lane", {
               taskType,
@@ -4237,7 +4409,7 @@ export class Indexer {
     const [semanticLane, voyageLane, keywordLane] = await Promise.all([
       Promise.resolve().then(() => {
         const started = performance.now();
-        if (!arcticQueryVector) {
+        if (!hasDensePrimary || !arcticQueryVector) {
           return { results: [] as RankedCandidate[], ms: performance.now() - started };
         }
 
@@ -4255,7 +4427,7 @@ export class Indexer {
       }),
       Promise.resolve().then(() => {
         const started = performance.now();
-        if (!rawVoyageQueryVector || !voyageStore || !voyageLaneAvailable) {
+        if (!hasDenseVoyage || !rawVoyageQueryVector || !voyageStore || !voyageLaneAvailable) {
           return { results: [] as RankedCandidate[], ms: performance.now() - started };
         }
 
@@ -4490,7 +4662,7 @@ export class Indexer {
     limit: number,
     branch?: string | null
   ): Promise<Array<{ id: string; score: number; metadata: ChunkMetadata }>> {
-    const { store, invertedIndex } = await this.ensureInitialized();
+    const { database, invertedIndex } = await this.ensureInitialized();
     const scores = branch
       ? invertedIndex.searchOnBranch(query, branch, limit)
       : invertedIndex.search(query, limit);
@@ -4499,10 +4671,21 @@ export class Indexer {
       return [];
     }
 
-    // Only fetch metadata for chunks returned by BM25 (O(n) where n = result count)
-    // instead of getAllMetadata() which fetches ALL chunks in the index
     const chunkIds = Array.from(scores.keys());
-    const metadataMap = store.getMetadataBatch(chunkIds);
+    const metadataMap = new Map(
+      database.getChunkMetadataBatch(chunkIds).map((row) => [
+        row.chunkId,
+        {
+          filePath: row.filePath,
+          startLine: row.startLine,
+          endLine: row.endLine,
+          chunkType: (row.nodeType ?? "other") as ChunkType,
+          name: row.name,
+          language: row.language,
+          hash: row.embeddingInputHash,
+        } satisfies ChunkMetadata,
+      ])
+    );
 
     const results: Array<{ id: string; score: number; metadata: ChunkMetadata }> = [];
     for (const [chunkId, score] of scores) {
@@ -4519,11 +4702,15 @@ export class Indexer {
   async getStatus(): Promise<StatusResult> {
     const { configuredProviderInfo, database } = await this.ensureInitialized();
     const vectorCount = this.totalVectorCount();
+    const branch = this.getActiveBranchKey(this.currentBranch);
+    const branchChunkCount = database.getBranchChunkIds(branch).length;
+    const branchSymbolCount = database.getBranchSymbolIds(branch).length;
+    const embedding = this.readEmbeddingProgressState(database, branch);
     const chunkCapDrops = database.getChunkCapDropsForBranch(this.currentBranch);
     this.rerankerHealth = this.readPersistedRerankerHealth(database);
 
     return {
-      indexed: vectorCount > 0,
+      indexed: branchChunkCount > 0,
       vectorCount,
       provider: configuredProviderInfo.provider,
       model: configuredProviderInfo.modelInfo.model,
@@ -4533,6 +4720,20 @@ export class Indexer {
       compatibility: this.indexCompatibility,
       rerankerHealth: this.rerankerHealth,
       chunkCapSummary: this.summarizeChunkCapDrops(chunkCapDrops),
+      foreground: {
+        bm25Ready: branchChunkCount > 0,
+        callGraphReady: branchChunkCount > 0 && branchSymbolCount >= 0,
+      },
+      embedding: embedding
+        ? {
+            status: embedding.status,
+            embedded: embedding.embedded,
+            total: embedding.total,
+            startedAt: embedding.startedAt ?? null,
+            updatedAt: embedding.updatedAt ?? null,
+            failed: embedding.failed ?? null,
+          }
+        : null,
     };
   }
 

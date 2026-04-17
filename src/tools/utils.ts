@@ -1,4 +1,5 @@
 import {
+  ForegroundIndexResult,
   IndexStats,
   IndexProgress,
   SearchResult,
@@ -73,6 +74,47 @@ export function formatIndexStats(stats: IndexStats, verbose: boolean = false): s
   return lines.join("\n");
 }
 
+export function formatForegroundReadyMessage(
+  result: ForegroundIndexResult,
+  verbose: boolean = false
+): string {
+  if (result.alreadyInProgress) {
+    const progress =
+      result.embeddingProgress.total > 0
+        ? ` (${result.embeddingProgress.embedded}/${result.embeddingProgress.total} chunks embedded)`
+        : "";
+    return `Index ready. Semantic search embedding is already in progress for this branch${progress}. Use index_status to check progress.`;
+  }
+
+  const lines = [
+    "Index ready. BM25 search, call graph, and symbol navigation are available now.",
+    "",
+    `Files processed: ${result.filesProcessed}`,
+    `Chunks indexed: ${result.totalChunks}`,
+  ];
+
+  if (result.removedChunks > 0) {
+    lines.push(`Removed stale chunks: ${result.removedChunks}`);
+  }
+
+  if (result.embeddingStatus === "complete" || result.embeddingProgress.total === 0) {
+    lines.push("");
+    lines.push("Semantic search: complete");
+  } else {
+    lines.push("");
+    lines.push(
+      `Semantic search: indexing in background (${result.embeddingProgress.embedded}/${result.embeddingProgress.total} chunks embedded)`
+    );
+    lines.push("Use index_status to check embedding progress.");
+  }
+
+  if (verbose) {
+    lines.push(`Foreground duration: ${(result.durationMs / 1000).toFixed(2)}s`);
+  }
+
+  return lines.join("\n");
+}
+
 export function formatStatus(status: StatusResult): string {
   if (!status.indexed) {
     return "Codebase is not indexed. Run index_codebase to create an index.";
@@ -85,6 +127,29 @@ export function formatStatus(status: StatusResult): string {
     `  Model: ${status.model}`,
     `  Location: ${status.indexPath}`,
   ];
+
+  if (status.foreground) {
+    lines.push(
+      `  BM25 + call graph: ${status.foreground.bm25Ready && status.foreground.callGraphReady ? "complete" : "pending"}`
+    );
+  }
+
+  if (status.embedding) {
+    const suffix =
+      status.embedding.total > 0
+        ? ` (${status.embedding.embedded}/${status.embedding.total})`
+        : "";
+    if (status.embedding.status === "complete") {
+      lines.push("  Semantic search: complete");
+    } else if (status.embedding.status === "in_progress" || status.embedding.status === "pending") {
+      lines.push(`  Semantic search: indexing in background${suffix}`);
+    } else {
+      lines.push(`  Semantic search: ${status.embedding.status}${suffix}`);
+      if (status.embedding.failed) {
+        lines.push(`  Embedding failure: ${status.embedding.failed}`);
+      }
+    }
+  }
 
   if (status.currentBranch !== "default") {
     lines.push(`  Current branch: ${status.currentBranch}`);

@@ -76,7 +76,7 @@
     },
     {
       "id": "sem-index-codebase-caller",
-      "query": "which tool formats index stats after indexing and returns progress",
+      "query": "which tool returns the foreground-ready indexing message and sends indexing progress updates",
       "queryType": "similarity",
       "expected": {
         "filePath": "src/tools/index.ts",

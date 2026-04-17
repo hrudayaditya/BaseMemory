@@ -1643,6 +1643,20 @@ pub struct ChunkKindEnrichmentRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct ChunkMetadataRow {
+    pub chunk_id: String,
+    pub embedding_input_hash: String,
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub node_type: Option<String>,
+    pub name: Option<String>,
+    pub chunk_kind: Option<String>,
+    pub symbol_kind: Option<String>,
+    pub language: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct SymbolChunkRow {
     pub symbol_id: String,
     pub chunk_id: String,
@@ -1684,6 +1698,50 @@ pub fn get_chunk_kinds_batch(
                 chunk_id: row.get(0)?,
                 chunk_kind: row.get(1)?,
                 symbol_kind: row.get(2)?,
+            })
+        })?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    Ok(results)
+}
+
+/// Get retrieval metadata for multiple chunk ids without relying on vector-store metadata.
+pub fn get_chunk_metadata_batch(
+    conn: &Connection,
+    chunk_ids: &[String],
+) -> DbResult<Vec<ChunkMetadataRow>> {
+    if chunk_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    for chunk in chunk_ids.chunks(SQL_BIND_PARAM_BATCH_SIZE) {
+        let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT chunk_id, embedding_input_hash, file_path, start_line, end_line, node_type, name, chunk_kind, symbol_kind, language FROM chunks WHERE chunk_id IN ({})",
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(ChunkMetadataRow {
+                chunk_id: row.get(0)?,
+                embedding_input_hash: row.get(1)?,
+                file_path: row.get(2)?,
+                start_line: row.get(3)?,
+                end_line: row.get(4)?,
+                node_type: row.get(5)?,
+                name: row.get(6)?,
+                chunk_kind: row.get(7)?,
+                symbol_kind: row.get(8)?,
+                language: row.get(9)?,
             })
         })?;
 

@@ -865,6 +865,19 @@ export interface ChunkKindEnrichment {
   symbolKind?: ChunkSymbolKind;
 }
 
+export interface ChunkMetadataLookup {
+  chunkId: string;
+  embeddingInputHash: string;
+  filePath: string;
+  startLine: number;
+  endLine: number;
+  nodeType?: ChunkType;
+  name?: string;
+  chunkKind?: ChunkKind;
+  symbolKind?: ChunkSymbolKind;
+  language: string;
+}
+
 export interface BranchDelta {
   added: string[];
   removed: string[];
@@ -1233,6 +1246,41 @@ export class Database {
   getChunkKindsBatch(chunkIds: string[]): ChunkKindEnrichment[] {
     if (chunkIds.length === 0) return [];
     return this.inner.getChunkKindsBatch(chunkIds);
+  }
+
+  getChunkMetadataBatch(chunkIds: string[]): ChunkMetadataLookup[] {
+    if (chunkIds.length === 0) return [];
+    return this.inner.getChunkMetadataBatch(chunkIds).map((item: {
+      chunkId?: string;
+      chunk_id?: string;
+      embeddingInputHash?: string;
+      embedding_input_hash?: string;
+      filePath?: string;
+      file_path?: string;
+      startLine?: number;
+      start_line?: number;
+      endLine?: number;
+      end_line?: number;
+      nodeType?: ChunkType;
+      node_type?: ChunkType;
+      name?: string;
+      chunkKind?: ChunkKind;
+      chunk_kind?: ChunkKind;
+      symbolKind?: ChunkSymbolKind;
+      symbol_kind?: ChunkSymbolKind;
+      language: string;
+    }) => ({
+      chunkId: item.chunkId ?? item.chunk_id ?? "",
+      embeddingInputHash: item.embeddingInputHash ?? item.embedding_input_hash ?? "",
+      filePath: item.filePath ?? item.file_path ?? "",
+      startLine: item.startLine ?? item.start_line ?? 0,
+      endLine: item.endLine ?? item.end_line ?? 0,
+      nodeType: item.nodeType ?? item.node_type ?? undefined,
+      name: item.name ?? undefined,
+      chunkKind: item.chunkKind ?? item.chunk_kind ?? undefined,
+      symbolKind: item.symbolKind ?? item.symbol_kind ?? undefined,
+      language: item.language,
+    }));
   }
 
   deleteChunksByFile(filePath: string): number {

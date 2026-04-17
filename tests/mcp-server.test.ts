@@ -58,17 +58,22 @@ vi.mock("../src/indexer/index.js", () => {
         score: 0.88,
       },
     ]);
-    index = vi.fn().mockResolvedValue({
-      totalFiles: 10,
+    indexForeground = vi.fn().mockResolvedValue({
+      filesProcessed: 10,
       totalChunks: 50,
-      indexedChunks: 50,
-      failedChunks: 0,
-      tokensUsed: 1000,
-      durationMs: 500,
-      existingChunks: 0,
+      chunksIndexed: 50,
       removedChunks: 0,
-      skippedFiles: [],
-      parseFailures: [],
+      durationMs: 500,
+      bm25Ready: true,
+      callGraphReady: true,
+      embeddingStatus: "pending",
+      embeddingProgress: {
+        embedded: 0,
+        total: 50,
+        startedAt: null,
+        updatedAt: null,
+        failed: null,
+      },
     });
     getStatus = vi.fn().mockResolvedValue({
       indexed: true,
@@ -79,6 +84,18 @@ vi.mock("../src/indexer/index.js", () => {
       currentBranch: "main",
       baseBranch: "main",
       compatibility: { compatible: true },
+      foreground: {
+        bm25Ready: true,
+        callGraphReady: true,
+      },
+      embedding: {
+        status: "in_progress",
+        embedded: 10,
+        total: 50,
+        startedAt: 1,
+        updatedAt: 2,
+        failed: null,
+      },
     });
     getCoverageReport = vi.fn().mockResolvedValue({
       branch: "main",

@@ -7,7 +7,7 @@ import type { LogLevel } from "../config/schema.js";
 import type { LogEntry } from "../utils/logger.js";
 import {
   formatProgressTitle,
-  formatIndexStats,
+  formatForegroundReadyMessage,
   formatStatus,
   calculatePercentage,
   formatCodebasePeek,
@@ -95,7 +95,7 @@ export const index_codebase: ToolDefinition = tool({
       await indexer.clearIndex();
     }
 
-    const stats = await indexer.index((progress) => {
+    const stats = await indexer.indexForeground((progress) => {
       context.metadata({
         title: formatProgressTitle(progress),
         metadata: {
@@ -108,7 +108,7 @@ export const index_codebase: ToolDefinition = tool({
         },
       });
     });
-    return formatIndexStats(stats, args.verbose ?? false);
+    return formatForegroundReadyMessage(stats, args.verbose ?? false);
   },
 });
 

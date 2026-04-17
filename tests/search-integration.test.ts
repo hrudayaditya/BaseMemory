@@ -57,6 +57,19 @@ function getPrimaryStore(indexer: Indexer): {
   return store;
 }
 
+async function waitForCondition(
+  predicate: () => boolean,
+  timeoutMs: number = 5_000
+): Promise<void> {
+  const startedAt = Date.now();
+  while (!predicate()) {
+    if (Date.now() - startedAt > timeoutMs) {
+      throw new Error("Timed out waiting for condition");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 describe("search integration", () => {
   let tempDir: string;
   let fetchSpy: ReturnType<typeof vi.spyOn>;
@@ -196,6 +209,76 @@ export async function handleEvalCommand(): Promise<void> {
     })).resolves.toEqual([]);
 
     expect(fetchSpy.mock.calls.length).toBe(fetchCountBefore);
+  });
+
+  it("falls back to BM25-only search while background embedding is still running", async () => {
+    const releaseEmbedding = Promise.withResolvers<void>();
+    fetchSpy.mockImplementation(async (_url, init) => {
+      await releaseEmbedding.promise;
+      const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[]; model?: string };
+      const texts = Array.isArray(body.input) ? body.input : [];
+      const data = texts.map((text) => {
+        let seed = 0;
+        for (const ch of text) {
+          seed = (seed * 31 + ch.charCodeAt(0)) % 1000;
+        }
+        return {
+          embedding: Array.from({ length: 8 }, (_, idx) => ((seed + idx * 17) % 997) / 997),
+        };
+      });
+
+      return new Response(
+        JSON.stringify({
+          data,
+          usage: { total_tokens: Math.max(1, texts.length * 8) },
+        }),
+        { status: 200 }
+      );
+    });
+
+    const config = parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    const foreground = await indexer.indexForeground();
+    const statusDuring = await indexer.getStatus();
+    const storeDuring = getPrimaryStore(indexer);
+
+    expect(foreground.embeddingStatus).toBe("pending");
+    expect(statusDuring.indexed).toBe(true);
+    expect(statusDuring.vectorCount).toBe(0);
+    expect(storeDuring.getAllMetadata()).toHaveLength(0);
+
+    const results = await indexer.search("rankHybridResults implementation", 5, {
+      metadataOnly: true,
+      filterByBranch: false,
+    });
+
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0]?.filePath).toContain("/app/indexer/index.ts");
+
+    releaseEmbedding.resolve();
+    await waitForCondition(() => !indexer.isBackgroundEmbeddingRunning());
+
+    const statusAfter = await indexer.getStatus();
+    expect(statusAfter.embedding?.status).toBe("complete");
+    expect(statusAfter.vectorCount).toBeGreaterThan(0);
   });
 
   it("returns implementation definitions before fixture/benchmark noise for implementation-intent query", async () => {

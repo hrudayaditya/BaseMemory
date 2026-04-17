@@ -47,7 +47,7 @@ import {
   LOW_PRIORITY_STARVATION_THRESHOLD_MS,
   type JobQueueDrainOptions,
 } from "./job-queue.js";
-import type { IndexStats, ProgressCallback } from "./index.js";
+import type { ForegroundIndexResult, IndexStats, ProgressCallback } from "./index.js";
 import {
   clearWatcherEventTimestamp,
   consumeWatcherEventTimestamp,
@@ -168,6 +168,7 @@ interface FileJobPlan {
   currentChunks: ChunkRecord[];
   dirtyChunks: EmbeddingWorkChunk[];
   voyageDebtChunks: EmbeddingWorkChunk[];
+  backgroundEmbedChunkCount: number;
   removedChunkIds: Set<string>;
   oldChunkIds: Set<string>;
   oldSymbolIds: Set<string>;
@@ -229,6 +230,7 @@ interface RunContext {
   branch: string;
   runId: string;
   runType: PipelineRunType;
+  mode: "full" | "foreground" | "background_embed";
   configVersion: ConfigVersion;
   configHash: string;
   store: VectorStore;
@@ -259,10 +261,24 @@ interface RunContext {
   healedVoyageDebtFiles: Set<string>;
   failedFiles: Set<string>;
   deferredHotUpdatePaths: Set<string>;
+  backgroundEmbeddingTotalChunks: number;
+  backgroundEmbeddingCompletedChunks: number;
   stats: IndexStats;
   baseSnapshot: string | null;
   fileHashes: Map<string, string>;
 }
+
+interface EmbeddingProgressState {
+  status: "pending" | "in_progress" | "complete" | "partial" | "failed";
+  embedded: number;
+  total: number;
+  startedAt?: number | null;
+  updatedAt?: number | null;
+  failed?: string | null;
+  activeRunId?: string | null;
+}
+
+const EMBEDDING_PROGRESS_METADATA_PREFIX = "index.embedding_progress.";
 
 type StoredConfigRecord = NonNullable<
   ReturnType<CheckpointManager["getActiveConfigVersion"]>
@@ -546,6 +562,10 @@ function toAbsolutePath(projectRoot: string, filePath: string): string {
   return path.isAbsolute(filePath) ? filePath : path.join(projectRoot, filePath);
 }
 
+function embeddingProgressMetadataKey(branch: string): string {
+  return `${EMBEDDING_PROGRESS_METADATA_PREFIX}${branch}`;
+}
+
 export function buildChunkStageInputHash(
   fileContentHash: string,
   chunkerVersion: string
@@ -578,10 +598,12 @@ export function buildEmbedStageInputHash(
 // but pipeline_state requires a concrete non-null hash. We persist the current
 // file-level embed identity so the checkpoint row stays verifiable.
 export function buildIndexStageInputHash(
-  embeddingInputHashes: string[],
-  embedConfigHash: string
+  chunks: Array<{ chunkId: string; contentHash: string }>
 ): string {
-  return buildEmbedStageInputHash(embeddingInputHashes, embedConfigHash);
+  const chunkInputs = chunks
+    .map((chunk) => `${chunk.chunkId}:${chunk.contentHash}`)
+    .sort();
+  return hashContent(chunkInputs.join("\n"));
 }
 
 export function buildGraphStageInputHash(
@@ -897,6 +919,7 @@ export class IncrementalIndexOrchestrator {
       branch,
       runId: run.runId,
       runType: "config_change",
+      mode: "full",
       configVersion,
       configHash,
       forceFreshPrimaryEmbeddings: plan.forceFreshPrimaryEmbeddings,
@@ -1010,6 +1033,30 @@ export class IncrementalIndexOrchestrator {
     return this.checkpointManager;
   }
 
+  private readEmbeddingProgress(
+    database: Database,
+    branch: string
+  ): EmbeddingProgressState | null {
+    const raw = database.getMetadata(embeddingProgressMetadataKey(branch));
+    if (!raw) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(raw) as EmbeddingProgressState;
+    } catch {
+      return null;
+    }
+  }
+
+  private writeEmbeddingProgress(
+    database: Database,
+    branch: string,
+    progress: EmbeddingProgressState
+  ): void {
+    database.setMetadata(embeddingProgressMetadataKey(branch), JSON.stringify(progress));
+  }
+
   async coldStart(onProgress?: ProgressCallback): Promise<IndexStats> {
     await this.ensureStartupState();
 
@@ -1048,6 +1095,7 @@ export class IncrementalIndexOrchestrator {
         branch,
         runId: run.runId,
         runType: "cold_start",
+        mode: "full",
         configVersion,
         configHash,
         baseSnapshot: this.getStoredSnapshot(resources.database, branch),
@@ -1075,6 +1123,149 @@ export class IncrementalIndexOrchestrator {
       await this.enqueueFilesForRun(context, coldStartFilePaths, "cold_start", "low");
       await this.drainRunContext(context);
       return this.finalizeRunContext(context, onProgress);
+    });
+  }
+
+  async coldStartForeground(onProgress?: ProgressCallback): Promise<ForegroundIndexResult> {
+    await this.ensureStartupState();
+
+    if (this.forceColdStart) {
+      this.forceColdStart = false;
+    }
+
+    return this.host.runWithCrashMarker(async () => {
+      const resources = await this.prepareRun();
+      const branch = this.host.getCurrentBranch();
+      this.consumePendingHotUpdatePaths(branch);
+      const configVersion = await getCurrentConfigVersion(
+        resources.configuredProviderInfo,
+        resources.voyageModelId,
+        this.getActiveVoyageMaxTokens(resources)
+      );
+      const configHash = hashConfigVersion(configVersion);
+      const snapshot = await buildMerkleSnapshot(
+        this.host.getProjectRoot(),
+        branch,
+        this.host.buildMerkleIgnoreRules()
+      );
+      const fileHashes = toAbsoluteFileHashes(this.host.getProjectRoot(), snapshot.snapshot);
+      const run = this.checkpoints.startRun(branch, "cold_start", configHash);
+
+      onProgress?.({
+        phase: "scanning",
+        filesProcessed: 0,
+        totalFiles: fileHashes.size,
+        chunksProcessed: 0,
+        totalChunks: 0,
+      });
+
+      const context = this.createRunContext({
+        ...resources,
+        branch,
+        runId: run.runId,
+        runType: "cold_start",
+        mode: "foreground",
+        configVersion,
+        configHash,
+        baseSnapshot: this.getStoredSnapshot(resources.database, branch),
+        fileHashes,
+      });
+
+      const trackedDeletedFiles = Array.from(
+        new Set(
+          this.checkpoints
+            .getKnownFiles(branch)
+            .map((filePath) => toAbsolutePath(this.host.getProjectRoot(), filePath))
+            .filter((filePath) => !fileHashes.has(filePath))
+        )
+      ).sort((left, right) => left.localeCompare(right));
+
+      for (const filePath of trackedDeletedFiles) {
+        this.processRemovedFile(context, filePath);
+      }
+
+      const coldStartFilePaths = this.includeActiveVoyageDebtFiles(
+        context,
+        Array.from(fileHashes.keys())
+      );
+      context.stats.totalFiles = coldStartFilePaths.length;
+      await this.enqueueFilesForRun(context, coldStartFilePaths, "cold_start", "low");
+      await this.drainRunContext(context);
+      return this.finalizeForegroundRunContext(context, onProgress);
+    });
+  }
+
+  async runBackgroundEmbedding(branch: string): Promise<void> {
+    await this.ensureStartupState();
+
+    await this.host.runWithCrashMarker(async () => {
+      const resources = await this.prepareRun();
+      const configVersion = await getCurrentConfigVersion(
+        resources.configuredProviderInfo,
+        resources.voyageModelId,
+        this.getActiveVoyageMaxTokens(resources)
+      );
+      const configHash = hashConfigVersion(configVersion);
+      const unfinishedFiles = this.checkpoints
+        .getUnfinishedFiles(branch)
+        .filter((filePath) => this.checkpoints.getStageState(branch, filePath, "embed")?.status !== "complete")
+        .map((filePath) => toAbsolutePath(this.host.getProjectRoot(), filePath));
+
+      const progress = this.readEmbeddingProgress(resources.database, branch);
+      if (unfinishedFiles.length === 0) {
+        this.writeEmbeddingProgress(resources.database, branch, {
+          status: "complete",
+          embedded: progress?.total ?? progress?.embedded ?? 0,
+          total: progress?.total ?? progress?.embedded ?? 0,
+          startedAt: progress?.startedAt ?? Date.now(),
+          updatedAt: Date.now(),
+          activeRunId: null,
+        });
+        return;
+      }
+
+      const snapshot = await buildMerkleSnapshot(
+        this.host.getProjectRoot(),
+        branch,
+        this.host.buildMerkleIgnoreRules()
+      );
+      const fileHashes = toAbsoluteFileHashes(this.host.getProjectRoot(), snapshot.snapshot);
+      const run = this.checkpoints.startRun(branch, "background_embed", configHash);
+      const context = this.createRunContext({
+        ...resources,
+        branch,
+        runId: run.runId,
+        runType: "background_embed",
+        mode: "background_embed",
+        configVersion,
+        configHash,
+        baseSnapshot: this.getStoredSnapshot(resources.database, branch),
+        fileHashes,
+      });
+
+      context.stats.totalFiles = unfinishedFiles.length;
+      context.backgroundEmbeddingTotalChunks = progress?.total ?? 0;
+      this.writeEmbeddingProgress(resources.database, branch, {
+        status: "in_progress",
+        embedded: 0,
+        total: context.backgroundEmbeddingTotalChunks,
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+        activeRunId: run.runId,
+      });
+
+      for (const filePath of unfinishedFiles) {
+        this.queue.enqueue({
+          branch,
+          filePath,
+          priority: "low",
+          trigger: "cold_start",
+          runId: run.runId,
+        });
+      }
+
+      await this.drainRunContext(context);
+      await this.finalizeBackgroundEmbeddingRun(context);
     });
   }
 
@@ -1130,6 +1321,7 @@ export class IncrementalIndexOrchestrator {
         branch,
         runId: run.runId,
         runType: "hot_update",
+        mode: "full",
         configVersion,
         configHash,
         baseSnapshot: preparedHotUpdate.baseSnapshot,
@@ -1356,6 +1548,7 @@ export class IncrementalIndexOrchestrator {
         branch: run.branch,
         runId: run.runId,
         runType: "resume",
+        mode: "full",
         configVersion,
         configHash,
         baseSnapshot: snapshot,
@@ -1614,7 +1807,12 @@ export class IncrementalIndexOrchestrator {
     return {
       chunk: buildChunkStageInputHash(fileContentHash, configVersion.chunkerVersion),
       embed: buildEmbedStageInputHash(embeddingInputHashes, embedConfigHash),
-      index: buildIndexStageInputHash(embeddingInputHashes, embedConfigHash),
+      index: buildIndexStageInputHash(
+        currentChunks.map((chunk) => ({
+          chunkId: chunk.chunkId,
+          contentHash: chunk.contentHash,
+        }))
+      ),
       graph: buildGraphStageInputHash(fileContentHash, configVersion.graphExtractorVersion),
     };
   }
@@ -1686,6 +1884,7 @@ export class IncrementalIndexOrchestrator {
     branch: string;
     runId: string;
     runType: PipelineRunType;
+    mode: "full" | "foreground" | "background_embed";
     configVersion: ConfigVersion;
     configHash: string;
     forceFreshPrimaryEmbeddings?: boolean;
@@ -1723,6 +1922,7 @@ export class IncrementalIndexOrchestrator {
       branch: args.branch,
       runId: args.runId,
       runType: args.runType,
+      mode: args.mode,
       configVersion: args.configVersion,
       configHash: args.configHash,
       store: args.store,
@@ -1753,6 +1953,8 @@ export class IncrementalIndexOrchestrator {
       healedVoyageDebtFiles: new Set<string>(),
       failedFiles: new Set<string>(),
       deferredHotUpdatePaths: new Set<string>(),
+      backgroundEmbeddingTotalChunks: 0,
+      backgroundEmbeddingCompletedChunks: 0,
       stats: createEmptyStats(),
       baseSnapshot: args.baseSnapshot,
       fileHashes: args.fileHashes,
@@ -1885,13 +2087,47 @@ export class IncrementalIndexOrchestrator {
       chunkInputHash
     );
 
+    if (context.mode === "foreground") {
+      context.backgroundEmbeddingTotalChunks += filePlan.backgroundEmbedChunkCount;
+    }
+
     try {
       if (filePlan.voyageDebtChunks.length > 0) {
-        await this.processVoyageDebtFile(context, job.filePath, filePlan);
+        if (context.mode === "background_embed" || context.mode === "full") {
+          await this.processVoyageDebtFile(context, job.filePath, filePlan);
+          if (context.mode === "background_embed") {
+            context.backgroundEmbeddingCompletedChunks += filePlan.backgroundEmbedChunkCount;
+            this.writeEmbeddingProgress(context.database, context.branch, {
+              status: "in_progress",
+              embedded: context.backgroundEmbeddingCompletedChunks,
+              total: context.backgroundEmbeddingTotalChunks,
+              startedAt: context.startTime,
+              updatedAt: Date.now(),
+              activeRunId: context.runId,
+            });
+          }
+        }
         return;
       }
-      await this.processEmbedStage(context, job.filePath, filePlan);
-      await this.processIndexStage(context, job.filePath, filePlan);
+
+      if (context.mode === "background_embed") {
+        await this.processEmbedStage(context, job.filePath, filePlan);
+        context.backgroundEmbeddingCompletedChunks += filePlan.backgroundEmbedChunkCount;
+        this.writeEmbeddingProgress(context.database, context.branch, {
+          status: "in_progress",
+          embedded: context.backgroundEmbeddingCompletedChunks,
+          total: context.backgroundEmbeddingTotalChunks,
+          startedAt: context.startTime,
+          updatedAt: Date.now(),
+          activeRunId: context.runId,
+        });
+        return;
+      }
+
+      await this.processSparseIndexStage(context, job.filePath, filePlan);
+      if (context.mode === "full") {
+        await this.processEmbedStage(context, job.filePath, filePlan);
+      }
       await this.processGraphStage(context, job.filePath, fileContent, fileContentHash, filePlan);
       this.recordSuccessfulFile(
         context,
@@ -2000,8 +2236,10 @@ export class IncrementalIndexOrchestrator {
       embedConfigHash
     );
     const indexStageInputHash = buildIndexStageInputHash(
-      currentEmbeddingInputHashes,
-      embedConfigHash
+      currentChunks.map((chunk) => ({
+        chunkId: chunk.chunkId,
+        contentHash: chunk.contentHash,
+      }))
     );
     const embedStageIsStale = this.checkpoints.isStageStale(
       context.branch,
@@ -2051,6 +2289,8 @@ export class IncrementalIndexOrchestrator {
       currentChunks,
       dirtyChunks,
       voyageDebtChunks,
+      backgroundEmbedChunkCount:
+        dirtyChunks.length > 0 ? dirtyChunks.length : voyageDebtChunks.length,
       removedChunkIds,
       oldChunkIds,
       oldSymbolIds,
@@ -2108,7 +2348,7 @@ export class IncrementalIndexOrchestrator {
       plan.embedStageInputHash
     );
 
-    const { store, invertedIndex, database, provider } = context;
+    const { store, database, provider } = context;
     const arcticModelId = context.configuredProviderInfo.modelInfo.model;
     const voyageProvider = context.voyageProvider;
     const voyageStore = context.voyageStore;
@@ -2193,8 +2433,6 @@ export class IncrementalIndexOrchestrator {
           )
         );
         store.add(chunk.id, vector, chunk.metadata);
-        invertedIndex.removeChunk(chunk.id);
-        invertedIndex.addChunk(chunk.id, chunk.content);
         plan.primaryMaterializedChunkIds.add(chunk.id);
         context.stats.existingChunks += 1;
         context.stats.indexedChunks += 1;
@@ -2311,8 +2549,6 @@ export class IncrementalIndexOrchestrator {
                   }))
                 );
                 for (const chunk of arcticBatch) {
-                  invertedIndex.removeChunk(chunk.id);
-                  invertedIndex.addChunk(chunk.id, chunk.content);
                   plan.primaryMaterializedChunkIds.add(chunk.id);
                 }
                 context.stats.indexedChunks += arcticBatch.length;
@@ -2566,7 +2802,7 @@ export class IncrementalIndexOrchestrator {
     this.clearVoyageEmbeddingDebt(context, filePath, voyageModelId);
   }
 
-  private async processIndexStage(
+  private async processSparseIndexStage(
     context: RunContext,
     filePath: string,
     plan: FileJobPlan
@@ -2587,6 +2823,11 @@ export class IncrementalIndexOrchestrator {
       "index",
       plan.indexStageInputHash
     );
+
+    for (const chunk of plan.dirtyChunks) {
+      context.invertedIndex.removeChunk(chunk.id);
+      context.invertedIndex.addChunk(chunk.id, chunk.content);
+    }
     plan.indexStarted = true;
   }
 
@@ -3128,6 +3369,256 @@ export class IncrementalIndexOrchestrator {
     });
 
     return context.stats;
+  }
+
+  private async finalizeForegroundRunContext(
+    context: RunContext,
+    onProgress?: ProgressCallback
+  ): Promise<ForegroundIndexResult> {
+    this.checkpoints.markRunFinalizing(context.runId);
+    const previousBranchChunkIds = new Set(context.branchChunkIds);
+    const staleChunkIds = Array.from(context.oldChunkIdsForTouchedFiles).filter(
+      (chunkId) => !context.currentChunkIds.has(chunkId)
+    );
+    for (const chunkId of staleChunkIds) {
+      if (
+        this.host.removeChunkFromRetrievalIfUnreferenced(
+          context.database,
+          context.invertedIndex,
+          chunkId
+        )
+      ) {
+        context.stats.removedChunks += 1;
+      }
+    }
+
+    const staleSymbolIds = Array.from(context.oldSymbolIdsForTouchedFiles).filter(
+      (symbolId) => !context.allSymbolIds.has(symbolId)
+    );
+    for (const symbolId of staleSymbolIds) {
+      this.host.removeSymbolFromGraphIfUnreferenced(context.database, symbolId);
+    }
+
+    context.database.clearBranch(context.branch);
+    context.database.addChunksToBranchBatch(context.branch, Array.from(context.currentChunkIds));
+    const addedBranchChunkIds = Array.from(context.currentChunkIds).filter(
+      (chunkId) => !previousBranchChunkIds.has(chunkId)
+    );
+    const removedBranchChunkIds = Array.from(previousBranchChunkIds).filter(
+      (chunkId) => !context.currentChunkIds.has(chunkId)
+    );
+    this.host.applyNativeBranchMembershipDelta(
+      context.branch,
+      addedBranchChunkIds,
+      removedBranchChunkIds
+    );
+    context.database.clearBranchSymbols(context.branch);
+    context.database.addSymbolsToBranchBatch(context.branch, Array.from(context.allSymbolIds));
+    const resolvedCrossFileEdges = context.database.resolveUnresolvedCallEdgesForBranch(
+      context.branch
+    );
+    if (resolvedCrossFileEdges > 0) {
+      this.host.logger.branch("debug", "Resolved unresolved call edges for branch", {
+        branch: context.branch,
+        resolvedCrossFileEdges,
+        runId: context.runId,
+      });
+    }
+
+    if (staleChunkIds.length > 0) {
+      context.database.gcOrphanChunks();
+      context.database.gcOrphanEmbeddings();
+    }
+
+    context.invertedIndex.save();
+
+    for (const [filePath, completion] of context.pendingIndexCompletions) {
+      this.checkpoints.markStageComplete(
+        context.branch,
+        filePath,
+        "index",
+        completion.inputHash
+      );
+      context.successfulFileHashes.set(filePath, completion.fileContentHash);
+
+      if (context.runType === "hot_update") {
+        const watcherTimestamp = consumeWatcherEventTimestamp(filePath);
+        if (watcherTimestamp !== undefined) {
+          const ttiMs = Date.now() - watcherTimestamp;
+          const exceededTarget = ttiMs > TTI_TARGET_MS;
+          context.stats.ttiMeasurements?.push({
+            filePath,
+            durationMs: ttiMs,
+            exceededTarget,
+          });
+          this.host.logger.recordHotUpdateTti(ttiMs, exceededTarget);
+          this.host.logger.branch("debug", "Recorded hot update TTI", {
+            branch: context.branch,
+            filePath,
+            runId: context.runId,
+            ttiMs,
+            targetMs: TTI_TARGET_MS,
+          });
+          if (exceededTarget) {
+            this.host.logger.warn("Hot update TTI exceeded target", {
+              branch: context.branch,
+              filePath,
+              runId: context.runId,
+              ttiMs,
+              targetMs: TTI_TARGET_MS,
+            });
+          }
+        }
+      }
+    }
+
+    this.host.commitFileHashChanges(context.successfulFileHashes, context.removedAbsolutePaths);
+
+    const committedSnapshot = buildSnapshotFromObservedFileState({
+      branch: context.branch,
+      baseSnapshot: context.baseSnapshot,
+      observedFiles: context.observedSnapshotFiles,
+      removedRelativePaths: context.removedRelativePaths,
+    });
+    context.database.saveMerkleSnapshot(committedSnapshot);
+
+    const embeddingProgress: EmbeddingProgressState =
+      context.backgroundEmbeddingTotalChunks > 0
+        ? {
+            status: "pending",
+            embedded: 0,
+            total: context.backgroundEmbeddingTotalChunks,
+            startedAt: null,
+            updatedAt: Date.now(),
+            failed: null,
+            activeRunId: null,
+          }
+        : {
+            status: "complete",
+            embedded: 0,
+            total: 0,
+            startedAt: null,
+            updatedAt: Date.now(),
+            failed: null,
+            activeRunId: null,
+          };
+    this.writeEmbeddingProgress(context.database, context.branch, embeddingProgress);
+
+    if (context.failedFiles.size === 0) {
+      this.checkpoints.markBranchConfigApplied(context.branch, context.configHash);
+      this.checkpoints.markRunComplete(context.runId);
+    } else {
+      this.checkpoints.markRunFailed(context.runId);
+    }
+
+    if (context.initialVoyageDebtFiles.size > 0 && context.voyageModelId) {
+      this.host.logger.info(
+        `Voyage embedding debt cleared: ${context.healedVoyageDebtFiles.size}/${context.initialVoyageDebtFiles.size} files healed`,
+        {
+          branch: context.branch,
+          runId: context.runId,
+          healedFiles: context.healedVoyageDebtFiles.size,
+          totalDebtFiles: context.initialVoyageDebtFiles.size,
+          model: context.voyageModelId,
+        }
+      );
+    }
+
+    this.applyPostFinalizationSideEffects(context.configuredProviderInfo);
+    context.stats.durationMs = Date.now() - context.startTime;
+    if (context.failedFiles.size > 0) {
+      context.stats.failedBatchesPath = this.host.getFailedBatchesPath();
+    }
+
+    this.host.logger.recordIndexingEnd();
+    this.host.logger.info("Foreground indexing run complete", {
+      branch: context.branch,
+      runId: context.runId,
+      runType: context.runType,
+      files: context.stats.totalFiles,
+      indexed: context.stats.indexedChunks,
+      removed: context.stats.removedChunks,
+      failed: context.failedFiles.size,
+      backgroundEmbeddingTotalChunks: context.backgroundEmbeddingTotalChunks,
+    });
+
+    onProgress?.({
+      phase: "complete",
+      filesProcessed: context.stats.totalFiles,
+      totalFiles: context.stats.totalFiles,
+      chunksProcessed: context.stats.indexedChunks,
+      totalChunks: context.stats.totalChunks,
+    });
+
+    return {
+      filesProcessed: context.stats.totalFiles,
+      totalChunks: context.stats.totalChunks,
+      chunksIndexed: context.stats.indexedChunks,
+      removedChunks: context.stats.removedChunks,
+      durationMs: context.stats.durationMs,
+      bm25Ready: true,
+      callGraphReady: true,
+      embeddingStatus: embeddingProgress.status,
+      embeddingProgress: {
+        embedded: embeddingProgress.embedded,
+        total: embeddingProgress.total,
+        startedAt: embeddingProgress.startedAt ?? null,
+        updatedAt: embeddingProgress.updatedAt ?? null,
+        failed: embeddingProgress.failed ?? null,
+      },
+    };
+  }
+
+  private async finalizeBackgroundEmbeddingRun(context: RunContext): Promise<void> {
+    this.checkpoints.markRunFinalizing(context.runId);
+    context.store.save();
+    context.voyageStore?.save();
+
+    const progress: EmbeddingProgressState =
+      context.failedFiles.size === 0
+        ? {
+            status: "complete",
+            embedded: context.backgroundEmbeddingTotalChunks,
+            total: context.backgroundEmbeddingTotalChunks,
+            startedAt: context.startTime,
+            updatedAt: Date.now(),
+            failed: null,
+            activeRunId: null,
+          }
+        : {
+            status: context.backgroundEmbeddingCompletedChunks > 0 ? "partial" : "failed",
+            embedded: context.backgroundEmbeddingCompletedChunks,
+            total: context.backgroundEmbeddingTotalChunks,
+            startedAt: context.startTime,
+            updatedAt: Date.now(),
+            failed:
+              context.failedFiles.size > 0
+                ? `Embedding failed for ${context.failedFiles.size} file(s)`
+                : null,
+            activeRunId: null,
+          };
+    this.writeEmbeddingProgress(context.database, context.branch, progress);
+
+    if (context.failedFiles.size === 0) {
+      this.checkpoints.markRunComplete(context.runId);
+    } else {
+      this.checkpoints.markRunFailed(context.runId);
+    }
+
+    context.stats.durationMs = Date.now() - context.startTime;
+    if (context.failedFiles.size > 0) {
+      context.stats.failedBatchesPath = this.host.getFailedBatchesPath();
+    }
+
+    this.host.logger.recordIndexingEnd();
+    this.host.logger.info("Background embedding run complete", {
+      branch: context.branch,
+      runId: context.runId,
+      runType: context.runType,
+      totalChunks: context.backgroundEmbeddingTotalChunks,
+      embeddedChunks: context.backgroundEmbeddingCompletedChunks,
+      failed: context.failedFiles.size,
+    });
   }
 
   private applyPostFinalizationSideEffects(providerInfo: ConfiguredProviderInfo): void {
