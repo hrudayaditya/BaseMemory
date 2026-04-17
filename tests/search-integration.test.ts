@@ -668,14 +668,14 @@ export const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-2";
     const internals = indexer as unknown as {
       searchReranker: SearchReranker;
       recordRerankerHealth: (event: {
-        backend: "transformers-cross-encoder" | "heuristic-local" | "none";
+        backend: "jina-api" | "transformers-cross-encoder" | "heuristic-local" | "none";
         status: "healthy" | "failed" | "never-loaded";
         model?: string | null;
         error?: string | null;
       }) => void;
     };
     const reportHealth = (event: {
-      backend: "transformers-cross-encoder" | "heuristic-local" | "none";
+      backend: "jina-api" | "transformers-cross-encoder" | "heuristic-local" | "none";
       status: "healthy" | "failed" | "never-loaded";
       model?: string | null;
       error?: string | null;
@@ -733,14 +733,14 @@ export const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-2";
     const internals = indexer as unknown as {
       searchReranker: SearchReranker;
       recordRerankerHealth: (event: {
-        backend: "transformers-cross-encoder" | "heuristic-local" | "none";
+        backend: "jina-api" | "transformers-cross-encoder" | "heuristic-local" | "none";
         status: "healthy" | "failed" | "never-loaded";
         model?: string | null;
         error?: string | null;
       }) => void;
     };
     const reportHealth = (event: {
-      backend: "transformers-cross-encoder" | "heuristic-local" | "none";
+      backend: "jina-api" | "transformers-cross-encoder" | "heuristic-local" | "none";
       status: "healthy" | "failed" | "never-loaded";
       model?: string | null;
       error?: string | null;
@@ -808,7 +808,7 @@ export const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-2";
     await indexer.getStatus();
 
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining("[reranker:warn] Cross-encoder reranker is degraded.")
+      expect.stringContaining("[reranker:warn] Search reranker is degraded.")
     );
     warnSpy.mockRestore();
   });

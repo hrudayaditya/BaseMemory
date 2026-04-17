@@ -11,6 +11,9 @@ export const DEFAULT_LOCAL_CROSS_ENCODER_TOKENIZER = "Xenova/ms-marco-MiniLM-L-6
 // repo provides the quantized ONNX graph and matching tokenizer assets for
 // the same cross-encoder.
 export const DEFAULT_LOCAL_CROSS_ENCODER_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2";
+export const DEFAULT_JINA_RERANKER_MODEL = "jina-reranker-v3";
+const JINA_RERANKER_ENDPOINT = "https://api.jina.ai/v1/rerank";
+const JINA_RERANKER_TIMEOUT_MS = 15_000;
 
 export interface RerankerCandidate {
   id: string;
@@ -29,7 +32,7 @@ export interface RerankerResult {
   failedBackend?: string | null;
 }
 
-export type RerankerHealthBackend = "transformers-cross-encoder" | "heuristic-local" | "none";
+export type RerankerHealthBackend = "jina-api" | "transformers-cross-encoder" | "heuristic-local" | "none";
 export type RerankerHealthStatus = "healthy" | "failed" | "never-loaded";
 
 export interface RerankerHealthEvent {
@@ -53,6 +56,7 @@ interface CrossEncoderPair {
 }
 
 type CrossEncoderScorer = (pairs: CrossEncoderPair[]) => Promise<number[]>;
+type FetchLike = typeof fetch;
 
 interface CrossEncoderLoadResult {
   scorer: CrossEncoderScorer | null;
@@ -114,6 +118,13 @@ interface TransformersModule {
 export interface SearchRerankerBackend {
   readonly name: string;
   rerank(query: string, candidates: RerankerCandidate[], taskType: SearchTaskType): Promise<RerankerCandidate[]>;
+}
+
+interface SearchRerankerOptions {
+  jinaApiKey?: string;
+  jinaModel?: string;
+  fetchImpl?: FetchLike;
+  onSelection?: (backend: string, model?: string | null) => void;
 }
 
 function getErrorMessage(error: unknown): string {
@@ -522,17 +533,141 @@ export class TransformersCrossEncoderBackend implements SearchRerankerBackend {
   }
 }
 
+interface JinaRerankResponse {
+  model: string;
+  results: Array<{
+    index: number;
+    relevance_score: number;
+  }>;
+}
+
+export class JinaApiRerankerBackend implements SearchRerankerBackend {
+  readonly name = "jina-api";
+
+  constructor(
+    private readonly apiKey: string,
+    private readonly model: string = DEFAULT_JINA_RERANKER_MODEL,
+    private readonly reportHealth?: (event: RerankerHealthEvent) => void,
+    private readonly fetchImpl: FetchLike = fetch
+  ) {}
+
+  async rerank(
+    query: string,
+    candidates: RerankerCandidate[],
+    _taskType: SearchTaskType
+  ): Promise<RerankerCandidate[]> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), JINA_RERANKER_TIMEOUT_MS);
+
+    try {
+      const response = await this.fetchImpl(JINA_RERANKER_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: this.model,
+          query,
+          documents: candidates.map((candidate) => buildCrossEncoderDocument(candidate)),
+          return_documents: false,
+          truncation: true,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const responseBody = await response.text().catch(() => "");
+        throw new Error(`Jina reranker request failed with ${response.status}: ${responseBody || response.statusText}`);
+      }
+
+      const payload = (await response.json()) as Partial<JinaRerankResponse>;
+      if (!Array.isArray(payload.results)) {
+        throw new Error("Jina reranker response missing results array");
+      }
+
+      const seen = new Set<number>();
+      const reranked: RerankerCandidate[] = [];
+      for (const result of payload.results) {
+        const originalIndex = result?.index;
+        const relevanceScore = result?.relevance_score;
+        if (!Number.isInteger(originalIndex) || originalIndex < 0 || originalIndex >= candidates.length) {
+          continue;
+        }
+        if (typeof relevanceScore !== "number" || !Number.isFinite(relevanceScore)) {
+          continue;
+        }
+        seen.add(originalIndex);
+        reranked.push({
+          ...candidates[originalIndex],
+          baseScore: relevanceScore,
+        });
+      }
+
+      for (let index = 0; index < candidates.length; index += 1) {
+        if (!seen.has(index)) {
+          reranked.push(candidates[index]);
+        }
+      }
+
+      this.reportHealth?.({
+        backend: "jina-api",
+        status: "healthy",
+        model: this.model,
+        error: null,
+      });
+
+      return reranked;
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new Error(`Jina reranker request timed out after ${JINA_RERANKER_TIMEOUT_MS}ms`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  getModelId(): string {
+    return this.model;
+  }
+}
+
 export class SearchReranker {
   private readonly backends: SearchRerankerBackend[];
 
   constructor(
     backends?: SearchRerankerBackend[],
-    private readonly reportHealth?: (event: RerankerHealthEvent) => void
+    private readonly reportHealth?: (event: RerankerHealthEvent) => void,
+    options: SearchRerankerOptions = {}
   ) {
-    this.backends = backends ?? [
-      new TransformersCrossEncoderBackend(loadTransformersCrossEncoderScorer, reportHealth),
-      new HeuristicLocalRerankerBackend(),
-    ];
+    this.backends = backends ?? (
+      options.jinaApiKey
+        ? [
+            new JinaApiRerankerBackend(
+              options.jinaApiKey,
+              options.jinaModel ?? DEFAULT_JINA_RERANKER_MODEL,
+              reportHealth,
+              options.fetchImpl ?? fetch
+            ),
+            new HeuristicLocalRerankerBackend(),
+          ]
+        : [
+            new TransformersCrossEncoderBackend(loadTransformersCrossEncoderScorer, reportHealth),
+            new HeuristicLocalRerankerBackend(),
+          ]
+    );
+
+    const primary = this.backends[0];
+    if (primary) {
+      const model =
+        primary instanceof JinaApiRerankerBackend
+          ? options.jinaModel ?? DEFAULT_JINA_RERANKER_MODEL
+          : primary instanceof TransformersCrossEncoderBackend
+            ? DEFAULT_LOCAL_CROSS_ENCODER_MODEL
+            : null;
+      options.onSelection?.(primary.name, model);
+    }
   }
 
   async rerank(
@@ -564,6 +699,14 @@ export class SearchReranker {
         };
       } catch (error) {
         failedBackend = backend.name;
+        if (backend instanceof JinaApiRerankerBackend) {
+          this.reportHealth?.({
+            backend: "jina-api",
+            status: "failed",
+            model: backend.getModelId(),
+            error: getErrorMessage(error),
+          });
+        }
         if (backend instanceof TransformersCrossEncoderBackend) {
           this.reportHealth?.({
             backend: "heuristic-local",

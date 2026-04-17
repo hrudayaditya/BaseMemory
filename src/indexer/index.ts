@@ -2313,7 +2313,16 @@ export class Indexer {
     this.failedBatchesPath = path.join(this.indexPath, "failed-batches.json");
     this.indexingLockPath = path.join(this.indexPath, "indexing.lock");
     this.logger = initializeLogger(config.debug);
-    this.searchReranker = new SearchReranker(undefined, (event) => this.recordRerankerHealth(event));
+    this.searchReranker = new SearchReranker(undefined, (event) => this.recordRerankerHealth(event), {
+      jinaApiKey: this.config.jinaApiKey,
+      jinaModel: this.config.jinaRerankerModel,
+      onSelection: (backend, model) => {
+        this.logger.search("info", "Initialized search reranker backend", {
+          backend,
+          model: model ?? undefined,
+        });
+      },
+    });
     this.orchestrator = new IncrementalIndexOrchestrator({
       logger: this.logger,
       getConfig: () => this.config,
@@ -2718,9 +2727,9 @@ export class Indexer {
       ? ` Last error: ${this.rerankerHealth.error}`
       : "";
     console.warn(
-      `[reranker:warn] Cross-encoder reranker is degraded. Retrieval quality may be reduced.${errorSuffix} Check reranker configuration.`
+      `[reranker:warn] Search reranker is degraded. Retrieval quality may be reduced.${errorSuffix} Check reranker configuration.`
     );
-    this.logger.search("warn", "Cross-encoder reranker is degraded. Retrieval quality may be reduced.", {
+    this.logger.search("warn", "Search reranker is degraded. Retrieval quality may be reduced.", {
       backend: this.rerankerHealth.backend,
       error: this.rerankerHealth.error ?? undefined,
       model: this.rerankerHealth.model ?? undefined,

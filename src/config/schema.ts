@@ -79,6 +79,8 @@ export interface CodebaseIndexConfig {
   embeddingModel?: EmbeddingModelName;
   /** Configuration for custom OpenAI-compatible embedding providers (required when embeddingProvider is 'custom') */
   customProvider?: CustomProviderConfig;
+  jinaApiKey?: string;
+  jinaRerankerModel?: string;
   voyageApiKey?: string;
   voyageModelId?: string;
   scope: IndexScope;
@@ -194,6 +196,8 @@ function isValidLogLevel(value: unknown): value is LogLevel {
 export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
   const input = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   const embeddingProviderValue = getResolvedString(input.embeddingProvider, "$root.embeddingProvider");
+  const jinaApiKeyValue = getResolvedString(input.jinaApiKey, "$root.jinaApiKey");
+  const jinaRerankerModelValue = getResolvedString(input.jinaRerankerModel, "$root.jinaRerankerModel");
   const voyageApiKeyValue = getResolvedString(input.voyageApiKey, "$root.voyageApiKey");
   const voyageModelIdValue = getResolvedString(input.voyageModelId, "$root.voyageModelId");
   const scopeValue = getResolvedString(input.scope, "$root.scope");
@@ -326,6 +330,8 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
     embeddingProvider,
     embeddingModel,
     customProvider,
+    jinaApiKey: jinaApiKeyValue?.trim() || undefined,
+    jinaRerankerModel: jinaRerankerModelValue?.trim() || "jina-reranker-v3",
     voyageApiKey: voyageApiKeyValue?.trim() || undefined,
     voyageModelId: voyageModelIdValue?.trim() || "voyage-code-2",
     scope: isValidScope(scopeValue) ? scopeValue : "project",

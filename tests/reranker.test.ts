@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ChunkMetadata } from "../src/native/index.js";
 import type { SearchTaskType } from "../src/indexer/search-recipes.js";
@@ -6,11 +6,13 @@ import {
   DEFAULT_LOCAL_CROSS_ENCODER_MODEL,
   DEFAULT_LOCAL_CROSS_ENCODER_TOKENIZER,
   HeuristicLocalRerankerBackend,
+  JinaApiRerankerBackend,
   SearchReranker,
   TransformersCrossEncoderBackend,
   type RerankerCandidate,
   type SearchRerankerBackend,
 } from "../src/indexer/reranker.js";
+import { parseConfig } from "../src/config/schema.js";
 
 function candidate(
   id: string,
@@ -68,6 +70,11 @@ class IdentityBackend implements SearchRerankerBackend {
 }
 
 describe("search reranker", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
   it("reorders candidates by local joint score", async () => {
     const backend = new HeuristicLocalRerankerBackend();
     const reranked = await backend.rerank("where is validateToken implementation", [
@@ -182,6 +189,163 @@ describe("search reranker", () => {
     expect(result.backend).toBe("reverse");
     expect(result.failedBackend).toBe("throwing");
     expect(result.candidates.map((item) => item.id)).toEqual(["second", "first"]);
+  });
+
+  it("parses jina reranker config and selects the jina backend when a key is configured", async () => {
+    vi.stubEnv("JINA_API_KEY", "jina_test_key");
+    const config = parseConfig({
+      jinaApiKey: "$JINA_API_KEY",
+      jinaRerankerModel: "jina-reranker-v3",
+    });
+
+    expect(config.jinaApiKey).toBe("jina_test_key");
+    expect(config.jinaRerankerModel).toBe("jina-reranker-v3");
+
+    const seenSelections: Array<{ backend: string; model?: string | null }> = [];
+    const reranker = new SearchReranker(undefined, undefined, {
+      jinaApiKey: config.jinaApiKey,
+      jinaModel: config.jinaRerankerModel,
+      onSelection: (backend, model) => seenSelections.push({ backend, model }),
+      fetchImpl: vi.fn(),
+    });
+
+    expect(seenSelections).toEqual([
+      {
+        backend: "jina-api",
+        model: "jina-reranker-v3",
+      },
+    ]);
+    expect(reranker).toBeDefined();
+  });
+
+  it("sends the exact Jina rerank request shape", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          model: "jina-reranker-v3",
+          results: [
+            { index: 0, relevance_score: 0.9 },
+            { index: 1, relevance_score: 0.1 },
+          ],
+          usage: { total_tokens: 123 },
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }
+      )
+    );
+    const backend = new JinaApiRerankerBackend("jina_test_key", "jina-reranker-v3", undefined, fetchMock);
+
+    await backend.rerank("find target implementation", [
+      candidate("generic", {
+        content: "generic helper function",
+        chunkKind: "Code",
+        symbolKind: "Function",
+      }),
+      candidate("target", {
+        content: "target implementation body",
+        chunkKind: "Test",
+        relation: "callee",
+      }),
+    ], "definition");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://api.jina.ai/v1/rerank");
+    expect(init.method).toBe("POST");
+    expect(init.headers).toMatchObject({
+      "Content-Type": "application/json",
+      Authorization: "Bearer jina_test_key",
+    });
+    expect(JSON.parse(String(init.body))).toEqual({
+      model: "jina-reranker-v3",
+      query: "find target implementation",
+      documents: [
+        "[name: generic] [kind: Code] [symbol: Function] generic helper function",
+        "[name: target] [kind: Test] [relation: callee] target implementation body",
+      ],
+      return_documents: false,
+      truncation: true,
+    });
+  });
+
+  it("maps Jina response indices back to the original candidate order", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          model: "jina-reranker-v3",
+          results: [
+            { index: 2, relevance_score: 0.99 },
+            { index: 0, relevance_score: 0.75 },
+            { index: 1, relevance_score: 0.1 },
+          ],
+          usage: { total_tokens: 123 },
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }
+      )
+    );
+    const backend = new JinaApiRerankerBackend("jina_test_key", "jina-reranker-v3", undefined, fetchMock);
+
+    const reranked = await backend.rerank("query", [
+      candidate("first"),
+      candidate("second"),
+      candidate("third"),
+    ], "semantic");
+
+    expect(reranked.map((item) => item.id)).toEqual(["third", "first", "second"]);
+    expect(reranked.map((item) => item.baseScore)).toEqual([0.99, 0.75, 0.1]);
+  });
+
+  it("falls back to heuristic scoring when the Jina request fails", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error("network down"));
+    const reportHealth = vi.fn();
+    const reranker = new SearchReranker(undefined, reportHealth, {
+      jinaApiKey: "jina_test_key",
+      jinaModel: "jina-reranker-v3",
+      fetchImpl: fetchMock,
+    });
+
+    const result = await reranker.rerank("where is validateToken implementation", [
+      candidate("generic", {
+        metadata: {
+          filePath: "/repo/src/auth/helpers.ts",
+          startLine: 1,
+          endLine: 10,
+          chunkType: "function",
+          language: "typescript",
+          hash: "generic",
+          name: "helper",
+        },
+        content: "function helper() { return true; }",
+      }),
+      candidate("target", {
+        metadata: {
+          filePath: "/repo/src/auth/validate-token.ts",
+          startLine: 1,
+          endLine: 15,
+          chunkType: "function",
+          language: "typescript",
+          hash: "target",
+          name: "validateToken",
+        },
+        content: "export function validateToken(token: string) { return token.length > 0; }",
+      }),
+    ], "definition");
+
+    expect(result.applied).toBe(true);
+    expect(result.backend).toBe("heuristic-local");
+    expect(result.failedBackend).toBe("jina-api");
+    expect(result.candidates[0]?.id).toBe("target");
+    expect(reportHealth).toHaveBeenCalledWith({
+      backend: "jina-api",
+      status: "failed",
+      model: "jina-reranker-v3",
+      error: "network down",
+    });
   });
 
   it("demotes test chunks after reranking for bug queries", async () => {

@@ -161,7 +161,7 @@ export function formatStatus(status: StatusResult): string {
     if (reranker.status === "healthy") {
       lines.push(`  Reranker: ${reranker.backend} (healthy)`);
     } else if (reranker.status === "failed") {
-      lines.push(`  Reranker: ${reranker.backend} (DEGRADED - cross-encoder failed)`);
+      lines.push(`  Reranker: ${reranker.backend} (DEGRADED - backend failed)`);
     } else {
       lines.push(`  Reranker: ${reranker.backend} (${reranker.status})`);
     }
