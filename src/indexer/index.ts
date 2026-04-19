@@ -610,6 +610,14 @@ interface QueryEmbeddingCacheEntry {
   timestamp: number;
 }
 
+interface QueryEmbeddingFailureState {
+  until: number;
+  reason: string;
+}
+
+const SECONDARY_PROVIDER_HEALTH_PROBE_TIMEOUT_MS = 2_000;
+const SECONDARY_PROVIDER_HEALTH_PROBE_QUERY = "health";
+
 interface EmbeddingProgressState {
   status: "pending" | "in_progress" | "complete" | "partial" | "failed";
   embedded: number;
@@ -693,10 +701,15 @@ const IMPLEMENTATION_EXCLUDE_PATH_SEGMENTS = [
   "__tests__/",
   "/test/",
   "fixtures/",
+  "_artifacts/",
+  "skills/",
   "benchmark",
+  "/bench/",
   "readme",
   "architecture",
   "docs/",
+  "/www/",
+  "/versioned_docs/",
   "examples/",
   "example/",
   ".github/",
@@ -832,9 +845,12 @@ function chunkTypeBoost(chunkType: string): number {
     case "struct":
     case "impl":
     case "trait":
-    case "module":
     case "constant":
       return 0.1;
+    case "module":
+      return -0.1;
+    case "other":
+      return -0.05;
     default:
       return 0;
   }
@@ -2279,9 +2295,12 @@ export class Indexer {
   private baseBranch: string = "main";
   private logger!: Logger;
   private queryEmbeddingCache: Map<string, QueryEmbeddingCacheEntry> = new Map();
+  private queryEmbeddingFailureState: Map<string, QueryEmbeddingFailureState> = new Map();
+  private secondaryProviderProbeTokens: Map<string, symbol> = new Map();
   private readonly maxQueryCacheSize = 100;
   private readonly queryCacheTtlMs = 5 * 60 * 1000;
   private readonly querySimilarityThreshold = 0.85;
+  private readonly queryEmbeddingFailureCooldownMs = 5 * 60 * 1000;
   private indexCompatibility: IndexCompatibility | null = null;
   private indexingLockPath: string = "";
   private indexingQueue: Promise<void> = Promise.resolve();
@@ -2769,6 +2788,8 @@ export class Indexer {
         );
         this.getStore(secondaryProviderInfo.modelInfo.model).load();
       }
+
+      this.startSecondaryProviderHealthProbe(this.voyageProvider);
       return;
     }
 
@@ -3867,6 +3888,72 @@ export class Indexer {
     return `${modelId}\u0000${query}`;
   }
 
+  private setQueryEmbeddingLaneDegraded(modelId: string, reason: string): void {
+    this.queryEmbeddingFailureState.set(modelId, {
+      until: Date.now() + this.queryEmbeddingFailureCooldownMs,
+      reason,
+    });
+  }
+
+  private clearQueryEmbeddingLaneDegraded(modelId: string): void {
+    this.queryEmbeddingFailureState.delete(modelId);
+  }
+
+  private startSecondaryProviderHealthProbe(
+    provider: Pick<EmbeddingProviderInterface, "getModelInfo"> & {
+      embedQuery(query: string): Promise<EmbeddingResult | null>;
+    }
+  ): void {
+    const modelId = provider.getModelInfo().model;
+    const probeToken = Symbol(modelId);
+    this.secondaryProviderProbeTokens.set(modelId, probeToken);
+    const startedAt = performance.now();
+    let finished = false;
+
+    const finishFailure = (reason: string): void => {
+      if (finished || this.secondaryProviderProbeTokens.get(modelId) !== probeToken) {
+        return;
+      }
+      finished = true;
+      this.setQueryEmbeddingLaneDegraded(modelId, reason);
+      this.logger.search("debug", "[secondary-provider] health probe failed, lane in cooldown", {
+        modelId,
+        elapsedMs: Math.round((performance.now() - startedAt) * 100) / 100,
+        error: reason,
+      });
+    };
+
+    const finishSuccess = (): void => {
+      if (finished || this.secondaryProviderProbeTokens.get(modelId) !== probeToken) {
+        return;
+      }
+      finished = true;
+      this.clearQueryEmbeddingLaneDegraded(modelId);
+      this.logger.search("debug", "[secondary-provider] health probe passed, lane active", {
+        modelId,
+        elapsedMs: Math.round((performance.now() - startedAt) * 100) / 100,
+      });
+    };
+
+    const timeoutHandle = setTimeout(() => {
+      finishFailure(`startup health probe timed out after ${SECONDARY_PROVIDER_HEALTH_PROBE_TIMEOUT_MS}ms`);
+    }, SECONDARY_PROVIDER_HEALTH_PROBE_TIMEOUT_MS);
+
+    void provider.embedQuery(SECONDARY_PROVIDER_HEALTH_PROBE_QUERY)
+      .then((result) => {
+        clearTimeout(timeoutHandle);
+        if (!result) {
+          finishFailure("provider returned no query embedding");
+          return;
+        }
+        finishSuccess();
+      })
+      .catch((error) => {
+        clearTimeout(timeoutHandle);
+        finishFailure(getErrorMessage(error));
+      });
+  }
+
   private async getQueryEmbedding(
     query: string,
     provider: Pick<EmbeddingProviderInterface, "getModelInfo"> & {
@@ -3876,6 +3963,18 @@ export class Indexer {
     const now = Date.now();
     const modelId = provider.getModelInfo().model;
     const cacheKey = this.getQueryEmbeddingCacheKey(modelId, query);
+    const degradedState = this.queryEmbeddingFailureState.get(modelId);
+    if (degradedState && degradedState.until > now) {
+      this.logger.search("debug", "Skipping degraded query embedding lane during cooldown", {
+        modelId,
+        retryInMs: degradedState.until - now,
+        reason: degradedState.reason,
+      });
+      return null;
+    }
+    if (degradedState && degradedState.until <= now) {
+      this.queryEmbeddingFailureState.delete(modelId);
+    }
     const cached = this.queryEmbeddingCache.get(cacheKey);
 
     if (cached && (now - cached.timestamp) < this.queryCacheTtlMs) {
@@ -3904,12 +4003,30 @@ export class Indexer {
       modelId,
     });
     this.logger.recordQueryCacheMiss();
-    const result = await provider.embedQuery(query);
+    let result: EmbeddingResult | null;
+    try {
+      result = await provider.embedQuery(query);
+    } catch (error) {
+      const reason = getErrorMessage(error);
+      this.setQueryEmbeddingLaneDegraded(modelId, reason);
+      this.logger.search("warn", "Query embedding lane failed; entering cooldown", {
+        modelId,
+        cooldownMs: this.queryEmbeddingFailureCooldownMs,
+        error: reason,
+      });
+      throw error;
+    }
     if (!result) {
+      this.setQueryEmbeddingLaneDegraded(modelId, "provider returned no query embedding");
+      this.logger.search("warn", "Query embedding lane returned no embedding; entering cooldown", {
+        modelId,
+        cooldownMs: this.queryEmbeddingFailureCooldownMs,
+      });
       return null;
     }
     const { embedding, tokensUsed } = result;
     this.logger.recordEmbeddingApiCall(tokensUsed);
+    this.clearQueryEmbeddingLaneDegraded(modelId);
 
     if (this.queryEmbeddingCache.size >= this.maxQueryCacheSize) {
       const oldestKey = this.queryEmbeddingCache.keys().next().value;

@@ -1,0 +1,402 @@
+{
+  "version": "1.0.0",
+  "name": "zod-external",
+  "description": "40-query external benchmark for Zod",
+  "queries": [
+    {
+      "id": "zod-def-zod-real-error",
+      "source": "curated",
+      "query": "where is the classic ZodError constructor wired as ZodRealError for stack traces and instanceof checks",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/errors.ts",
+        "symbol": "ZodRealError"
+      }
+    },
+    {
+      "id": "zod-def-async-parse-error-class",
+      "source": "curated",
+      "query": "where is the error type defined that tells you synchronous parsing hit a Promise and you should switch to the async parser",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/core.ts",
+        "symbol": "$ZodAsyncError"
+      }
+    },
+    {
+      "id": "zod-def-schema-constructor-factory",
+      "source": "curated",
+      "query": "where is the reusable factory implemented that builds schema classes with init hooks and custom instanceof behavior",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/core.ts",
+        "symbol": "$constructor"
+      }
+    },
+    {
+      "id": "zod-def-registry-factory-fn",
+      "source": "curated",
+      "query": "where is the function that allocates a fresh metadata registry instance for attaching ids to schemas",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/registries.ts",
+        "symbol": "registry"
+      }
+    },
+    {
+      "id": "zod-def-from-json-schema-entry",
+      "source": "curated",
+      "query": "where is the main entry that turns a JSON Schema document into a classic z schema value",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/from-json-schema.ts",
+        "symbol": "fromJSONSchema"
+      }
+    },
+    {
+      "id": "zod-def-json-schema-generator-class",
+      "source": "curated",
+      "query": "where is the deprecated class kept that wraps json schema generation for older call sites",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/json-schema-generator.ts",
+        "symbol": "JSONSchemaGenerator"
+      }
+    },
+    {
+      "id": "zod-def-to-json-schema-export",
+      "source": "curated",
+      "query": "where is the supported public helper defined that emits json schema from a schema instance or a registry",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/json-schema-processors.ts",
+        "symbol": "toJSONSchema"
+      }
+    },
+    {
+      "id": "zod-def-iso-duration-core-factory",
+      "source": "curated",
+      "query": "where is the internal core factory implemented that backs iso duration string formats used by the classic iso helpers",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/api.ts",
+        "symbol": "_isoDuration"
+      }
+    },
+    {
+      "id": "zod-def-zod-string-classic",
+      "source": "curated",
+      "query": "where is the classic string schema constructor registered for the v4 string builder",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/schemas.ts",
+        "symbol": "ZodString"
+      }
+    },
+    {
+      "id": "zod-def-zod-number-classic",
+      "source": "curated",
+      "query": "where is the classic number schema constructor registered for the v4 number builder",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/schemas.ts",
+        "symbol": "ZodNumber"
+      }
+    },
+    {
+      "id": "zod-def-capture-stack-trace-shim",
+      "source": "curated",
+      "query": "where is the cross runtime helper defined that optionally delegates to v8 style captureStackTrace when available",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/util.ts",
+        "symbol": "captureStackTrace"
+      }
+    },
+    {
+      "id": "zod-def-base-zod-type-constructor",
+      "source": "curated",
+      "query": "where is the core base schema prototype constructor implemented that every zod type builds on",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/schemas.ts",
+        "symbol": "$ZodType"
+      }
+    },
+    {
+      "id": "zod-rel-set-error-map-compat",
+      "source": "curated",
+      "query": "what compat shim forwards a zod 3 style setErrorMap call into the v4 global config merge",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/compat.ts",
+        "symbol": "setErrorMap"
+      }
+    },
+    {
+      "id": "zod-rel-parse-async-classic-binding",
+      "source": "curated",
+      "query": "which classic export binds the real zod error class into the core async parse factory",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/parse.ts",
+        "symbol": "parseAsync"
+      }
+    },
+    {
+      "id": "zod-rel-json-schema-generator-emit-finalize",
+      "source": "curated",
+      "query": "which method on the legacy json schema generator runs extractDefs and then calls finalize on the shared context",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/json-schema-generator.ts",
+        "symbol": "emit"
+      }
+    },
+    {
+      "id": "zod-rel-decode-classic-binding",
+      "source": "curated",
+      "query": "which classic export wires the real zod error class into the synchronous decode path",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/parse.ts",
+        "symbol": "decode"
+      }
+    },
+    {
+      "id": "zod-rel-encode-classic-binding",
+      "source": "curated",
+      "query": "which classic export wires the real zod error class into the synchronous encode path",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/parse.ts",
+        "symbol": "encode"
+      }
+    },
+    {
+      "id": "zod-rel-safe-parse-classic-binding",
+      "source": "curated",
+      "query": "which classic export binds the real zod error class into the synchronous safe parse helper",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/parse.ts",
+        "symbol": "safeParse"
+      }
+    },
+    {
+      "id": "zod-rel-parse-classic-binding",
+      "source": "curated",
+      "query": "which classic export binds the real zod error class into the synchronous parse helper returned from the internal factory",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/parse.ts",
+        "symbol": "parse"
+      }
+    },
+    {
+      "id": "zod-rel-get-error-map-compat",
+      "source": "curated",
+      "query": "what compat helper reads the active custom error map back out of the merged global config",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/compat.ts",
+        "symbol": "getErrorMap"
+      }
+    },
+    {
+      "id": "zod-con-finalize-issue-locale",
+      "source": "curated",
+      "query": "where are individual validation issues normalized with locale aware messaging before they end up on thrown errors",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/util.ts",
+        "symbol": "finalizeIssue"
+      }
+    },
+    {
+      "id": "zod-con-clone-schema-instance",
+      "source": "curated",
+      "query": "where is schema instance duplication handled so cloned schemas can keep an optional parent pointer",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/util.ts",
+        "symbol": "clone"
+      }
+    },
+    {
+      "id": "zod-con-treeify-errors",
+      "source": "curated",
+      "query": "where is a nested tree representation of validation issues built from a flat zod failure result",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/errors.ts",
+        "symbol": "treeifyError"
+      }
+    },
+    {
+      "id": "zod-con-flatten-errors",
+      "source": "curated",
+      "query": "where is the form style breakdown produced that splits field errors from root form errors on a zod error",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/errors.ts",
+        "symbol": "flattenError"
+      }
+    },
+    {
+      "id": "zod-con-json-schema-context-init",
+      "source": "curated",
+      "query": "where is json schema generation context assembled including normalizing older draft target names like draft 4 spelling variants",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/to-json-schema.ts",
+        "symbol": "initializeContext"
+      }
+    },
+    {
+      "id": "zod-con-iso-duration-factory-classic",
+      "source": "curated",
+      "query": "which classic iso submodule factory returns a duration string format schema backed by the core iso duration constructor",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/iso.ts",
+        "symbol": "duration"
+      }
+    },
+    {
+      "id": "zod-con-coerced-string-factory",
+      "source": "curated",
+      "query": "which classic coerce submodule entry builds a string schema that coerces non strings via the core coerced string path",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/coerce.ts",
+        "symbol": "string"
+      }
+    },
+    {
+      "id": "zod-con-format-error-object",
+      "source": "curated",
+      "query": "where is the deeply nested object shaped error view produced from a zod error using per path message mapping",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/errors.ts",
+        "symbol": "formatError"
+      }
+    },
+    {
+      "id": "zod-con-extract-json-schema-defs",
+      "source": "curated",
+      "query": "where is shared json schema definition extraction handled while walking a schema graph for emission",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/to-json-schema.ts",
+        "symbol": "extractDefs"
+      }
+    },
+    {
+      "id": "zod-con-finalize-json-schema-node",
+      "source": "curated",
+      "query": "where is the final json schema object assembled for a given zod node after defs have been collected on the context",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/to-json-schema.ts",
+        "symbol": "finalize"
+      }
+    },
+    {
+      "id": "zod-bug-sync-parse-promise-throw",
+      "source": "curated",
+      "query": "where does synchronous parsing throw when schema evaluation returns a Promise instead of a finished payload",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/parse.ts",
+        "symbol": "_parse"
+      }
+    },
+    {
+      "id": "zod-bug-safe-parse-promise-throw",
+      "source": "curated",
+      "query": "where does synchronous safe parsing throw the same promise during sync parse style error when evaluation returns a Promise",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/parse.ts",
+        "symbol": "_safeParse"
+      }
+    },
+    {
+      "id": "zod-bug-multiple-of-mixed-types",
+      "source": "curated",
+      "query": "where does a multiple of check throw because the runtime value type disagrees with the divisor type for number versus bigint",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/checks.ts",
+        "symbol": "$ZodCheckMultipleOf"
+      }
+    },
+    {
+      "id": "zod-bug-mini-type-uninitialized",
+      "source": "curated",
+      "query": "where does mini schema construction throw if the internal zod bag was never initialized on the instance",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "packages/zod/src/v4/mini/schemas.ts",
+        "symbol": "ZodMiniType"
+      }
+    },
+    {
+      "id": "zod-bug-invalid-uuid-version",
+      "source": "curated",
+      "query": "where does uuid string format setup throw when an unsupported version token is provided in the schema definition",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "packages/zod/src/v4/core/schemas.ts",
+        "symbol": "$ZodUUID"
+      }
+    },
+    {
+      "id": "zod-test-from-json-schema",
+      "source": "curated",
+      "query": "what tests cover converting json schema documents back into zod schemas in the classic suite",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/tests/from-json-schema.test.ts"
+      }
+    },
+    {
+      "id": "zod-test-to-json-schema",
+      "source": "curated",
+      "query": "where are the large classic tests that validate zod to json schema output including openapi draft targets",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/tests/to-json-schema.test.ts"
+      }
+    },
+    {
+      "id": "zod-test-discriminated-unions",
+      "source": "curated",
+      "query": "what tests cover discriminated union parsing and error behavior in v4 classic",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/tests/discriminated-unions.test.ts"
+      }
+    },
+    {
+      "id": "zod-test-async-refinements",
+      "source": "curated",
+      "query": "which classic tests document that async refinements cannot be exercised through synchronous safe parsing",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/tests/async-refinements.test.ts"
+      }
+    },
+    {
+      "id": "zod-test-error-utils",
+      "source": "curated",
+      "query": "what tests cover prettifying flattening and treeifying zod failures in the classic error helpers",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "packages/zod/src/v4/classic/tests/error-utils.test.ts"
+      }
+    }
+  ]
+}

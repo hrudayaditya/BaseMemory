@@ -83,7 +83,7 @@ describe("config schema", () => {
       expect(config.embeddingModel).toBeUndefined();
       expect(config.scope).toBe("project");
       expect(config.include).toHaveLength(10);
-      expect(config.exclude).toHaveLength(13);
+      expect(config.exclude).toHaveLength(18);
     });
 
     it("should return defaults for null input", () => {

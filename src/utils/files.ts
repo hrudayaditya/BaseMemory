@@ -126,6 +126,7 @@ class HierarchicalIgnoreFilter implements IgnoreFilter {
         ? this.projectRoot
         : path.join(this.projectRoot, ...baseRelativePath.split("/"));
     this.addIgnoreFileIfPresent(matcher, path.join(baseAbsolutePath, ".gitignore"));
+    this.addIgnoreFileIfPresent(matcher, path.join(baseAbsolutePath, ".memignore"));
 
     this.matcherCache.set(baseRelativePath, matcher);
     return matcher;

@@ -57,6 +57,24 @@ function getPrimaryStore(indexer: Indexer): {
   return store;
 }
 
+function getQueryEmbeddingFailureState(indexer: Indexer): Map<string, { until: number; reason: string }> {
+  return (indexer as unknown as {
+    queryEmbeddingFailureState: Map<string, { until: number; reason: string }>;
+  }).queryEmbeddingFailureState;
+}
+
+function getSecondaryProvider(indexer: Indexer): {
+  getModelInfo(): { model: string };
+  embedQuery(query: string): Promise<{ embedding: number[]; tokensUsed: number } | null>;
+} | null {
+  return (indexer as unknown as {
+    voyageProvider: {
+      getModelInfo(): { model: string };
+      embedQuery(query: string): Promise<{ embedding: number[]; tokensUsed: number } | null>;
+    } | null;
+  }).voyageProvider;
+}
+
 async function waitForCondition(
   predicate: () => boolean,
   timeoutMs: number = 5_000
@@ -2450,6 +2468,169 @@ export function graphCallHelper(value: string) { return graphTargetHelper(value)
     });
 
     expect(results.some((entry) => entry.name === "graphCallHelper" && entry.relation === "caller")).toBe(true);
+  });
+
+  it("marks the secondary query lane degraded during startup when the probe fails", async () => {
+    let customProbeCalls = 0;
+    fetchSpy.mockImplementation(async (url, init) => {
+      const requestUrl = String(url);
+      const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[]; model?: string };
+      const texts = Array.isArray(body.input) ? body.input : [];
+      if (requestUrl.includes("api.voyageai.com")) {
+        return createMockEmbeddingResponse(init);
+      }
+      if (requestUrl.includes("127.0.0.1:11434") && texts.some((text) => text.includes("health"))) {
+        customProbeCalls += 1;
+        throw new Error("ollama down");
+      }
+      return createMockEmbeddingResponse(init);
+    });
+
+    const config = parseConfig({
+      embeddingProvider: "voyage",
+      voyageApiKey: "voyage-test-key",
+      voyageModelId: "voyage-code-2",
+      customProvider: {
+        baseUrl: "http://127.0.0.1:11434/v1",
+        model: "snowflake-arctic-embed2",
+        dimensions: 1024,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.initialize();
+
+    await waitForCondition(() => customProbeCalls > 0);
+    await waitForCondition(() => getQueryEmbeddingFailureState(indexer).has("snowflake-arctic-embed2"));
+
+    expect(getQueryEmbeddingFailureState(indexer).get("snowflake-arctic-embed2")?.reason).toContain("startup health probe");
+  });
+
+  it("keeps the secondary query lane healthy when the startup probe succeeds", async () => {
+    let customProbeCalls = 0;
+    fetchSpy.mockImplementation(async (url, init) => {
+      const requestUrl = String(url);
+      const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[]; model?: string };
+      const texts = Array.isArray(body.input) ? body.input : [];
+      if (requestUrl.includes("127.0.0.1:11434") && texts.some((text) => text.includes("health"))) {
+        customProbeCalls += 1;
+      }
+      return createMockEmbeddingResponse(init);
+    });
+
+    const config = parseConfig({
+      embeddingProvider: "voyage",
+      voyageApiKey: "voyage-test-key",
+      voyageModelId: "voyage-code-2",
+      customProvider: {
+        baseUrl: "http://127.0.0.1:11434/v1",
+        model: "snowflake-arctic-embed2",
+        dimensions: 1024,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.initialize();
+
+    await waitForCondition(() => customProbeCalls > 0);
+    expect(getQueryEmbeddingFailureState(indexer).has("snowflake-arctic-embed2")).toBe(false);
+  });
+
+  it("recovers the secondary query lane after cooldown when the provider comes back", async () => {
+    fetchSpy.mockImplementation(async (url, init) => {
+      const requestUrl = String(url);
+      const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[]; model?: string };
+      const texts = Array.isArray(body.input) ? body.input : [];
+      const dimensions =
+        requestUrl.includes("api.voyageai.com") || body.model === "voyage-code-2"
+          ? 1536
+          : body.model === "snowflake-arctic-embed2"
+            ? 1024
+            : 8;
+      if (requestUrl.includes("api.voyageai.com")) {
+        const data = texts.map((text) => {
+          let seed = 0;
+          for (const ch of text) {
+            seed = (seed * 31 + ch.charCodeAt(0)) % 1000;
+          }
+          return {
+            embedding: Array.from({ length: dimensions }, (_, idx) => ((seed + idx * 17) % 997) / 997),
+          };
+        });
+        return new Response(
+          JSON.stringify({
+            data,
+            usage: { total_tokens: Math.max(1, texts.length * 8) },
+          }),
+          { status: 200 }
+        );
+      }
+      const data = texts.map((text) => {
+        let seed = 0;
+        for (const ch of text) {
+          seed = (seed * 31 + ch.charCodeAt(0)) % 1000;
+        }
+        return {
+          embedding: Array.from({ length: dimensions }, (_, idx) => ((seed + idx * 17) % 997) / 997),
+        };
+      });
+      return new Response(
+        JSON.stringify({
+          data,
+          usage: { total_tokens: Math.max(1, texts.length * 8) },
+        }),
+        { status: 200 }
+      );
+    });
+
+    const config = parseConfig({
+      embeddingProvider: "voyage",
+      voyageApiKey: "voyage-test-key",
+      voyageModelId: "voyage-code-2",
+      customProvider: {
+        baseUrl: "http://127.0.0.1:11434/v1",
+        model: "snowflake-arctic-embed2",
+        dimensions: 1024,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN: 20,
+      },
+    });
+
+    const indexer = new Indexer(tempDir, config);
+    await indexer.initialize();
+    const failureState = getQueryEmbeddingFailureState(indexer);
+    failureState.set("snowflake-arctic-embed2", {
+      until: Date.now() - 1,
+      reason: "expired for test",
+    });
+
+    const secondaryProvider = getSecondaryProvider(indexer);
+    expect(secondaryProvider).toBeDefined();
+    await (indexer as unknown as {
+      getQueryEmbedding(
+        query: string,
+        provider: {
+          getModelInfo(): { model: string };
+          embedQuery(query: string): Promise<{ embedding: number[]; tokensUsed: number } | null>;
+        }
+      ): Promise<number[] | null>;
+    }).getQueryEmbedding("health", secondaryProvider!);
+
+    expect(getQueryEmbeddingFailureState(indexer).has("snowflake-arctic-embed2")).toBe(false);
   });
 
   it("expands callers for split function symbols after call-edge resolution canonicalizes the target", async () => {

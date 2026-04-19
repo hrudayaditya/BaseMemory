@@ -164,6 +164,7 @@ fn build_walk(_repo_root: &Path, root: &Path) -> WalkBuilder {
     builder.standard_filters(true);
     builder.max_depth(None);
     builder.add_custom_ignore_filename(".gitignore");
+    builder.add_custom_ignore_filename(".memignore");
     builder.require_git(false);
     builder
 }
@@ -338,6 +339,8 @@ pub fn relative_to_fs_path(relative_path: &str) -> PathBuf {
 mod tests {
     use super::*;
     use crate::merkle::types::DEFAULT_MAX_FILE_SIZE;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn normalizes_relative_paths_with_forward_slashes() {
@@ -422,5 +425,29 @@ mod tests {
         assert!(!matcher.should_include("README.md"));
         assert!(!matcher.should_include("dist/out.js"));
         assert!(matcher.should_include("dist/keep.ts"));
+    }
+
+    #[test]
+    fn scan_repo_honors_memignore_files() {
+        let repo = tempdir().unwrap();
+        fs::create_dir_all(repo.path().join("packages/docs")).unwrap();
+        fs::create_dir_all(repo.path().join("src")).unwrap();
+        fs::write(repo.path().join(".memignore"), "packages/docs/\n").unwrap();
+        fs::write(repo.path().join("packages/docs/page.ts"), "export const doc = 1;\n").unwrap();
+        fs::write(repo.path().join("src/app.ts"), "export const app = 1;\n").unwrap();
+
+        let files = scan_repo(
+            repo.path(),
+            &IgnoreRules {
+                include: vec![String::from("**/*.ts")],
+                exclude: Vec::new(),
+                max_file_size: DEFAULT_MAX_FILE_SIZE,
+            },
+        )
+        .unwrap();
+
+        let paths: Vec<String> = files.into_iter().map(|file| file.path).collect();
+        assert!(paths.iter().any(|path| path == "src/app.ts"));
+        assert!(!paths.iter().any(|path| path == "packages/docs/page.ts"));
     }
 }

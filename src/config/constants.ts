@@ -25,6 +25,11 @@ export const DEFAULT_EXCLUDE = [
   "**/.next/**",
   "**/.nuxt/**",
   "**/.opencode/**",
+  "**/_artifacts/**",
+  "**/skills/**",
+  "**/CHANGELOG*",
+  "**/LICENSE*",
+  "**/AGENTS.md",
 ];
 
 
