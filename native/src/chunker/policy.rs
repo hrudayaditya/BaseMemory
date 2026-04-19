@@ -9,6 +9,7 @@ use tree_sitter::Node;
 #[derive(Debug, Clone)]
 pub struct SemanticInfo {
     pub symbol_name: Option<String>,
+    pub symbol_aliases: Vec<String>,
     pub symbol_kind: Option<SymbolKind>,
     pub chunk_kind: ChunkKind,
     pub coarse_eligible: bool,

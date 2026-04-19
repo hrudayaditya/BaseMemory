@@ -349,8 +349,8 @@ describe("retrieval ranking", () => {
       },
     ];
 
-    const reranked = rerankResults("header value sanitize", candidates, 10, {
-      pathPreference: "source",
+    const reranked = rerankResults("zzqv", candidates, 10, {
+      pathPreference: "balanced",
       taskType: "definition",
     });
 
@@ -358,14 +358,47 @@ describe("retrieval ranking", () => {
     expect(reranked[1]?.id).toBe("unnamedModule");
   });
 
-  it("suppresses default-named or file-stem module chunks when a named sibling is present", () => {
+  it("does not suppress real named module chunks that merely match the file stem", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "moduleChunk",
+        score: 1.25,
+        metadata: meta({
+          filePath: "/repo/lib/core/AxiosHeaders.js",
+          name: "AxiosHeaders",
+          chunkType: "module",
+        }),
+      },
+      {
+        id: "namedFunction",
+        score: 0.9,
+        metadata: meta({
+          filePath: "/repo/lib/core/AxiosHeaders.js",
+          name: "sanitizeHeaderValue",
+          chunkType: "function",
+        }),
+      },
+    ];
+
+    const reranked = rerankResults("zzqv", candidates, 10, {
+      pathPreference: "balanced",
+      taskType: "definition",
+    });
+
+    // The module chunk still pays the normal `module` base penalty, but it should
+    // no longer take the extra -0.10 same-file unnamed/default suppression.
+    expect(reranked[0]?.id).toBe("moduleChunk");
+    expect(reranked[1]?.id).toBe("namedFunction");
+  });
+
+  it("suppresses placeholder-named module chunks when a named sibling is present", () => {
     const candidates: Candidate[] = [
       {
         id: "moduleChunk",
         score: 0.918,
         metadata: meta({
           filePath: "/repo/lib/core/AxiosHeaders.js",
-          name: "AxiosHeaders",
+          name: "<default>",
           chunkType: "module",
         }),
       },

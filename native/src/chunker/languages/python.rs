@@ -88,6 +88,7 @@ fn classify_python_assignment(node: Node<'_>, source: &str) -> Option<SemanticIn
 
     Some(SemanticInfo {
         symbol_name: Some(symbol_name),
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(SymbolKind::Constant),
         chunk_kind: ChunkKind::Code,
         coarse_eligible: false,
@@ -106,6 +107,7 @@ fn classify_python_type_alias(node: Node<'_>, source: &str) -> Option<SemanticIn
 
     Some(SemanticInfo {
         symbol_name: Some(symbol_name),
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(SymbolKind::Type),
         chunk_kind: ChunkKind::Code,
         coarse_eligible: false,
@@ -139,6 +141,7 @@ fn classify_python_docstring(node: Node<'_>) -> Option<SemanticInfo> {
 
     Some(SemanticInfo {
         symbol_name: None,
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(SymbolKind::Block),
         chunk_kind: ChunkKind::Doc,
         coarse_eligible: false,
@@ -192,6 +195,7 @@ fn classify_python_function(node: Node<'_>, source: &str) -> Option<SemanticInfo
 
     Some(SemanticInfo {
         symbol_name: Some(name),
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(symbol_kind),
         chunk_kind,
         coarse_eligible: has_function_leading_docstring(node),
@@ -204,6 +208,7 @@ fn classify_python_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         "function_definition" => classify_python_function(node, source),
         "class_definition" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Class),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,

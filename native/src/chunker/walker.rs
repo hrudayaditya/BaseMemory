@@ -12,6 +12,7 @@ use tree_sitter::{Node, Tree};
 #[derive(Debug, Clone)]
 struct PendingChunk {
     symbol_name: Option<String>,
+    symbol_aliases: Vec<String>,
     symbol_kind: Option<SymbolKind>,
     chunk_kind: ChunkKind,
     delegate_target_name: Option<String>,
@@ -69,6 +70,7 @@ impl<'a> WalkerContext<'a> {
             file_path: self.file_path.to_string(),
             language: self.language.to_string(),
             symbol_name: pending.symbol_name,
+            symbol_aliases: pending.symbol_aliases,
             symbol_kind: pending.symbol_kind,
             chunk_kind: pending.chunk_kind,
             granularity: pending.granularity,
@@ -291,6 +293,7 @@ fn emit_gap(ctx: &WalkerContext<'_>, start: usize, end: usize, chunks: &mut Vec<
 
     chunks.push(PendingChunk {
         symbol_name: None,
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(SymbolKind::Block),
         chunk_kind: ChunkKind::Code,
         delegate_target_name: None,
@@ -445,9 +448,17 @@ fn merge_small_siblings(ctx: &WalkerContext<'_>, chunks: &mut Vec<PendingChunk>)
 
 fn is_gap_only_chunk(chunk: &PendingChunk) -> bool {
     chunk.symbol_name.is_none()
+        && chunk.symbol_aliases.is_empty()
         && chunk.delegate_target_name.is_none()
         && matches!(chunk.chunk_kind, ChunkKind::Code)
         && matches!(chunk.symbol_kind, None | Some(SymbolKind::Block))
+}
+
+fn push_symbol_alias(aliases: &mut Vec<String>, alias: String) {
+    if alias.is_empty() || aliases.iter().any(|existing| existing == &alias) {
+        return;
+    }
+    aliases.push(alias);
 }
 
 fn merge_delegation_wrappers(chunks: &mut Vec<PendingChunk>) {
@@ -486,8 +497,16 @@ fn merge_delegation_wrappers(chunks: &mut Vec<PendingChunk>) {
 
         let wrapper_start = chunks[index].start_byte;
         let wrapper_symbol_name = chunks[index].symbol_name.clone();
+        let wrapper_symbol_aliases = chunks[index].symbol_aliases.clone();
+        let target_symbol_name = chunks[target_index].symbol_name.clone();
         chunks[target_index].start_byte = wrapper_start;
         chunks[target_index].symbol_name = wrapper_symbol_name;
+        for alias in wrapper_symbol_aliases {
+            push_symbol_alias(&mut chunks[target_index].symbol_aliases, alias);
+        }
+        if let Some(target_symbol_name) = target_symbol_name {
+            push_symbol_alias(&mut chunks[target_index].symbol_aliases, target_symbol_name);
+        }
         chunks.drain(index..target_index);
         index += 1;
     }
@@ -537,6 +556,7 @@ fn split_oversized_leaf_node_by_statements(
             );
             chunks.push(PendingChunk {
                 symbol_name: template.symbol_name.clone(),
+                symbol_aliases: template.symbol_aliases.clone(),
                 symbol_kind: if chunk_kind == ChunkKind::Config {
                     Some(SymbolKind::Block)
                 } else {
@@ -557,6 +577,7 @@ fn split_oversized_leaf_node_by_statements(
         classify_statement_group_kind(ctx, &statements[first_statement_index..], &template.chunk_kind);
     let final_chunk = PendingChunk {
         symbol_name: template.symbol_name.clone(),
+        symbol_aliases: template.symbol_aliases.clone(),
         symbol_kind: if final_chunk_kind == ChunkKind::Config {
             Some(SymbolKind::Block)
         } else {
@@ -630,6 +651,7 @@ fn build_semantic_chunk(
 
     let template = PendingChunk {
         symbol_name: info.symbol_name,
+        symbol_aliases: info.symbol_aliases,
         symbol_kind: info.symbol_kind,
         chunk_kind: info.chunk_kind,
         delegate_target_name: info.delegate_target_name,
@@ -641,6 +663,7 @@ fn build_semantic_chunk(
     if !ctx.range_exceeds_budget(node_start, node_end) && !should_prefer_children {
         return vec![PendingChunk {
             symbol_name: template.symbol_name,
+            symbol_aliases: template.symbol_aliases,
             symbol_kind: template.symbol_kind,
             chunk_kind: template.chunk_kind,
             delegate_target_name: template.delegate_target_name,
@@ -746,6 +769,7 @@ fn build_node_chunks(ctx: &WalkerContext<'_>, node: Node<'_>) -> Vec<PendingChun
     if split_children.is_empty() {
         let template = PendingChunk {
             symbol_name: None,
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Block),
             chunk_kind: ChunkKind::Code,
             delegate_target_name: None,
@@ -874,6 +898,7 @@ fn maybe_emit_file_module_header_chunk(
 
     let candidate = ctx.finalize_chunk(PendingChunk {
         symbol_name: Some(symbol_name),
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(SymbolKind::Module),
         chunk_kind: ChunkKind::File,
         delegate_target_name: None,
@@ -944,6 +969,7 @@ pub fn chunk_tree(
 
             let pending = PendingChunk {
                 symbol_name: info.symbol_name,
+                symbol_aliases: info.symbol_aliases,
                 symbol_kind: info.symbol_kind,
                 chunk_kind: info.chunk_kind,
                 delegate_target_name: None,

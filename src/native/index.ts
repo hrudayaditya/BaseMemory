@@ -103,6 +103,7 @@ export interface SemanticChunk {
   filePath: string;
   language: string;
   symbolName?: string;
+  symbolAliases?: string[];
   symbolKind?: ChunkSymbolKind;
   chunkKind: ChunkKind;
   granularity: Granularity;
@@ -151,6 +152,7 @@ export interface SymbolData {
   id: string;
   filePath: string;
   name: string;
+  symbolAliases?: string[];
   kind: string;
   startLine: number;
   startCol: number;
@@ -191,6 +193,7 @@ export interface SymbolChunkData {
   endLine: number;
   nodeType?: string;
   name?: string;
+  symbolAliases?: string[];
   chunkKind?: string;
   symbolKind?: string;
   language: string;
@@ -288,6 +291,7 @@ function mapSemanticChunk(c: any): SemanticChunk {
     filePath: c.filePath ?? c.file_path,
     language: c.language,
     symbolName: c.symbolName ?? c.symbol_name ?? undefined,
+    symbolAliases: c.symbolAliases ?? c.symbol_aliases ?? [],
     symbolKind: c.symbolKind ?? c.symbol_kind ?? undefined,
     chunkKind: c.chunkKind ?? c.chunk_kind,
     granularity: c.granularity,
@@ -854,6 +858,7 @@ export interface ChunkData {
   endLine: number;
   nodeType?: string;
   name?: string;
+  symbolAliases?: string[];
   chunkKind?: string;
   symbolKind?: string;
   language: string;
@@ -873,6 +878,7 @@ export interface ChunkMetadataLookup {
   endLine: number;
   nodeType?: ChunkType;
   name?: string;
+  symbolAliases?: string[];
   chunkKind?: ChunkKind;
   symbolKind?: ChunkSymbolKind;
   language: string;
@@ -954,6 +960,56 @@ export interface StoredBranchConfigVersionData {
   branch: string;
   configHash: string;
   appliedAt: number;
+}
+
+function maybeExposeSymbolAliases<T extends { symbolAliases?: string[] }>(value: T): T {
+  if (!value.symbolAliases || value.symbolAliases.length === 0) {
+    const { symbolAliases: _symbolAliases, ...rest } = value;
+    return rest as T;
+  }
+  return value;
+}
+
+function normalizeChunkDataForWrite(chunk: ChunkData): ChunkData {
+  return {
+    ...chunk,
+    symbolAliases: chunk.symbolAliases ?? [],
+  };
+}
+
+function normalizeChunkDataFromRead(chunk: ChunkData): ChunkData {
+  return maybeExposeSymbolAliases({
+    ...chunk,
+    symbolAliases: chunk.symbolAliases ?? [],
+  });
+}
+
+function normalizeSymbolDataForWrite(symbol: SymbolData): SymbolData {
+  return {
+    ...symbol,
+    symbolAliases: symbol.symbolAliases ?? [],
+  };
+}
+
+function normalizeSymbolDataFromRead(symbol: SymbolData): SymbolData {
+  return maybeExposeSymbolAliases({
+    ...symbol,
+    symbolAliases: symbol.symbolAliases ?? [],
+  });
+}
+
+function normalizeSymbolChunkData(symbolChunk: SymbolChunkData): SymbolChunkData {
+  return maybeExposeSymbolAliases({
+    ...symbolChunk,
+    symbolAliases: symbolChunk.symbolAliases ?? [],
+  });
+}
+
+function normalizeChunkMetadataLookup(chunk: ChunkMetadataLookup): ChunkMetadataLookup {
+  return maybeExposeSymbolAliases({
+    ...chunk,
+    symbolAliases: chunk.symbolAliases ?? [],
+  });
 }
 
 export class Database {
@@ -1172,24 +1228,25 @@ export class Database {
   }
 
   upsertChunk(chunk: ChunkData): void {
-    this.inner.upsertChunk(chunk);
+    this.inner.upsertChunk(normalizeChunkDataForWrite(chunk));
   }
 
   upsertChunksBatch(chunks: ChunkData[]): void {
     if (chunks.length === 0) return;
-    this.inner.upsertChunksBatch(chunks);
+    this.inner.upsertChunksBatch(chunks.map(normalizeChunkDataForWrite));
   }
 
   getChunk(chunkId: string): ChunkData | null {
-    return this.inner.getChunk(chunkId) ?? null;
+    const result = this.inner.getChunk(chunkId);
+    return result ? normalizeChunkDataFromRead(result) : null;
   }
 
   getChunksByFile(filePath: string): ChunkData[] {
-    return this.inner.getChunksByFile(filePath);
+    return this.inner.getChunksByFile(filePath).map(normalizeChunkDataFromRead);
   }
 
   getChunksByFileOnBranch(filePath: string, branch: string): ChunkData[] {
-    return this.inner.getChunksByFileOnBranch(filePath, branch);
+    return this.inner.getChunksByFileOnBranch(filePath, branch).map(normalizeChunkDataFromRead);
   }
 
   async getChunkIdsByFiltersForBranch(
@@ -1219,7 +1276,7 @@ export class Database {
     branch: string,
     allowedChunkIds?: string[]
   ): SymbolChunkData[] {
-    return this.inner.getChunksForSymbolsBatch(symbolIds, branch, allowedChunkIds ?? null).map((item: any) => ({
+    return this.inner.getChunksForSymbolsBatch(symbolIds, branch, allowedChunkIds ?? null).map((item: any) => normalizeSymbolChunkData({
       symbolId: item.symbolId ?? item.symbol_id,
       chunkId: item.chunkId ?? item.chunk_id,
       contentHash: item.contentHash ?? item.content_hash,
@@ -1229,6 +1286,7 @@ export class Database {
       endLine: item.endLine ?? item.end_line,
       nodeType: item.nodeType ?? item.node_type ?? undefined,
       name: item.name ?? undefined,
+      symbolAliases: item.symbolAliases ?? item.symbol_aliases ?? [],
       chunkKind: item.chunkKind ?? item.chunk_kind ?? undefined,
       symbolKind: item.symbolKind ?? item.symbol_kind ?? undefined,
       language: item.language,
@@ -1236,11 +1294,11 @@ export class Database {
   }
 
   getChunksByName(name: string): ChunkData[] {
-    return this.inner.getChunksByName(name);
+    return this.inner.getChunksByName(name).map(normalizeChunkDataFromRead);
   }
 
   getChunksByNameCi(name: string): ChunkData[] {
-    return this.inner.getChunksByNameCi(name);
+    return this.inner.getChunksByNameCi(name).map(normalizeChunkDataFromRead);
   }
 
   getChunkKindsBatch(chunkIds: string[]): ChunkKindEnrichment[] {
@@ -1269,7 +1327,7 @@ export class Database {
       symbolKind?: ChunkSymbolKind;
       symbol_kind?: ChunkSymbolKind;
       language: string;
-    }) => ({
+    }) => normalizeChunkMetadataLookup({
       chunkId: item.chunkId ?? item.chunk_id ?? "",
       embeddingInputHash: item.embeddingInputHash ?? item.embedding_input_hash ?? "",
       filePath: item.filePath ?? item.file_path ?? "",
@@ -1277,6 +1335,7 @@ export class Database {
       endLine: item.endLine ?? item.end_line ?? 0,
       nodeType: item.nodeType ?? item.node_type ?? undefined,
       name: item.name ?? undefined,
+      symbolAliases: item.symbolAliases ?? item.symbol_aliases ?? [],
       chunkKind: item.chunkKind ?? item.chunk_kind ?? undefined,
       symbolKind: item.symbolKind ?? item.symbol_kind ?? undefined,
       language: item.language,
@@ -1568,66 +1627,70 @@ export class Database {
   // ── Symbol methods ──────────────────────────────────────────────
 
   upsertSymbol(symbol: SymbolData): void {
-    this.inner.upsertSymbol(symbol);
+    this.inner.upsertSymbol(normalizeSymbolDataForWrite(symbol));
   }
 
   upsertSymbolsBatch(symbols: SymbolData[]): void {
     if (symbols.length === 0) return;
-    this.inner.upsertSymbolsBatch(symbols);
+    this.inner.upsertSymbolsBatch(symbols.map(normalizeSymbolDataForWrite));
   }
 
   getSymbolsByFile(filePath: string): SymbolData[] {
-    return this.inner.getSymbolsByFile(filePath);
+    return this.inner.getSymbolsByFile(filePath).map(normalizeSymbolDataFromRead);
   }
 
   getSymbolsByFileOnBranch(filePath: string, branch: string): SymbolData[] {
-    return this.inner.getSymbolsByFileOnBranch(filePath, branch);
+    return this.inner.getSymbolsByFileOnBranch(filePath, branch).map(normalizeSymbolDataFromRead);
   }
 
   getSymbolById(symbolId: string): SymbolData | null {
-    return this.inner.getSymbolById(symbolId) ?? null;
+    const result = this.inner.getSymbolById(symbolId);
+    return result ? normalizeSymbolDataFromRead(result) : null;
   }
 
   getSymbolByIdOnBranch(symbolId: string, branch: string): SymbolData | null {
-    return this.inner.getSymbolByIdOnBranch(symbolId, branch) ?? null;
+    const result = this.inner.getSymbolByIdOnBranch(symbolId, branch);
+    return result ? normalizeSymbolDataFromRead(result) : null;
   }
 
   getSymbolsByIdsOnBranch(symbolIds: string[], branch: string): SymbolData[] {
     if (symbolIds.length === 0) {
       return [];
     }
-    return this.inner.getSymbolsByIdsOnBranch(symbolIds, branch);
+    return this.inner.getSymbolsByIdsOnBranch(symbolIds, branch).map(normalizeSymbolDataFromRead);
   }
 
   getSymbolByName(name: string, filePath: string): SymbolData | null {
-    return this.inner.getSymbolByName(name, filePath) ?? null;
+    const result = this.inner.getSymbolByName(name, filePath);
+    return result ? normalizeSymbolDataFromRead(result) : null;
   }
 
   getSymbolByNameOnBranch(name: string, filePath: string, branch: string): SymbolData | null {
-    return this.inner.getSymbolByNameOnBranch(name, filePath, branch) ?? null;
+    const result = this.inner.getSymbolByNameOnBranch(name, filePath, branch);
+    return result ? normalizeSymbolDataFromRead(result) : null;
   }
 
   getSymbolsByName(name: string): SymbolData[] {
-    return this.inner.getSymbolsByName(name);
+    return this.inner.getSymbolsByName(name).map(normalizeSymbolDataFromRead);
   }
 
   getSymbolsByNameOnBranch(name: string, branch: string): SymbolData[] {
-    return this.inner.getSymbolsByNameOnBranch(name, branch);
+    return this.inner.getSymbolsByNameOnBranch(name, branch).map(normalizeSymbolDataFromRead);
   }
 
   getSymbolsByNamesOnBranch(names: string[], branch: string): SymbolData[] {
     if (names.length === 0) {
       return [];
     }
-    return this.inner.getSymbolsByNamesOnBranch(names, branch);
+    return this.inner.getSymbolsByNamesOnBranch(names, branch).map(normalizeSymbolDataFromRead);
   }
 
   getSymbolsByNameCi(name: string): SymbolData[] {
-    return this.inner.getSymbolsByNameCi(name);
+    return this.inner.getSymbolsByNameCi(name).map(normalizeSymbolDataFromRead);
   }
 
   getSymbolsByNameCiOnBranch(name: string, branch: string): SymbolData[] {
-    return this.inner.getSymbolsByNameCiOnBranch(name, branch);
+    return this.inner.getSymbolsByNameCiOnBranch(name, branch).map(normalizeSymbolDataFromRead);
   }
 
   symbolExistsOnOtherBranches(branch: string, symbolId: string): boolean {

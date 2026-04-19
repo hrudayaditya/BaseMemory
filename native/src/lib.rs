@@ -540,6 +540,7 @@ pub struct SymbolData {
     pub id: String,
     pub file_path: String,
     pub name: String,
+    pub symbol_aliases: Vec<String>,
     pub kind: String,
     pub start_line: u32,
     pub start_col: u32,
@@ -583,6 +584,7 @@ pub struct SymbolChunkData {
     pub end_line: u32,
     pub node_type: Option<String>,
     pub name: Option<String>,
+    pub symbol_aliases: Vec<String>,
     pub chunk_kind: Option<String>,
     pub symbol_kind: Option<String>,
     pub language: String,
@@ -726,6 +728,7 @@ pub struct ChunkData {
     pub end_line: u32,
     pub node_type: Option<String>,
     pub name: Option<String>,
+    pub symbol_aliases: Vec<String>,
     pub chunk_kind: Option<String>,
     pub symbol_kind: Option<String>,
     pub language: String,
@@ -747,9 +750,42 @@ pub struct ChunkMetadataLookupData {
     pub end_line: u32,
     pub node_type: Option<String>,
     pub name: Option<String>,
+    pub symbol_aliases: Vec<String>,
     pub chunk_kind: Option<String>,
     pub symbol_kind: Option<String>,
     pub language: String,
+}
+
+fn chunk_row_to_js(row: db::ChunkRow) -> ChunkData {
+    ChunkData {
+        chunk_id: row.chunk_id,
+        content_hash: row.content_hash,
+        embedding_input_hash: row.embedding_input_hash,
+        file_path: row.file_path,
+        start_line: row.start_line,
+        end_line: row.end_line,
+        node_type: row.node_type,
+        name: row.name,
+        symbol_aliases: row.symbol_aliases,
+        chunk_kind: row.chunk_kind,
+        symbol_kind: row.symbol_kind,
+        language: row.language,
+    }
+}
+
+fn symbol_row_to_js(row: db::SymbolRow) -> SymbolData {
+    SymbolData {
+        id: row.id,
+        file_path: row.file_path,
+        name: row.name,
+        symbol_aliases: row.symbol_aliases,
+        kind: row.kind,
+        start_line: row.start_line,
+        start_col: row.start_col,
+        end_line: row.end_line,
+        end_col: row.end_col,
+        language: row.language,
+    }
 }
 
 #[napi(object)]
@@ -1231,6 +1267,7 @@ impl Database {
             chunk.end_line,
             chunk.node_type.as_deref(),
             chunk.name.as_deref(),
+            &chunk.symbol_aliases,
             chunk.chunk_kind.as_deref(),
             chunk.symbol_kind.as_deref(),
             &chunk.language,
@@ -1246,19 +1283,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let result =
             db::get_chunk(&conn, &chunk_id).map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(result.map(|row| ChunkData {
-            chunk_id: row.chunk_id,
-            content_hash: row.content_hash,
-            embedding_input_hash: row.embedding_input_hash,
-            file_path: row.file_path,
-            start_line: row.start_line,
-            end_line: row.end_line,
-            node_type: row.node_type,
-            name: row.name,
-            chunk_kind: row.chunk_kind,
-            symbol_kind: row.symbol_kind,
-            language: row.language,
-        }))
+        Ok(result.map(chunk_row_to_js))
     }
 
     #[napi]
@@ -1269,22 +1294,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let rows = db::get_chunks_by_file(&conn, &file_path)
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|row| ChunkData {
-                chunk_id: row.chunk_id,
-                content_hash: row.content_hash,
-                embedding_input_hash: row.embedding_input_hash,
-                file_path: row.file_path,
-                start_line: row.start_line,
-                end_line: row.end_line,
-                node_type: row.node_type,
-                name: row.name,
-                chunk_kind: row.chunk_kind,
-                symbol_kind: row.symbol_kind,
-                language: row.language,
-            })
-            .collect())
+        Ok(rows.into_iter().map(chunk_row_to_js).collect())
     }
 
     #[napi]
@@ -1299,22 +1309,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let rows = db::get_chunks_by_file_on_branch(&conn, &file_path, &branch)
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|row| ChunkData {
-                chunk_id: row.chunk_id,
-                content_hash: row.content_hash,
-                embedding_input_hash: row.embedding_input_hash,
-                file_path: row.file_path,
-                start_line: row.start_line,
-                end_line: row.end_line,
-                node_type: row.node_type,
-                name: row.name,
-                chunk_kind: row.chunk_kind,
-                symbol_kind: row.symbol_kind,
-                language: row.language,
-            })
-            .collect())
+        Ok(rows.into_iter().map(chunk_row_to_js).collect())
     }
 
     #[napi]
@@ -1377,6 +1372,7 @@ impl Database {
                 end_line: row.end_line,
                 node_type: row.node_type,
                 name: row.name,
+                symbol_aliases: row.symbol_aliases,
                 chunk_kind: row.chunk_kind,
                 symbol_kind: row.symbol_kind,
                 language: row.language,
@@ -1392,22 +1388,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let rows =
             db::get_chunks_by_name(&conn, &name).map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|row| ChunkData {
-                chunk_id: row.chunk_id,
-                content_hash: row.content_hash,
-                embedding_input_hash: row.embedding_input_hash,
-                file_path: row.file_path,
-                start_line: row.start_line,
-                end_line: row.end_line,
-                node_type: row.node_type,
-                name: row.name,
-                chunk_kind: row.chunk_kind,
-                symbol_kind: row.symbol_kind,
-                language: row.language,
-            })
-            .collect())
+        Ok(rows.into_iter().map(chunk_row_to_js).collect())
     }
 
     #[napi]
@@ -1418,22 +1399,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let rows = db::get_chunks_by_name_ci(&conn, &name)
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|row| ChunkData {
-                chunk_id: row.chunk_id,
-                content_hash: row.content_hash,
-                embedding_input_hash: row.embedding_input_hash,
-                file_path: row.file_path,
-                start_line: row.start_line,
-                end_line: row.end_line,
-                node_type: row.node_type,
-                name: row.name,
-                chunk_kind: row.chunk_kind,
-                symbol_kind: row.symbol_kind,
-                language: row.language,
-            })
-            .collect())
+        Ok(rows.into_iter().map(chunk_row_to_js).collect())
     }
 
     #[napi]
@@ -1478,6 +1444,7 @@ impl Database {
                 end_line: row.end_line,
                 node_type: row.node_type,
                 name: row.name,
+                symbol_aliases: row.symbol_aliases,
                 chunk_kind: row.chunk_kind,
                 symbol_kind: row.symbol_kind,
                 language: row.language,
@@ -1544,6 +1511,7 @@ impl Database {
                 end_line: c.end_line,
                 node_type: c.node_type,
                 name: c.name,
+                symbol_aliases: c.symbol_aliases,
                 chunk_kind: c.chunk_kind,
                 symbol_kind: c.symbol_kind,
                 language: c.language,
@@ -2107,6 +2075,7 @@ impl Database {
             id: symbol.id,
             file_path: symbol.file_path,
             name: symbol.name,
+            symbol_aliases: symbol.symbol_aliases,
             kind: symbol.kind,
             start_line: symbol.start_line,
             start_col: symbol.start_col,
@@ -2129,6 +2098,7 @@ impl Database {
                 id: s.id,
                 file_path: s.file_path,
                 name: s.name,
+                symbol_aliases: s.symbol_aliases,
                 kind: s.kind,
                 start_line: s.start_line,
                 start_col: s.start_col,
@@ -2148,20 +2118,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let rows = db::get_symbols_by_file(&conn, &file_path)
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|r| SymbolData {
-                id: r.id,
-                file_path: r.file_path,
-                name: r.name,
-                kind: r.kind,
-                start_line: r.start_line,
-                start_col: r.start_col,
-                end_line: r.end_line,
-                end_col: r.end_col,
-                language: r.language,
-            })
-            .collect())
+        Ok(rows.into_iter().map(symbol_row_to_js).collect())
     }
 
     #[napi]
@@ -2176,20 +2133,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let rows = db::get_symbols_by_file_on_branch(&conn, &file_path, &branch)
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|r| SymbolData {
-                id: r.id,
-                file_path: r.file_path,
-                name: r.name,
-                kind: r.kind,
-                start_line: r.start_line,
-                start_col: r.start_col,
-                end_line: r.end_line,
-                end_col: r.end_col,
-                language: r.language,
-            })
-            .collect())
+        Ok(rows.into_iter().map(symbol_row_to_js).collect())
     }
 
     #[napi]
@@ -2200,17 +2144,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let row = db::get_symbol_by_id(&conn, &symbol_id)
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(row.map(|r| SymbolData {
-            id: r.id,
-            file_path: r.file_path,
-            name: r.name,
-            kind: r.kind,
-            start_line: r.start_line,
-            start_col: r.start_col,
-            end_line: r.end_line,
-            end_col: r.end_col,
-            language: r.language,
-        }))
+        Ok(row.map(symbol_row_to_js))
     }
 
     #[napi]
@@ -2225,17 +2159,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let row = db::get_symbol_by_id_on_branch(&conn, &symbol_id, &branch)
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(row.map(|r| SymbolData {
-            id: r.id,
-            file_path: r.file_path,
-            name: r.name,
-            kind: r.kind,
-            start_line: r.start_line,
-            start_col: r.start_col,
-            end_line: r.end_line,
-            end_col: r.end_col,
-            language: r.language,
-        }))
+        Ok(row.map(symbol_row_to_js))
     }
 
     #[napi]
@@ -2250,20 +2174,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let rows = db::get_symbols_by_ids_on_branch(&conn, &symbol_ids, &branch)
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|r| SymbolData {
-                id: r.id,
-                file_path: r.file_path,
-                name: r.name,
-                kind: r.kind,
-                start_line: r.start_line,
-                start_col: r.start_col,
-                end_line: r.end_line,
-                end_col: r.end_col,
-                language: r.language,
-            })
-            .collect())
+        Ok(rows.into_iter().map(symbol_row_to_js).collect())
     }
 
     #[napi]
@@ -2278,17 +2189,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let row = db::get_symbol_by_name(&conn, &name, &file_path)
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(row.map(|r| SymbolData {
-            id: r.id,
-            file_path: r.file_path,
-            name: r.name,
-            kind: r.kind,
-            start_line: r.start_line,
-            start_col: r.start_col,
-            end_line: r.end_line,
-            end_col: r.end_col,
-            language: r.language,
-        }))
+        Ok(row.map(symbol_row_to_js))
     }
 
     #[napi]
@@ -2304,17 +2205,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let row = db::get_symbol_by_name_on_branch(&conn, &name, &file_path, &branch)
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(row.map(|r| SymbolData {
-            id: r.id,
-            file_path: r.file_path,
-            name: r.name,
-            kind: r.kind,
-            start_line: r.start_line,
-            start_col: r.start_col,
-            end_line: r.end_line,
-            end_col: r.end_col,
-            language: r.language,
-        }))
+        Ok(row.map(symbol_row_to_js))
     }
 
     #[napi]
@@ -2325,20 +2216,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let rows =
             db::get_symbols_by_name(&conn, &name).map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|r| SymbolData {
-                id: r.id,
-                file_path: r.file_path,
-                name: r.name,
-                kind: r.kind,
-                start_line: r.start_line,
-                start_col: r.start_col,
-                end_line: r.end_line,
-                end_col: r.end_col,
-                language: r.language,
-            })
-            .collect())
+        Ok(rows.into_iter().map(symbol_row_to_js).collect())
     }
 
     #[napi]
@@ -2353,20 +2231,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let rows = db::get_symbols_by_name_on_branch(&conn, &name, &branch)
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|r| SymbolData {
-                id: r.id,
-                file_path: r.file_path,
-                name: r.name,
-                kind: r.kind,
-                start_line: r.start_line,
-                start_col: r.start_col,
-                end_line: r.end_line,
-                end_col: r.end_col,
-                language: r.language,
-            })
-            .collect())
+        Ok(rows.into_iter().map(symbol_row_to_js).collect())
     }
 
     #[napi]
@@ -2381,20 +2246,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let rows = db::get_symbols_by_names_on_branch(&conn, &names, &branch)
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|r| SymbolData {
-                id: r.id,
-                file_path: r.file_path,
-                name: r.name,
-                kind: r.kind,
-                start_line: r.start_line,
-                start_col: r.start_col,
-                end_line: r.end_line,
-                end_col: r.end_col,
-                language: r.language,
-            })
-            .collect())
+        Ok(rows.into_iter().map(symbol_row_to_js).collect())
     }
 
     #[napi]
@@ -2405,20 +2257,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let rows = db::get_symbols_by_name_ci(&conn, &name)
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|r| SymbolData {
-                id: r.id,
-                file_path: r.file_path,
-                name: r.name,
-                kind: r.kind,
-                start_line: r.start_line,
-                start_col: r.start_col,
-                end_line: r.end_line,
-                end_col: r.end_col,
-                language: r.language,
-            })
-            .collect())
+        Ok(rows.into_iter().map(symbol_row_to_js).collect())
     }
 
     #[napi]
@@ -2433,20 +2272,7 @@ impl Database {
             .map_err(|e| Error::from_reason(e.to_string()))?;
         let rows = db::get_symbols_by_name_ci_on_branch(&conn, &name, &branch)
             .map_err(|e| Error::from_reason(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|r| SymbolData {
-                id: r.id,
-                file_path: r.file_path,
-                name: r.name,
-                kind: r.kind,
-                start_line: r.start_line,
-                start_col: r.start_col,
-                end_line: r.end_line,
-                end_col: r.end_col,
-                language: r.language,
-            })
-            .collect())
+        Ok(rows.into_iter().map(symbol_row_to_js).collect())
     }
 
     #[napi]

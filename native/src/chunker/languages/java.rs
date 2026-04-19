@@ -100,6 +100,7 @@ fn classify_java_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             let is_test = has_test_annotation(node, source);
             Some(SemanticInfo {
                 symbol_name: extract_name_by_fields(node, source, &["name"]),
+                symbol_aliases: Vec::new(),
                 symbol_kind: Some(if is_test {
                     SymbolKind::Test
                 } else {
@@ -117,6 +118,7 @@ fn classify_java_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         "class_declaration" | "annotation_type_declaration" | "record_declaration" => {
             Some(SemanticInfo {
                 symbol_name: extract_name_by_fields(node, source, &["name"]),
+                symbol_aliases: Vec::new(),
                 symbol_kind: Some(SymbolKind::Class),
                 chunk_kind: ChunkKind::Code,
                 coarse_eligible: true,
@@ -125,6 +127,7 @@ fn classify_java_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }
         "enum_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Type),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -132,6 +135,7 @@ fn classify_java_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "interface_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Interface),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -139,6 +143,7 @@ fn classify_java_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "static_initializer" => Some(SemanticInfo {
             symbol_name: Some("<static_init>".to_string()),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Block),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,

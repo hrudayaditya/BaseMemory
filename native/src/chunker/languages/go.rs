@@ -30,6 +30,7 @@ fn classify_go_function(node: Node<'_>, source: &str, is_method: bool) -> Semant
 
     SemanticInfo {
         symbol_name: name,
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(if is_test {
             SymbolKind::Test
         } else if is_method {
@@ -84,6 +85,7 @@ fn classify_go_type_spec(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
 
     Some(SemanticInfo {
         symbol_name: extract_name_by_fields(node, source, &["name"]),
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(symbol_kind),
         chunk_kind: ChunkKind::Code,
         coarse_eligible: matches!(symbol_kind, SymbolKind::Struct | SymbolKind::Interface),
@@ -98,6 +100,7 @@ fn classify_go_named_value_spec(
 ) -> Option<SemanticInfo> {
     Some(SemanticInfo {
         symbol_name: first_go_name(node, source),
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(symbol_kind),
         chunk_kind: ChunkKind::Code,
         coarse_eligible: false,

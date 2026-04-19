@@ -238,8 +238,8 @@
       "expected": {
         "filePath": "native/src/db.rs",
         "symbol": "retry_busy_sqlite",
-        "startLine": 45,
-        "endLine": 63
+        "startLine": 67,
+        "endLine": 83
       }
     },
     {

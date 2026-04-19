@@ -64,6 +64,7 @@ fn classify_ruby_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     match node.kind() {
         "method" | "singleton_method" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Method),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
@@ -71,6 +72,7 @@ fn classify_ruby_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "class" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Class),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -78,6 +80,7 @@ fn classify_ruby_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "module" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Module),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -96,6 +99,7 @@ fn classify_ruby_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
 
             Some(SemanticInfo {
                 symbol_name: Some(method_name.to_string()),
+                symbol_aliases: Vec::new(),
                 symbol_kind: Some(SymbolKind::Block),
                 chunk_kind: ChunkKind::Code,
                 coarse_eligible: false,
@@ -110,6 +114,7 @@ fn classify_bash_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     match node.kind() {
         "function_definition" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Function),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,

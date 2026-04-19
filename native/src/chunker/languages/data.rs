@@ -30,6 +30,7 @@ fn classify_json_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             symbol_name: first_named_child_of_kind(node, "string").and_then(|key| {
                 node_text(key, source).map(|text| text.trim_matches('"').to_string())
             }),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Block),
             chunk_kind: ChunkKind::Config,
             coarse_eligible: false,
@@ -37,6 +38,7 @@ fn classify_json_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "object" | "array" => Some(SemanticInfo {
             symbol_name: None,
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Module),
             chunk_kind: ChunkKind::Config,
             coarse_eligible: true,
@@ -50,6 +52,7 @@ fn classify_toml_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     match node.kind() {
         "table" | "table_array_element" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Module),
             chunk_kind: ChunkKind::Config,
             coarse_eligible: true,
@@ -57,6 +60,7 @@ fn classify_toml_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "pair" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["key"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Block),
             chunk_kind: ChunkKind::Config,
             coarse_eligible: false,
@@ -77,6 +81,7 @@ fn classify_yaml_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
                     .and_then(|child| node_text(child, source).map(|text| text.trim().to_string()));
                 key
             }),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Block),
             chunk_kind: ChunkKind::Config,
             coarse_eligible: false,
@@ -85,6 +90,7 @@ fn classify_yaml_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         "block_sequence" | "flow_sequence" | "block_mapping" | "flow_mapping" => {
             Some(SemanticInfo {
                 symbol_name: None,
+                symbol_aliases: Vec::new(),
                 symbol_kind: Some(SymbolKind::Module),
                 chunk_kind: ChunkKind::Config,
                 coarse_eligible: true,

@@ -81,6 +81,7 @@ fn classify_rust_function(node: Node<'_>, source: &str) -> SemanticInfo {
 
     SemanticInfo {
         symbol_name: extract_name_by_fields(node, source, &["name"]),
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(symbol_kind),
         chunk_kind,
         coarse_eligible: false,
@@ -96,6 +97,7 @@ fn classify_named_rust_item(
 ) -> Option<SemanticInfo> {
     Some(SemanticInfo {
         symbol_name: extract_name_by_fields(node, source, &["name"]),
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(symbol_kind),
         chunk_kind: ChunkKind::Code,
         coarse_eligible,
@@ -142,6 +144,7 @@ fn classify_rust_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }
         "impl_item" => Some(SemanticInfo {
             symbol_name: impl_item_name(node, source),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Block),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,

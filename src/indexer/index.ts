@@ -538,6 +538,7 @@ interface ParsedChunkCandidate {
   endByte: number;
   chunkType: ChunkMetadata["chunkType"];
   name?: string;
+  symbolAliases: string[];
   chunkKind?: string;
   symbolKind?: string;
   language: string;
@@ -859,7 +860,7 @@ export function chunkTypeBoost(chunkType: string): number {
 }
 
 function getInterfaceTypePenalty(taskType: SearchTaskType, chunkType: string): number {
-  if (taskType !== "definition" && taskType !== "bug") {
+  if (taskType !== "definition") {
     return 0;
   }
 
@@ -877,12 +878,11 @@ function shouldSuppressUnnamedSiblingCandidate(candidate: RankedCandidate): bool
     return false;
   }
 
-  if (name.length === 0 || name.includes("<default>")) {
+  if (name.length === 0 || name === "<default>") {
     return true;
   }
 
-  const parsedPath = path.parse(candidate.metadata.filePath);
-  return name.toLowerCase() === parsedPath.name.toLowerCase();
+  return name.startsWith("<") && name.endsWith(">");
 }
 
 function resolveRetrievalCandidateLimit(limit: number): number {
@@ -3276,6 +3276,7 @@ export class Indexer {
         endLine: metadata.endLine,
         nodeType: metadata.chunkType,
         name: metadata.name,
+        symbolAliases: [],
         chunkKind: undefined,
         symbolKind: undefined,
         language: metadata.language,
@@ -3497,6 +3498,7 @@ export class Indexer {
             endByte: chunk.endByte,
             chunkType: mapSemanticChunkType(chunk.symbolKind),
             name: chunk.symbolName,
+            symbolAliases: chunk.symbolAliases ?? [],
             chunkKind: chunk.chunkKind,
             symbolKind: chunk.symbolKind,
             language: chunk.language,
@@ -3544,6 +3546,7 @@ export class Indexer {
           id: symbolId,
           filePath: parsed.path,
           name: chunk.name,
+          symbolAliases: chunk.symbolAliases ?? [],
           kind: chunk.chunkType,
           startLine: chunk.startLine,
           startCol: 0,
@@ -3557,9 +3560,12 @@ export class Indexer {
 
       const symbolsByName = new Map<string, SymbolData[]>();
       for (const symbol of fileSymbols) {
-        const existing = symbolsByName.get(symbol.name) ?? [];
-        existing.push(symbol);
-        symbolsByName.set(symbol.name, existing);
+        const symbolNames = [symbol.name, ...(symbol.symbolAliases ?? [])];
+        for (const symbolName of symbolNames) {
+          const existing = symbolsByName.get(symbolName) ?? [];
+          existing.push(symbol);
+          symbolsByName.set(symbolName, existing);
+        }
       }
 
       const fileLanguage = parsed.chunks[0]?.language;

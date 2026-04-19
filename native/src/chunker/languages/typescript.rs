@@ -154,6 +154,7 @@ fn classify_call_wrapper(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
 
     Some(SemanticInfo {
         symbol_name: Some(symbol_name),
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(symbol_kind),
         chunk_kind: ChunkKind::Code,
         coarse_eligible: false,
@@ -168,6 +169,7 @@ fn classify_constant_declarator(node: Node<'_>, source: &str) -> Option<Semantic
 
     Some(SemanticInfo {
         symbol_name: Some(symbol_name),
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(SymbolKind::Constant),
         chunk_kind: ChunkKind::Code,
         coarse_eligible,
@@ -200,6 +202,7 @@ fn classify_export_clause(node: Node<'_>, source: &str) -> Option<SemanticInfo> 
 
     Some(SemanticInfo {
         symbol_name: Some(display),
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(SymbolKind::Module),
         chunk_kind: ChunkKind::Code,
         coarse_eligible: false,
@@ -222,6 +225,7 @@ fn classify_internal_module(node: Node<'_>, source: &str) -> Option<SemanticInfo
 
     Some(SemanticInfo {
         symbol_name: Some(symbol_name),
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(SymbolKind::Module),
         chunk_kind: ChunkKind::Code,
         coarse_eligible: true,
@@ -235,6 +239,7 @@ fn classify_export_default_expression(node: Node<'_>, source: &str) -> Option<Se
     match node.kind() {
         "arrow_function" | "function" | "function_expression" => Some(SemanticInfo {
             symbol_name,
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Function),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
@@ -242,6 +247,7 @@ fn classify_export_default_expression(node: Node<'_>, source: &str) -> Option<Se
         }),
         "class" => Some(SemanticInfo {
             symbol_name,
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Module),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -249,6 +255,7 @@ fn classify_export_default_expression(node: Node<'_>, source: &str) -> Option<Se
         }),
         "call_expression" => Some(SemanticInfo {
             symbol_name,
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Module),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
@@ -256,6 +263,7 @@ fn classify_export_default_expression(node: Node<'_>, source: &str) -> Option<Se
         }),
         "identifier" | "member_expression" => Some(SemanticInfo {
             symbol_name,
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Module),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
@@ -263,6 +271,7 @@ fn classify_export_default_expression(node: Node<'_>, source: &str) -> Option<Se
         }),
         _ => classify_constant_expression(node, source).map(|coarse_eligible| SemanticInfo {
             symbol_name,
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Constant),
             chunk_kind: ChunkKind::Code,
             coarse_eligible,
@@ -407,6 +416,7 @@ fn classify_variable_declarator(node: Node<'_>, source: &str) -> Option<Semantic
     match value.kind() {
         "arrow_function" | "function" | "function_expression" => Some(SemanticInfo {
             symbol_name,
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Function),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
@@ -414,6 +424,7 @@ fn classify_variable_declarator(node: Node<'_>, source: &str) -> Option<Semantic
         }),
         "class" | "class_declaration" => Some(SemanticInfo {
             symbol_name,
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Class),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -450,6 +461,7 @@ fn classify_test_expression(node: Node<'_>, source: &str) -> Option<SemanticInfo
 
     Some(SemanticInfo {
         symbol_name: label,
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(SymbolKind::Test),
         chunk_kind: ChunkKind::Test,
         coarse_eligible: false,
@@ -633,6 +645,7 @@ fn classify_commonjs_assignment(node: Node<'_>, source: &str) -> Option<Semantic
     if object == "module" && property == "exports" {
         return Some(SemanticInfo {
             symbol_name: Some("<module.exports>".to_string()),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(if is_constant_export {
                 SymbolKind::Constant
             } else {
@@ -647,6 +660,7 @@ fn classify_commonjs_assignment(node: Node<'_>, source: &str) -> Option<Semantic
     if object == "exports" {
         return Some(SemanticInfo {
             symbol_name: Some(property),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(if is_constant_export {
                 SymbolKind::Constant
             } else {
@@ -677,6 +691,7 @@ fn classify_ts_js_node_impl(
                 .and_then(|name| delegation_target_for_function_like(node, source, name));
             Some(SemanticInfo {
                 symbol_name,
+                symbol_aliases: Vec::new(),
                 symbol_kind: Some(SymbolKind::Function),
                 chunk_kind: ChunkKind::Code,
                 coarse_eligible: false,
@@ -690,6 +705,7 @@ fn classify_ts_js_node_impl(
             }
             Some(SemanticInfo {
                 symbol_name,
+                symbol_aliases: Vec::new(),
                 symbol_kind: Some(SymbolKind::Method),
                 chunk_kind: ChunkKind::Code,
                 coarse_eligible: false,
@@ -698,6 +714,7 @@ fn classify_ts_js_node_impl(
         }
         "class_declaration" | "abstract_class_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Class),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -705,6 +722,7 @@ fn classify_ts_js_node_impl(
         }),
         "interface_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Interface),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -712,6 +730,7 @@ fn classify_ts_js_node_impl(
         }),
         "type_alias_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Type),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
@@ -719,6 +738,7 @@ fn classify_ts_js_node_impl(
         }),
         "enum_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Type),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,

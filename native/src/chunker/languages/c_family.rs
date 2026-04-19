@@ -102,6 +102,7 @@ fn classify_csharp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             let is_test = has_test_attribute_csharp(node, source);
             Some(SemanticInfo {
                 symbol_name: extract_name_by_fields(node, source, &["name"]),
+                symbol_aliases: Vec::new(),
                 symbol_kind: Some(if is_test {
                     SymbolKind::Test
                 } else {
@@ -122,6 +123,7 @@ fn classify_csharp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             } else {
                 extract_name_by_fields(node, source, &["name"])
             },
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Method),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
@@ -129,6 +131,7 @@ fn classify_csharp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "namespace_declaration" | "file_scoped_namespace_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Module),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -136,6 +139,7 @@ fn classify_csharp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "class_declaration" | "record_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Class),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -143,6 +147,7 @@ fn classify_csharp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "enum_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Type),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -150,6 +155,7 @@ fn classify_csharp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "interface_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Interface),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -157,6 +163,7 @@ fn classify_csharp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "struct_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Struct),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -164,6 +171,7 @@ fn classify_csharp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "global_statement" => Some(SemanticInfo {
             symbol_name: Some("<top-level>".to_string()),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Block),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
@@ -177,6 +185,7 @@ fn classify_c_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     match node.kind() {
         "function_definition" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["declarator", "name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Function),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
@@ -184,6 +193,7 @@ fn classify_c_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "struct_specifier" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Struct),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -191,6 +201,7 @@ fn classify_c_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "enum_specifier" | "type_definition" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Type),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -204,6 +215,7 @@ fn classify_cpp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     match node.kind() {
         "function_definition" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["declarator", "name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Function),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
@@ -211,6 +223,7 @@ fn classify_cpp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "class_specifier" | "template_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Class),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -218,6 +231,7 @@ fn classify_cpp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "enum_specifier" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Type),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -225,6 +239,7 @@ fn classify_cpp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "struct_specifier" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Struct),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
@@ -239,6 +254,7 @@ fn classify_cpp_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
                     .and_then(|child| node_text(child, source).map(ToString::to_string));
                 namespace
             }),
+            symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Module),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,

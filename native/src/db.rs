@@ -14,7 +14,7 @@ pub enum DbError {
 pub type DbResult<T> = Result<T, DbError>;
 
 /// Schema version for migrations
-const SCHEMA_VERSION: i32 = 15;
+const SCHEMA_VERSION: i32 = 16;
 
 pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const INIT_DB_BUSY_RETRY_ATTEMPTS: usize = 2;
@@ -23,6 +23,28 @@ const INIT_DB_BUSY_RETRY_BASE_DELAY_MS: u64 = 50;
 /// Maximum number of SQL bind parameters per query.
 /// SQLite defaults to 999 (SQLITE_MAX_VARIABLE_NUMBER). We use 900 to stay safely under.
 const SQL_BIND_PARAM_BATCH_SIZE: usize = 900;
+
+fn serialize_symbol_aliases(aliases: &[String]) -> String {
+    aliases.join(",")
+}
+
+fn deserialize_symbol_aliases(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn alias_match_sql(column: &str, case_insensitive: bool) -> String {
+    if case_insensitive {
+        format!(
+            "(',' || LOWER(COALESCE({column}, '')) || ',') LIKE ('%,' || LOWER(?) || ',%')"
+        )
+    } else {
+        format!("(',' || COALESCE({column}, '') || ',') LIKE ('%,' || ? || ',%')")
+    }
+}
 
 pub fn is_sqlite_busy_error(error: &rusqlite::Error) -> bool {
     matches!(
@@ -665,6 +687,20 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> DbResult<()> {
         )?;
     }
 
+    if from_version < 16 {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE chunks ADD COLUMN symbol_aliases TEXT NOT NULL DEFAULT '';
+            ALTER TABLE symbols ADD COLUMN symbol_aliases TEXT NOT NULL DEFAULT '';
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1249,10 +1285,12 @@ pub fn upsert_chunk(
     end_line: u32,
     node_type: Option<&str>,
     name: Option<&str>,
+    symbol_aliases: &[String],
     chunk_kind: Option<&str>,
     symbol_kind: Option<&str>,
     language: &str,
 ) -> DbResult<()> {
+    let symbol_aliases = serialize_symbol_aliases(symbol_aliases);
     conn.execute(
         r#"
         INSERT INTO chunks (
@@ -1264,11 +1302,12 @@ pub fn upsert_chunk(
             end_line,
             node_type,
             name,
+            symbol_aliases,
             chunk_kind,
             symbol_kind,
             language
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chunk_id) DO UPDATE SET
             content_hash = excluded.content_hash,
             embedding_input_hash = excluded.embedding_input_hash,
@@ -1277,6 +1316,7 @@ pub fn upsert_chunk(
             end_line = excluded.end_line,
             node_type = excluded.node_type,
             name = excluded.name,
+            symbol_aliases = excluded.symbol_aliases,
             chunk_kind = excluded.chunk_kind,
             symbol_kind = excluded.symbol_kind,
             language = excluded.language
@@ -1290,6 +1330,7 @@ pub fn upsert_chunk(
             end_line,
             node_type,
             name,
+            symbol_aliases,
             chunk_kind,
             symbol_kind,
             language
@@ -1314,14 +1355,15 @@ pub fn upsert_chunks_batch(conn: &mut Connection, chunks: &[ChunkRow]) -> DbResu
                 embedding_input_hash,
                 file_path,
                 start_line,
-                end_line,
-                node_type,
-                name,
-                chunk_kind,
-                symbol_kind,
-                language
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            end_line,
+            node_type,
+            name,
+            symbol_aliases,
+            chunk_kind,
+            symbol_kind,
+            language
+        )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(chunk_id) DO UPDATE SET
                 content_hash = excluded.content_hash,
                 embedding_input_hash = excluded.embedding_input_hash,
@@ -1330,6 +1372,7 @@ pub fn upsert_chunks_batch(conn: &mut Connection, chunks: &[ChunkRow]) -> DbResu
                 end_line = excluded.end_line,
                 node_type = excluded.node_type,
                 name = excluded.name,
+                symbol_aliases = excluded.symbol_aliases,
                 chunk_kind = excluded.chunk_kind,
                 symbol_kind = excluded.symbol_kind,
                 language = excluded.language
@@ -1346,6 +1389,7 @@ pub fn upsert_chunks_batch(conn: &mut Connection, chunks: &[ChunkRow]) -> DbResu
                 chunk.end_line,
                 chunk.node_type,
                 chunk.name,
+                serialize_symbol_aliases(&chunk.symbol_aliases),
                 chunk.chunk_kind,
                 chunk.symbol_kind,
                 chunk.language
@@ -1361,25 +1405,11 @@ pub fn get_chunk(conn: &Connection, chunk_id: &str) -> DbResult<Option<ChunkRow>
     let result = conn
         .query_row(
             r#"
-            SELECT chunk_id, content_hash, embedding_input_hash, file_path, start_line, end_line, node_type, name, chunk_kind, symbol_kind, language
+            SELECT chunk_id, content_hash, embedding_input_hash, file_path, start_line, end_line, node_type, name, symbol_aliases, chunk_kind, symbol_kind, language
             FROM chunks WHERE chunk_id = ?
             "#,
             params![chunk_id],
-            |row| {
-                Ok(ChunkRow {
-                    chunk_id: row.get(0)?,
-                    content_hash: row.get(1)?,
-                    embedding_input_hash: row.get(2)?,
-                    file_path: row.get(3)?,
-                    start_line: row.get(4)?,
-                    end_line: row.get(5)?,
-                    node_type: row.get(6)?,
-                    name: row.get(7)?,
-                    chunk_kind: row.get(8)?,
-                    symbol_kind: row.get(9)?,
-                    language: row.get(10)?,
-                })
-            },
+            map_chunk_row,
         )
         .optional()?;
     Ok(result)
@@ -1389,27 +1419,13 @@ pub fn get_chunk(conn: &Connection, chunk_id: &str) -> DbResult<Option<ChunkRow>
 pub fn get_chunks_by_file(conn: &Connection, file_path: &str) -> DbResult<Vec<ChunkRow>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT chunk_id, content_hash, embedding_input_hash, file_path, start_line, end_line, node_type, name, chunk_kind, symbol_kind, language
+        SELECT chunk_id, content_hash, embedding_input_hash, file_path, start_line, end_line, node_type, name, symbol_aliases, chunk_kind, symbol_kind, language
         FROM chunks WHERE file_path = ?
         ORDER BY start_line
         "#,
     )?;
 
-    let rows = stmt.query_map(params![file_path], |row| {
-        Ok(ChunkRow {
-            chunk_id: row.get(0)?,
-            content_hash: row.get(1)?,
-            embedding_input_hash: row.get(2)?,
-            file_path: row.get(3)?,
-            start_line: row.get(4)?,
-            end_line: row.get(5)?,
-            node_type: row.get(6)?,
-            name: row.get(7)?,
-            chunk_kind: row.get(8)?,
-            symbol_kind: row.get(9)?,
-            language: row.get(10)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![file_path], map_chunk_row)?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -1426,7 +1442,7 @@ pub fn get_chunks_by_file_on_branch(
 ) -> DbResult<Vec<ChunkRow>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT c.chunk_id, c.content_hash, c.embedding_input_hash, c.file_path, c.start_line, c.end_line, c.node_type, c.name, c.chunk_kind, c.symbol_kind, c.language
+        SELECT c.chunk_id, c.content_hash, c.embedding_input_hash, c.file_path, c.start_line, c.end_line, c.node_type, c.name, c.symbol_aliases, c.chunk_kind, c.symbol_kind, c.language
         FROM chunks c
         INNER JOIN branch_chunks bc ON bc.chunk_id = c.chunk_id
         WHERE c.file_path = ? AND bc.branch = ?
@@ -1434,21 +1450,7 @@ pub fn get_chunks_by_file_on_branch(
         "#,
     )?;
 
-    let rows = stmt.query_map(params![file_path, branch], |row| {
-        Ok(ChunkRow {
-            chunk_id: row.get(0)?,
-            content_hash: row.get(1)?,
-            embedding_input_hash: row.get(2)?,
-            file_path: row.get(3)?,
-            start_line: row.get(4)?,
-            end_line: row.get(5)?,
-            node_type: row.get(6)?,
-            name: row.get(7)?,
-            chunk_kind: row.get(8)?,
-            symbol_kind: row.get(9)?,
-            language: row.get(10)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![file_path, branch], map_chunk_row)?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -1553,28 +1555,18 @@ pub fn get_chunk_ids_by_filters_for_branch(
 }
 
 pub fn get_chunks_by_name(conn: &Connection, name: &str) -> DbResult<Vec<ChunkRow>> {
+    let alias_match = alias_match_sql("symbol_aliases", false);
     let mut stmt = conn.prepare(
-        r#"
-        SELECT chunk_id, content_hash, embedding_input_hash, file_path, start_line, end_line, node_type, name, chunk_kind, symbol_kind, language
-        FROM chunks WHERE name = ?
+        &format!(
+            r#"
+        SELECT chunk_id, content_hash, embedding_input_hash, file_path, start_line, end_line, node_type, name, symbol_aliases, chunk_kind, symbol_kind, language
+        FROM chunks WHERE name = ? OR {}
         "#,
+            alias_match
+        ),
     )?;
 
-    let rows = stmt.query_map(params![name], |row| {
-        Ok(ChunkRow {
-            chunk_id: row.get(0)?,
-            content_hash: row.get(1)?,
-            embedding_input_hash: row.get(2)?,
-            file_path: row.get(3)?,
-            start_line: row.get(4)?,
-            end_line: row.get(5)?,
-            node_type: row.get(6)?,
-            name: row.get(7)?,
-            chunk_kind: row.get(8)?,
-            symbol_kind: row.get(9)?,
-            language: row.get(10)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![name, name], map_chunk_row)?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -1584,28 +1576,18 @@ pub fn get_chunks_by_name(conn: &Connection, name: &str) -> DbResult<Vec<ChunkRo
 }
 
 pub fn get_chunks_by_name_ci(conn: &Connection, name: &str) -> DbResult<Vec<ChunkRow>> {
+    let alias_match = alias_match_sql("symbol_aliases", true);
     let mut stmt = conn.prepare(
-        r#"
-        SELECT chunk_id, content_hash, embedding_input_hash, file_path, start_line, end_line, node_type, name, chunk_kind, symbol_kind, language
-        FROM chunks WHERE lower(name) = lower(?)
+        &format!(
+            r#"
+        SELECT chunk_id, content_hash, embedding_input_hash, file_path, start_line, end_line, node_type, name, symbol_aliases, chunk_kind, symbol_kind, language
+        FROM chunks WHERE lower(name) = lower(?) OR {}
         "#,
+            alias_match
+        ),
     )?;
 
-    let rows = stmt.query_map(params![name], |row| {
-        Ok(ChunkRow {
-            chunk_id: row.get(0)?,
-            content_hash: row.get(1)?,
-            embedding_input_hash: row.get(2)?,
-            file_path: row.get(3)?,
-            start_line: row.get(4)?,
-            end_line: row.get(5)?,
-            node_type: row.get(6)?,
-            name: row.get(7)?,
-            chunk_kind: row.get(8)?,
-            symbol_kind: row.get(9)?,
-            language: row.get(10)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![name, name], map_chunk_row)?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -1630,6 +1612,7 @@ pub struct ChunkRow {
     pub end_line: u32,
     pub node_type: Option<String>,
     pub name: Option<String>,
+    pub symbol_aliases: Vec<String>,
     pub chunk_kind: Option<String>,
     pub symbol_kind: Option<String>,
     pub language: String,
@@ -1651,6 +1634,7 @@ pub struct ChunkMetadataRow {
     pub end_line: u32,
     pub node_type: Option<String>,
     pub name: Option<String>,
+    pub symbol_aliases: Vec<String>,
     pub chunk_kind: Option<String>,
     pub symbol_kind: Option<String>,
     pub language: String,
@@ -1667,6 +1651,7 @@ pub struct SymbolChunkRow {
     pub end_line: u32,
     pub node_type: Option<String>,
     pub name: Option<String>,
+    pub symbol_aliases: Vec<String>,
     pub chunk_kind: Option<String>,
     pub symbol_kind: Option<String>,
     pub language: String,
@@ -1722,7 +1707,7 @@ pub fn get_chunk_metadata_batch(
     for chunk in chunk_ids.chunks(SQL_BIND_PARAM_BATCH_SIZE) {
         let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let query = format!(
-            "SELECT chunk_id, embedding_input_hash, file_path, start_line, end_line, node_type, name, chunk_kind, symbol_kind, language FROM chunks WHERE chunk_id IN ({})",
+            "SELECT chunk_id, embedding_input_hash, file_path, start_line, end_line, node_type, name, symbol_aliases, chunk_kind, symbol_kind, language FROM chunks WHERE chunk_id IN ({})",
             placeholders
         );
 
@@ -1731,6 +1716,7 @@ pub fn get_chunk_metadata_batch(
             chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
 
         let rows = stmt.query_map(params.as_slice(), |row| {
+            let symbol_aliases: String = row.get(7)?;
             Ok(ChunkMetadataRow {
                 chunk_id: row.get(0)?,
                 embedding_input_hash: row.get(1)?,
@@ -1739,9 +1725,10 @@ pub fn get_chunk_metadata_batch(
                 end_line: row.get(4)?,
                 node_type: row.get(5)?,
                 name: row.get(6)?,
-                chunk_kind: row.get(7)?,
-                symbol_kind: row.get(8)?,
-                language: row.get(9)?,
+                symbol_aliases: deserialize_symbol_aliases(&symbol_aliases),
+                chunk_kind: row.get(8)?,
+                symbol_kind: row.get(9)?,
+                language: row.get(10)?,
             })
         })?;
 
@@ -1792,6 +1779,7 @@ pub fn get_chunks_for_symbols_batch(
                     c.end_line,
                     c.node_type,
                     c.name,
+                    c.symbol_aliases,
                     c.chunk_kind,
                     c.symbol_kind,
                     c.language,
@@ -1823,6 +1811,7 @@ pub fn get_chunks_for_symbols_batch(
                 end_line,
                 node_type,
                 name,
+                symbol_aliases,
                 chunk_kind,
                 symbol_kind,
                 language
@@ -1847,6 +1836,7 @@ pub fn get_chunks_for_symbols_batch(
         }
 
         let rows = stmt.query_map(params.as_slice(), |row| {
+            let symbol_aliases: String = row.get(9)?;
             Ok(SymbolChunkRow {
                 symbol_id: row.get(0)?,
                 chunk_id: row.get(1)?,
@@ -1857,9 +1847,10 @@ pub fn get_chunks_for_symbols_batch(
                 end_line: row.get(6)?,
                 node_type: row.get(7)?,
                 name: row.get(8)?,
-                chunk_kind: row.get(9)?,
-                symbol_kind: row.get(10)?,
-                language: row.get(11)?,
+                symbol_aliases: deserialize_symbol_aliases(&symbol_aliases),
+                chunk_kind: row.get(10)?,
+                symbol_kind: row.get(11)?,
+                language: row.get(12)?,
             })
         })?;
 
@@ -2030,12 +2021,47 @@ pub struct SymbolRow {
     pub id: String,
     pub file_path: String,
     pub name: String,
+    pub symbol_aliases: Vec<String>,
     pub kind: String,
     pub start_line: u32,
     pub start_col: u32,
     pub end_line: u32,
     pub end_col: u32,
     pub language: String,
+}
+
+fn map_chunk_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRow> {
+    let symbol_aliases: String = row.get(8)?;
+    Ok(ChunkRow {
+        chunk_id: row.get(0)?,
+        content_hash: row.get(1)?,
+        embedding_input_hash: row.get(2)?,
+        file_path: row.get(3)?,
+        start_line: row.get(4)?,
+        end_line: row.get(5)?,
+        node_type: row.get(6)?,
+        name: row.get(7)?,
+        symbol_aliases: deserialize_symbol_aliases(&symbol_aliases),
+        chunk_kind: row.get(9)?,
+        symbol_kind: row.get(10)?,
+        language: row.get(11)?,
+    })
+}
+
+fn map_symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolRow> {
+    let symbol_aliases: String = row.get(3)?;
+    Ok(SymbolRow {
+        id: row.get(0)?,
+        file_path: row.get(1)?,
+        name: row.get(2)?,
+        symbol_aliases: deserialize_symbol_aliases(&symbol_aliases),
+        kind: row.get(4)?,
+        start_line: row.get(5)?,
+        start_col: row.get(6)?,
+        end_line: row.get(7)?,
+        end_col: row.get(8)?,
+        language: row.get(9)?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -2079,13 +2105,15 @@ pub struct CallEdgeFrontierBatch {
 /// Insert or update a symbol without deleting the existing row.
 /// Using REPLACE here would cascade-delete call edges for unchanged symbol ids.
 pub fn upsert_symbol(conn: &Connection, symbol: &SymbolRow) -> DbResult<()> {
+    let symbol_aliases = serialize_symbol_aliases(&symbol.symbol_aliases);
     conn.execute(
         r#"
-        INSERT INTO symbols (id, file_path, name, kind, start_line, start_col, end_line, end_col, language)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO symbols (id, file_path, name, symbol_aliases, kind, start_line, start_col, end_line, end_col, language)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             file_path = excluded.file_path,
             name = excluded.name,
+            symbol_aliases = excluded.symbol_aliases,
             kind = excluded.kind,
             start_line = excluded.start_line,
             start_col = excluded.start_col,
@@ -2097,6 +2125,7 @@ pub fn upsert_symbol(conn: &Connection, symbol: &SymbolRow) -> DbResult<()> {
             symbol.id,
             symbol.file_path,
             symbol.name,
+            symbol_aliases,
             symbol.kind,
             symbol.start_line,
             symbol.start_col,
@@ -2118,11 +2147,12 @@ pub fn upsert_symbols_batch(conn: &mut Connection, symbols: &[SymbolRow]) -> DbR
     {
         let mut stmt = tx.prepare(
             r#"
-            INSERT INTO symbols (id, file_path, name, kind, start_line, start_col, end_line, end_col, language)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO symbols (id, file_path, name, symbol_aliases, kind, start_line, start_col, end_line, end_col, language)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 file_path = excluded.file_path,
                 name = excluded.name,
+                symbol_aliases = excluded.symbol_aliases,
                 kind = excluded.kind,
                 start_line = excluded.start_line,
                 start_col = excluded.start_col,
@@ -2137,6 +2167,7 @@ pub fn upsert_symbols_batch(conn: &mut Connection, symbols: &[SymbolRow]) -> DbR
                 symbol.id,
                 symbol.file_path,
                 symbol.name,
+                serialize_symbol_aliases(&symbol.symbol_aliases),
                 symbol.kind,
                 symbol.start_line,
                 symbol.start_col,
@@ -2154,25 +2185,13 @@ pub fn upsert_symbols_batch(conn: &mut Connection, symbols: &[SymbolRow]) -> DbR
 pub fn get_symbols_by_file(conn: &Connection, file_path: &str) -> DbResult<Vec<SymbolRow>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT id, file_path, name, kind, start_line, start_col, end_line, end_col, language
+        SELECT id, file_path, name, symbol_aliases, kind, start_line, start_col, end_line, end_col, language
         FROM symbols WHERE file_path = ?
         ORDER BY start_line
         "#,
     )?;
 
-    let rows = stmt.query_map(params![file_path], |row| {
-        Ok(SymbolRow {
-            id: row.get(0)?,
-            file_path: row.get(1)?,
-            name: row.get(2)?,
-            kind: row.get(3)?,
-            start_line: row.get(4)?,
-            start_col: row.get(5)?,
-            end_line: row.get(6)?,
-            end_col: row.get(7)?,
-            language: row.get(8)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![file_path], map_symbol_row)?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -2189,7 +2208,7 @@ pub fn get_symbols_by_file_on_branch(
 ) -> DbResult<Vec<SymbolRow>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT s.id, s.file_path, s.name, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
+        SELECT s.id, s.file_path, s.name, s.symbol_aliases, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
         FROM symbols s
         INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
         WHERE s.file_path = ? AND bs.branch = ?
@@ -2197,19 +2216,7 @@ pub fn get_symbols_by_file_on_branch(
         "#,
     )?;
 
-    let rows = stmt.query_map(params![file_path, branch], |row| {
-        Ok(SymbolRow {
-            id: row.get(0)?,
-            file_path: row.get(1)?,
-            name: row.get(2)?,
-            kind: row.get(3)?,
-            start_line: row.get(4)?,
-            start_col: row.get(5)?,
-            end_line: row.get(6)?,
-            end_col: row.get(7)?,
-            language: row.get(8)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![file_path, branch], map_symbol_row)?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -2222,23 +2229,11 @@ pub fn get_symbol_by_id(conn: &Connection, symbol_id: &str) -> DbResult<Option<S
     let result = conn
         .query_row(
             r#"
-            SELECT id, file_path, name, kind, start_line, start_col, end_line, end_col, language
+            SELECT id, file_path, name, symbol_aliases, kind, start_line, start_col, end_line, end_col, language
             FROM symbols WHERE id = ?
             "#,
             params![symbol_id],
-            |row| {
-                Ok(SymbolRow {
-                    id: row.get(0)?,
-                    file_path: row.get(1)?,
-                    name: row.get(2)?,
-                    kind: row.get(3)?,
-                    start_line: row.get(4)?,
-                    start_col: row.get(5)?,
-                    end_line: row.get(6)?,
-                    end_col: row.get(7)?,
-                    language: row.get(8)?,
-                })
-            },
+            map_symbol_row,
         )
         .optional()?;
     Ok(result)
@@ -2252,25 +2247,13 @@ pub fn get_symbol_by_id_on_branch(
     let result = conn
         .query_row(
             r#"
-            SELECT s.id, s.file_path, s.name, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
+            SELECT s.id, s.file_path, s.name, s.symbol_aliases, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
             FROM symbols s
             INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
             WHERE s.id = ? AND bs.branch = ?
             "#,
             params![symbol_id, branch],
-            |row| {
-                Ok(SymbolRow {
-                    id: row.get(0)?,
-                    file_path: row.get(1)?,
-                    name: row.get(2)?,
-                    kind: row.get(3)?,
-                    start_line: row.get(4)?,
-                    start_col: row.get(5)?,
-                    end_line: row.get(6)?,
-                    end_col: row.get(7)?,
-                    language: row.get(8)?,
-                })
-            },
+            map_symbol_row,
         )
         .optional()?;
     Ok(result)
@@ -2292,7 +2275,7 @@ pub fn get_symbols_by_ids_on_branch(
         let placeholders = symbol_batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let query = format!(
             r#"
-            SELECT s.id, s.file_path, s.name, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
+            SELECT s.id, s.file_path, s.name, s.symbol_aliases, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
             FROM symbols s
             INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
             WHERE bs.branch = ? AND s.id IN ({})
@@ -2307,19 +2290,7 @@ pub fn get_symbols_by_ids_on_branch(
             params.push(symbol_id as &dyn rusqlite::ToSql);
         }
 
-        let rows = stmt.query_map(params.as_slice(), |row| {
-            Ok(SymbolRow {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                name: row.get(2)?,
-                kind: row.get(3)?,
-                start_line: row.get(4)?,
-                start_col: row.get(5)?,
-                end_line: row.get(6)?,
-                end_col: row.get(7)?,
-                language: row.get(8)?,
-            })
-        })?;
+        let rows = stmt.query_map(params.as_slice(), map_symbol_row)?;
 
         for row in rows {
             results.push(row?);
@@ -2335,26 +2306,18 @@ pub fn get_symbol_by_name(
     name: &str,
     file_path: &str,
 ) -> DbResult<Option<SymbolRow>> {
+    let alias_match = alias_match_sql("symbol_aliases", false);
     let result = conn
         .query_row(
-            r#"
-            SELECT id, file_path, name, kind, start_line, start_col, end_line, end_col, language
-            FROM symbols WHERE name = ? AND file_path = ?
+            &format!(
+                r#"
+            SELECT id, file_path, name, symbol_aliases, kind, start_line, start_col, end_line, end_col, language
+            FROM symbols WHERE (name = ? OR {}) AND file_path = ?
             "#,
-            params![name, file_path],
-            |row| {
-                Ok(SymbolRow {
-                    id: row.get(0)?,
-                    file_path: row.get(1)?,
-                    name: row.get(2)?,
-                    kind: row.get(3)?,
-                    start_line: row.get(4)?,
-                    start_col: row.get(5)?,
-                    end_line: row.get(6)?,
-                    end_col: row.get(7)?,
-                    language: row.get(8)?,
-                })
-            },
+                alias_match
+            ),
+            params![name, name, file_path],
+            map_symbol_row,
         )
         .optional()?;
     Ok(result)
@@ -2366,56 +2329,40 @@ pub fn get_symbol_by_name_on_branch(
     file_path: &str,
     branch: &str,
 ) -> DbResult<Option<SymbolRow>> {
+    let alias_match = alias_match_sql("s.symbol_aliases", false);
     let result = conn
         .query_row(
-            r#"
-            SELECT s.id, s.file_path, s.name, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
+            &format!(
+                r#"
+            SELECT s.id, s.file_path, s.name, s.symbol_aliases, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
             FROM symbols s
             INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
-            WHERE s.name = ? AND s.file_path = ? AND bs.branch = ?
+            WHERE (s.name = ? OR {}) AND s.file_path = ? AND bs.branch = ?
             ORDER BY s.start_line ASC, s.start_col ASC, s.id ASC
             LIMIT 1
             "#,
-            params![name, file_path, branch],
-            |row| {
-                Ok(SymbolRow {
-                    id: row.get(0)?,
-                    file_path: row.get(1)?,
-                    name: row.get(2)?,
-                    kind: row.get(3)?,
-                    start_line: row.get(4)?,
-                    start_col: row.get(5)?,
-                    end_line: row.get(6)?,
-                    end_col: row.get(7)?,
-                    language: row.get(8)?,
-                })
-            },
+                alias_match
+            ),
+            params![name, name, file_path, branch],
+            map_symbol_row,
         )
         .optional()?;
     Ok(result)
 }
 
 pub fn get_symbols_by_name(conn: &Connection, name: &str) -> DbResult<Vec<SymbolRow>> {
+    let alias_match = alias_match_sql("symbol_aliases", false);
     let mut stmt = conn.prepare(
-        r#"
-        SELECT id, file_path, name, kind, start_line, start_col, end_line, end_col, language
-        FROM symbols WHERE name = ?
+        &format!(
+            r#"
+        SELECT id, file_path, name, symbol_aliases, kind, start_line, start_col, end_line, end_col, language
+        FROM symbols WHERE name = ? OR {}
         "#,
+            alias_match
+        ),
     )?;
 
-    let rows = stmt.query_map(params![name], |row| {
-        Ok(SymbolRow {
-            id: row.get(0)?,
-            file_path: row.get(1)?,
-            name: row.get(2)?,
-            kind: row.get(3)?,
-            start_line: row.get(4)?,
-            start_col: row.get(5)?,
-            end_line: row.get(6)?,
-            end_col: row.get(7)?,
-            language: row.get(8)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![name, name], map_symbol_row)?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -2429,29 +2376,21 @@ pub fn get_symbols_by_name_on_branch(
     name: &str,
     branch: &str,
 ) -> DbResult<Vec<SymbolRow>> {
+    let alias_match = alias_match_sql("s.symbol_aliases", false);
     let mut stmt = conn.prepare(
-        r#"
-        SELECT s.id, s.file_path, s.name, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
+        &format!(
+            r#"
+        SELECT s.id, s.file_path, s.name, s.symbol_aliases, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
         FROM symbols s
         INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
-        WHERE s.name = ? AND bs.branch = ?
+        WHERE (s.name = ? OR {}) AND bs.branch = ?
         ORDER BY s.file_path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
         "#,
+            alias_match
+        ),
     )?;
 
-    let rows = stmt.query_map(params![name, branch], |row| {
-        Ok(SymbolRow {
-            id: row.get(0)?,
-            file_path: row.get(1)?,
-            name: row.get(2)?,
-            kind: row.get(3)?,
-            start_line: row.get(4)?,
-            start_col: row.get(5)?,
-            end_line: row.get(6)?,
-            end_col: row.get(7)?,
-            language: row.get(8)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![name, name, branch], map_symbol_row)?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -2473,38 +2412,37 @@ pub fn get_symbols_by_names_on_branch(
     let name_batch_size = SQL_BIND_PARAM_BATCH_SIZE.saturating_sub(1).max(1);
 
     for name_batch in names.chunks(name_batch_size) {
-        let placeholders = name_batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let direct_placeholders = name_batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let query = format!(
             r#"
-            SELECT s.id, s.file_path, s.name, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
+            SELECT s.id, s.file_path, s.name, s.symbol_aliases, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
             FROM symbols s
             INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
-            WHERE bs.branch = ? AND s.name IN ({})
+            WHERE bs.branch = ? AND (
+                s.name IN ({})
+                OR {}
+            )
             ORDER BY s.name ASC, s.file_path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
             "#,
-            placeholders
+            direct_placeholders,
+            name_batch
+                .iter()
+                .map(|_| alias_match_sql("s.symbol_aliases", false))
+                .collect::<Vec<_>>()
+                .join(" OR ")
         );
 
         let mut stmt = conn.prepare(&query)?;
-        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + name_batch.len());
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + name_batch.len() * 2);
         params.push(&branch);
         for name in name_batch {
             params.push(name as &dyn rusqlite::ToSql);
         }
+        for name in name_batch {
+            params.push(name as &dyn rusqlite::ToSql);
+        }
 
-        let rows = stmt.query_map(params.as_slice(), |row| {
-            Ok(SymbolRow {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                name: row.get(2)?,
-                kind: row.get(3)?,
-                start_line: row.get(4)?,
-                start_col: row.get(5)?,
-                end_line: row.get(6)?,
-                end_col: row.get(7)?,
-                language: row.get(8)?,
-            })
-        })?;
+        let rows = stmt.query_map(params.as_slice(), map_symbol_row)?;
 
         for row in rows {
             results.push(row?);
@@ -2515,26 +2453,18 @@ pub fn get_symbols_by_names_on_branch(
 }
 
 pub fn get_symbols_by_name_ci(conn: &Connection, name: &str) -> DbResult<Vec<SymbolRow>> {
+    let alias_match = alias_match_sql("symbol_aliases", true);
     let mut stmt = conn.prepare(
-        r#"
-        SELECT id, file_path, name, kind, start_line, start_col, end_line, end_col, language
-        FROM symbols WHERE lower(name) = lower(?)
+        &format!(
+            r#"
+        SELECT id, file_path, name, symbol_aliases, kind, start_line, start_col, end_line, end_col, language
+        FROM symbols WHERE lower(name) = lower(?) OR {}
         "#,
+            alias_match
+        ),
     )?;
 
-    let rows = stmt.query_map(params![name], |row| {
-        Ok(SymbolRow {
-            id: row.get(0)?,
-            file_path: row.get(1)?,
-            name: row.get(2)?,
-            kind: row.get(3)?,
-            start_line: row.get(4)?,
-            start_col: row.get(5)?,
-            end_line: row.get(6)?,
-            end_col: row.get(7)?,
-            language: row.get(8)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![name, name], map_symbol_row)?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -2548,28 +2478,20 @@ pub fn get_symbols_by_name_ci_on_branch(
     name: &str,
     branch: &str,
 ) -> DbResult<Vec<SymbolRow>> {
+    let alias_match = alias_match_sql("s.symbol_aliases", true);
     let mut stmt = conn.prepare(
-        r#"
-        SELECT s.id, s.file_path, s.name, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
+        &format!(
+            r#"
+        SELECT s.id, s.file_path, s.name, s.symbol_aliases, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
         FROM symbols s
         INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
-        WHERE lower(s.name) = lower(?) AND bs.branch = ?
+        WHERE (lower(s.name) = lower(?) OR {}) AND bs.branch = ?
         "#,
+            alias_match
+        ),
     )?;
 
-    let rows = stmt.query_map(params![name, branch], |row| {
-        Ok(SymbolRow {
-            id: row.get(0)?,
-            file_path: row.get(1)?,
-            name: row.get(2)?,
-            kind: row.get(3)?,
-            start_line: row.get(4)?,
-            start_col: row.get(5)?,
-            end_line: row.get(6)?,
-            end_col: row.get(7)?,
-            language: row.get(8)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![name, name, branch], map_symbol_row)?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -4256,7 +4178,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "15");
+        assert_eq!(version, "16");
         let busy_timeout: i64 = conn
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
@@ -4373,6 +4295,7 @@ mod tests {
             20,
             Some("function"),
             Some("main"),
+            &[],
             Some("function"),
             Some("function"),
             "rust",
@@ -4398,15 +4321,15 @@ mod tests {
         upsert_embedding(&conn, "hash3", "hash3", &[3], "c3", "m").unwrap();
 
         upsert_chunk(
-            &conn, "c1", "hash1", "hash1", "f1.rs", 1, 10, None, None, None, None, "rust",
+            &conn, "c1", "hash1", "hash1", "f1.rs", 1, 10, None, None, &[], None, None, "rust",
         )
         .unwrap();
         upsert_chunk(
-            &conn, "c2", "hash2", "hash2", "f2.rs", 1, 10, None, None, None, None, "rust",
+            &conn, "c2", "hash2", "hash2", "f2.rs", 1, 10, None, None, &[], None, None, "rust",
         )
         .unwrap();
         upsert_chunk(
-            &conn, "c3", "hash3", "hash3", "f3.rs", 1, 10, None, None, None, None, "rust",
+            &conn, "c3", "hash3", "hash3", "f3.rs", 1, 10, None, None, &[], None, None, "rust",
         )
         .unwrap();
 
@@ -4434,7 +4357,7 @@ mod tests {
 
         // Create chunk using one embedding
         upsert_chunk(
-            &conn, "c1", "used", "used", "f1.rs", 1, 10, None, None, None, None, "rust",
+            &conn, "c1", "used", "used", "f1.rs", 1, 10, None, None, &[], None, None, "rust",
         )
         .unwrap();
         add_chunks_to_branch(&conn, "main", &["c1".to_string()]).unwrap();
@@ -4455,6 +4378,7 @@ mod tests {
             id: "sym1".to_string(),
             file_path: "src/main.ts".to_string(),
             name: "handleRequest".to_string(),
+            symbol_aliases: Vec::new(),
             kind: "function".to_string(),
             start_line: 10,
             start_col: 0,
@@ -4498,6 +4422,42 @@ mod tests {
     }
 
     #[test]
+    fn test_symbol_alias_lookup_on_branch_returns_primary_symbol() {
+        let (_temp_dir, mut conn) = setup_test_db();
+
+        let symbol = SymbolRow {
+            id: "sym_parse".to_string(),
+            file_path: "src/parse.ts".to_string(),
+            name: "parse".to_string(),
+            symbol_aliases: vec!["_parse".to_string()],
+            kind: "function".to_string(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 20,
+            end_col: 1,
+            language: "typescript".to_string(),
+        };
+
+        upsert_symbol(&conn, &symbol).unwrap();
+        add_symbols_to_branch(&conn, "main", &["sym_parse".to_string()]).unwrap();
+
+        let alias_match = get_symbols_by_name_on_branch(&conn, "_parse", "main").unwrap();
+        assert_eq!(alias_match.len(), 1);
+        assert_eq!(alias_match[0].name, "parse");
+        assert_eq!(alias_match[0].symbol_aliases, vec!["_parse".to_string()]);
+
+        let primary_match = get_symbols_by_name_on_branch(&conn, "parse", "main").unwrap();
+        assert_eq!(primary_match.len(), 1);
+        assert_eq!(primary_match[0].name, "parse");
+        assert_eq!(primary_match[0].symbol_aliases, vec!["_parse".to_string()]);
+
+        let scoped_alias =
+            get_symbol_by_name_on_branch(&conn, "_parse", "src/parse.ts", "main").unwrap();
+        assert!(scoped_alias.is_some());
+        assert_eq!(scoped_alias.unwrap().name, "parse");
+    }
+
+    #[test]
     fn test_symbol_batch_operations() {
         let (_temp_dir, mut conn) = setup_test_db();
 
@@ -4506,6 +4466,7 @@ mod tests {
                 id: "s1".to_string(),
                 file_path: "src/a.ts".to_string(),
                 name: "foo".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -4517,6 +4478,7 @@ mod tests {
                 id: "s2".to_string(),
                 file_path: "src/a.ts".to_string(),
                 name: "bar".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 7,
                 start_col: 0,
@@ -4528,6 +4490,7 @@ mod tests {
                 id: "s3".to_string(),
                 file_path: "src/b.ts".to_string(),
                 name: "baz".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "class".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -4564,6 +4527,7 @@ mod tests {
                 end_line: 10,
                 node_type: Some("function".to_string()),
                 name: Some("processPayment".to_string()),
+                symbol_aliases: Vec::new(),
                 chunk_kind: Some("Code".to_string()),
                 symbol_kind: Some("Function".to_string()),
                 language: "typescript".to_string(),
@@ -4577,6 +4541,7 @@ mod tests {
                 end_line: 30,
                 node_type: Some("function".to_string()),
                 name: Some("processPayment".to_string()),
+                symbol_aliases: Vec::new(),
                 chunk_kind: Some("Code".to_string()),
                 symbol_kind: Some("Function".to_string()),
                 language: "typescript".to_string(),
@@ -4591,6 +4556,7 @@ mod tests {
                 id: "sym_main".to_string(),
                 file_path: "src/shared.ts".to_string(),
                 name: "processPayment".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -4602,6 +4568,7 @@ mod tests {
                 id: "sym_feature".to_string(),
                 file_path: "src/shared.ts".to_string(),
                 name: "processPayment".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 20,
                 start_col: 0,
@@ -4645,6 +4612,7 @@ mod tests {
                 id: "sym_main".to_string(),
                 file_path: "src/main.ts".to_string(),
                 name: "main".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -4656,6 +4624,7 @@ mod tests {
                 id: "sym_helper".to_string(),
                 file_path: "src/helper.ts".to_string(),
                 name: "helper".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -4740,6 +4709,7 @@ mod tests {
                     id: "sym_caller".to_string(),
                     file_path: "src/caller.ts".to_string(),
                     name: "runTask".to_string(),
+                    symbol_aliases: Vec::new(),
                     kind: "function".to_string(),
                     start_line: 1,
                     start_col: 0,
@@ -4751,6 +4721,7 @@ mod tests {
                     id: "sym_helper".to_string(),
                     file_path: "src/helper.ts".to_string(),
                     name: "helperFn".to_string(),
+                    symbol_aliases: Vec::new(),
                     kind: "function".to_string(),
                     start_line: 1,
                     start_col: 0,
@@ -4813,6 +4784,7 @@ mod tests {
                     id: "sym_caller".to_string(),
                     file_path: "src/caller.ts".to_string(),
                     name: "runTask".to_string(),
+                    symbol_aliases: Vec::new(),
                     kind: "function".to_string(),
                     start_line: 1,
                     start_col: 0,
@@ -4824,6 +4796,7 @@ mod tests {
                     id: "sym_process_a".to_string(),
                     file_path: "src/process-a.ts".to_string(),
                     name: "process".to_string(),
+                    symbol_aliases: Vec::new(),
                     kind: "function".to_string(),
                     start_line: 1,
                     start_col: 0,
@@ -4835,6 +4808,7 @@ mod tests {
                     id: "sym_process_b".to_string(),
                     file_path: "src/process-b.ts".to_string(),
                     name: "process".to_string(),
+                    symbol_aliases: Vec::new(),
                     kind: "function".to_string(),
                     start_line: 1,
                     start_col: 0,
@@ -4898,6 +4872,7 @@ mod tests {
                     id: "sym_caller".to_string(),
                     file_path: "src/runner.ts".to_string(),
                     name: "runEval".to_string(),
+                    symbol_aliases: Vec::new(),
                     kind: "function".to_string(),
                     start_line: 1,
                     start_col: 0,
@@ -4909,6 +4884,7 @@ mod tests {
                     id: "sym_target_head".to_string(),
                     file_path: "src/metrics.ts".to_string(),
                     name: "computeMetrics".to_string(),
+                    symbol_aliases: Vec::new(),
                     kind: "function".to_string(),
                     start_line: 20,
                     start_col: 0,
@@ -4920,6 +4896,7 @@ mod tests {
                     id: "sym_target_tail".to_string(),
                     file_path: "src/metrics.ts".to_string(),
                     name: "computeMetrics".to_string(),
+                    symbol_aliases: Vec::new(),
                     kind: "function".to_string(),
                     start_line: 81,
                     start_col: 0,
@@ -4986,6 +4963,7 @@ mod tests {
                     id: "sym_caller".to_string(),
                     file_path: "src/runner.ts".to_string(),
                     name: "runEval".to_string(),
+                    symbol_aliases: Vec::new(),
                     kind: "function".to_string(),
                     start_line: 1,
                     start_col: 0,
@@ -4997,6 +4975,7 @@ mod tests {
                     id: "sym_target_a_head".to_string(),
                     file_path: "src/metrics-a.ts".to_string(),
                     name: "computeMetrics".to_string(),
+                    symbol_aliases: Vec::new(),
                     kind: "function".to_string(),
                     start_line: 20,
                     start_col: 0,
@@ -5008,6 +4987,7 @@ mod tests {
                     id: "sym_target_a_tail".to_string(),
                     file_path: "src/metrics-a.ts".to_string(),
                     name: "computeMetrics".to_string(),
+                    symbol_aliases: Vec::new(),
                     kind: "function".to_string(),
                     start_line: 81,
                     start_col: 0,
@@ -5019,6 +4999,7 @@ mod tests {
                     id: "sym_target_b".to_string(),
                     file_path: "src/metrics-b.ts".to_string(),
                     name: "computeMetrics".to_string(),
+                    symbol_aliases: Vec::new(),
                     kind: "function".to_string(),
                     start_line: 15,
                     start_col: 0,
@@ -5081,6 +5062,7 @@ mod tests {
                 id: "s1".to_string(),
                 file_path: "src/a.ts".to_string(),
                 name: "foo".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -5092,6 +5074,7 @@ mod tests {
                 id: "s2".to_string(),
                 file_path: "src/b.ts".to_string(),
                 name: "bar".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -5126,6 +5109,7 @@ mod tests {
                 id: "used".to_string(),
                 file_path: "src/a.ts".to_string(),
                 name: "used_fn".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -5137,6 +5121,7 @@ mod tests {
                 id: "orphan".to_string(),
                 file_path: "src/b.ts".to_string(),
                 name: "orphan_fn".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -5207,6 +5192,7 @@ mod tests {
                 id: "caller".to_string(),
                 file_path: "src/a.ts".to_string(),
                 name: "caller".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -5218,6 +5204,7 @@ mod tests {
                 id: "target".to_string(),
                 file_path: "src/a.ts".to_string(),
                 name: "target".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 7,
                 start_col: 0,
@@ -5275,6 +5262,7 @@ mod tests {
             id: "s1".to_string(),
             file_path: "src/a.ts".to_string(),
             name: "test".to_string(),
+            symbol_aliases: Vec::new(),
             kind: "function".to_string(),
             start_line: 1,
             start_col: 0,
@@ -5383,7 +5371,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "15");
+        assert_eq!(schema_version, "16");
 
         let on_delete: String = conn
             .query_row("PRAGMA foreign_key_list(call_edges)", [], |row| row.get(6))
@@ -5441,7 +5429,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "15");
+        assert_eq!(schema_version, "16");
 
         let pipeline_state_exists: String = conn
             .query_row(
@@ -5651,7 +5639,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "15");
+        assert_eq!(schema_version, "16");
 
         let pipeline_state_exists: String = conn
             .query_row(
@@ -5719,6 +5707,7 @@ mod tests {
                 id: "sym_caller".to_string(),
                 file_path: "src/main.ts".to_string(),
                 name: "main".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -5730,6 +5719,7 @@ mod tests {
                 id: "sym_target".to_string(),
                 file_path: "src/main.ts".to_string(),
                 name: "target".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 12,
                 start_col: 0,
@@ -5785,6 +5775,7 @@ mod tests {
             id: "sym_shared".to_string(),
             file_path: "src/main.ts".to_string(),
             name: "main".to_string(),
+            symbol_aliases: Vec::new(),
             kind: "function".to_string(),
             start_line: 1,
             start_col: 0,
@@ -5844,6 +5835,7 @@ mod tests {
                 id: "sym_caller".to_string(),
                 file_path: "src/main.ts".to_string(),
                 name: "caller".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -5855,6 +5847,7 @@ mod tests {
                 id: "sym_target".to_string(),
                 file_path: "src/main.ts".to_string(),
                 name: "target".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 7,
                 start_col: 0,
@@ -5948,6 +5941,7 @@ mod tests {
                 id: "sym_caller".to_string(),
                 file_path: "src/main.ts".to_string(),
                 name: "caller".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -5959,6 +5953,7 @@ mod tests {
                 id: "sym_target".to_string(),
                 file_path: "src/main.ts".to_string(),
                 name: "target".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 7,
                 start_col: 0,
@@ -6025,6 +6020,7 @@ mod tests {
             id: "sym_main".to_string(),
             file_path: "src/main.ts".to_string(),
             name: "main".to_string(),
+            symbol_aliases: Vec::new(),
             kind: "function".to_string(),
             start_line: 1,
             start_col: 0,
@@ -6068,6 +6064,7 @@ mod tests {
             id: "sym_main".to_string(),
             file_path: "src/main.ts".to_string(),
             name: "main".to_string(),
+            symbol_aliases: Vec::new(),
             kind: "function".to_string(),
             start_line: 1,
             start_col: 0,
@@ -6108,6 +6105,7 @@ mod tests {
             id: "sym_branch_delete".to_string(),
             file_path: "src/main.ts".to_string(),
             name: "main".to_string(),
+            symbol_aliases: Vec::new(),
             kind: "function".to_string(),
             start_line: 1,
             start_col: 0,
@@ -6171,6 +6169,7 @@ mod tests {
             5,
             Some("function_item"),
             Some("main"),
+            &[],
             Some("Function"),
             Some("Function"),
             "rust",
@@ -6205,6 +6204,7 @@ mod tests {
             5,
             Some("function_item"),
             Some("main"),
+            &[],
             None,
             None,
             "rust",
@@ -6370,7 +6370,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "15");
+        assert_eq!(schema_version, "16");
 
         let call_edge_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM call_edges", [], |row| row.get(0))
@@ -6566,7 +6566,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "15");
+        assert_eq!(schema_version, "16");
 
         let chunk_indexes = index_names(&conn, "chunks");
         assert!(chunk_indexes
@@ -6676,6 +6676,17 @@ mod tests {
                     chunk_id TEXT NOT NULL,
                     PRIMARY KEY (branch, chunk_id)
                 );
+                CREATE TABLE symbols (
+                    id TEXT PRIMARY KEY,
+                    file_path TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    start_col INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    end_col INTEGER NOT NULL,
+                    language TEXT NOT NULL
+                );
                 CREATE TABLE pipeline_state (
                     branch TEXT NOT NULL,
                     file_path TEXT NOT NULL,
@@ -6736,7 +6747,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "15");
+        assert_eq!(schema_version, "16");
 
         let reranker_health_exists: String = conn
             .query_row(
@@ -6760,5 +6771,108 @@ mod tests {
         assert!(chunk_cap_indexes
             .iter()
             .any(|name| name == "idx_chunk_cap_drops_branch"));
+    }
+
+    #[test]
+    fn test_v15_to_v16_migration_adds_symbol_aliases_columns() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("migration-v15.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE chunks (
+                    chunk_id TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL,
+                    embedding_input_hash TEXT NOT NULL DEFAULT '',
+                    file_path TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    node_type TEXT,
+                    name TEXT,
+                    language TEXT NOT NULL,
+                    chunk_kind TEXT,
+                    symbol_kind TEXT
+                );
+                CREATE TABLE symbols (
+                    id TEXT PRIMARY KEY,
+                    file_path TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    start_col INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    end_col INTEGER NOT NULL,
+                    language TEXT NOT NULL
+                );
+                INSERT INTO metadata (key, value) VALUES ('schema_version', '15');
+                INSERT INTO chunks (
+                    chunk_id, content_hash, embedding_input_hash, file_path, start_line, end_line, node_type, name, language, chunk_kind, symbol_kind
+                ) VALUES (
+                    'chunk_legacy', 'hash_legacy', 'hash_legacy', 'src/parse.ts', 1, 10, 'function', 'parse', 'typescript', 'Code', 'Function'
+                );
+                INSERT INTO symbols (
+                    id, file_path, name, kind, start_line, start_col, end_line, end_col, language
+                ) VALUES (
+                    'sym_legacy', 'src/parse.ts', 'parse', 'function', 1, 0, 10, 1, 'typescript'
+                );
+                "#,
+            )
+            .unwrap();
+        }
+
+        let conn = init_db(&db_path).unwrap();
+
+        assert!(table_columns(&conn, "chunks")
+            .iter()
+            .any(|column| column == "symbol_aliases"));
+        assert!(table_columns(&conn, "symbols")
+            .iter()
+            .any(|column| column == "symbol_aliases"));
+
+        let legacy_chunk_aliases: String = conn
+            .query_row(
+                "SELECT symbol_aliases FROM chunks WHERE chunk_id = 'chunk_legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_chunk_aliases, "");
+
+        let legacy_symbol_aliases: String = conn
+            .query_row(
+                "SELECT symbol_aliases FROM symbols WHERE id = 'sym_legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_symbol_aliases, "");
+
+        upsert_symbol(
+            &conn,
+            &SymbolRow {
+                id: "sym_new".to_string(),
+                file_path: "src/parse.ts".to_string(),
+                name: "parse".to_string(),
+                symbol_aliases: vec!["_parse".to_string()],
+                kind: "function".to_string(),
+                start_line: 1,
+                start_col: 0,
+                end_line: 20,
+                end_col: 1,
+                language: "typescript".to_string(),
+            },
+        )
+        .unwrap();
+
+        let alias_lookup = get_symbols_by_name(&conn, "_parse").unwrap();
+        assert_eq!(alias_lookup.len(), 1);
+        assert_eq!(alias_lookup[0].name, "parse");
+        assert_eq!(alias_lookup[0].symbol_aliases, vec!["_parse".to_string()]);
     }
 }

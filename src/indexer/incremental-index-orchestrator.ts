@@ -63,6 +63,7 @@ export interface OrchestratorParsedChunk {
   endByte: number;
   chunkType: ChunkMetadata["chunkType"];
   name?: string;
+  symbolAliases: string[];
   chunkKind?: string;
   symbolKind?: string;
   language: string;
@@ -194,6 +195,7 @@ interface ChunkRecord {
   endLine: number;
   nodeType?: string;
   name?: string;
+  symbolAliases: string[];
   chunkKind?: string;
   symbolKind?: string;
   language: string;
@@ -2241,6 +2243,7 @@ export class IncrementalIndexOrchestrator {
         endLine: chunk.endLine,
         nodeType: chunk.nodeType,
         name: chunk.name,
+        symbolAliases: chunk.symbolAliases,
         chunkKind: chunk.chunkKind,
         symbolKind: chunk.symbolKind,
         language: chunk.language,
@@ -3036,6 +3039,7 @@ export class IncrementalIndexOrchestrator {
         endLine: chunk.endLine,
         nodeType: chunk.chunkType,
         name: chunk.name,
+        symbolAliases: chunk.symbolAliases,
         chunkKind: chunk.chunkKind,
         symbolKind: chunk.symbolKind,
         language: chunk.language,
@@ -3087,6 +3091,7 @@ export class IncrementalIndexOrchestrator {
         endLine: chunk.endLine,
         nodeType: chunk.nodeType,
         name: chunk.name,
+        symbolAliases: chunk.symbolAliases,
         language: chunk.language,
         text: chunk.name ?? chunk.chunkId,
         chunkHash: chunk.contentHash,
@@ -3228,6 +3233,7 @@ export class IncrementalIndexOrchestrator {
           endLine: chunk.endLine,
           nodeType: chunk.nodeType,
           name: chunk.name,
+          symbolAliases: chunk.symbolAliases,
           chunkKind: chunk.chunkKind,
           symbolKind: chunk.symbolKind,
           language: chunk.language,

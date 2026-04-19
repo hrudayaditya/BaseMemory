@@ -134,6 +134,7 @@ pub struct Chunk {
     pub file_path: String,
     pub language: String,
     pub symbol_name: Option<String>,
+    pub symbol_aliases: Vec<String>,
     pub symbol_kind: Option<SymbolKind>,
     pub chunk_kind: ChunkKind,
     pub granularity: Granularity,
@@ -224,6 +225,7 @@ fn append_small_file_module_chunk(
         file_path: file_path.to_string(),
         language: language.to_string(),
         symbol_name: Some(symbol_name),
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(SymbolKind::Module),
         chunk_kind: ChunkKind::File,
         granularity: Granularity::Coarse,
@@ -267,6 +269,7 @@ fn ensure_non_empty_chunks(
         file_path: file_path.to_string(),
         language: language.to_string(),
         symbol_name: None,
+        symbol_aliases: Vec::new(),
         symbol_kind: None,
         chunk_kind: ChunkKind::Code,
         granularity: Granularity::Fine,
@@ -328,6 +331,7 @@ fn gap_fill_chunk(
         file_path: file_path.to_string(),
         language: language.to_string(),
         symbol_name: None,
+        symbol_aliases: Vec::new(),
         symbol_kind: Some(SymbolKind::Block),
         chunk_kind: ChunkKind::Code,
         granularity: Granularity::Fine,
@@ -484,6 +488,7 @@ pub(crate) fn split_range_to_max_sized_chunks(
             file_path: file_path.to_string(),
             language: language.to_string(),
             symbol_name: base_chunk.symbol_name.clone(),
+            symbol_aliases: base_chunk.symbol_aliases.clone(),
             symbol_kind,
             chunk_kind,
             granularity: Granularity::Fine,
@@ -547,6 +552,7 @@ fn single_fallback_chunk(file_path: &str, language: &str, source_code: &str) -> 
             file_path: file_path.to_string(),
             language: language.to_string(),
             symbol_name: None,
+            symbol_aliases: Vec::new(),
             symbol_kind: None,
             chunk_kind: ChunkKind::Code,
             granularity: Granularity::Fine,
@@ -2115,6 +2121,7 @@ exports.helper = helper;
         assert!(merged_chunk.text.contains("function parse(input: string)"));
         assert!(merged_chunk.text.contains("return _parse(input);"));
         assert!(merged_chunk.text.contains("function _parse(input: string)"));
+        assert_eq!(merged_chunk.symbol_aliases, vec!["_parse".to_string()]);
         assert!(!fine_chunks(&chunks)
             .iter()
             .any(|chunk| chunk.symbol_name.as_deref() == Some("_parse")));
@@ -2137,6 +2144,7 @@ function _parse(input: string) {
         let merged_chunk = named_fine_chunk(&chunks, "parse");
         assert!(merged_chunk.text.trim_start().starts_with("function parse(input: string)"));
         assert!(merged_chunk.text.contains("function _parse(input: string)"));
+        assert_eq!(merged_chunk.symbol_aliases, vec!["_parse".to_string()]);
     }
 
     #[test]
@@ -2154,6 +2162,7 @@ function helper() {
         let factory_chunk = named_fine_chunk(&chunks, "string");
         assert_eq!(factory_chunk.symbol_kind, Some(SymbolKind::Function));
         assert!(factory_chunk.text.contains("new ZodString(...args)"));
+        assert!(factory_chunk.symbol_aliases.is_empty());
         assert!(!factory_chunk.text.contains("function helper()"));
     }
 
