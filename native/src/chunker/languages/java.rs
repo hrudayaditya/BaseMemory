@@ -111,6 +111,7 @@ fn classify_java_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
                     ChunkKind::Code
                 },
                 coarse_eligible: false,
+                delegate_target_name: None,
             })
         }
         "class_declaration" | "annotation_type_declaration" | "record_declaration" => {
@@ -119,6 +120,7 @@ fn classify_java_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
                 symbol_kind: Some(SymbolKind::Class),
                 chunk_kind: ChunkKind::Code,
                 coarse_eligible: true,
+                delegate_target_name: None,
             })
         }
         "enum_declaration" => Some(SemanticInfo {
@@ -126,18 +128,21 @@ fn classify_java_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             symbol_kind: Some(SymbolKind::Type),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
+            delegate_target_name: None,
         }),
         "interface_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
             symbol_kind: Some(SymbolKind::Interface),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
+            delegate_target_name: None,
         }),
         "static_initializer" => Some(SemanticInfo {
             symbol_name: Some("<static_init>".to_string()),
             symbol_kind: Some(SymbolKind::Block),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
+            delegate_target_name: None,
         }),
         _ => None,
     }

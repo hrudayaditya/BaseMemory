@@ -91,6 +91,7 @@ fn classify_python_assignment(node: Node<'_>, source: &str) -> Option<SemanticIn
         symbol_kind: Some(SymbolKind::Constant),
         chunk_kind: ChunkKind::Code,
         coarse_eligible: false,
+        delegate_target_name: None,
     })
 }
 
@@ -108,6 +109,7 @@ fn classify_python_type_alias(node: Node<'_>, source: &str) -> Option<SemanticIn
         symbol_kind: Some(SymbolKind::Type),
         chunk_kind: ChunkKind::Code,
         coarse_eligible: false,
+        delegate_target_name: None,
     })
 }
 
@@ -140,6 +142,7 @@ fn classify_python_docstring(node: Node<'_>) -> Option<SemanticInfo> {
         symbol_kind: Some(SymbolKind::Block),
         chunk_kind: ChunkKind::Doc,
         coarse_eligible: false,
+        delegate_target_name: None,
     })
 }
 
@@ -183,11 +186,16 @@ fn classify_python_function(node: Node<'_>, source: &str) -> Option<SemanticInfo
         chunk_kind = ChunkKind::Test;
     }
 
+    if is_method && name == "__init__" {
+        return None;
+    }
+
     Some(SemanticInfo {
         symbol_name: Some(name),
         symbol_kind: Some(symbol_kind),
         chunk_kind,
         coarse_eligible: has_function_leading_docstring(node),
+        delegate_target_name: None,
     })
 }
 
@@ -199,6 +207,7 @@ fn classify_python_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             symbol_kind: Some(SymbolKind::Class),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
+            delegate_target_name: None,
         }),
         "assignment" => classify_python_assignment(node, source),
         "type_alias_statement" => classify_python_type_alias(node, source),

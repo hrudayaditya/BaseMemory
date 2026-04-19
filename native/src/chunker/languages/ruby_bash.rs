@@ -67,18 +67,21 @@ fn classify_ruby_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             symbol_kind: Some(SymbolKind::Method),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
+            delegate_target_name: None,
         }),
         "class" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
             symbol_kind: Some(SymbolKind::Class),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
+            delegate_target_name: None,
         }),
         "module" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
             symbol_kind: Some(SymbolKind::Module),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
+            delegate_target_name: None,
         }),
         "call" => {
             if !is_ruby_class_or_module_body_call(node) {
@@ -96,6 +99,7 @@ fn classify_ruby_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
                 symbol_kind: Some(SymbolKind::Block),
                 chunk_kind: ChunkKind::Code,
                 coarse_eligible: false,
+                delegate_target_name: None,
             })
         }
         _ => None,
@@ -109,6 +113,7 @@ fn classify_bash_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             symbol_kind: Some(SymbolKind::Function),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
+            delegate_target_name: None,
         }),
         _ => None,
     }

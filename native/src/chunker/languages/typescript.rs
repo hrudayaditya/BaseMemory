@@ -43,6 +43,16 @@ fn simple_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn identifier_text(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "property_identifier" => node_text(node, source)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(ToString::to_string),
+        _ => None,
+    }
+}
+
 fn member_expression_property_name(node: Node<'_>, source: &str) -> Option<String> {
     let property = node.child_by_field_name("property")?;
     node_text(property, source)
@@ -147,6 +157,7 @@ fn classify_call_wrapper(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         symbol_kind: Some(symbol_kind),
         chunk_kind: ChunkKind::Code,
         coarse_eligible: false,
+        delegate_target_name: None,
     })
 }
 
@@ -160,6 +171,7 @@ fn classify_constant_declarator(node: Node<'_>, source: &str) -> Option<Semantic
         symbol_kind: Some(SymbolKind::Constant),
         chunk_kind: ChunkKind::Code,
         coarse_eligible,
+        delegate_target_name: None,
     })
 }
 
@@ -191,6 +203,7 @@ fn classify_export_clause(node: Node<'_>, source: &str) -> Option<SemanticInfo> 
         symbol_kind: Some(SymbolKind::Module),
         chunk_kind: ChunkKind::Code,
         coarse_eligible: false,
+        delegate_target_name: None,
     })
 }
 
@@ -212,6 +225,7 @@ fn classify_internal_module(node: Node<'_>, source: &str) -> Option<SemanticInfo
         symbol_kind: Some(SymbolKind::Module),
         chunk_kind: ChunkKind::Code,
         coarse_eligible: true,
+        delegate_target_name: None,
     })
 }
 
@@ -224,32 +238,105 @@ fn classify_export_default_expression(node: Node<'_>, source: &str) -> Option<Se
             symbol_kind: Some(SymbolKind::Function),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
+            delegate_target_name: None,
         }),
         "class" => Some(SemanticInfo {
             symbol_name,
             symbol_kind: Some(SymbolKind::Module),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
+            delegate_target_name: None,
         }),
         "call_expression" => Some(SemanticInfo {
             symbol_name,
             symbol_kind: Some(SymbolKind::Module),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
+            delegate_target_name: None,
         }),
         "identifier" | "member_expression" => Some(SemanticInfo {
             symbol_name,
             symbol_kind: Some(SymbolKind::Module),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
+            delegate_target_name: None,
         }),
         _ => classify_constant_expression(node, source).map(|coarse_eligible| SemanticInfo {
             symbol_name,
             symbol_kind: Some(SymbolKind::Constant),
             chunk_kind: ChunkKind::Code,
             coarse_eligible,
+            delegate_target_name: None,
         }),
     }
+}
+
+fn delegation_target_for_call(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+
+    let function = node.child_by_field_name("function")?;
+    identifier_text(function, source)
+}
+
+fn delegation_target_for_statement(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "return_statement" => {
+            let mut cursor = node.walk();
+            let child = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() != "comment")?;
+            delegation_target_for_call(unwrap_transparent_expression(child), source)
+        }
+        "expression_statement" => {
+            let mut cursor = node.walk();
+            let child = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() != "comment")?;
+            delegation_target_for_call(unwrap_transparent_expression(child), source)
+        }
+        _ => None,
+    }
+}
+
+fn capitalize_identifier(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+
+    let mut capitalized = String::new();
+    capitalized.extend(first.to_uppercase());
+    capitalized.push_str(chars.as_str());
+    capitalized
+}
+
+fn is_delegation_variant(caller_name: &str, target_name: &str) -> bool {
+    target_name == format!("_{caller_name}")
+        || target_name == format!("safe{}", capitalize_identifier(caller_name))
+}
+
+fn delegation_target_for_function_like(
+    node: Node<'_>,
+    source: &str,
+    caller_name: &str,
+) -> Option<String> {
+    let body = node.child_by_field_name("body")?;
+    let target_name = match body.kind() {
+        "statement_block" => {
+            let mut cursor = body.walk();
+            let mut statements = body.named_children(&mut cursor).filter(|child| child.kind() != "comment");
+            let statement = statements.next()?;
+            if statements.next().is_some() {
+                return None;
+            }
+            delegation_target_for_statement(statement, source)?
+        }
+        _ => delegation_target_for_call(unwrap_transparent_expression(body), source)?,
+    };
+
+    is_delegation_variant(caller_name, &target_name).then_some(target_name)
 }
 
 fn classify_ambient_declaration(
@@ -313,6 +400,9 @@ fn classify_export_statement(
 fn classify_variable_declarator(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     let value = node.child_by_field_name("value")?;
     let symbol_name = extract_name_by_fields(node, source, &["name"]);
+    let delegate_target_name = symbol_name
+        .as_deref()
+        .and_then(|name| delegation_target_for_function_like(value, source, name));
 
     match value.kind() {
         "arrow_function" | "function" | "function_expression" => Some(SemanticInfo {
@@ -320,12 +410,14 @@ fn classify_variable_declarator(node: Node<'_>, source: &str) -> Option<Semantic
             symbol_kind: Some(SymbolKind::Function),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
+            delegate_target_name,
         }),
         "class" | "class_declaration" => Some(SemanticInfo {
             symbol_name,
             symbol_kind: Some(SymbolKind::Class),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
+            delegate_target_name: None,
         }),
         "call_expression" => classify_call_wrapper(node, source),
         _ => classify_constant_declarator(node, source),
@@ -361,6 +453,7 @@ fn classify_test_expression(node: Node<'_>, source: &str) -> Option<SemanticInfo
         symbol_kind: Some(SymbolKind::Test),
         chunk_kind: ChunkKind::Test,
         coarse_eligible: false,
+        delegate_target_name: None,
     })
 }
 
@@ -547,6 +640,7 @@ fn classify_commonjs_assignment(node: Node<'_>, source: &str) -> Option<Semantic
             }),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: is_constant_export,
+            delegate_target_name: None,
         });
     }
 
@@ -560,6 +654,7 @@ fn classify_commonjs_assignment(node: Node<'_>, source: &str) -> Option<Semantic
             }),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: is_constant_export,
+            delegate_target_name: None,
         });
     }
 
@@ -575,41 +670,59 @@ fn classify_ts_js_node_impl(
         "ambient_declaration" => classify_ambient_declaration(node, source, allow_commonjs),
         "export_statement" => classify_export_statement(node, source, allow_commonjs),
         "export_clause" => classify_export_clause(node, source),
-        "function_declaration" => Some(SemanticInfo {
-            symbol_name: extract_name_by_fields(node, source, &["name"]),
-            symbol_kind: Some(SymbolKind::Function),
-            chunk_kind: ChunkKind::Code,
-            coarse_eligible: false,
-        }),
-        "method_definition" => Some(SemanticInfo {
-            symbol_name: extract_name_by_fields(node, source, &["name", "property"]),
-            symbol_kind: Some(SymbolKind::Method),
-            chunk_kind: ChunkKind::Code,
-            coarse_eligible: false,
-        }),
+        "function_declaration" => {
+            let symbol_name = extract_name_by_fields(node, source, &["name"]);
+            let delegate_target_name = symbol_name
+                .as_deref()
+                .and_then(|name| delegation_target_for_function_like(node, source, name));
+            Some(SemanticInfo {
+                symbol_name,
+                symbol_kind: Some(SymbolKind::Function),
+                chunk_kind: ChunkKind::Code,
+                coarse_eligible: false,
+                delegate_target_name,
+            })
+        }
+        "method_definition" => {
+            let symbol_name = extract_name_by_fields(node, source, &["name", "property"]);
+            if symbol_name.as_deref() == Some("constructor") {
+                return None;
+            }
+            Some(SemanticInfo {
+                symbol_name,
+                symbol_kind: Some(SymbolKind::Method),
+                chunk_kind: ChunkKind::Code,
+                coarse_eligible: false,
+                delegate_target_name: None,
+            })
+        }
         "class_declaration" | "abstract_class_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
             symbol_kind: Some(SymbolKind::Class),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
+            delegate_target_name: None,
         }),
         "interface_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
             symbol_kind: Some(SymbolKind::Interface),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
+            delegate_target_name: None,
         }),
         "type_alias_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
             symbol_kind: Some(SymbolKind::Type),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
+            delegate_target_name: None,
         }),
         "enum_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
             symbol_kind: Some(SymbolKind::Type),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
+            delegate_target_name: None,
         }),
         "internal_module" => classify_internal_module(node, source),
         "variable_declarator" => classify_variable_declarator(node, source),

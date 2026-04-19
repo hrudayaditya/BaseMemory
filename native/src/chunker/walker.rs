@@ -14,6 +14,7 @@ struct PendingChunk {
     symbol_name: Option<String>,
     symbol_kind: Option<SymbolKind>,
     chunk_kind: ChunkKind,
+    delegate_target_name: Option<String>,
     granularity: Granularity,
     start_byte: usize,
     end_byte: usize,
@@ -292,6 +293,7 @@ fn emit_gap(ctx: &WalkerContext<'_>, start: usize, end: usize, chunks: &mut Vec<
         symbol_name: None,
         symbol_kind: Some(SymbolKind::Block),
         chunk_kind: ChunkKind::Code,
+        delegate_target_name: None,
         granularity: Granularity::Fine,
         start_byte: start,
         end_byte: end,
@@ -441,6 +443,56 @@ fn merge_small_siblings(ctx: &WalkerContext<'_>, chunks: &mut Vec<PendingChunk>)
     *chunks = merged;
 }
 
+fn is_gap_only_chunk(chunk: &PendingChunk) -> bool {
+    chunk.symbol_name.is_none()
+        && chunk.delegate_target_name.is_none()
+        && matches!(chunk.chunk_kind, ChunkKind::Code)
+        && matches!(chunk.symbol_kind, None | Some(SymbolKind::Block))
+}
+
+fn merge_delegation_wrappers(chunks: &mut Vec<PendingChunk>) {
+    if chunks.len() < 2 {
+        return;
+    }
+
+    let mut index = 0usize;
+    while index < chunks.len() {
+        let Some(target_name) = chunks[index].delegate_target_name.clone() else {
+            index += 1;
+            continue;
+        };
+
+        let mut lookahead = index + 1;
+        let mut merge_target_index = None;
+        while lookahead < chunks.len() {
+            if chunks[lookahead].symbol_name.is_some() {
+                if chunks[lookahead].symbol_name.as_deref() == Some(target_name.as_str()) {
+                    merge_target_index = Some(lookahead);
+                }
+                break;
+            }
+
+            if !is_gap_only_chunk(&chunks[lookahead]) {
+                break;
+            }
+
+            lookahead += 1;
+        }
+
+        let Some(target_index) = merge_target_index else {
+            index += 1;
+            continue;
+        };
+
+        let wrapper_start = chunks[index].start_byte;
+        let wrapper_symbol_name = chunks[index].symbol_name.clone();
+        chunks[target_index].start_byte = wrapper_start;
+        chunks[target_index].symbol_name = wrapper_symbol_name;
+        chunks.drain(index..target_index);
+        index += 1;
+    }
+}
+
 fn is_statement_container_kind(kind: &str) -> bool {
     kind.contains("body") || kind.contains("block") || kind == "declaration_list"
 }
@@ -491,6 +543,7 @@ fn split_oversized_leaf_node_by_statements(
                     template.symbol_kind.clone()
                 },
                 chunk_kind,
+                delegate_target_name: template.delegate_target_name.clone(),
                 granularity: template.granularity.clone(),
                 start_byte: group_start,
                 end_byte: statement.start_byte(),
@@ -510,6 +563,7 @@ fn split_oversized_leaf_node_by_statements(
             template.symbol_kind.clone()
         },
         chunk_kind: final_chunk_kind,
+        delegate_target_name: template.delegate_target_name.clone(),
         granularity: template.granularity.clone(),
         start_byte: group_start,
         end_byte: template.end_byte,
@@ -578,6 +632,7 @@ fn build_semantic_chunk(
         symbol_name: info.symbol_name,
         symbol_kind: info.symbol_kind,
         chunk_kind: info.chunk_kind,
+        delegate_target_name: info.delegate_target_name,
         granularity: Granularity::Fine,
         start_byte: node_start,
         end_byte: node_end,
@@ -588,6 +643,7 @@ fn build_semantic_chunk(
             symbol_name: template.symbol_name,
             symbol_kind: template.symbol_kind,
             chunk_kind: template.chunk_kind,
+            delegate_target_name: template.delegate_target_name,
             granularity: template.granularity,
             start_byte: template.start_byte,
             end_byte: template.end_byte,
@@ -676,6 +732,7 @@ fn build_semantic_chunk(
         }
     }
 
+    merge_delegation_wrappers(&mut chunks);
     merge_small_siblings(ctx, &mut chunks);
     chunks
 }
@@ -691,6 +748,7 @@ fn build_node_chunks(ctx: &WalkerContext<'_>, node: Node<'_>) -> Vec<PendingChun
             symbol_name: None,
             symbol_kind: Some(SymbolKind::Block),
             chunk_kind: ChunkKind::Code,
+            delegate_target_name: None,
             granularity: Granularity::Fine,
             start_byte: node.start_byte(),
             end_byte: node.end_byte(),
@@ -761,6 +819,7 @@ fn build_node_chunks(ctx: &WalkerContext<'_>, node: Node<'_>) -> Vec<PendingChun
         }
     }
 
+    merge_delegation_wrappers(&mut chunks);
     merge_small_siblings(ctx, &mut chunks);
     chunks
 }
@@ -817,6 +876,7 @@ fn maybe_emit_file_module_header_chunk(
         symbol_name: Some(symbol_name),
         symbol_kind: Some(SymbolKind::Module),
         chunk_kind: ChunkKind::File,
+        delegate_target_name: None,
         granularity: Granularity::Coarse,
         start_byte: 0,
         end_byte,
@@ -886,6 +946,7 @@ pub fn chunk_tree(
                 symbol_name: info.symbol_name,
                 symbol_kind: info.symbol_kind,
                 chunk_kind: info.chunk_kind,
+                delegate_target_name: None,
                 granularity: Granularity::Coarse,
                 start_byte: attached_start(&ctx, node),
                 end_byte: node.end_byte(),

@@ -31,30 +31,35 @@ fn classify_php_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             symbol_kind: Some(SymbolKind::Function),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
+            delegate_target_name: None,
         }),
         "method_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
             symbol_kind: Some(SymbolKind::Method),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
+            delegate_target_name: None,
         }),
         "class_declaration" | "trait_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
             symbol_kind: Some(SymbolKind::Class),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
+            delegate_target_name: None,
         }),
         "enum_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
             symbol_kind: Some(SymbolKind::Type),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
+            delegate_target_name: None,
         }),
         "interface_declaration" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["name"]),
             symbol_kind: Some(SymbolKind::Interface),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
+            delegate_target_name: None,
         }),
         "const_declaration" => None,
         "const_element" => Some(SemanticInfo {
@@ -66,6 +71,7 @@ fn classify_php_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             symbol_kind: Some(SymbolKind::Constant),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: false,
+            delegate_target_name: None,
         }),
         "assignment_expression" => {
             let right = node.child_by_field_name("right")?;
@@ -83,6 +89,7 @@ fn classify_php_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
                 symbol_kind: Some(SymbolKind::Function),
                 chunk_kind: ChunkKind::Code,
                 coarse_eligible: false,
+                delegate_target_name: None,
             })
         }
         _ => None,

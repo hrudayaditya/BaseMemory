@@ -2026,6 +2026,159 @@ exports.helper = helper;
     }
 
     #[test]
+    fn keeps_typescript_constructor_in_class_chunk() {
+        let source = r#"export class TRPCClientError {
+  constructor(cause: unknown) {
+    this.name = "TRPCClientError";
+    this.message = String(cause ?? "unknown");
+  }
+}
+"#;
+
+        let chunks = chunk_file("TRPCClientError.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let class_chunk = named_fine_chunk(&chunks, "TRPCClientError");
+        assert_eq!(class_chunk.symbol_kind, Some(SymbolKind::Class));
+        assert!(class_chunk.text.contains("constructor(cause: unknown)"));
+        assert!(class_chunk.text.contains("this.message = String(cause ?? \"unknown\");"));
+        assert!(!chunks
+            .iter()
+            .any(|chunk| chunk.granularity == Granularity::Fine
+                && chunk.symbol_name.as_deref() == Some("constructor")));
+    }
+
+    #[test]
+    fn large_constructor_splits_without_named_constructor_chunk() {
+        let repeated = "    this.message += String(cause);\n".repeat(80);
+        let source = format!(
+            "export class TRPCClientError {{\n  constructor(cause: unknown) {{\n    this.message = \"\";\n{repeated}  }}\n}}\n"
+        );
+        let config = ChunkConfig {
+            target_token_budget: 48,
+            max_chunk_chars: 240,
+            min_chunk_chars: 80,
+            merge_small_siblings: true,
+            attach_comments: true,
+            emit_coarse_chunks: true,
+        };
+
+        let chunks = chunk_file("TRPCClientError.ts", "typescript", &source, &config)
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let fine: Vec<&Chunk> = fine_chunks(&chunks);
+        let class_fine: Vec<&Chunk> = fine
+            .iter()
+            .copied()
+            .filter(|chunk| chunk.symbol_name.as_deref() == Some("TRPCClientError"))
+            .collect();
+        assert!(class_fine.len() >= 2);
+        assert!(class_fine
+            .iter()
+            .any(|chunk| chunk.text.contains("constructor(cause: unknown)")));
+        assert!(!fine
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("constructor")));
+    }
+
+    #[test]
+    fn keeps_python_init_in_class_chunk() {
+        let source = r#"class ClientError:
+    def __init__(self, cause):
+        self.message = str(cause)
+
+"#;
+
+        let chunks = chunk_file("client_error.py", "python", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let class_chunk = named_fine_chunk(&chunks, "ClientError");
+        assert_eq!(class_chunk.symbol_kind, Some(SymbolKind::Class));
+        assert!(class_chunk.text.contains("def __init__(self, cause):"));
+        assert!(!chunks
+            .iter()
+            .any(|chunk| chunk.granularity == Granularity::Fine
+                && chunk.symbol_name.as_deref() == Some("__init__")));
+    }
+
+    #[test]
+    fn merges_delegation_wrapper_into_target_chunk() {
+        let repeated = "  total += input.length;\n".repeat(40);
+        let source = format!(
+            "function parse(input: string) {{\n  return _parse(input);\n}}\n\nfunction _parse(input: string) {{\n  let total = 0;\n{repeated}  return total;\n}}\n"
+        );
+
+        let chunks = chunk_file("parse.ts", "typescript", &source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let merged_chunk = named_fine_chunk(&chunks, "parse");
+        assert!(merged_chunk.text.contains("function parse(input: string)"));
+        assert!(merged_chunk.text.contains("return _parse(input);"));
+        assert!(merged_chunk.text.contains("function _parse(input: string)"));
+        assert!(!fine_chunks(&chunks)
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("_parse")));
+    }
+
+    #[test]
+    fn merged_delegation_chunk_preserves_wrapper_text() {
+        let source = r#"function parse(input: string) {
+  return _parse(input);
+}
+
+function _parse(input: string) {
+  return input.trim();
+}
+"#;
+
+        let chunks = chunk_file("parse.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let merged_chunk = named_fine_chunk(&chunks, "parse");
+        assert!(merged_chunk.text.trim_start().starts_with("function parse(input: string)"));
+        assert!(merged_chunk.text.contains("function _parse(input: string)"));
+    }
+
+    #[test]
+    fn keeps_short_factory_arrow_as_named_chunk() {
+        let source = r#"export const string = (...args) => new ZodString(...args);
+
+function helper() {
+  return 1;
+}
+"#;
+
+        let chunks = chunk_file("factory.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let factory_chunk = named_fine_chunk(&chunks, "string");
+        assert_eq!(factory_chunk.symbol_kind, Some(SymbolKind::Function));
+        assert!(factory_chunk.text.contains("new ZodString(...args)"));
+        assert!(!factory_chunk.text.contains("function helper()"));
+    }
+
+    #[test]
+    fn does_not_merge_cross_file_style_delegation_calls() {
+        let source = r#"function parse(input: string) {
+  return utils.parse(input);
+}
+
+function _parse(input: string) {
+  return input.trim();
+}
+"#;
+
+        let chunks = chunk_file("parse.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let parse_chunk = named_fine_chunk(&chunks, "parse");
+        let private_chunk = named_fine_chunk(&chunks, "_parse");
+        assert!(parse_chunk.text.contains("return utils.parse(input);"));
+        assert!(!parse_chunk.text.contains("function _parse(input: string)"));
+        assert!(private_chunk.text.contains("function _parse(input: string)"));
+    }
+
+    #[test]
     fn emits_file_module_chunk_for_small_files() {
         let source = r#"export const ARCTIC_QUERY_PREFIX = "prefix";
 export const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-2";

@@ -43,6 +43,7 @@ fn classify_go_function(node: Node<'_>, source: &str, is_method: bool) -> Semant
             ChunkKind::Code
         },
         coarse_eligible: false,
+        delegate_target_name: None,
     }
 }
 
@@ -86,6 +87,7 @@ fn classify_go_type_spec(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         symbol_kind: Some(symbol_kind),
         chunk_kind: ChunkKind::Code,
         coarse_eligible: matches!(symbol_kind, SymbolKind::Struct | SymbolKind::Interface),
+        delegate_target_name: None,
     })
 }
 
@@ -99,6 +101,7 @@ fn classify_go_named_value_spec(
         symbol_kind: Some(symbol_kind),
         chunk_kind: ChunkKind::Code,
         coarse_eligible: false,
+        delegate_target_name: None,
     })
 }
 

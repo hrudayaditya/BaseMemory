@@ -33,12 +33,14 @@ fn classify_json_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             symbol_kind: Some(SymbolKind::Block),
             chunk_kind: ChunkKind::Config,
             coarse_eligible: false,
+            delegate_target_name: None,
         }),
         "object" | "array" => Some(SemanticInfo {
             symbol_name: None,
             symbol_kind: Some(SymbolKind::Module),
             chunk_kind: ChunkKind::Config,
             coarse_eligible: true,
+            delegate_target_name: None,
         }),
         _ => None,
     }
@@ -51,12 +53,14 @@ fn classify_toml_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             symbol_kind: Some(SymbolKind::Module),
             chunk_kind: ChunkKind::Config,
             coarse_eligible: true,
+            delegate_target_name: None,
         }),
         "pair" => Some(SemanticInfo {
             symbol_name: extract_name_by_fields(node, source, &["key"]),
             symbol_kind: Some(SymbolKind::Block),
             chunk_kind: ChunkKind::Config,
             coarse_eligible: false,
+            delegate_target_name: None,
         }),
         _ => None,
     }
@@ -76,6 +80,7 @@ fn classify_yaml_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             symbol_kind: Some(SymbolKind::Block),
             chunk_kind: ChunkKind::Config,
             coarse_eligible: false,
+            delegate_target_name: None,
         }),
         "block_sequence" | "flow_sequence" | "block_mapping" | "flow_mapping" => {
             Some(SemanticInfo {
@@ -83,6 +88,7 @@ fn classify_yaml_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
                 symbol_kind: Some(SymbolKind::Module),
                 chunk_kind: ChunkKind::Config,
                 coarse_eligible: true,
+                delegate_target_name: None,
             })
         }
         _ => None,

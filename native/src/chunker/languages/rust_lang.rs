@@ -84,6 +84,7 @@ fn classify_rust_function(node: Node<'_>, source: &str) -> SemanticInfo {
         symbol_kind: Some(symbol_kind),
         chunk_kind,
         coarse_eligible: false,
+        delegate_target_name: None,
     }
 }
 
@@ -98,6 +99,7 @@ fn classify_named_rust_item(
         symbol_kind: Some(symbol_kind),
         chunk_kind: ChunkKind::Code,
         coarse_eligible,
+        delegate_target_name: None,
     })
 }
 
@@ -143,6 +145,7 @@ fn classify_rust_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
             symbol_kind: Some(SymbolKind::Block),
             chunk_kind: ChunkKind::Code,
             coarse_eligible: true,
+            delegate_target_name: None,
         }),
         _ => None,
     }

@@ -14,6 +14,7 @@ import {
   rankHybridResults,
   stripFilePathHint,
   rerankResults,
+  chunkTypeBoost,
 } from "../src/indexer/index.js";
 
 type Candidate = { id: string; score: number; metadata: ChunkMetadata };
@@ -234,6 +235,162 @@ describe("retrieval ranking", () => {
 
     const rerankedAgain = rerankResults("auth handler", candidates, 10);
     expect(rerankedAgain.map(r => r.id)).toEqual(["exactName", "pathOverlap", "generic"]);
+  });
+
+  it("penalizes interface chunks for definition queries so factories rank above them", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "iface",
+        score: 0.9,
+        metadata: meta({
+          filePath: "/repo/src/procedureBuilder.ts",
+          name: "ProcedureBuilder",
+          chunkType: "interface",
+        }),
+      },
+      {
+        id: "factory",
+        score: 0.82,
+        metadata: meta({
+          filePath: "/repo/src/procedureBuilder.ts",
+          name: "createBuilder",
+          chunkType: "function",
+        }),
+      },
+    ];
+
+    const reranked = rerankResults("factory that returns the mutable procedure builder", candidates, 10, {
+      pathPreference: "source",
+      taskType: "definition",
+    });
+
+    expect(reranked.map((candidate) => candidate.id)).toEqual(["factory", "iface"]);
+  });
+
+  it("does not penalize interface chunks for semantic queries", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "iface",
+        score: 0.9,
+        metadata: meta({
+          filePath: "/repo/src/procedureBuilder.ts",
+          name: "ProcedureBuilder",
+          chunkType: "interface",
+        }),
+      },
+      {
+        id: "factory",
+        score: 0.82,
+        metadata: meta({
+          filePath: "/repo/src/procedureBuilder.ts",
+          name: "createBuilder",
+          chunkType: "function",
+        }),
+      },
+    ];
+
+    const reranked = rerankResults("shape of the procedure builder interface", candidates, 10, {
+      pathPreference: "balanced",
+      taskType: "semantic",
+    });
+
+    expect(reranked[0]?.id).toBe("iface");
+  });
+
+  it("keeps implementation chunks ahead of interface chunks for representative definition queries", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "interfaceChunk",
+        score: 0.88,
+        metadata: meta({
+          filePath: "/repo/packages/server/src/unstable-core-do-not-import/procedureBuilder.ts",
+          name: "ProcedureBuilder",
+          chunkType: "interface",
+        }),
+      },
+      {
+        id: "factoryChunk",
+        score: 0.81,
+        metadata: meta({
+          filePath: "/repo/packages/server/src/unstable-core-do-not-import/procedureBuilder.ts",
+          name: "createBuilder",
+          chunkType: "function",
+        }),
+      },
+    ];
+
+    const reranked = rerankResults("where is createBuilder defined", candidates, 10, {
+      pathPreference: "source",
+      taskType: "definition",
+    });
+
+    expect(reranked[0]?.id).toBe("factoryChunk");
+  });
+
+  it("suppresses unnamed module or other chunks when a named sibling from the same file is present", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "unnamedModule",
+        score: 0.918,
+        metadata: meta({
+          filePath: "/repo/lib/core/AxiosHeaders.js",
+          name: undefined,
+          chunkType: "other",
+        }),
+      },
+      {
+        id: "namedFunction",
+        score: 0.9,
+        metadata: meta({
+          filePath: "/repo/lib/core/AxiosHeaders.js",
+          name: "sanitizeHeaderValue",
+          chunkType: "function",
+        }),
+      },
+    ];
+
+    const reranked = rerankResults("header value sanitize", candidates, 10, {
+      pathPreference: "source",
+      taskType: "definition",
+    });
+
+    expect(reranked[0]?.id).toBe("namedFunction");
+    expect(reranked[1]?.id).toBe("unnamedModule");
+  });
+
+  it("suppresses default-named or file-stem module chunks when a named sibling is present", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "moduleChunk",
+        score: 0.918,
+        metadata: meta({
+          filePath: "/repo/lib/core/AxiosHeaders.js",
+          name: "AxiosHeaders",
+          chunkType: "module",
+        }),
+      },
+      {
+        id: "namedFunction",
+        score: 0.9,
+        metadata: meta({
+          filePath: "/repo/lib/core/AxiosHeaders.js",
+          name: "sanitizeHeaderValue",
+          chunkType: "function",
+        }),
+      },
+    ];
+
+    const reranked = rerankResults("header value sanitize", candidates, 10, {
+      pathPreference: "source",
+      taskType: "definition",
+    });
+
+    expect(reranked[0]?.id).toBe("namedFunction");
+    expect(reranked[1]?.id).toBe("moduleChunk");
+  });
+
+  it("uses at least a -0.12 base penalty for unnamed other chunks", () => {
+    expect(chunkTypeBoost("other")).toBeLessThanOrEqual(-0.12);
   });
 
   it("applies hybrid ranking path for search and semantic-only rerank for findSimilar", () => {

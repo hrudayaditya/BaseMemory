@@ -12,6 +12,7 @@ pub struct SemanticInfo {
     pub symbol_kind: Option<SymbolKind>,
     pub chunk_kind: ChunkKind,
     pub coarse_eligible: bool,
+    pub delegate_target_name: Option<String>,
 }
 
 pub struct LanguagePolicy {

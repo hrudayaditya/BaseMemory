@@ -590,6 +590,7 @@ interface HybridRankOptions {
   voyageWeight?: number;
   voyageResults?: RankedCandidate[];
   pathPreference?: SearchPathPreference;
+  taskType?: SearchTaskType;
 }
 
 interface FusionWeights {
@@ -635,6 +636,7 @@ interface SemanticRankOptions {
   limit: number;
   pathPreference?: SearchPathPreference;
   prioritizeSourcePaths?: boolean;
+  taskType?: SearchTaskType;
 }
 
 interface HardRetrievalFilters {
@@ -830,7 +832,7 @@ function splitNameTokens(name: string): Set<string> {
   return tokens;
 }
 
-function chunkTypeBoost(chunkType: string): number {
+export function chunkTypeBoost(chunkType: string): number {
   switch (chunkType) {
     case "function":
     case "function_declaration":
@@ -850,10 +852,37 @@ function chunkTypeBoost(chunkType: string): number {
     case "module":
       return -0.1;
     case "other":
-      return -0.05;
+      return -0.12;
     default:
       return 0;
   }
+}
+
+function getInterfaceTypePenalty(taskType: SearchTaskType, chunkType: string): number {
+  if (taskType !== "definition" && taskType !== "bug") {
+    return 0;
+  }
+
+  return chunkType === "interface" || chunkType === "type" ? -0.15 : 0;
+}
+
+function shouldSuppressUnnamedSiblingCandidate(candidate: RankedCandidate): boolean {
+  const chunkType = candidate.metadata.chunkType;
+  const name = candidate.metadata.name?.trim() ?? "";
+  if (chunkType === "other") {
+    return name.length === 0;
+  }
+
+  if (chunkType !== "module") {
+    return false;
+  }
+
+  if (name.length === 0 || name.includes("<default>")) {
+    return true;
+  }
+
+  const parsedPath = path.parse(candidate.metadata.filePath);
+  return name.toLowerCase() === parsedPath.name.toLowerCase();
 }
 
 function resolveRetrievalCandidateLimit(limit: number): number {
@@ -1613,7 +1642,7 @@ export function rerankResults(
   query: string,
   candidates: RankedCandidate[],
   rerankTopN: number,
-  options?: { pathPreference?: SearchPathPreference }
+  options?: { pathPreference?: SearchPathPreference; taskType?: SearchTaskType }
 ): RankedCandidate[] {
   if (rerankTopN <= 0 || candidates.length <= 1) {
     return candidates;
@@ -1628,6 +1657,7 @@ export function rerankResults(
   const queryTokenList = Array.from(queryTokens);
   const intent = classifyQueryIntentRaw(query);
   const docIntent = classifyDocIntent(queryTokenList);
+  const taskType = options?.taskType ?? "general";
   const pathPreference = options?.pathPreference ?? "auto";
   const preferSourcePaths = pathPreference === "source"
     ? true
@@ -1692,6 +1722,7 @@ export function rerankResults(
       testDocPenalty +
       testPathBoost +
       readmeDocBoost +
+      getInterfaceTypePenalty(taskType, candidate.metadata.chunkType) +
       chunkTypeBoost(candidate.metadata.chunkType);
 
     return {
@@ -1705,6 +1736,21 @@ export function rerankResults(
       isReadmePath,
     };
   });
+
+  const filesWithNamedCandidates = new Set(
+    head
+      .filter((entry) => Boolean(entry.candidate.metadata.name?.trim()))
+      .map((entry) => entry.candidate.metadata.filePath)
+  );
+
+  for (const entry of head) {
+    if (
+      shouldSuppressUnnamedSiblingCandidate(entry.candidate) &&
+      filesWithNamedCandidates.has(entry.candidate.metadata.filePath)
+    ) {
+      entry.boostedScore -= 0.10;
+    }
+  }
 
   head.sort((a, b) => {
     if (b.boostedScore !== a.boostedScore) return b.boostedScore - a.boostedScore;
@@ -1787,6 +1833,7 @@ export function rankHybridResults(
     : "auto";
   return rerankResults(query, rerankPool, options.rerankTopN, {
     pathPreference: options.pathPreference ?? defaultPathPreference,
+    taskType: options.taskType,
   });
 }
 
@@ -1800,6 +1847,7 @@ export function rankSemanticOnlyResults(
   const defaultPathPreference = (options.prioritizeSourcePaths ?? false) ? "source" : "auto";
   return rerankResults(query, bounded, options.rerankTopN, {
     pathPreference: options.pathPreference ?? defaultPathPreference,
+    taskType: options.taskType,
   });
 }
 
@@ -4650,6 +4698,7 @@ export class Indexer {
       voyageResults: voyageCandidates,
       prioritizeSourcePaths: sourceIntent,
       pathPreference: recipe.pathPreference,
+      taskType,
     });
     const fusionMs = performance.now() - fusionStartTime;
 
