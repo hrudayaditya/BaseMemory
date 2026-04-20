@@ -2108,6 +2108,52 @@ exports.helper = helper;
     }
 
     #[test]
+    fn keeps_java_constructor_in_class_chunk() {
+        let source = r#"public class ClientError {
+    public ClientError(String cause) {
+        this.message = cause;
+    }
+}
+"#;
+
+        let chunks = chunk_file("ClientError.java", "java", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let class_chunk = named_fine_chunk(&chunks, "ClientError");
+        assert_eq!(class_chunk.symbol_kind, Some(SymbolKind::Class));
+        assert!(class_chunk.text.contains("public ClientError(String cause)"));
+        assert!(class_chunk.text.contains("this.message = cause;"));
+        assert!(!chunks
+            .iter()
+            .any(|chunk| chunk.granularity == Granularity::Fine
+                && chunk.symbol_name.as_deref() == Some("ClientError")
+                && chunk.symbol_kind == Some(SymbolKind::Method)));
+    }
+
+    #[test]
+    fn keeps_csharp_constructor_in_class_chunk() {
+        let source = r#"public class ClientError {
+    public ClientError(string cause) {
+        Message = cause;
+    }
+}
+"#;
+
+        let chunks = chunk_file("ClientError.cs", "csharp", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let class_chunk = named_fine_chunk(&chunks, "ClientError");
+        assert_eq!(class_chunk.symbol_kind, Some(SymbolKind::Class));
+        assert!(class_chunk.text.contains("public ClientError(string cause)"));
+        assert!(class_chunk.text.contains("Message = cause;"));
+        assert!(!chunks
+            .iter()
+            .any(|chunk| chunk.granularity == Granularity::Fine
+                && chunk.symbol_name.as_deref() == Some("ClientError")
+                && chunk.symbol_kind == Some(SymbolKind::Method)));
+    }
+
+    #[test]
     fn merges_delegation_wrapper_into_target_chunk() {
         let repeated = "  total += input.length;\n".repeat(40);
         let source = format!(

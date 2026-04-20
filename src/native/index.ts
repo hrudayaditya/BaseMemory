@@ -1322,6 +1322,8 @@ export class Database {
       nodeType?: ChunkType;
       node_type?: ChunkType;
       name?: string;
+      symbolAliases?: string[];
+      symbol_aliases?: string[];
       chunkKind?: ChunkKind;
       chunk_kind?: ChunkKind;
       symbolKind?: ChunkSymbolKind;

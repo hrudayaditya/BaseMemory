@@ -98,8 +98,12 @@ fn classify_java_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     match node.kind() {
         "method_declaration" | "constructor_declaration" => {
             let is_test = has_test_annotation(node, source);
+            let symbol_name = extract_name_by_fields(node, source, &["name"]);
+            if node.kind() == "constructor_declaration" {
+                return None;
+            }
             Some(SemanticInfo {
-                symbol_name: extract_name_by_fields(node, source, &["name"]),
+                symbol_name,
                 symbol_aliases: Vec::new(),
                 symbol_kind: Some(if is_test {
                     SymbolKind::Test
