@@ -234,6 +234,12 @@ export function buildPerQueryResult(
   const dedupedExpanded = uniqueResultsByIdentity(expandedResults);
   const hitAt = (cutoff: number): boolean =>
     deduped.slice(0, cutoff).some((result) => matchesExpectedResult(result, query));
+  const fileHitAt = (cutoff: number): boolean => {
+    const relevantPaths = getRelevantPaths(query);
+    return deduped
+      .slice(0, cutoff)
+      .some((result) => isRelevantResult(result.filePath, relevantPaths));
+  };
   const expandedHit = dedupedExpanded.some((result) => matchesExpectedResult(result, query));
 
   const perQuery: PerQueryEvalResult = {
@@ -247,9 +253,12 @@ export function buildPerQueryResult(
     effectiveGraphDepth: effective?.effectiveGraphDepth,
     latencyMs,
     prefilterMs: timings?.prefilterMs,
+    fileHitAt1: fileHitAt(1),
+    fileHitAt3: fileHitAt(3),
     hitAt1: hitAt(1),
     hitAt3: hitAt(3),
     hitAt5: hitAt(5),
+    fileHitAt10: fileHitAt(10),
     hitAt10: hitAt(10),
     expandedHit,
     expandedRecallAtK: combinedRecallAtK(deduped, dedupedExpanded, query, k),
@@ -274,9 +283,12 @@ export function computeEvalMetrics(
   const safeDiv = (value: number): number => (count === 0 ? 0 : value / count);
 
   const sum = {
+    fileHitAt1: 0,
+    fileHitAt3: 0,
     hitAt1: 0,
     hitAt3: 0,
     hitAt5: 0,
+    fileHitAt10: 0,
     hitAt10: 0,
     combinedRecallAt10: 0,
     expansionHitRate: 0,
@@ -294,9 +306,12 @@ export function computeEvalMetrics(
   const latencies = perQuery.map((item) => item.latencyMs);
 
   for (const query of perQuery) {
+    if (query.fileHitAt1) sum.fileHitAt1 += 1;
+    if (query.fileHitAt3) sum.fileHitAt3 += 1;
     if (query.hitAt1) sum.hitAt1 += 1;
     if (query.hitAt3) sum.hitAt3 += 1;
     if (query.hitAt5) sum.hitAt5 += 1;
+    if (query.fileHitAt10) sum.fileHitAt10 += 1;
     if (query.hitAt10) sum.hitAt10 += 1;
     sum.combinedRecallAt10 += query.expandedRecallAtK ?? 0;
     if (query.expandedHit) sum.expansionHitRate += 1;
@@ -310,9 +325,12 @@ export function computeEvalMetrics(
   const queryTokens = queries.reduce((acc, q) => acc + estimateTokens(q.query), 0);
 
   return {
+    fileHitAt1: safeDiv(sum.fileHitAt1),
+    fileHitAt3: safeDiv(sum.fileHitAt3),
     hitAt1: safeDiv(sum.hitAt1),
     hitAt3: safeDiv(sum.hitAt3),
     hitAt5: safeDiv(sum.hitAt5),
+    fileHitAt10: safeDiv(sum.fileHitAt10),
     hitAt10: safeDiv(sum.hitAt10),
     combinedRecallAt10: safeDiv(sum.combinedRecallAt10),
     expansionHitRate: safeDiv(sum.expansionHitRate),

@@ -97,9 +97,12 @@ export interface PerQueryEvalResult {
   effectiveGraphDepth?: number;
   latencyMs: number;
   prefilterMs?: number;
+  fileHitAt1: boolean;
+  fileHitAt3: boolean;
   hitAt1: boolean;
   hitAt3: boolean;
   hitAt5: boolean;
+  fileHitAt10: boolean;
   hitAt10: boolean;
   expandedHit?: boolean;
   expandedRecallAtK?: number;
@@ -111,9 +114,12 @@ export interface PerQueryEvalResult {
 }
 
 export interface EvalMetrics {
+  fileHitAt1: number;
+  fileHitAt3: number;
   hitAt1: number;
   hitAt3: number;
   hitAt5: number;
+  fileHitAt10: number;
   hitAt10: number;
   combinedRecallAt10: number;
   expansionHitRate: number;

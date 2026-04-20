@@ -105,9 +105,12 @@ export function createSummaryMarkdown(
   lines.push("");
   lines.push("| Metric | Value |");
   lines.push("|---|---:|");
+  lines.push(`| File Hit@1 | ${formatPct(summary.metrics.fileHitAt1)} |`);
+  lines.push(`| File Hit@3 | ${formatPct(summary.metrics.fileHitAt3)} |`);
   lines.push(`| Hit@1 | ${formatPct(summary.metrics.hitAt1)} |`);
   lines.push(`| Hit@3 | ${formatPct(summary.metrics.hitAt3)} |`);
   lines.push(`| Hit@5 | ${formatPct(summary.metrics.hitAt5)} |`);
+  lines.push(`| File Hit@10 | ${formatPct(summary.metrics.fileHitAt10)} |`);
   lines.push(`| Hit@10 | ${formatPct(summary.metrics.hitAt10)} |`);
   lines.push(`| Combined Recall@10 | ${formatPct(summary.metrics.combinedRecallAt10)} |`);
   lines.push(`| Expansion Hit Rate | ${formatPct(summary.metrics.expansionHitRate)} |`);
