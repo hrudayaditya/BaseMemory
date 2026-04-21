@@ -479,10 +479,10 @@ describe("retrieval ranking", () => {
 
     const penalized = applyChunkKindPenalty(candidates, "semantic", "where is budget enforcement handled");
 
-    expect(getChunkKindPenaltyFactor("semantic", "Test")).toBe(0.6);
-    expect(getChunkKindPenaltyFactor("semantic", "Doc")).toBe(0.6);
+    expect(getChunkKindPenaltyFactor("semantic", "Test")).toBe(0.45);
+    expect(getChunkKindPenaltyFactor("semantic", "Doc")).toBe(0.45);
     expect(penalized[0]?.id).toBe("sourceChunk");
-    expect(penalized[1]?.score).toBeCloseTo(0.54, 6);
+    expect(penalized[1]?.score).toBeCloseTo(0.405, 6);
   });
 
   it("does not penalize test chunks for test_debug queries", () => {
@@ -545,9 +545,9 @@ describe("retrieval ranking", () => {
 
     const penalized = applyChunkKindPenalty(candidates, "definition", "sqlite busy timeout handling");
 
-    expect(getChunkKindPenaltyFactor("definition", "Test")).toBe(0.7);
+    expect(getChunkKindPenaltyFactor("definition", "Test")).toBe(0.5);
     expect(penalized[0]?.id).toBe("sourceChunk");
-    expect(penalized[1]?.score).toBeCloseTo(0.595, 6);
+    expect(penalized[1]?.score).toBeCloseTo(0.425, 6);
   });
 
   it("does not penalize rust inline test chunks for test_debug queries", () => {
@@ -678,7 +678,7 @@ describe("retrieval ranking", () => {
     const penalized = applyChunkKindPenalty(candidates, "semantic", "what does the runner pipeline module do");
 
     expect(penalized.map((candidate) => candidate.id)).toEqual(["sourceChunk", "testChunk"]);
-    expect(penalized[1]?.score).toBeCloseTo(0.54, 6);
+    expect(penalized[1]?.score).toBeCloseTo(0.405, 6);
   });
 
   it("does not penalize semantic recipe-mapping queries", () => {

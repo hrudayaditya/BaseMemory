@@ -84,7 +84,7 @@ describe("multi-index vector store", () => {
     const internals = getInternals(indexer);
     expect(Array.from(internals.stores.keys())).toEqual(["mock-embedding-model"]);
     expect(internals.hasStore("mock-embedding-model")).toBe(true);
-    expect(internals.hasStore("voyage-code-2")).toBe(false);
+    expect(internals.hasStore("voyage-code-3")).toBe(false);
   });
 
   it("initializes dual named stores with model-keyed paths and dimensions when Voyage is configured", async () => {
@@ -99,16 +99,16 @@ describe("multi-index vector store", () => {
     const internals = getInternals(indexer);
     expect(Array.from(internals.stores.keys())).toEqual([
       "mock-embedding-model",
-      "voyage-code-2",
+      "voyage-code-3",
     ]);
     expect(internals.getStore("mock-embedding-model").getDimensions()).toBe(8);
-    expect(internals.getStore("voyage-code-2").getDimensions()).toBe(1536);
+    expect(internals.getStore("voyage-code-3").getDimensions()).toBe(1024);
     const resolvedTempDir = fs.realpathSync(tempDir);
     expect(internals.storePathForModel("mock-embedding-model")).toBe(
       path.join(resolvedTempDir, ".opencode", "index", "vectors-mock-embedding-model")
     );
-    expect(internals.storePathForModel("voyage-code-2")).toBe(
-      path.join(resolvedTempDir, ".opencode", "index", "vectors-voyage-code-2")
+    expect(internals.storePathForModel("voyage-code-3")).toBe(
+      path.join(resolvedTempDir, ".opencode", "index", "vectors-voyage-code-3")
     );
   });
 
@@ -171,7 +171,7 @@ describe("multi-index vector store", () => {
     await indexer.initialize();
 
     const internals = getInternals(indexer);
-    expect(internals.hasStore("voyage-code-2")).toBe(true);
+    expect(internals.hasStore("voyage-code-3")).toBe(true);
     expect(internals.hasStore("missing-model")).toBe(false);
     expect(() => internals.getStore("missing-model")).toThrow(
       'Vector store for model "missing-model" has not been initialized.'
@@ -189,9 +189,9 @@ describe("multi-index vector store", () => {
 
     const internals = getInternals(indexer);
     const primarySaveSpy = vi.spyOn(internals.getStore("mock-embedding-model"), "save");
-    const voyageSaveSpy = vi.spyOn(internals.getStore("voyage-code-2"), "save");
+    const voyageSaveSpy = vi.spyOn(internals.getStore("voyage-code-3"), "save");
     const primaryLoadSpy = vi.spyOn(internals.getStore("mock-embedding-model"), "load");
-    const voyageLoadSpy = vi.spyOn(internals.getStore("voyage-code-2"), "load");
+    const voyageLoadSpy = vi.spyOn(internals.getStore("voyage-code-3"), "load");
 
     internals.saveAllStores();
     internals.loadAllStores();
@@ -213,9 +213,9 @@ describe("multi-index vector store", () => {
 
     const internals = getInternals(indexer);
     const primaryStore = internals.getStore("mock-embedding-model");
-    const voyageStore = internals.getStore("voyage-code-2");
+    const voyageStore = internals.getStore("voyage-code-3");
     primaryStore.add("primary-chunk", createVector(8, 3), createMetadata("/tmp/primary.ts", "primary-hash"));
-    voyageStore.add("voyage-chunk", createVector(1536, 4), createMetadata("/tmp/voyage.ts", "voyage-hash"));
+    voyageStore.add("voyage-chunk", createVector(1024, 4), createMetadata("/tmp/voyage.ts", "voyage-hash"));
 
     expect(primaryStore.count()).toBe(1);
     expect(voyageStore.count()).toBe(1);

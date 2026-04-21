@@ -5,14 +5,14 @@ import {
   VoyageEmbeddingProvider,
 } from "../src/embeddings/provider.js";
 
-const VOYAGE_CODE_2_DIMENSIONS = 1536;
+const VOYAGE_CODE_3_DIMENSIONS = 1024;
 
 describe("VoyageEmbeddingProvider", () => {
   let fetchSpy: ReturnType<typeof vi.spyOn>;
   let warnSpy: ReturnType<typeof vi.spyOn>;
 
   function createEmbedding(value: number): number[] {
-    return new Array(VOYAGE_CODE_2_DIMENSIONS).fill(value);
+    return new Array(VOYAGE_CODE_3_DIMENSIONS).fill(value);
   }
 
   function createProvider(overrides?: {
@@ -67,7 +67,7 @@ describe("VoyageEmbeddingProvider", () => {
     const body = JSON.parse(options.body as string);
     expect(body).toEqual({
       input: ["doc one", "doc two"],
-      model: "voyage-code-2",
+      model: "voyage-code-3",
       input_type: "document",
     });
     expect(result!.totalTokensUsed).toBe(22);

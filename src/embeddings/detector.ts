@@ -111,7 +111,7 @@ export function createVoyageProviderInfo(config: {
   voyageApiKey: string;
   voyageModelId?: string;
 }): ConfiguredProviderInfo {
-  const modelId = config.voyageModelId?.trim() || "voyage-code-2";
+  const modelId = config.voyageModelId?.trim() || "voyage-code-3";
   const modelInfo = EMBEDDING_MODELS.voyage[modelId as keyof typeof EMBEDDING_MODELS.voyage];
   if (!modelInfo) {
     throw new Error(`Voyage model '${modelId}' is not supported`);

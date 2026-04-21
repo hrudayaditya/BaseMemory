@@ -49,6 +49,7 @@ interface ScoredCandidate {
 }
 
 const BUG_TEST_DOC_POST_RERANK_FACTOR = 0.05;
+const TEST_DEBUG_COARSE_MODULE_POST_RERANK_FACTOR = 0.75;
 
 interface CrossEncoderPair {
   text: string;
@@ -222,20 +223,28 @@ function overlapCount(left: Set<string>, right: Set<string>): number {
 }
 
 function getPostRerankScoreFactor(candidate: RerankerCandidate, taskType: SearchTaskType): number {
-  if (taskType !== "bug") {
-    return 1;
+  if (taskType === "bug") {
+    return candidate.chunkKind === "Test" || candidate.chunkKind === "Doc"
+      ? BUG_TEST_DOC_POST_RERANK_FACTOR
+      : 1;
   }
 
-  return candidate.chunkKind === "Test" || candidate.chunkKind === "Doc"
-    ? BUG_TEST_DOC_POST_RERANK_FACTOR
-    : 1;
+  if (taskType === "test_debug") {
+    return candidate.metadata.chunkType === "module" ||
+      candidate.chunkKind === "File" ||
+      candidate.symbolKind === "Module"
+      ? TEST_DEBUG_COARSE_MODULE_POST_RERANK_FACTOR
+      : 1;
+  }
+
+  return 1;
 }
 
 function applyPostRerankTaskBias(
   candidates: RerankerCandidate[],
   taskType: SearchTaskType
 ): RerankerCandidate[] {
-  if (taskType !== "bug") {
+  if (taskType !== "bug" && taskType !== "test_debug") {
     return candidates;
   }
 

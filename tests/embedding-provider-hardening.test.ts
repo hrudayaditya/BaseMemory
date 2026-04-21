@@ -167,11 +167,11 @@ const providerCases: ProviderCase[] = [
   },
   {
     name: "Voyage",
-    dimensions: 1536,
+    dimensions: 1024,
     createProvider: () => new VoyageEmbeddingProvider({ voyageApiKey: "voyage-test-key" }),
     createSuccessResponse: createVoyageResponse,
     createMalformedResponse: () => new Response(JSON.stringify({ embeddings: [{}] }), { status: 200 }),
-    createWrongDimensionResponse: () => createVoyageResponse(1, 1535),
+    createWrongDimensionResponse: () => createVoyageResponse(1, 1023),
   },
 ];
 

@@ -32,7 +32,7 @@ describe("search recipes", () => {
     expect(definition.denseWeight).toBe(0.2);
     expect(definition.voyageWeight).toBe(0.3);
     expect(definition.identifierBoost).toBe(2.0);
-    expect(definition.testDocChunkPenalty).toBe(0.7);
+    expect(definition.testDocChunkPenalty).toBe(0.5);
   });
 
   it("assigns the expected bug-search retrieval profile", () => {
@@ -67,7 +67,7 @@ describe("search recipes", () => {
     expect(recipe.denseWeight).toBe(0.7);
     expect(recipe.voyageWeight).toBe(0.2);
     expect(recipe.identifierBoost).toBe(1.0);
-    expect(recipe.testDocChunkPenalty).toBe(0.6);
+    expect(recipe.testDocChunkPenalty).toBe(0.45);
   });
 
   it("does not apply test/doc chunk damping to test_debug", () => {

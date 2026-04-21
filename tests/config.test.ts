@@ -755,9 +755,9 @@ describe("config schema", () => {
     });
 
     describe("voyage provider config", () => {
-      it("defaults voyageModelId to voyage-code-2", () => {
+      it("defaults voyageModelId to voyage-code-3", () => {
         const config = parseConfig({});
-        expect(config.voyageModelId).toBe("voyage-code-2");
+        expect(config.voyageModelId).toBe("voyage-code-3");
         expect(config.voyageApiKey).toBeUndefined();
       });
 
@@ -779,7 +779,7 @@ describe("config schema", () => {
         }));
 
         expect(config.voyageApiKey).toBe("voyage-env-key");
-        expect(config.voyageModelId).toBe("voyage-code-2");
+        expect(config.voyageModelId).toBe("voyage-code-3");
 
         vi.unstubAllEnvs();
       });

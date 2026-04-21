@@ -139,7 +139,7 @@ describe("incremental index orchestrator", () => {
     return parseConfig({
       embeddingProvider: "voyage",
       voyageApiKey: "voyage-test-key",
-      voyageModelId: "voyage-code-2",
+      voyageModelId: "voyage-code-3",
       indexing: {
         watchFiles: false,
         ...(overrideRecord.indexing ?? {}),
@@ -380,7 +380,7 @@ describe("incremental index orchestrator", () => {
 
     const voyageCalls = fetchSpy.mock.calls.filter(([, init]) => {
       const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string; input?: string[] };
-      return body.model === "voyage-code-2" && Array.isArray(body.input);
+      return body.model === "voyage-code-3" && Array.isArray(body.input);
     });
     const expectedBatches = Math.ceil(foreground.embeddingProgress.total / 128);
 
@@ -403,7 +403,7 @@ describe("incremental index orchestrator", () => {
     let failedPayload: string | null = null;
     fetchSpy.mockImplementation(async (_url, init) => {
       const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[]; model?: string };
-      if (body.model === "voyage-code-2" && Array.isArray(body.input) && body.input.length > 0) {
+      if (body.model === "voyage-code-3" && Array.isArray(body.input) && body.input.length > 0) {
         const payloadKey = JSON.stringify(body.input);
         if (!seenVoyagePayloads.has(payloadKey)) {
           seenVoyagePayloads.add(payloadKey);
@@ -446,7 +446,7 @@ describe("incremental index orchestrator", () => {
     let voyageCallCount = 0;
     fetchSpy.mockImplementation(async (_url, init) => {
       const body = JSON.parse(String(init?.body ?? "{}")) as { input?: string[]; model?: string };
-      if (body.model === "voyage-code-2" && Array.isArray(body.input) && body.input.length > 0) {
+      if (body.model === "voyage-code-3" && Array.isArray(body.input) && body.input.length > 0) {
         voyageCallCount += 1;
         if (voyageCallCount === 2) {
           await releaseSecondBatch.promise;
@@ -489,7 +489,7 @@ describe("incremental index orchestrator", () => {
 
     const voyageCalls = fetchSpy.mock.calls.filter(([, init]) => {
       const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string; input?: string[] };
-      return body.model === "voyage-code-2" && Array.isArray(body.input);
+      return body.model === "voyage-code-3" && Array.isArray(body.input);
     });
 
     expect(voyageCalls).toHaveLength(1);
@@ -2407,6 +2407,28 @@ describe("incremental index orchestrator", () => {
     expect(callers[0]?.isResolved).toBe(true);
   });
 
+  it("preserves branch symbol membership when graph stage is already fresh", async () => {
+    const { callerFile, helperFile } = createCrossFileCallRepo();
+    const indexer = new Indexer(tempDir, createConfig());
+
+    await indexer.index();
+    await indexer.index();
+
+    const { branch, database } = await openDatabase(indexer);
+    const callerSymbol = database.getSymbolsByNameOnBranch("runTask", branch)[0];
+    const helperSymbol = database.getSymbolsByNameOnBranch("helperFn", branch)[0];
+
+    expect(callerSymbol).toBeTruthy();
+    expect(helperSymbol).toBeTruthy();
+    expect(path.basename(callerSymbol!.filePath)).toBe(path.basename(callerFile));
+    expect(path.basename(helperSymbol!.filePath)).toBe(path.basename(helperFile));
+
+    const callers = database.getCallersWithContextByTargetSymbolId(helperSymbol!.id, branch);
+    expect(callers).toHaveLength(1);
+    expect(callers[0]?.fromSymbolId).toBe(callerSymbol!.id);
+    expect(callers[0]?.isResolved).toBe(true);
+  });
+
   it("keeps ambiguous cross-file call edges unresolved after finalization", async () => {
     const { callerFile, processAFile, processBFile } = createAmbiguousCrossFileCallRepo();
     const indexer = new Indexer(tempDir, createConfig());
@@ -3651,7 +3673,7 @@ describe("incremental index orchestrator", () => {
 
     const internals = getIndexerInternals(indexer);
     const arcticStore = internals.stores.get("mock-embedding-model");
-    const voyageStore = internals.stores.get("voyage-code-2");
+    const voyageStore = internals.stores.get("voyage-code-3");
     expect(arcticStore?.count()).toBe(chunkIds.length);
     expect(voyageStore?.count()).toBe(chunkIds.length);
 
@@ -3659,7 +3681,7 @@ describe("incremental index orchestrator", () => {
       const chunk = database.getChunk(chunkId);
       expect(chunk).not.toBeNull();
       expect(database.getEmbeddingForModel(chunk!.embeddingInputHash, "mock-embedding-model")).not.toBeNull();
-      expect(database.getEmbeddingForModel(chunk!.embeddingInputHash, "voyage-code-2")).not.toBeNull();
+      expect(database.getEmbeddingForModel(chunk!.embeddingInputHash, "voyage-code-3")).not.toBeNull();
     }
   });
 
@@ -3688,23 +3710,23 @@ describe("incremental index orchestrator", () => {
       expect.objectContaining({
         branch,
         filePath: trackedA,
-        model: "voyage-code-2",
+        model: "voyage-code-3",
       }),
       expect.objectContaining({
         branch,
         filePath: trackedB,
-        model: "voyage-code-2",
+        model: "voyage-code-3",
       }),
     ]);
 
     const chunkIds = database.getBranchChunkIds(branch);
-    const voyageStore = getIndexerInternals(indexer).stores.get("voyage-code-2");
+    const voyageStore = getIndexerInternals(indexer).stores.get("voyage-code-3");
     expect(voyageStore?.count() ?? 0).toBe(0);
     for (const chunkId of chunkIds) {
       const chunk = database.getChunk(chunkId);
       expect(chunk).not.toBeNull();
       expect(database.getEmbeddingForModel(chunk!.embeddingInputHash, "mock-embedding-model")).not.toBeNull();
-      expect(database.getEmbeddingForModel(chunk!.embeddingInputHash, "voyage-code-2")).toBeNull();
+      expect(database.getEmbeddingForModel(chunk!.embeddingInputHash, "voyage-code-3")).toBeNull();
     }
   });
 
@@ -3756,7 +3778,7 @@ describe("incremental index orchestrator", () => {
       return body.model;
     });
     expect(models.length).toBeGreaterThan(0);
-    expect(models.every((model) => model === "voyage-code-2")).toBe(true);
+    expect(models.every((model) => model === "voyage-code-3")).toBe(true);
   });
 
   it("heals Voyage debt without changing Arctic embeddings", async () => {
@@ -3801,7 +3823,7 @@ describe("incremental index orchestrator", () => {
           "hex"
         )
       ).toBe(arcticBefore.get(chunk!.embeddingInputHash));
-      expect(database.getEmbeddingForModel(chunk!.embeddingInputHash, "voyage-code-2")).not.toBeNull();
+      expect(database.getEmbeddingForModel(chunk!.embeddingInputHash, "voyage-code-3")).not.toBeNull();
     }
   });
 
@@ -3809,7 +3831,7 @@ describe("incremental index orchestrator", () => {
     const branch = "main";
     const filePath = "/tmp/debt.ts";
     const database = new Database(path.join(tempDir, "branch-debt.db"));
-    database.recordEmbeddingDebt(branch, filePath, "voyage-code-2", "provider timeout");
+    database.recordEmbeddingDebt(branch, filePath, "voyage-code-3", "provider timeout");
     database.upsertPipelineState({
       branch,
       filePath,
@@ -3884,13 +3906,13 @@ describe("incremental index orchestrator", () => {
     expect(chunkRows.length).toBeGreaterThan(0);
 
     const arcticStore = getIndexerInternals(indexer).stores.get("mock-embedding-model");
-    const voyageStore = getIndexerInternals(indexer).stores.get("voyage-code-2");
+    const voyageStore = getIndexerInternals(indexer).stores.get("voyage-code-3");
     expect(arcticStore?.count() ?? 0).toBe(0);
     expect(voyageStore?.count()).toBe(chunkRows.length);
 
     for (const chunk of chunkRows) {
       expect(database.getEmbeddingForModel(chunk.embeddingInputHash, "mock-embedding-model")).toBeNull();
-      expect(database.getEmbeddingForModel(chunk.embeddingInputHash, "voyage-code-2")).not.toBeNull();
+      expect(database.getEmbeddingForModel(chunk.embeddingInputHash, "voyage-code-3")).not.toBeNull();
     }
   });
 
@@ -3927,7 +3949,7 @@ describe("incremental index orchestrator", () => {
       return body.model;
     });
     expect(models.length).toBeGreaterThan(0);
-    expect(models.every((model) => model === "voyage-code-2")).toBe(true);
+    expect(models.every((model) => model === "voyage-code-3")).toBe(true);
   });
 
   it("reruns Voyage-only embedding work when voyageModelId changes without touching CHUNK or GRAPH", async () => {
@@ -3936,6 +3958,7 @@ describe("incremental index orchestrator", () => {
       tempDir,
       createConfig({
         voyageApiKey: "voyage-test-key",
+        voyageModelId: "voyage-code-2",
       })
     );
     await indexer.index();
@@ -4014,10 +4037,10 @@ describe("incremental index orchestrator", () => {
       (entry) => entry.model === "mock-embedding-model" && entry.event === "end"
     );
     const voyageStart = callTimeline.find(
-      (entry) => entry.model === "voyage-code-2" && entry.event === "start"
+      (entry) => entry.model === "voyage-code-3" && entry.event === "start"
     );
     const voyageEnd = callTimeline.find(
-      (entry) => entry.model === "voyage-code-2" && entry.event === "end"
+      (entry) => entry.model === "voyage-code-3" && entry.event === "end"
     );
 
     expect(arcticStart).toBeTruthy();

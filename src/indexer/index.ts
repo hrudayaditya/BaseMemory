@@ -1147,6 +1147,203 @@ function inferRelationshipTarget(query: string): string | null {
   return null;
 }
 
+function applyCallerTargetPenalty(
+  query: string,
+  candidates: RankedCandidate[],
+  taskType: SearchTaskType
+): RankedCandidate[] {
+  if (taskType !== "definition" || candidates.length < 2) {
+    return candidates;
+  }
+
+  if (inferRelationshipGraphDirection(query) !== "caller") {
+    return candidates;
+  }
+
+  const target = inferRelationshipTarget(query)?.toLowerCase();
+  if (!target) {
+    return candidates;
+  }
+
+  const rescored = candidates.map((candidate, originalIndex) => {
+    const candidateName = candidate.metadata.name?.toLowerCase();
+    const penalty = candidateName === target ? 0.51 : 0;
+    return {
+      candidate: penalty === 0
+        ? candidate
+        : {
+            ...candidate,
+            score: candidate.score - penalty,
+          },
+      originalIndex,
+    };
+  });
+
+  rescored.sort((left, right) => {
+    if (right.candidate.score !== left.candidate.score) {
+      return right.candidate.score - left.candidate.score;
+    }
+    if (left.originalIndex !== right.originalIndex) {
+      return left.originalIndex - right.originalIndex;
+    }
+    return left.candidate.id.localeCompare(right.candidate.id);
+  });
+
+  return rescored.map((entry) => entry.candidate);
+}
+
+function applyCallerContentBoost(
+  query: string,
+  candidates: RankedCandidate[],
+  storedChunkTexts: Map<string, string>,
+  taskType: SearchTaskType
+): RankedCandidate[] {
+  if (taskType !== "definition" || candidates.length < 2) {
+    return candidates;
+  }
+
+  if (inferRelationshipGraphDirection(query) !== "caller") {
+    return candidates;
+  }
+
+  const target = inferRelationshipTarget(query)?.toLowerCase();
+  if (!target) {
+    return candidates;
+  }
+
+  const rescored = candidates.map((candidate, originalIndex) => {
+    const candidateName = candidate.metadata.name?.toLowerCase() ?? "";
+    const chunkText = storedChunkTexts.get(candidate.metadata.hash)?.toLowerCase() ?? "";
+    const referencesTarget = candidateName !== target && chunkText.includes(target);
+    const boost = referencesTarget &&
+      isImplementationChunkType(candidate.metadata.chunkType) &&
+      isLikelyImplementationPath(candidate.metadata.filePath)
+      ? 0.18
+      : 0;
+
+    return {
+      candidate: boost === 0
+        ? candidate
+        : {
+            ...candidate,
+            score: candidate.score + boost,
+          },
+      originalIndex,
+    };
+  });
+
+  rescored.sort((left, right) => {
+    if (right.candidate.score !== left.candidate.score) {
+      return right.candidate.score - left.candidate.score;
+    }
+    if (left.originalIndex !== right.originalIndex) {
+      return left.originalIndex - right.originalIndex;
+    }
+    return left.candidate.id.localeCompare(right.candidate.id);
+  });
+
+  return rescored.map((entry) => entry.candidate);
+}
+
+function applyRelationshipGraphBias(
+  query: string,
+  candidates: RankedCandidate[],
+  taskType: SearchTaskType
+): RankedCandidate[] {
+  if (taskType !== "definition" || candidates.length < 2) {
+    return candidates;
+  }
+
+  const direction = inferRelationshipGraphDirection(query);
+  if (!direction || direction === "both") {
+    return candidates;
+  }
+
+  const rescored = candidates.map((candidate, originalIndex) => {
+    const isDirectRelationship = candidate.relation === direction;
+    const boost = isDirectRelationship
+      ? (isTestOrDocPath(candidate.metadata.filePath) ? 0.2 : 0.6)
+      : 0;
+
+    return {
+      candidate: boost === 0
+        ? candidate
+        : {
+            ...candidate,
+            score: candidate.score + boost,
+          },
+      originalIndex,
+    };
+  });
+
+  rescored.sort((left, right) => {
+    if (right.candidate.score !== left.candidate.score) {
+      return right.candidate.score - left.candidate.score;
+    }
+    if (left.originalIndex !== right.originalIndex) {
+      return left.originalIndex - right.originalIndex;
+    }
+    return left.candidate.id.localeCompare(right.candidate.id);
+  });
+
+  return rescored.map((entry) => entry.candidate);
+}
+
+function injectRelationshipGraphCandidates(
+  query: string,
+  candidates: RankedCandidate[],
+  database: Database,
+  branch: string,
+  graphDepth: number,
+  graphDirection: GraphExpansionDirection,
+  allowedChunkIds: Set<string> | null,
+  taskType: SearchTaskType
+): RankedCandidate[] {
+  if (taskType !== "definition" || candidates.length === 0 || graphDepth <= 0 || graphDirection === "both") {
+    return candidates;
+  }
+
+  const graphSeedCandidates = selectGraphSeedsForQuery(candidates, graphDirection, query);
+  const graphSeeds: GraphExpansionSeed[] = graphSeedCandidates.map((candidate) => ({
+    id: candidate.id,
+    metadata: candidate.metadata,
+  }));
+  const expanded = expandGraphContext(database, graphSeeds, {
+    branch,
+    depth: graphDepth,
+    direction: graphDirection,
+    allowedChunkIds,
+  });
+  if (expanded.length === 0) {
+    return candidates;
+  }
+
+  const byId = new Map(candidates.map((candidate): [string, RankedCandidate] => [candidate.id, candidate]));
+  for (const entry of expanded) {
+    const existing = byId.get(entry.id);
+    const baseGraphScore = isTestOrDocPath(entry.metadata.filePath) ? 0.72 : 0.97;
+    const graphScore = baseGraphScore - Math.max(0, entry.depth - 1) * 0.08;
+    byId.set(entry.id, {
+      ...existing,
+      id: entry.id,
+      score: Math.max(existing?.score ?? Number.NEGATIVE_INFINITY, graphScore),
+      metadata: existing?.metadata ?? entry.metadata,
+      lane: existing?.lane ?? "hybrid",
+      relation: entry.relation,
+      chunkKind: existing?.chunkKind ?? entry.metadata.chunkKind,
+      symbolKind: existing?.symbolKind ?? entry.metadata.symbolKind,
+      reranked: existing?.reranked,
+    });
+  }
+
+  return Array.from(byId.values()).sort((left, right) => {
+    if (right.score !== left.score) {
+      return right.score - left.score;
+    }
+    return left.id.localeCompare(right.id);
+  });
+}
+
 function selectGraphSeedsForQuery(
   candidates: RankedCandidate[],
   direction: GraphExpansionDirection,
@@ -1268,6 +1465,82 @@ export function applyChunkKindPenalty(
   });
 
   return rescored.map((entry) => entry.candidate);
+}
+
+function applySemanticSourcePathPenalty(
+  candidates: RankedCandidate[],
+  taskType: SearchTaskType,
+  pathPreference: SearchPathPreference
+): RankedCandidate[] {
+  if (taskType !== "semantic" || pathPreference !== "source" || candidates.length < 2) {
+    return candidates;
+  }
+
+  const rescored = candidates.map((candidate, originalIndex) => ({
+    candidate: isTestOrDocPath(candidate.metadata.filePath)
+      ? {
+          ...candidate,
+          score: candidate.score - 0.35,
+        }
+      : candidate,
+    originalIndex,
+  }));
+
+  rescored.sort((left, right) => {
+    if (right.candidate.score !== left.candidate.score) {
+      return right.candidate.score - left.candidate.score;
+    }
+    if (left.originalIndex !== right.originalIndex) {
+      return left.originalIndex - right.originalIndex;
+    }
+    return left.candidate.id.localeCompare(right.candidate.id);
+  });
+
+  return rescored.map((entry) => entry.candidate);
+}
+
+function preferEarlierNamedChunkSlices(candidates: RankedCandidate[]): RankedCandidate[] {
+  if (candidates.length < 2) {
+    return candidates;
+  }
+
+  const reordered = [...candidates];
+  let index = 0;
+
+  while (index < reordered.length) {
+    const current = reordered[index];
+    const currentName = current?.metadata.name?.trim();
+    if (!current || !currentName) {
+      index += 1;
+      continue;
+    }
+
+    const groupStart = index;
+    index += 1;
+    while (index < reordered.length) {
+      const next = reordered[index];
+      const nextName = next?.metadata.name?.trim();
+      if (
+        !next ||
+        !nextName ||
+        next.metadata.filePath !== current.metadata.filePath ||
+        next.metadata.chunkType !== current.metadata.chunkType ||
+        nextName !== currentName
+      ) {
+        break;
+      }
+      index += 1;
+    }
+
+    if (index - groupStart > 1) {
+      const sortedGroup = reordered
+        .slice(groupStart, index)
+        .sort((left, right) => left.metadata.startLine - right.metadata.startLine);
+      reordered.splice(groupStart, sortedGroup.length, ...sortedGroup);
+    }
+  }
+
+  return reordered;
 }
 
 export function inferTaskType(query: string, explicit?: SearchTaskType): SearchTaskType {
@@ -2847,7 +3120,7 @@ export class Indexer {
       return;
     }
 
-    const requestedModelId = this.config.voyageModelId?.trim() || "voyage-code-2";
+    const requestedModelId = this.config.voyageModelId?.trim() || "voyage-code-3";
     const currentModelId = this.voyageProvider?.getModelInfo().model;
     if (!this.voyageProvider || currentModelId !== requestedModelId) {
       this.voyageProvider = createVoyageEmbeddingProvider({
@@ -4327,7 +4600,7 @@ export class Indexer {
   ): Promise<{ ordered: RankedCandidate[]; applied: boolean; backend: string | null; failedBackend?: string | null }> {
     if (rerankTopN <= 0 || candidates.length < 2) {
       return {
-        ordered: candidates,
+        ordered: applyRelationshipGraphBias(query, applyCallerTargetPenalty(query, candidates, taskType), taskType),
         applied: false,
         backend: null,
         failedBackend: null,
@@ -4353,7 +4626,7 @@ export class Indexer {
 
     if (!reranked.applied) {
       return {
-        ordered: candidates,
+        ordered: applyRelationshipGraphBias(query, applyCallerTargetPenalty(query, candidates, taskType), taskType),
         applied: false,
         backend: null,
         failedBackend: reranked.failedBackend,
@@ -4384,7 +4657,11 @@ export class Indexer {
     }));
 
     return {
-      ordered: [...promotedHead, ...orderedTail],
+      ordered: applyRelationshipGraphBias(
+        query,
+        applyCallerTargetPenalty(query, [...promotedHead, ...orderedTail], taskType),
+        taskType
+      ),
       applied: true,
       backend: reranked.backend,
       failedBackend: reranked.failedBackend,
@@ -4521,6 +4798,8 @@ export class Indexer {
         : taskType === "general" && queryIntent === "doc_test" && options?.definitionIntent !== true
           ? 0
           : recipe.finalRerankTopN;
+    const graphDirection = options?.graphDirection ?? inferRelationshipGraphDirection(query) ?? "both";
+    const graphDepth = Math.max(0, Math.min(2, options?.graphDepth ?? recipe.graphDepth ?? 0));
     const prefilterStartTime = performance.now();
     const metadataAllowedChunkIds = await this.buildAllowedChunkIds(database, branch, {
       fileType: options?.fileType,
@@ -4777,17 +5056,38 @@ export class Indexer {
       candidate.chunkKind = enrichment.chunkKind;
       candidate.symbolKind = enrichment.symbolKind;
     }
-    const filtered = applyChunkKindPenalty(
-      suppressCoarseFileChunksWhenSymbolMatchesExist(query, filteredBase),
+    const filteredWithPathBias = applySemanticSourcePathPenalty(
+      applyChunkKindPenalty(
+        suppressCoarseFileChunksWhenSymbolMatchesExist(query, filteredBase),
+        taskType,
+        query
+      ),
       taskType,
-      query
+      recipe.pathPreference
     );
+    const filtered = taskType === "semantic"
+      ? preferEarlierNamedChunkSlices(filteredWithPathBias)
+      : filteredWithPathBias;
+    const relationshipGraphAugmented = injectRelationshipGraphCandidates(
+      query,
+      filtered,
+      database,
+      branch,
+      graphDepth,
+      graphDirection,
+      metadataAllowedChunkIds,
+      taskType
+    );
+    const callerChunkTexts = await this.batchFetchStoredChunkTexts(
+      relationshipGraphAugmented.map((candidate) => candidate.metadata.hash)
+    );
+    const callerBoosted = applyCallerContentBoost(query, relationshipGraphAugmented, callerChunkTexts, taskType);
 
     const fileContentCache = new Map<string, string | null>();
     const rerankStartTime = performance.now();
     const reranked = await this.applyFinalReranker(
       query,
-      filtered,
+      callerBoosted,
       taskType,
       finalRerankTopN,
       fileContentCache
@@ -4822,8 +5122,6 @@ export class Indexer {
     const contextLines = options?.contextLines ?? this.config.search.contextLines;
     const visiblePrimaryCandidates = reranked.ordered.slice(0, maxResults);
     let expanded: GraphExpansionEntry[] = [];
-    const graphDirection = options?.graphDirection ?? inferRelationshipGraphDirection(query) ?? "both";
-    const graphDepth = Math.max(0, Math.min(2, options?.graphDepth ?? recipe.graphDepth ?? 0));
     if (graphDepth > 0) {
       const graphSeedCandidates = selectGraphSeedsForQuery(visiblePrimaryCandidates, graphDirection, query);
       const graphSeeds: GraphExpansionSeed[] = graphSeedCandidates.map((candidate) => ({

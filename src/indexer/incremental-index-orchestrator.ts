@@ -2884,6 +2884,9 @@ export class IncrementalIndexOrchestrator {
       context.configVersion.graphExtractorVersion
     );
     if (!this.checkpoints.isStageStale(context.branch, filePath, "graph", graphInputHash)) {
+      for (const symbolId of plan.oldSymbolIds) {
+        plan.newSymbolIds.add(symbolId);
+      }
       return;
     }
 
