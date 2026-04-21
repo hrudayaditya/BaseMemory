@@ -28,7 +28,7 @@ export interface VoyageProviderConfig {
 const ARCTIC_QUERY_PREFIX = "Represent this sentence for searching relevant passages: ";
 
 const VOYAGE_EMBEDDING_ENDPOINT = "https://api.voyageai.com/v1/embeddings";
-const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-2";
+const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-3";
 const VOYAGE_MAX_BATCH_SIZE = 128;
 const OLLAMA_MAX_CONCURRENT_REQUESTS = 2;
 const GOOGLE_MAX_CONCURRENT_BATCHES = 4;

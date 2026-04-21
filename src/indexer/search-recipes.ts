@@ -35,7 +35,7 @@ export const GENERAL_FINAL_RERANK_TOP_N = 10;
 const RECIPE_BY_TASK_TYPE: Record<SearchTaskType, SearchRecipe> = {
   general: {
     taskType: "general",
-    hybridWeight: 0.3,
+    hybridWeight: 0.5,
     bm25Weight: 0.2,
     denseWeight: 0.6,
     voyageWeight: 0.2,
@@ -64,12 +64,12 @@ const RECIPE_BY_TASK_TYPE: Record<SearchTaskType, SearchRecipe> = {
     enableIdentifierDefinitionLane: true,
     enableSymbolDefinitionLane: true,
     implementationOnlyOnCodeHints: true,
-    testDocChunkPenalty: 0.7,
+    testDocChunkPenalty: 0.5,
     finalRerankTopN: DEFAULT_FINAL_RERANK_TOP_N,
   },
   bug: {
     taskType: "bug",
-    hybridWeight: 0.4,
+    hybridWeight: 0.5,
     graphDepth: 1,
     bm25Weight: 0.4,
     denseWeight: 0.2,
@@ -86,7 +86,7 @@ const RECIPE_BY_TASK_TYPE: Record<SearchTaskType, SearchRecipe> = {
   },
   test_debug: {
     taskType: "test_debug",
-    hybridWeight: 0.4,
+    hybridWeight: 0.5,
     graphDepth: 1,
     bm25Weight: 0.4,
     denseWeight: 0.2,
@@ -109,13 +109,13 @@ const RECIPE_BY_TASK_TYPE: Record<SearchTaskType, SearchRecipe> = {
     voyageWeight: 0.2,
     identifierBoost: 1.0,
     forceDefinitionIntent: false,
-    pathPreference: "balanced",
+    pathPreference: "source",
     enableIdentifierPromotion: false,
     enableDeterministicIdentifierLane: false,
     enableIdentifierDefinitionLane: false,
     enableSymbolDefinitionLane: false,
     implementationOnlyOnCodeHints: false,
-    testDocChunkPenalty: 0.6,
+    testDocChunkPenalty: 0.45,
     finalRerankTopN: 0,
   },
 };

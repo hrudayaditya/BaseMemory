@@ -121,5 +121,5 @@ export const DEFAULT_PROVIDER_MODELS = {
   "openai": "text-embedding-3-small",
   "google": "text-embedding-005",
   "ollama": "nomic-embed-text",
-  "voyage": "voyage-code-2",
+  "voyage": "voyage-code-3",
 } as const

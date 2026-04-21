@@ -333,7 +333,7 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
     jinaApiKey: jinaApiKeyValue?.trim() || undefined,
     jinaRerankerModel: jinaRerankerModelValue?.trim() || "jina-reranker-v3",
     voyageApiKey: voyageApiKeyValue?.trim() || undefined,
-    voyageModelId: voyageModelIdValue?.trim() || "voyage-code-2",
+    voyageModelId: voyageModelIdValue?.trim() || "voyage-code-3",
     scope: isValidScope(scopeValue) ? scopeValue : "project",
     include: includeValue ?? DEFAULT_INCLUDE,
     exclude: excludeValue ?? DEFAULT_EXCLUDE,
