@@ -14,6 +14,7 @@ const CONFIG_PATH = path.join(BASE_MEMORY_ROOT, ".opencode", "codebase-index.jso
 interface ScriptArgs {
   repoPath: string;
   verbose: boolean;
+  reindex: boolean;
 }
 
 interface TimingBreakdown {
@@ -32,16 +33,22 @@ interface InstrumentedIndexerInternals {
 }
 
 function usage(): string {
-  return "Usage: npx tsx scripts/index-repo.ts <repo-path> [--verbose]";
+  return "Usage: npx tsx scripts/index-repo.ts <repo-path> [--verbose] [--reindex]";
 }
 
 function parseArgs(argv: string[]): ScriptArgs {
   let repoPath: string | null = null;
   let verbose = false;
+  let reindex = false;
 
   for (const arg of argv) {
     if (arg === "--verbose") {
       verbose = true;
+      continue;
+    }
+
+    if (arg === "--reindex") {
+      reindex = true;
       continue;
     }
 
@@ -63,6 +70,7 @@ function parseArgs(argv: string[]): ScriptArgs {
   return {
     repoPath: path.resolve(process.cwd(), repoPath),
     verbose,
+    reindex,
   };
 }
 
@@ -241,6 +249,12 @@ async function main(): Promise<void> {
   console.log("Initializing indexer...");
   await indexer.initialize();
   console.log("Initialization complete.");
+
+  if (args.reindex) {
+    console.log("Clearing existing index (--reindex)...");
+    await indexer.clearIndex();
+    console.log("Existing index cleared.");
+  }
 
   const timings = args.verbose ? installTimingInstrumentation(indexer) : null;
 

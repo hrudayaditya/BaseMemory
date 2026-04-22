@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-import { Indexer, type IndexStats } from "./indexer/index.js";
+import { Indexer, type IndexStats, type ScoreBreakdown } from "./indexer/index.js";
 import { SEARCH_TASK_TYPES } from "./indexer/search-recipes.js";
 import type { ParsedCodebaseIndexConfig, LogLevel } from "./config/schema.js";
 import { formatCoverageReport, formatDefinitionLookup, formatExpandedContext, formatStatus as formatToolStatus } from "./tools/utils.js";
@@ -79,6 +79,30 @@ const CHUNK_TYPE_ENUM = [
 const TASK_TYPE_ENUM = [...SEARCH_TASK_TYPES] as [typeof SEARCH_TASK_TYPES[number], ...typeof SEARCH_TASK_TYPES[number][]];
 const CHUNK_KIND_FILTER_ENUM = ["code", "test", "doc", "config"] as const;
 
+function formatScoreBreakdownForMcp(breakdown: ScoreBreakdown | undefined): {
+  lanes: ScoreBreakdown["lanes"];
+  fusion: ScoreBreakdown["fusion"];
+  sources: string[];
+  stages: ScoreBreakdown["stages"];
+  pre_rerank_score: number;
+  reranker?: ScoreBreakdown["reranker"];
+  final_score: number;
+} | null {
+  if (!breakdown) {
+    return null;
+  }
+
+  return {
+    lanes: breakdown.lanes,
+    fusion: breakdown.fusion,
+    sources: breakdown.sources,
+    stages: breakdown.stages,
+    pre_rerank_score: breakdown.preRerankScore,
+    reranker: breakdown.reranker,
+    final_score: breakdown.finalScore,
+  };
+}
+
 function encodeCursor(offset: number): string {
   return Buffer.from(String(offset), "utf8").toString("base64");
 }
@@ -148,6 +172,33 @@ export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndex
           name: z.string().nullable().optional(),
           lane: z.enum(["bm25", "semantic", "hybrid"]),
           reranker_score: z.number().nullable(),
+          score_breakdown: z.object({
+            lanes: z.object({
+              bm25: z.object({ score: z.number(), rank: z.number() }).optional(),
+              arctic: z.object({ score: z.number(), rank: z.number() }).optional(),
+              voyage: z.object({ score: z.number(), rank: z.number() }).optional(),
+            }),
+            fusion: z.object({
+              strategy: z.enum(["rrf", "weighted"]),
+              score: z.number(),
+              rank: z.number(),
+            }),
+            sources: z.array(z.string()),
+            stages: z.array(z.object({
+              name: z.string(),
+              kind: z.enum(["add", "multiply", "set-min", "set", "filter", "sort", "replace"]),
+              before: z.number(),
+              after: z.number(),
+              reason: z.string(),
+            })),
+            pre_rerank_score: z.number(),
+            reranker: z.object({
+              score: z.number(),
+              rank: z.number(),
+              backend: z.string(),
+            }).optional(),
+            final_score: z.number(),
+          }).nullable().optional(),
         })),
         cursor: z.string().nullable(),
       },
@@ -169,6 +220,7 @@ export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndex
         contextLines: args.contextLines,
         taskType: args.taskType,
         graphDepth,
+        includeScoreBreakdown: args.include_scores === true,
       });
 
       if (response.primaryResults.length === 0 || offset >= response.primaryResults.length) {
@@ -208,6 +260,9 @@ export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndex
             name: result.name ?? null,
             lane: result.lane ?? "hybrid",
             reranker_score: args.include_scores ? (result.rerankerScore ?? null) : null,
+            ...(args.include_scores
+              ? { score_breakdown: formatScoreBreakdownForMcp(result.scoreBreakdown) }
+              : {}),
           })),
           cursor,
         },

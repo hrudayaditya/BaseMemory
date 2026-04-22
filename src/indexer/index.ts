@@ -71,6 +71,53 @@ const CALL_GRAPH_SYMBOL_CHUNK_TYPES = new Set([
   "module",
 ]);
 
+export const CALLER_TARGET_PENALTY = 0.51; // SCORING-DEBT: load-bearing, tune carefully.
+export const CALLER_CONTENT_BOOST = 0.18; // SCORING-DEBT: load-bearing, tune carefully.
+export const RELATIONSHIP_BIAS_TEST_DOC = 0.2; // SCORING-DEBT: load-bearing, tune carefully.
+export const RELATIONSHIP_BIAS_SOURCE = 0.6; // SCORING-DEBT: load-bearing, tune carefully.
+export const GRAPH_TEST_DOC_FLOOR = 0.72; // SCORING-DEBT: dangerous, lower in Phase 2B.
+export const GRAPH_SOURCE_FLOOR = 0.97; // SCORING-DEBT: load-bearing, tune carefully.
+export const GRAPH_DEPTH_DECAY = 0.08; // SCORING-DEBT: load-bearing, tune carefully.
+export const SEMANTIC_TEST_DOC_PATH_PENALTY = 0.35; // SCORING-DEBT: dangerous, validate on external repos.
+export const DETERMINISTIC_IDENTIFIER_EXACT_FILE_HINT_SCORE = 0.995; // SCORING-DEBT: dangerous, lower in Phase 2B.
+export const DETERMINISTIC_IDENTIFIER_BASE_SCORE = 0.9; // SCORING-DEBT: dangerous, lower in Phase 2B.
+export const DETERMINISTIC_IDENTIFIER_MATCH_SCALE = 0.09; // SCORING-DEBT: dangerous, lower in Phase 2B.
+export const SYMBOL_DEFINITION_EXACT_SCORE = 0.99; // SCORING-DEBT: dangerous, lower in Phase 2B.
+export const SYMBOL_DEFINITION_FUZZY_SCORE = 0.88; // SCORING-DEBT: dangerous, lower in Phase 2B.
+export const SYMBOL_FALLBACK_EXACT_FLOOR = 0.97; // SCORING-DEBT: dangerous, lower in Phase 2B.
+export const SYMBOL_FALLBACK_TOKEN_BASE = 0.82; // SCORING-DEBT: dangerous, lower in Phase 2B.
+export const SYMBOL_FALLBACK_TOKEN_SCALE = 0.03; // SCORING-DEBT: dangerous, lower in Phase 2B.
+export const SYMBOL_FALLBACK_TOKEN_CAP = 0.95; // SCORING-DEBT: dangerous, lower in Phase 2B.
+export const SYMBOL_OVERLAP_FALLBACK_BASE = 0.8; // SCORING-DEBT: dangerous, lower in Phase 2B.
+export const SYMBOL_OVERLAP_FALLBACK_SCALE = 0.1; // SCORING-DEBT: dangerous, lower in Phase 2B.
+export const SYMBOL_OVERLAP_FALLBACK_CAP = 0.94; // SCORING-DEBT: dangerous, lower in Phase 2B.
+export const IDENTIFIER_DATABASE_BASELINE_SCORE = 0.5; // SCORING-DEBT: dangerous, validate on external repos.
+export const IDENTIFIER_EXACT_RESCUE_BOOST = 0.45; // SCORING-DEBT: dangerous, lower in Phase 2B.
+export const IDENTIFIER_FUZZY_RESCUE_BOOST = 0.25; // SCORING-DEBT: dangerous, lower in Phase 2B.
+export const CHUNK_TYPE_PRIMARY_BOOST = 0.2; // SCORING-DEBT: load-bearing, tune carefully.
+export const CHUNK_TYPE_SECONDARY_BOOST = 0.1; // SCORING-DEBT: load-bearing, tune carefully.
+export const CHUNK_TYPE_MODULE_PENALTY = -0.1; // SCORING-DEBT: dangerous, validate on external repos.
+export const CHUNK_TYPE_OTHER_PENALTY = -0.12; // SCORING-DEBT: dangerous, validate on external repos.
+export const INTERFACE_TYPE_DEFINITION_PENALTY = -0.15; // SCORING-DEBT: dangerous, validate on external repos.
+export const IDENTIFIER_MATCH_EXACT_SCORE = 1; // SCORING-DEBT: load-bearing, tune carefully.
+export const IDENTIFIER_MATCH_SUBSTRING_SCORE = 0.8; // SCORING-DEBT: dangerous, validate on external repos.
+export const IDENTIFIER_MATCH_PATH_SCORE = 0.6; // SCORING-DEBT: dangerous, validate on external repos.
+export const DETERMINISTIC_NAME_HIT_BOOST = 0.08; // SCORING-DEBT: load-bearing, tune carefully.
+export const DETERMINISTIC_PATH_OVERLAP_BOOST = 0.03; // SCORING-DEBT: load-bearing, tune carefully.
+export const DETERMINISTIC_CHUNK_TYPE_HIT_BOOST = 0.02; // SCORING-DEBT: load-bearing, tune carefully.
+export const DETERMINISTIC_COVERAGE_BOOST_CAP = 0.12; // SCORING-DEBT: load-bearing, tune carefully.
+export const DETERMINISTIC_COVERAGE_BOOST_SCALE = 0.06; // SCORING-DEBT: load-bearing, tune carefully.
+export const DETERMINISTIC_IMPLEMENTATION_PATH_BOOST = 0.08; // SCORING-DEBT: load-bearing, tune carefully.
+export const DETERMINISTIC_TEST_DOC_PATH_PENALTY = 0.12; // SCORING-DEBT: dangerous, validate on external repos.
+export const DETERMINISTIC_TEST_PATH_BOOST = 0.16; // SCORING-DEBT: load-bearing, tune carefully.
+export const DETERMINISTIC_README_DOC_BOOST = 0.08; // SCORING-DEBT: load-bearing, tune carefully.
+export const DETERMINISTIC_IDENTIFIER_SORT_BOOST = 0.12; // SCORING-DEBT: dangerous, validate on external repos.
+export const SIBLING_SUPPRESSION_SORT_PENALTY = 0.10; // SCORING-DEBT: dangerous, validate on external repos.
+const DETERMINISTIC_SORT_STAGE = "deterministicSortPreference";
+const DETERMINISTIC_INTENT_STAGE = "deterministicIntentLane";
+const PATH_AND_KIND_SUPPRESSION_STAGE = "pathAndKindSuppression";
+const STRUCTURAL_RELATIONSHIP_STAGE = "structuralRelationshipAdjustment";
+
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
@@ -116,6 +163,163 @@ function mergeSearchResultLane(
     return existingLane;
   }
   return "hybrid";
+}
+
+function cloneScoreBreakdown(breakdown: ScoreBreakdown | undefined): ScoreBreakdown | undefined {
+  if (!breakdown) {
+    return undefined;
+  }
+
+  return {
+    lanes: {
+      bm25: breakdown.lanes.bm25 ? { ...breakdown.lanes.bm25 } : undefined,
+      arctic: breakdown.lanes.arctic ? { ...breakdown.lanes.arctic } : undefined,
+      voyage: breakdown.lanes.voyage ? { ...breakdown.lanes.voyage } : undefined,
+    },
+    fusion: { ...breakdown.fusion },
+    sources: [...breakdown.sources],
+    stages: breakdown.stages.map((stage) => ({ ...stage })),
+    preRerankScore: breakdown.preRerankScore,
+    reranker: breakdown.reranker ? { ...breakdown.reranker } : undefined,
+    finalScore: breakdown.finalScore,
+  };
+}
+
+function createScoreBreakdown(
+  lanes: ScoreBreakdown["lanes"],
+  fusionStrategy: "rrf" | "weighted",
+  score: number,
+  rank: number,
+  sources: ScoreBreakdownSource[]
+): ScoreBreakdown {
+  return {
+    lanes,
+    fusion: {
+      strategy: fusionStrategy,
+      score,
+      rank,
+    },
+    sources: Array.from(new Set(sources)),
+    stages: [],
+    preRerankScore: score,
+    finalScore: score,
+  };
+}
+
+function ensureScoreBreakdown(
+  candidate: RankedCandidate,
+  source: ScoreBreakdownSource,
+  strategy: "rrf" | "weighted" = "rrf"
+): ScoreBreakdown {
+  if (!candidate.scoreBreakdown) {
+    candidate.scoreBreakdown = createScoreBreakdown({}, strategy, candidate.score, 0, [source]);
+  } else if (!candidate.scoreBreakdown.sources.includes(source)) {
+    candidate.scoreBreakdown.sources.push(source);
+  }
+
+  return candidate.scoreBreakdown;
+}
+
+function addBreakdownSource(candidate: RankedCandidate, source: ScoreBreakdownSource): void {
+  if (!candidate.scoreBreakdown || candidate.scoreBreakdown.sources.includes(source)) {
+    return;
+  }
+  candidate.scoreBreakdown.sources.push(source);
+}
+
+function recordScoreStage(
+  candidate: RankedCandidate,
+  stage: ScoreStage
+): void {
+  if (!candidate.scoreBreakdown) {
+    return;
+  }
+  candidate.scoreBreakdown.stages.push(stage);
+  candidate.scoreBreakdown.finalScore = stage.after;
+}
+
+function recordDeterministicSortPreference(candidate: RankedCandidate, reason: string): void {
+  if (!candidate.scoreBreakdown) {
+    return;
+  }
+
+  const existing = candidate.scoreBreakdown.stages.find((stage) =>
+    stage.name === DETERMINISTIC_SORT_STAGE &&
+    stage.kind === "sort" &&
+    stage.before === candidate.score &&
+    stage.after === candidate.score
+  );
+  if (existing) {
+    existing.reason = `${existing.reason}; ${reason}`;
+    return;
+  }
+
+  recordScoreStage(candidate, {
+    name: DETERMINISTIC_SORT_STAGE,
+    kind: "sort",
+    before: candidate.score,
+    after: candidate.score,
+    reason,
+  });
+}
+
+function appendPathAndKindSuppressionReason(
+  candidate: RankedCandidate,
+  previousScore: number,
+  reason: string
+): void {
+  const breakdown = candidate.scoreBreakdown;
+  if (!breakdown) {
+    return;
+  }
+
+  let existing: ScoreStage | undefined;
+  for (let index = breakdown.stages.length - 1; index >= 0; index -= 1) {
+    const stage = breakdown.stages[index];
+    if (stage?.name === PATH_AND_KIND_SUPPRESSION_STAGE && stage.after === previousScore) {
+      existing = stage;
+      break;
+    }
+  }
+  if (!existing) {
+    return;
+  }
+
+  existing.after = candidate.score;
+  existing.reason = `${existing.reason}; ${reason}`;
+  breakdown.finalScore = candidate.score;
+}
+
+function buildLaneScoreBreakdowns(
+  bm25Results: RankedCandidate[],
+  arcticResults: RankedCandidate[],
+  voyageResults: RankedCandidate[]
+): Map<string, ScoreBreakdown["lanes"]> {
+  const byId = new Map<string, ScoreBreakdown["lanes"]>();
+  const upsert = (
+    source: keyof ScoreBreakdown["lanes"],
+    results: RankedCandidate[]
+  ) => {
+    results.forEach((candidate, index) => {
+      const lanes = byId.get(candidate.id) ?? {};
+      lanes[source] = { score: candidate.score, rank: index + 1 };
+      byId.set(candidate.id, lanes);
+    });
+  };
+
+  upsert("bm25", bm25Results);
+  upsert("arctic", arcticResults);
+  upsert("voyage", voyageResults);
+  return byId;
+}
+
+function sourcesFromLaneBreakdown(lanes: ScoreBreakdown["lanes"]): ScoreBreakdownSource[] {
+  const sources: ScoreBreakdownSource[] = [];
+  if (lanes.bm25) sources.push("bm25");
+  if (lanes.arctic) sources.push("arctic");
+  if (lanes.voyage) sources.push("voyage");
+  if (sources.length > 1) sources.push("hybrid");
+  return sources.length > 0 ? sources : ["hybrid"];
 }
 
 function normalizeRequestedChunkKind(
@@ -308,6 +512,7 @@ export interface SearchResult {
   relation?: "caller" | "callee";
   depth?: number;
   viaSymbol?: string;
+  scoreBreakdown?: ScoreBreakdown;
 }
 
 export interface GraphContextResult extends SearchResult {
@@ -354,6 +559,37 @@ export interface SearchOptions {
   taskType?: SearchTaskType;
   graphDepth?: number;
   graphDirection?: GraphExpansionDirection;
+  includeScoreBreakdown?: boolean;
+}
+
+export interface ScoreStage {
+  name: string;
+  kind: "add" | "multiply" | "set-min" | "set" | "filter" | "sort" | "replace";
+  before: number;
+  after: number;
+  reason: string;
+}
+
+export interface ScoreBreakdown {
+  lanes: {
+    bm25?: { score: number; rank: number };
+    arctic?: { score: number; rank: number };
+    voyage?: { score: number; rank: number };
+  };
+  fusion: {
+    strategy: "rrf" | "weighted";
+    score: number;
+    rank: number;
+  };
+  sources: string[];
+  stages: ScoreStage[];
+  preRerankScore: number;
+  reranker?: {
+    score: number;
+    rank: number;
+    backend: string;
+  };
+  finalScore: number;
 }
 
 export interface StructuralSymbolInfoEntry {
@@ -568,6 +804,7 @@ interface FailedBatch {
 
 type RetrievalChunkMetadata = GraphExpansionMetadata;
 type SearchResultLane = "bm25" | "semantic" | "hybrid";
+type ScoreBreakdownSource = "bm25" | "arctic" | "voyage" | "hybrid" | "graph" | "identifier" | "symbol";
 
 type RankedCandidate = {
   id: string;
@@ -578,6 +815,7 @@ type RankedCandidate = {
   chunkKind?: ChunkKind;
   symbolKind?: ChunkSymbolKind;
   reranked?: boolean;
+  scoreBreakdown?: ScoreBreakdown;
 };
 
 interface HybridRankOptions {
@@ -592,6 +830,7 @@ interface HybridRankOptions {
   voyageResults?: RankedCandidate[];
   pathPreference?: SearchPathPreference;
   taskType?: SearchTaskType;
+  scoreBreakdownLanes?: Map<string, ScoreBreakdown["lanes"]>;
 }
 
 interface FusionWeights {
@@ -841,7 +1080,7 @@ export function chunkTypeBoost(chunkType: string): number {
     case "method_definition":
     case "class":
     case "class_declaration":
-      return 0.2;
+      return CHUNK_TYPE_PRIMARY_BOOST;
     case "interface":
     case "type":
     case "enum":
@@ -849,11 +1088,11 @@ export function chunkTypeBoost(chunkType: string): number {
     case "impl":
     case "trait":
     case "constant":
-      return 0.1;
+      return CHUNK_TYPE_SECONDARY_BOOST;
     case "module":
-      return -0.1;
+      return CHUNK_TYPE_MODULE_PENALTY;
     case "other":
-      return -0.12;
+      return CHUNK_TYPE_OTHER_PENALTY;
     default:
       return 0;
   }
@@ -864,7 +1103,7 @@ function getInterfaceTypePenalty(taskType: SearchTaskType, chunkType: string): n
     return 0;
   }
 
-  return chunkType === "interface" || chunkType === "type" ? -0.15 : 0;
+  return chunkType === "interface" || chunkType === "type" ? INTERFACE_TYPE_DEFINITION_PENALTY : 0;
 }
 
 function shouldSuppressUnnamedSiblingCandidate(candidate: RankedCandidate): boolean {
@@ -1167,14 +1406,24 @@ function applyCallerTargetPenalty(
 
   const rescored = candidates.map((candidate, originalIndex) => {
     const candidateName = candidate.metadata.name?.toLowerCase();
-    const penalty = candidateName === target ? 0.51 : 0;
+    const penalty = candidateName === target ? CALLER_TARGET_PENALTY : 0;
+    const nextCandidate = penalty === 0
+      ? candidate
+      : {
+          ...candidate,
+          score: candidate.score - penalty,
+        };
+    if (penalty !== 0) {
+      recordScoreStage(nextCandidate, {
+        name: STRUCTURAL_RELATIONSHIP_STAGE,
+        kind: "add",
+        before: candidate.score,
+        after: nextCandidate.score,
+        reason: `callerTargetPenalty: target=${target}; penalty=-${penalty}`,
+      });
+    }
     return {
-      candidate: penalty === 0
-        ? candidate
-        : {
-            ...candidate,
-            score: candidate.score - penalty,
-          },
+      candidate: nextCandidate,
       originalIndex,
     };
   });
@@ -1218,16 +1467,26 @@ function applyCallerContentBoost(
     const boost = referencesTarget &&
       isImplementationChunkType(candidate.metadata.chunkType) &&
       isLikelyImplementationPath(candidate.metadata.filePath)
-      ? 0.18
+      ? CALLER_CONTENT_BOOST
       : 0;
+    const nextCandidate = boost === 0
+      ? candidate
+      : {
+          ...candidate,
+          score: candidate.score + boost,
+        };
+    if (boost !== 0) {
+      recordScoreStage(nextCandidate, {
+        name: STRUCTURAL_RELATIONSHIP_STAGE,
+        kind: "add",
+        before: candidate.score,
+        after: nextCandidate.score,
+        reason: `callerContentBoost: target=${target}; boost=${boost}`,
+      });
+    }
 
     return {
-      candidate: boost === 0
-        ? candidate
-        : {
-            ...candidate,
-            score: candidate.score + boost,
-          },
+      candidate: nextCandidate,
       originalIndex,
     };
   });
@@ -1262,16 +1521,27 @@ function applyRelationshipGraphBias(
   const rescored = candidates.map((candidate, originalIndex) => {
     const isDirectRelationship = candidate.relation === direction;
     const boost = isDirectRelationship
-      ? (isTestOrDocPath(candidate.metadata.filePath) ? 0.2 : 0.6)
+      ? (isTestOrDocPath(candidate.metadata.filePath) ? RELATIONSHIP_BIAS_TEST_DOC : RELATIONSHIP_BIAS_SOURCE)
       : 0;
+    const nextCandidate = boost === 0
+      ? candidate
+      : {
+          ...candidate,
+          score: candidate.score + boost,
+        };
+    if (boost !== 0) {
+      recordScoreStage(nextCandidate, {
+        name: STRUCTURAL_RELATIONSHIP_STAGE,
+        kind: "add",
+        before: candidate.score,
+        after: nextCandidate.score,
+        reason: `relationshipGraphBias: direction=${direction}; relation=${candidate.relation}; boost=${boost}`,
+      });
+      addBreakdownSource(nextCandidate, "graph");
+    }
 
     return {
-      candidate: boost === 0
-        ? candidate
-        : {
-            ...candidate,
-            score: candidate.score + boost,
-          },
+      candidate: nextCandidate,
       originalIndex,
     };
   });
@@ -1297,7 +1567,8 @@ function injectRelationshipGraphCandidates(
   graphDepth: number,
   graphDirection: GraphExpansionDirection,
   allowedChunkIds: Set<string> | null,
-  taskType: SearchTaskType
+  taskType: SearchTaskType,
+  includeScoreBreakdown: boolean = false
 ): RankedCandidate[] {
   if (taskType !== "definition" || candidates.length === 0 || graphDepth <= 0 || graphDirection === "both") {
     return candidates;
@@ -1321,18 +1592,39 @@ function injectRelationshipGraphCandidates(
   const byId = new Map(candidates.map((candidate): [string, RankedCandidate] => [candidate.id, candidate]));
   for (const entry of expanded) {
     const existing = byId.get(entry.id);
-    const baseGraphScore = isTestOrDocPath(entry.metadata.filePath) ? 0.72 : 0.97;
-    const graphScore = baseGraphScore - Math.max(0, entry.depth - 1) * 0.08;
-    byId.set(entry.id, {
+    const baseGraphScore = isTestOrDocPath(entry.metadata.filePath) ? GRAPH_TEST_DOC_FLOOR : GRAPH_SOURCE_FLOOR;
+    const graphScore = baseGraphScore - Math.max(0, entry.depth - 1) * GRAPH_DEPTH_DECAY;
+    const before = existing?.score ?? Number.NEGATIVE_INFINITY;
+    const after = Math.max(before, graphScore);
+    const scoreBreakdown = existing?.scoreBreakdown
+      ? cloneScoreBreakdown(existing.scoreBreakdown)
+      : includeScoreBreakdown
+        ? createScoreBreakdown({}, "rrf", Number.isFinite(before) ? before : 0, 0, ["graph"])
+        : undefined;
+    const nextCandidate: RankedCandidate = {
       ...existing,
       id: entry.id,
-      score: Math.max(existing?.score ?? Number.NEGATIVE_INFINITY, graphScore),
+      score: after,
       metadata: existing?.metadata ?? entry.metadata,
       lane: existing?.lane ?? "hybrid",
       relation: entry.relation,
       chunkKind: existing?.chunkKind ?? entry.metadata.chunkKind,
       symbolKind: existing?.symbolKind ?? entry.metadata.symbolKind,
       reranked: existing?.reranked,
+      scoreBreakdown,
+    };
+    if (nextCandidate.scoreBreakdown) {
+      addBreakdownSource(nextCandidate, "graph");
+      recordScoreStage(nextCandidate, {
+        name: DETERMINISTIC_INTENT_STAGE,
+        kind: existing ? "set-min" : "set",
+        before: Number.isFinite(before) ? before : 0,
+        after,
+        reason: `graphInjection: relation=${entry.relation}; depth=${entry.depth}; graphScore=${graphScore}`,
+      });
+    }
+    byId.set(entry.id, {
+      ...nextCandidate,
     });
   }
 
@@ -1443,13 +1735,24 @@ export function applyChunkKindPenalty(
   const rescored = candidates.map((candidate, originalIndex) => {
     const chunkKind = candidate.chunkKind ?? candidate.metadata.chunkKind;
     const factor = getChunkKindPenaltyFactor(taskType, chunkKind);
+    const before = candidate.score;
+    const nextCandidate = factor === 1
+      ? candidate
+      : {
+          ...candidate,
+          score: candidate.score * factor,
+        };
+    if (factor !== 1) {
+      recordScoreStage(nextCandidate, {
+        name: PATH_AND_KIND_SUPPRESSION_STAGE,
+        kind: "multiply",
+        before,
+        after: nextCandidate.score,
+        reason: `testDocChunkPenalty: chunkKind=${chunkKind}; factor=${factor} (${before}->${nextCandidate.score})`,
+      });
+    }
     return {
-      candidate: factor === 1
-        ? candidate
-        : {
-            ...candidate,
-            score: candidate.score * factor,
-          },
+      candidate: nextCandidate,
       originalIndex,
     };
   });
@@ -1476,15 +1779,36 @@ function applySemanticSourcePathPenalty(
     return candidates;
   }
 
-  const rescored = candidates.map((candidate, originalIndex) => ({
-    candidate: isTestOrDocPath(candidate.metadata.filePath)
+  const rescored = candidates.map((candidate, originalIndex) => {
+    const shouldPenalize = isTestOrDocPath(candidate.metadata.filePath);
+    const nextCandidate = shouldPenalize
       ? {
           ...candidate,
-          score: candidate.score - 0.35,
+          score: candidate.score - SEMANTIC_TEST_DOC_PATH_PENALTY,
         }
-      : candidate,
-    originalIndex,
-  }));
+      : candidate;
+    if (shouldPenalize) {
+      const reason = `semanticPathPenalty: isTestOrDocPath=true delta=-${SEMANTIC_TEST_DOC_PATH_PENALTY} (${candidate.score}->${nextCandidate.score})`;
+      appendPathAndKindSuppressionReason(nextCandidate, candidate.score, reason);
+      if (!nextCandidate.scoreBreakdown?.stages.some((stage) =>
+        stage.name === PATH_AND_KIND_SUPPRESSION_STAGE &&
+        stage.after === nextCandidate.score &&
+        stage.reason.includes(reason)
+      )) {
+        recordScoreStage(nextCandidate, {
+          name: PATH_AND_KIND_SUPPRESSION_STAGE,
+          kind: "add",
+          before: candidate.score,
+          after: nextCandidate.score,
+          reason,
+        });
+      }
+    }
+    return {
+      candidate: nextCandidate,
+      originalIndex,
+    };
+  });
 
   rescored.sort((left, right) => {
     if (right.candidate.score !== left.candidate.score) {
@@ -1669,11 +1993,11 @@ function scoreIdentifierMatch(name: string | undefined, filePath: string, hints:
     const variants = normalizeIdentifierVariants(hint);
     for (const variant of variants) {
       if (nameLower === variant) {
-        best = Math.max(best, 1);
+        best = Math.max(best, IDENTIFIER_MATCH_EXACT_SCORE);
       } else if (nameLower.includes(variant)) {
-        best = Math.max(best, 0.8);
+        best = Math.max(best, IDENTIFIER_MATCH_SUBSTRING_SCORE);
       } else if (pathLower.includes(variant)) {
-        best = Math.max(best, 0.6);
+        best = Math.max(best, IDENTIFIER_MATCH_PATH_SCORE);
       }
     }
   }
@@ -1738,7 +2062,8 @@ function buildDeterministicIdentifierPass(
   query: string,
   candidates: RankedCandidate[],
   limit: number,
-  prioritizeSourcePaths: boolean = classifyQueryIntentRaw(query) === "source"
+  prioritizeSourcePaths: boolean = classifyQueryIntentRaw(query) === "source",
+  includeScoreBreakdown: boolean = false
 ): RankedCandidate[] {
   if (!prioritizeSourcePaths) {
     return [];
@@ -1805,18 +2130,34 @@ function buildDeterministicIdentifierPass(
     })
     .slice(0, Math.max(limit * 2, 12));
 
-  return deterministic.map((entry) => ({
-    id: entry.candidate.id,
-    score: entry.pathMatchesFileHint && entry.nameMatchesPrimary
-      ? 0.995
-      : Math.min(1, 0.9 + entry.maxMatch * 0.09),
-    metadata: entry.candidate.metadata,
-  }));
+  return deterministic.map((entry) => {
+    const score = entry.pathMatchesFileHint && entry.nameMatchesPrimary
+      ? DETERMINISTIC_IDENTIFIER_EXACT_FILE_HINT_SCORE
+      : Math.min(1, DETERMINISTIC_IDENTIFIER_BASE_SCORE + entry.maxMatch * DETERMINISTIC_IDENTIFIER_MATCH_SCALE);
+    const candidate: RankedCandidate = {
+      id: entry.candidate.id,
+      score,
+      metadata: entry.candidate.metadata,
+      scoreBreakdown: cloneScoreBreakdown(entry.candidate.scoreBreakdown),
+    };
+    if (includeScoreBreakdown) {
+      ensureScoreBreakdown(candidate, "identifier");
+      recordScoreStage(candidate, {
+        name: DETERMINISTIC_INTENT_STAGE,
+        kind: "set",
+        before: entry.candidate.score,
+        after: score,
+        reason: `deterministicIdentifierLane: maxMatch=${entry.maxMatch}; pathMatchesFileHint=${entry.pathMatchesFileHint}; nameMatchesPrimary=${entry.nameMatchesPrimary}`,
+      });
+    }
+    return candidate;
+  });
 }
 
 export function fuseResultsWeighted(
   lanes: FusionLane[],
-  limit: number
+  limit: number,
+  scoreBreakdownLanes?: Map<string, ScoreBreakdown["lanes"]>
 ): RankedCandidate[] {
   const fusedScores = new Map<string, {
     score: number;
@@ -1844,7 +2185,7 @@ export function fuseResultsWeighted(
     }
   }
 
-  const results = Array.from(fusedScores.entries()).map(([id, data]) => ({
+  const results: RankedCandidate[] = Array.from(fusedScores.entries()).map(([id, data]) => ({
     id,
     score: data.score,
     metadata: data.metadata,
@@ -1852,13 +2193,27 @@ export function fuseResultsWeighted(
   }));
 
   results.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
-  return results.slice(0, limit);
+  const bounded = results.slice(0, limit);
+  if (scoreBreakdownLanes) {
+    bounded.forEach((candidate, index) => {
+      const laneBreakdown = scoreBreakdownLanes.get(candidate.id) ?? {};
+      candidate.scoreBreakdown = createScoreBreakdown(
+        laneBreakdown,
+        "weighted",
+        candidate.score,
+        index + 1,
+        sourcesFromLaneBreakdown(laneBreakdown)
+      );
+    });
+  }
+  return bounded;
 }
 
 export function fuseResultsRrf(
   lanes: FusionLane[],
   rrfK: number,
-  limit: number
+  limit: number,
+  scoreBreakdownLanes?: Map<string, ScoreBreakdown["lanes"]>
 ): RankedCandidate[] {
   const activeLanes = lanes.filter((lane) => lane.weight > 0 && lane.results.length > 0);
   if (activeLanes.length === 0) {
@@ -1908,7 +2263,20 @@ export function fuseResultsRrf(
   }
 
   fused.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
-  return fused.slice(0, limit);
+  const bounded = fused.slice(0, limit);
+  if (scoreBreakdownLanes) {
+    bounded.forEach((candidate, index) => {
+      const laneBreakdown = scoreBreakdownLanes.get(candidate.id) ?? {};
+      candidate.scoreBreakdown = createScoreBreakdown(
+        laneBreakdown,
+        "rrf",
+        candidate.score,
+        index + 1,
+        sourcesFromLaneBreakdown(laneBreakdown)
+      );
+    });
+  }
+  return bounded;
 }
 
 export function rerankResults(
@@ -1974,21 +2342,21 @@ export function rerankResults(
     const lowerName = (candidate.metadata.name ?? "").toLowerCase();
     const hasIdentifierMatch = identifierHints.some((id) => lowerPath.includes(id) || lowerName.includes(id));
 
-    const implementationPathBoost = preferSourcePaths && isLikelyImplementationPath(candidate.metadata.filePath) ? 0.08 : 0;
+    const implementationPathBoost = preferSourcePaths && isLikelyImplementationPath(candidate.metadata.filePath) ? DETERMINISTIC_IMPLEMENTATION_PATH_BOOST : 0;
     const isReadmePath = candidate.metadata.filePath.toLowerCase().includes("readme");
-    const testDocPenalty = preferSourcePaths && likelyTestOrDoc ? 0.12 : 0;
-    const testPathBoost = preferTestPaths && likelyTestOrDoc ? 0.16 : 0;
-    const readmeDocBoost = !preferSourcePaths && isReadmePath ? 0.08 : 0;
-    const identifierBoost = hasIdentifierMatch ? 0.12 : 0;
+    const testDocPenalty = preferSourcePaths && likelyTestOrDoc ? DETERMINISTIC_TEST_DOC_PATH_PENALTY : 0;
+    const testPathBoost = preferTestPaths && likelyTestOrDoc ? DETERMINISTIC_TEST_PATH_BOOST : 0;
+    const readmeDocBoost = !preferSourcePaths && isReadmePath ? DETERMINISTIC_README_DOC_BOOST : 0;
+    const identifierBoost = hasIdentifierMatch ? DETERMINISTIC_IDENTIFIER_SORT_BOOST : 0;
     const tokenCoverage = queryTokenList.length > 0
       ? (exactOrPrefixNameHits + pathOverlap + chunkTypeHits) / queryTokenList.length
       : 0;
-    const coverageBoost = Math.min(0.12, tokenCoverage * 0.06);
+    const coverageBoost = Math.min(DETERMINISTIC_COVERAGE_BOOST_CAP, tokenCoverage * DETERMINISTIC_COVERAGE_BOOST_SCALE);
 
     const deterministicBoost =
-      exactOrPrefixNameHits * 0.08 +
-      pathOverlap * 0.03 +
-      chunkTypeHits * 0.02 +
+      exactOrPrefixNameHits * DETERMINISTIC_NAME_HIT_BOOST +
+      pathOverlap * DETERMINISTIC_PATH_OVERLAP_BOOST +
+      chunkTypeHits * DETERMINISTIC_CHUNK_TYPE_HIT_BOOST +
       coverageBoost +
       identifierBoost +
       implementationPathBoost -
@@ -1997,6 +2365,40 @@ export function rerankResults(
       readmeDocBoost +
       getInterfaceTypePenalty(taskType, candidate.metadata.chunkType) +
       chunkTypeBoost(candidate.metadata.chunkType);
+
+    if (candidate.scoreBreakdown) {
+      const chunkBoost = chunkTypeBoost(candidate.metadata.chunkType);
+      const interfacePenalty = getInterfaceTypePenalty(taskType, candidate.metadata.chunkType);
+      const pathDelta = -testDocPenalty + testPathBoost + readmeDocBoost + implementationPathBoost;
+      recordDeterministicSortPreference(
+        candidate,
+        `initialDeterministicRerank: virtualBoost=${deterministicBoost}; nameHits=${exactOrPrefixNameHits}; pathOverlap=${pathOverlap}; chunkTypeHits=${chunkTypeHits}`
+      );
+      if (chunkBoost !== 0) {
+        recordDeterministicSortPreference(
+          candidate,
+          `chunkTypeBoost: chunkType=${candidate.metadata.chunkType}; virtualBoost=${chunkBoost}`
+        );
+      }
+      if (interfacePenalty !== 0) {
+        recordDeterministicSortPreference(
+          candidate,
+          `interfaceTypePenalty: chunkType=${candidate.metadata.chunkType}; virtualPenalty=${interfacePenalty}`
+        );
+      }
+      if (pathDelta !== 0) {
+        recordDeterministicSortPreference(
+          candidate,
+          `${testDocPenalty > 0 ? "testDocPathPenalty" : "pathPreferenceBoost"}: virtualPathDelta=${pathDelta}; preferSource=${preferSourcePaths}; preferTest=${preferTestPaths}`
+        );
+      }
+      if (identifierBoost !== 0) {
+        recordDeterministicSortPreference(
+          candidate,
+          `identifierSortBoost: hasIdentifierMatch=${hasIdentifierMatch}; virtualBoost=${identifierBoost}`
+        );
+      }
+    }
 
     return {
       candidate,
@@ -2021,7 +2423,13 @@ export function rerankResults(
       shouldSuppressUnnamedSiblingCandidate(entry.candidate) &&
       filesWithNamedCandidates.has(entry.candidate.metadata.filePath)
     ) {
-      entry.boostedScore -= 0.10;
+      if (entry.candidate.scoreBreakdown) {
+        recordDeterministicSortPreference(
+          entry.candidate,
+          "siblingSuppression: unnamed/module sibling sorted lower by virtualPenalty=-0.10"
+        );
+      }
+      entry.boostedScore -= SIBLING_SUPPRESSION_SORT_PENALTY;
     }
   }
 
@@ -2033,6 +2441,9 @@ export function rerankResults(
   });
 
   if (preferSourcePaths) {
+    for (const entry of head) {
+      recordDeterministicSortPreference(entry.candidate, "sourcePathSort: reordered by source path preference");
+    }
     head.sort((a, b) => {
       const aId = a.hasIdentifierMatch ? 1 : 0;
       const bId = b.hasIdentifierMatch ? 1 : 0;
@@ -2053,6 +2464,9 @@ export function rerankResults(
       return 0;
     });
   } else if (preferTestPaths) {
+    for (const entry of head) {
+      recordDeterministicSortPreference(entry.candidate, "testPathSort: reordered by test path preference");
+    }
     head.sort((a, b) => {
       const aTestDoc = a.isTestOrDocPath ? 1 : 0;
       const bTestDoc = b.isTestOrDocPath ? 1 : 0;
@@ -2065,6 +2479,9 @@ export function rerankResults(
       return 0;
     });
   } else if (docIntent === "docs") {
+    for (const entry of head) {
+      recordDeterministicSortPreference(entry.candidate, "docPathSort: reordered by docs/readme preference");
+    }
     head.sort((a, b) => {
       const aReadme = a.isReadmePath ? 1 : 0;
       const bReadme = b.isReadmePath ? 1 : 0;
@@ -2096,8 +2513,8 @@ export function rankHybridResults(
     { results: keywordResults, weight: fusionWeights.bm25Weight },
   ];
   const fused = options.fusionStrategy === "rrf"
-    ? fuseResultsRrf(lanes, options.rrfK, overfetchLimit)
-    : fuseResultsWeighted(lanes, overfetchLimit);
+    ? fuseResultsRrf(lanes, options.rrfK, overfetchLimit, options.scoreBreakdownLanes)
+    : fuseResultsWeighted(lanes, overfetchLimit, options.scoreBreakdownLanes);
 
   const rerankPoolLimit = Math.max(overfetchLimit, options.rerankTopN * 3, options.limit * 6);
   const rerankPool = fused.slice(0, rerankPoolLimit);
@@ -2160,7 +2577,8 @@ function promoteIdentifierMatches(
   database?: Database,
   allowedChunkIds?: Set<string> | null,
   pathPreference: SearchPathPreference = classifyQueryIntentRaw(query) === "source" ? "source" : "auto",
-  identifierBoost: number = 1
+  identifierBoost: number = 1,
+  includeScoreBreakdown: boolean = false
 ): RankedCandidate[] {
   if (combined.length === 0) {
     return combined;
@@ -2225,14 +2643,27 @@ function promoteIdentifierMatches(
             hash: chunk.embeddingInputHash,
           };
 
-          const baselineScore = existing?.score ?? 0.5;
-          candidateUnion.set(chunk.chunkId, {
+          const baselineScore = existing?.score ?? IDENTIFIER_DATABASE_BASELINE_SCORE;
+          const boostedScore = Math.min(1, baselineScore + IDENTIFIER_DATABASE_BASELINE_SCORE * Math.max(0, identifierBoost));
+          const nextCandidate: RankedCandidate = {
             id: chunk.chunkId,
-            score: Math.min(1, baselineScore + 0.5 * Math.max(0, identifierBoost)),
+            score: boostedScore,
             metadata,
             chunkKind: (chunk.chunkKind as ChunkKind | undefined) ?? existing?.chunkKind ?? metadata.chunkKind,
             symbolKind: (chunk.symbolKind as ChunkSymbolKind | undefined) ?? existing?.symbolKind ?? metadata.symbolKind,
-          });
+            scoreBreakdown: cloneScoreBreakdown(existing?.scoreBreakdown),
+          };
+          if (includeScoreBreakdown) {
+            ensureScoreBreakdown(nextCandidate, "identifier");
+            recordScoreStage(nextCandidate, {
+              name: DETERMINISTIC_INTENT_STAGE,
+              kind: "set",
+              before: baselineScore,
+              after: boostedScore,
+              reason: `identifierPromotion: databaseSymbol=${identifier}; identifierBoost=${identifierBoost}`,
+            });
+          }
+          candidateUnion.set(chunk.chunkId, nextCandidate);
         }
       }
     }
@@ -2263,15 +2694,27 @@ function promoteIdentifierMatches(
     }
 
     const existing = combinedById.get(candidate.id) ?? candidate;
-    const rescueBoost = (exactIdentifierMatch ? 0.45 : 0.25) * Math.max(0, identifierBoost);
+    const rescueBoost = (exactIdentifierMatch ? IDENTIFIER_EXACT_RESCUE_BOOST : IDENTIFIER_FUZZY_RESCUE_BOOST) * Math.max(0, identifierBoost);
     const boostedScore = Math.min(1, Math.max(existing.score, candidate.score) + rescueBoost);
-    promoted.push({
+    const nextCandidate: RankedCandidate = {
       id: existing.id,
       score: boostedScore,
       metadata: existing.metadata,
       chunkKind: existing.chunkKind ?? candidate.chunkKind ?? existing.metadata.chunkKind,
       symbolKind: existing.symbolKind ?? candidate.symbolKind ?? existing.metadata.symbolKind,
-    });
+      scoreBreakdown: cloneScoreBreakdown(existing.scoreBreakdown ?? candidate.scoreBreakdown),
+    };
+    if (includeScoreBreakdown) {
+      ensureScoreBreakdown(nextCandidate, "identifier");
+      recordScoreStage(nextCandidate, {
+        name: DETERMINISTIC_INTENT_STAGE,
+        kind: "add",
+        before: Math.max(existing.score, candidate.score),
+        after: boostedScore,
+        reason: `identifierPromotion: exactIdentifierMatch=${exactIdentifierMatch}; boost=${rescueBoost}`,
+      });
+    }
+    promoted.push(nextCandidate);
   }
 
   if (promoted.length === 0) {
@@ -2291,7 +2734,8 @@ function buildSymbolDefinitionLane(
   allowedChunkIds: Set<string> | null,
   limit: number,
   fallbackCandidates: RankedCandidate[],
-  prioritizeSourcePaths: boolean = classifyQueryIntentRaw(query) === "source"
+  prioritizeSourcePaths: boolean = classifyQueryIntentRaw(query) === "source",
+  includeScoreBreakdown: boolean = false
 ): RankedCandidate[] {
   if (!prioritizeSourcePaths) {
     return [];
@@ -2337,11 +2781,11 @@ function buildSymbolDefinitionLane(
     const exactName =
       nameLower === identifier ||
       nameLower.replace(/_/g, "") === normalizedIdentifier;
-    const base = baseScore ?? (exactName ? 0.99 : 0.88);
+    const base = baseScore ?? (exactName ? SYMBOL_DEFINITION_EXACT_SCORE : SYMBOL_DEFINITION_FUZZY_SCORE);
 
     const existing = symbolCandidates.get(chunk.chunkId);
     if (!existing || base > existing.score) {
-      symbolCandidates.set(chunk.chunkId, {
+      const candidate: RankedCandidate = {
         id: chunk.chunkId,
         score: base,
         metadata: {
@@ -2353,7 +2797,18 @@ function buildSymbolDefinitionLane(
           language: chunk.language,
           hash: chunk.embeddingInputHash,
         },
-      });
+      };
+      if (includeScoreBreakdown) {
+        ensureScoreBreakdown(candidate, "symbol");
+        recordScoreStage(candidate, {
+          name: DETERMINISTIC_INTENT_STAGE,
+          kind: "set",
+          before: 0,
+          after: base,
+          reason: `symbolDefinitionLane: identifier=${identifier}; exactName=${exactName}`,
+        });
+      }
+      symbolCandidates.set(chunk.chunkId, candidate);
     }
   };
 
@@ -2444,13 +2899,25 @@ function buildSymbolDefinitionLane(
       }
 
       const laneScore = exactHintMatch
-        ? Math.min(1, Math.max(candidate.score, 0.97))
-        : Math.min(0.95, Math.max(candidate.score, 0.82 + tokenHits * 0.03));
-      symbolCandidates.set(candidate.id, {
+        ? Math.min(1, Math.max(candidate.score, SYMBOL_FALLBACK_EXACT_FLOOR))
+        : Math.min(SYMBOL_FALLBACK_TOKEN_CAP, Math.max(candidate.score, SYMBOL_FALLBACK_TOKEN_BASE + tokenHits * SYMBOL_FALLBACK_TOKEN_SCALE));
+      const nextCandidate: RankedCandidate = {
         id: candidate.id,
         score: laneScore,
         metadata: candidate.metadata,
-      });
+        scoreBreakdown: cloneScoreBreakdown(candidate.scoreBreakdown),
+      };
+      if (includeScoreBreakdown) {
+        ensureScoreBreakdown(nextCandidate, "symbol");
+        recordScoreStage(nextCandidate, {
+          name: DETERMINISTIC_INTENT_STAGE,
+          kind: "set-min",
+          before: candidate.score,
+          after: laneScore,
+          reason: `symbolDefinitionFallback: exactHintMatch=${exactHintMatch}; tokenHits=${tokenHits}`,
+        });
+      }
+      symbolCandidates.set(candidate.id, nextCandidate);
     }
 
     if (symbolCandidates.size === 0) {
@@ -2476,11 +2943,23 @@ function buildSymbolDefinitionLane(
         .slice(0, Math.max(limit, 3));
 
       for (const entry of rankedFallback) {
-        symbolCandidates.set(entry.candidate.id, {
+        const nextCandidate: RankedCandidate = {
           id: entry.candidate.id,
-          score: Math.min(0.94, Math.max(entry.candidate.score, 0.8 + entry.overlapScore * 0.1)),
+          score: Math.min(SYMBOL_OVERLAP_FALLBACK_CAP, Math.max(entry.candidate.score, SYMBOL_OVERLAP_FALLBACK_BASE + entry.overlapScore * SYMBOL_OVERLAP_FALLBACK_SCALE)),
           metadata: entry.candidate.metadata,
-        });
+          scoreBreakdown: cloneScoreBreakdown(entry.candidate.scoreBreakdown),
+        };
+        if (includeScoreBreakdown) {
+          ensureScoreBreakdown(nextCandidate, "symbol");
+          recordScoreStage(nextCandidate, {
+            name: DETERMINISTIC_INTENT_STAGE,
+            kind: "set-min",
+            before: entry.candidate.score,
+            after: nextCandidate.score,
+            reason: `symbolDefinitionOverlapFallback: overlapScore=${entry.overlapScore}`,
+          });
+        }
+        symbolCandidates.set(entry.candidate.id, nextCandidate);
       }
     }
   }
@@ -2493,7 +2972,8 @@ function buildIdentifierDefinitionLane(
   query: string,
   candidates: RankedCandidate[],
   limit: number,
-  prioritizeSourcePaths: boolean = classifyQueryIntentRaw(query) === "source"
+  prioritizeSourcePaths: boolean = classifyQueryIntentRaw(query) === "source",
+  includeScoreBreakdown: boolean = false
 ): RankedCandidate[] {
   if (!prioritizeSourcePaths) {
     return [];
@@ -2525,11 +3005,26 @@ function buildIdentifierDefinitionLane(
     })
     .slice(0, Math.max(limit * 2, 10));
 
-  return scored.map((entry) => ({
-    id: entry.candidate.id,
-    score: Math.min(1, 0.9 + entry.matchScore * 0.09),
-    metadata: entry.candidate.metadata,
-  }));
+  return scored.map((entry) => {
+    const score = Math.min(1, DETERMINISTIC_IDENTIFIER_BASE_SCORE + entry.matchScore * DETERMINISTIC_IDENTIFIER_MATCH_SCALE);
+    const candidate: RankedCandidate = {
+      id: entry.candidate.id,
+      score,
+      metadata: entry.candidate.metadata,
+      scoreBreakdown: cloneScoreBreakdown(entry.candidate.scoreBreakdown),
+    };
+    if (includeScoreBreakdown) {
+      ensureScoreBreakdown(candidate, "identifier");
+      recordScoreStage(candidate, {
+        name: DETERMINISTIC_INTENT_STAGE,
+        kind: "set",
+        before: entry.candidate.score,
+        after: score,
+        reason: `identifierDefinitionLane: matchScore=${entry.matchScore}`,
+      });
+    }
+    return candidate;
+  });
 }
 
 export function mergeTieredResults(
@@ -4555,6 +5050,7 @@ export class Indexer {
           chunkKind: candidate.chunkKind ?? candidate.metadata.chunkKind,
           symbolKind: candidate.symbolKind ?? candidate.metadata.symbolKind,
           name: candidate.metadata.name,
+          scoreBreakdown: cloneScoreBreakdown(candidate.scoreBreakdown),
         };
       })
     );
@@ -4598,6 +5094,13 @@ export class Indexer {
     rerankTopN: number,
     fileContentCache: Map<string, string | null>
   ): Promise<{ ordered: RankedCandidate[]; applied: boolean; backend: string | null; failedBackend?: string | null }> {
+    for (const candidate of candidates) {
+      if (candidate.scoreBreakdown) {
+        candidate.scoreBreakdown.preRerankScore = candidate.score;
+        candidate.scoreBreakdown.finalScore = candidate.score;
+      }
+    }
+
     if (rerankTopN <= 0 || candidates.length < 2) {
       return {
         ordered: applyRelationshipGraphBias(query, applyCallerTargetPenalty(query, candidates, taskType), taskType),
@@ -4635,13 +5138,13 @@ export class Indexer {
 
     const headById = new Map(head.map((candidate) => [candidate.id, candidate]));
     const orderedHead = reranked.candidates
-      .map<RankedCandidate | undefined>((candidate) => {
+      .map<RankedCandidate | undefined>((candidate, rerankerIndex) => {
         const original = headById.get(candidate.id);
         if (!original) {
           return undefined;
         }
 
-        return {
+        const nextCandidate: RankedCandidate = {
           ...original,
           score: candidate.baseScore,
           chunkKind: candidate.chunkKind ?? original.chunkKind ?? original.metadata.chunkKind,
@@ -4649,6 +5152,22 @@ export class Indexer {
           relation: candidate.relation ?? original.relation,
           reranked: true,
         };
+        if (nextCandidate.scoreBreakdown) {
+          recordScoreStage(nextCandidate, {
+            name: "finalReranker",
+            kind: "replace",
+            before: original.score,
+            after: candidate.baseScore,
+            reason: `backend=${reranked.backend ?? "unknown"}; rank=${rerankerIndex + 1}`,
+          });
+          nextCandidate.scoreBreakdown.reranker = {
+            score: candidate.baseScore,
+            rank: rerankerIndex + 1,
+            backend: reranked.backend ?? "unknown",
+          };
+          nextCandidate.scoreBreakdown.finalScore = candidate.baseScore;
+        }
+        return nextCandidate;
       });
     const promotedHead: RankedCandidate[] = orderedHead.filter((candidate): candidate is RankedCandidate => candidate !== undefined);
     const orderedTail = tail.map((candidate) => ({
@@ -4778,6 +5297,7 @@ export class Indexer {
 
     const maxResults = limit ?? this.config.search.maxResults;
     const recipe = getSearchRecipe(taskType);
+    const includeScoreBreakdown = options?.includeScoreBreakdown === true;
     const queryIntent = classifyQueryIntentRaw(query);
     const hybridWeight = options?.hybridWeight ?? recipe.hybridWeight ?? this.config.search.hybridWeight;
     const configuredBm25Weight = options?.bm25Weight ?? recipe.bm25Weight;
@@ -4969,6 +5489,9 @@ export class Indexer {
       metadataAllowedChunkIds
     );
     const keywordMs = keywordLane.ms;
+    const scoreBreakdownLanes = includeScoreBreakdown
+      ? buildLaneScoreBreakdowns(keywordCandidates, semanticCandidates, voyageCandidates)
+      : undefined;
 
     const fusionStartTime = performance.now();
     const combined = rankHybridResults(query, semanticCandidates, keywordCandidates, {
@@ -4984,6 +5507,7 @@ export class Indexer {
       prioritizeSourcePaths: sourceIntent,
       pathPreference: recipe.pathPreference,
       taskType,
+      scoreBreakdownLanes,
     });
     const fusionMs = performance.now() - fusionStartTime;
 
@@ -4995,7 +5519,8 @@ export class Indexer {
           database,
           metadataAllowedChunkIds,
           recipe.pathPreference,
-          identifierBoost
+          identifierBoost,
+          includeScoreBreakdown
         )
       : combined;
 
@@ -5006,7 +5531,8 @@ export class Indexer {
           query,
           union,
           maxResults,
-          sourceIntent
+          sourceIntent,
+          includeScoreBreakdown
         )
       : [];
 
@@ -5015,7 +5541,8 @@ export class Indexer {
           query,
           union,
           maxResults,
-          sourceIntent
+          sourceIntent,
+          includeScoreBreakdown
         )
       : [];
 
@@ -5026,7 +5553,8 @@ export class Indexer {
         metadataAllowedChunkIds,
         maxResults,
         union,
-        sourceIntent
+        sourceIntent,
+        includeScoreBreakdown
         )
       : [];
 
@@ -5076,7 +5604,8 @@ export class Indexer {
       graphDepth,
       graphDirection,
       metadataAllowedChunkIds,
-      taskType
+      taskType,
+      includeScoreBreakdown
     );
     const callerChunkTexts = await this.batchFetchStoredChunkTexts(
       relationshipGraphAugmented.map((candidate) => candidate.metadata.hash)

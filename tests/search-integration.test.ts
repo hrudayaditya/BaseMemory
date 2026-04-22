@@ -410,8 +410,8 @@ export async function handleEvalCommand(): Promise<void> {
     expect(overlappingRegistrationChunks.every((row) => row.chunkKind === "Config")).toBe(true);
     expect(parsedChunkRows).toContainEqual({
       chunkKind: "Config",
-      startLine: 794,
-      endLine: 801,
+      startLine: 752,
+      endLine: 809,
       nodeType: "other",
     });
 
@@ -649,6 +649,7 @@ export const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-2";
       metadataOnly: true,
       filterByBranch: false,
       taskType: "definition",
+      includeScoreBreakdown: true,
     });
 
     expect(baseline.reranker.applied).toBe(false);
@@ -658,6 +659,11 @@ export const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-2";
     expect(reranked.primaryResults[0]?.score).not.toBe(baseline.primaryResults[0]?.score);
     expect(reranked.primaryResults[0]?.reranked).toBe(true);
     expect(reranked.primaryResults[0]?.chunkKind).toBe("Code");
+    expect(reranked.primaryResults[0]?.scoreBreakdown?.reranker).toEqual(expect.objectContaining({
+      score: 0.97,
+      rank: 1,
+      backend: "fixed-score",
+    }));
   });
 
   it("persists healthy reranker status after a successful cross-encoder load", async () => {
@@ -2405,12 +2411,20 @@ export function graphOuterCaller(value: string) { return graphCallHelper(value);
     const callerResponse = await indexer.searchDetailed("what calls graphTargetHelper", 5, {
       metadataOnly: true,
       filterByBranch: false,
+      includeScoreBreakdown: true,
     });
     expect(callerResponse.taskType).toBe("definition");
     expect(callerResponse.graphDirection).toBe("caller");
     expect(callerResponse.expandedContext.map((entry) => entry.name)).toContain("graphCallHelper");
     expect(callerResponse.expandedContext.every((entry) => entry.relation === "caller")).toBe(true);
     expect(callerResponse.expandedContext.map((entry) => entry.name)).not.toContain("graphOuterCaller");
+    expect(callerResponse.primaryResults.some((entry) =>
+      entry.scoreBreakdown?.stages.some((stage) =>
+        stage.name === "deterministicIntentLane" &&
+        (stage.kind === "set-min" || stage.kind === "set") &&
+        stage.reason.includes("graphInjection")
+      )
+    )).toBe(true);
 
     const calleeResponse = await indexer.searchDetailed("what does graphCallHelper call", 5, {
       metadataOnly: true,

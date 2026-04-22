@@ -144,9 +144,15 @@ describe("eval runner", () => {
     expect(readFileSync(path.join(result.outputDir, "summary.md"), "utf-8")).toContain("# Evaluation Summary");
     expect(readFileSync(path.join(result.outputDir, "per-query.json"), "utf-8")).toContain("\"queries\"");
     const perQueryArtifact = JSON.parse(readFileSync(path.join(result.outputDir, "per-query.json"), "utf-8")) as {
-      queries: Array<{ prefilterMs?: number }>;
+      queries: Array<{ prefilterMs?: number; results: Array<{ scoreBreakdown?: unknown }> }>;
     };
     expect(perQueryArtifact.queries[0]?.prefilterMs).toBeDefined();
+    expect(perQueryArtifact.queries[0]?.results[0]?.scoreBreakdown).toEqual(expect.objectContaining({
+      lanes: expect.any(Object),
+      fusion: expect.any(Object),
+      stages: expect.any(Array),
+      finalScore: expect.any(Number),
+    }));
   });
 
   it("uses the general task type for all eval queries when useQueryTypes is false", async () => {

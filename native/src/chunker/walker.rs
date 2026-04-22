@@ -254,6 +254,10 @@ fn collect_split_children<'tree>(
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
+        if is_suppressed_js_constructor_method(ctx, child) {
+            continue;
+        }
+
         if classify(ctx.policy, child, ctx.source).is_some()
             || is_go_transparent_declaration_container(ctx.language, child)
         {
@@ -262,6 +266,17 @@ fn collect_split_children<'tree>(
             collect_split_children(ctx, child, results);
         }
     }
+}
+
+fn is_suppressed_js_constructor_method(ctx: &WalkerContext<'_>, node: Node<'_>) -> bool {
+    if !is_js_like_language(ctx.language) || node.kind() != "method_definition" {
+        return false;
+    }
+
+    node.child_by_field_name("name")
+        .and_then(|name| ctx.slice(name.start_byte(), name.end_byte()).ok())
+        .map(str::trim)
+        == Some("constructor")
 }
 
 fn count_semantic_units(ctx: &WalkerContext<'_>, node: Node<'_>) -> usize {
@@ -599,6 +614,39 @@ fn split_oversized_leaf_node_by_statements(
     Some(chunks)
 }
 
+fn try_emit_semantic_parent_header_gap(
+    ctx: &WalkerContext<'_>,
+    cursor: usize,
+    first_start: usize,
+    template: &PendingChunk,
+    chunks: &mut Vec<PendingChunk>,
+) -> bool {
+    if !is_js_like_language(ctx.language)
+        || !chunks.is_empty()
+        || template.symbol_name.is_none()
+        || template.symbol_kind != Some(SymbolKind::Class)
+    {
+        return false;
+    }
+
+    let header_text = ctx.slice(cursor, first_start).unwrap_or("");
+    if !header_text.contains("class ") || header_text.contains("export class") {
+        return false;
+    }
+
+    chunks.push(PendingChunk {
+        symbol_name: template.symbol_name.clone(),
+        symbol_aliases: template.symbol_aliases.clone(),
+        symbol_kind: template.symbol_kind.clone(),
+        chunk_kind: template.chunk_kind.clone(),
+        delegate_target_name: template.delegate_target_name.clone(),
+        granularity: Granularity::Fine,
+        start_byte: cursor,
+        end_byte: first_start,
+    });
+    true
+}
+
 fn classify_statement_group_kind(
     ctx: &WalkerContext<'_>,
     statements: &[Node<'_>],
@@ -734,7 +782,14 @@ fn build_semantic_chunk(
                 )
             {
             } else {
-                if !try_attach_display_name_gap(ctx, node, cursor, first_start, &mut chunks) {
+                if !try_emit_semantic_parent_header_gap(
+                    ctx,
+                    cursor,
+                    first_start,
+                    &template,
+                    &mut chunks,
+                ) && !try_attach_display_name_gap(ctx, node, cursor, first_start, &mut chunks)
+                {
                     emit_gap(ctx, cursor, first_start, &mut chunks);
                 }
             }

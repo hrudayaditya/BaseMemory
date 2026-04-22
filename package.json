@@ -1,5 +1,5 @@
 {
-  "name": "opencode-codebase-index",
+  "name": "base-memory",
   "version": "0.6.1",
   "description": "Semantic codebase indexing and search for OpenCode - find code by meaning, not just keywords",
   "type": "module",
@@ -86,6 +86,7 @@
     "@vitest/coverage-v8": "^4.1.2",
     "eslint": "^9.39.4",
     "tsup": "^8.1.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.58.0",
     "vitest": "^4.1.2",

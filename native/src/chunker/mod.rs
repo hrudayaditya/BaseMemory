@@ -1994,6 +1994,113 @@ exports.helper = helper;
     }
 
     #[test]
+    fn classifies_exported_new_expression_constants() {
+        let source = r#"class TRPCBuilder {}
+
+/**
+ * Builder to initialize the tRPC root object - use this exactly once per backend
+ */
+export const initTRPC = new TRPCBuilder();
+export type { TRPCBuilder };
+"#;
+
+        let chunks = chunk_file("initTRPC.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let constant_chunk = named_fine_chunk(&chunks, "initTRPC");
+        assert_eq!(constant_chunk.symbol_kind, Some(SymbolKind::Constant));
+        assert_eq!(constant_chunk.chunk_kind, ChunkKind::Code);
+        assert!(constant_chunk.text.contains("export const initTRPC = new TRPCBuilder();"));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.granularity == Granularity::Fine
+                && chunk.text.contains("export const initTRPC")
+                && chunk.symbol_name.is_none()
+        }));
+    }
+
+    #[test]
+    fn preserves_named_typescript_class_header_when_class_splits_into_methods() {
+        let source = r#"class TRPCBuilder<TContext extends object, TMeta extends object> {
+  /**
+   * Add a context shape as a generic to the root object
+   */
+  context<TNewContext extends object>() {
+    return new TRPCBuilder<TNewContext, TMeta>();
+  }
+
+  /**
+   * Create the root object
+   */
+  create() {
+    return {
+      router: createRouterFactory(),
+      procedure: createBuilder(),
+    };
+  }
+}
+
+export type { TRPCBuilder };
+"#;
+
+        let chunks = chunk_file("initTRPC.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let class_chunk = named_fine_chunk(&chunks, "TRPCBuilder");
+        assert_eq!(class_chunk.symbol_kind, Some(SymbolKind::Class));
+        assert_eq!(class_chunk.chunk_kind, ChunkKind::Code);
+        assert!(class_chunk.text.contains("class TRPCBuilder"));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.granularity == Granularity::Fine
+                && chunk.symbol_name.is_none()
+                && chunk.text.contains("class TRPCBuilder")
+        }));
+    }
+
+    #[test]
+    fn classifies_exported_async_generator_functions() {
+        let source = r#"export async function* takeWithGrace<T>(
+  iterable: AsyncIterable<T>,
+  opts: {
+    count: number;
+    gracePeriodMs: number;
+  },
+): AsyncGenerator<T> {
+  let count = opts.count;
+  let timerPromise = Promise.resolve();
+  while (true) {
+    if (--count === 0) {
+      timerPromise = Promise.resolve();
+    }
+    yield await timerPromise;
+  }
+}
+"#;
+
+        let chunks = chunk_file("asyncIterable.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let function_chunks: Vec<&Chunk> = chunks
+            .iter()
+            .filter(|chunk| {
+                chunk.granularity == Granularity::Fine
+                    && chunk.symbol_name.as_deref() == Some("takeWithGrace")
+            })
+            .collect();
+
+        assert!(!function_chunks.is_empty());
+        assert!(function_chunks
+            .iter()
+            .all(|chunk| chunk.symbol_kind == Some(SymbolKind::Function)));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.granularity == Granularity::Fine
+                && matches!(
+                    chunk.symbol_name.as_deref(),
+                    Some("count" | "timerPromise")
+                )
+        }));
+    }
+
+    #[test]
     fn classifies_nullish_coalescing_config_constants() {
         let source = r#"export const API_BASE_URL =
   import.meta.env.VITE_API_URL ?? "http://localhost:3001";
@@ -2052,6 +2159,38 @@ exports.helper = helper;
             .iter()
             .any(|chunk| chunk.granularity == Granularity::Fine
                 && chunk.symbol_name.as_deref() == Some("constructor")));
+    }
+
+    #[test]
+    fn keeps_constructor_local_declarations_inside_typescript_class_chunk() {
+        let source = r#"export class TRPCError extends Error {
+  public override readonly cause?: Error;
+  public readonly code;
+
+  constructor(opts: { message?: string; code: string; cause?: unknown }) {
+    const cause = getCauseFromUnknown(opts.cause);
+    const message = opts.message ?? cause?.message ?? opts.code;
+    super(message, { cause });
+    this.code = opts.code;
+    this.name = "TRPCError";
+  }
+}
+"#;
+
+        let chunks = chunk_file("TRPCError.ts", "typescript", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let class_chunk = named_fine_chunk(&chunks, "TRPCError");
+        assert_eq!(class_chunk.symbol_kind, Some(SymbolKind::Class));
+        assert!(class_chunk.text.contains("class TRPCError extends Error"));
+        assert!(class_chunk.text.contains("const cause = getCauseFromUnknown(opts.cause);"));
+        assert!(class_chunk
+            .text
+            .contains("const message = opts.message ?? cause?.message ?? opts.code;"));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.granularity == Granularity::Fine
+                && matches!(chunk.symbol_name.as_deref(), Some("cause" | "message"))
+        }));
     }
 
     #[test]

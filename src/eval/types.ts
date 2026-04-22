@@ -1,4 +1,5 @@
 import type { SearchConfig } from "../config/schema.js";
+import type { ScoreBreakdown } from "../indexer/index.js";
 import type { SearchTaskType } from "../indexer/search-recipes.js";
 
 export type GoldenQueryType =
@@ -78,6 +79,7 @@ export interface EvalSearchResult {
   score: number;
   chunkType: string;
   name?: string;
+  scoreBreakdown?: ScoreBreakdown;
 }
 
 export type FailureBucket =

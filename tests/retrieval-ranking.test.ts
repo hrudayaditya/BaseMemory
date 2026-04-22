@@ -1,12 +1,21 @@
+import { readFileSync } from "fs";
+
 import { describe, expect, it } from "vitest";
 
+import type { ScoreBreakdown } from "../src/indexer/index.js";
 import type { ChunkMetadata } from "../src/native/index.js";
 import {
   applyChunkKindPenalty,
+  CALLER_TARGET_PENALTY,
   extractFilePathHint,
   fuseResultsRrf,
   fuseResultsWeighted,
+  GRAPH_SOURCE_FLOOR,
+  GRAPH_TEST_DOC_FLOOR,
   getChunkKindPenaltyFactor,
+  RELATIONSHIP_BIAS_SOURCE,
+  SEMANTIC_TEST_DOC_PATH_PENALTY,
+  SYMBOL_FALLBACK_EXACT_FLOOR,
   inferTaskType,
   matchesHardRetrievalFilters,
   rankSemanticOnlyResults,
@@ -55,6 +64,25 @@ function meta(overrides: Partial<ChunkMetadata>): ChunkMetadata {
   };
 }
 
+function laneBreakdowns(
+  semantic: Candidate[],
+  keyword: Candidate[],
+  voyage: Candidate[] = []
+): Map<string, ScoreBreakdown["lanes"]> {
+  const byId = new Map<string, ScoreBreakdown["lanes"]>();
+  const add = (source: keyof ScoreBreakdown["lanes"], candidates: Candidate[]) => {
+    candidates.forEach((candidate, index) => {
+      const lanes = byId.get(candidate.id) ?? {};
+      lanes[source] = { score: candidate.score, rank: index + 1 };
+      byId.set(candidate.id, lanes);
+    });
+  };
+  add("arctic", semantic);
+  add("bm25", keyword);
+  add("voyage", voyage);
+  return byId;
+}
+
 describe("retrieval ranking", () => {
   it("fuses hybrid results using RRF rank ordering", () => {
     const semantic: Candidate[] = [
@@ -72,6 +100,87 @@ describe("retrieval ranking", () => {
     expect(fused.map(r => r.id).slice(0, 3)).toEqual(["a", "c", "d"]);
     expect(fused[0]?.score ?? 0).toBeLessThanOrEqual(1);
     expect(fused[0]?.score ?? 0).toBeGreaterThan(0);
+  });
+
+  it("keeps result order and scores identical when score breakdown is enabled", () => {
+    const semantic: Candidate[] = [
+      { id: "a", score: 0.91, metadata: meta({ filePath: "/repo/src/auth.ts", name: "validateAuth", chunkType: "function" }) },
+      { id: "b", score: 0.89, metadata: meta({ filePath: "/repo/src/session.ts", name: "loadSession", chunkType: "function" }) },
+    ];
+    const keyword: Candidate[] = [
+      { id: "b", score: 10, metadata: meta({ filePath: "/repo/src/session.ts", name: "loadSession", chunkType: "function" }) },
+      { id: "a", score: 1, metadata: meta({ filePath: "/repo/src/auth.ts", name: "validateAuth", chunkType: "function" }) },
+    ];
+
+    const withoutBreakdown = rankHybridResults("where is validateAuth implementation", semantic, keyword, {
+      fusionStrategy: "rrf",
+      rrfK: 60,
+      rerankTopN: 10,
+      limit: 5,
+      hybridWeight: 0.5,
+      bm25Weight: 0.5,
+      denseWeight: 0.5,
+      voyageWeight: 0,
+      taskType: "general",
+    });
+    const withBreakdown = rankHybridResults("where is validateAuth implementation", semantic, keyword, {
+      fusionStrategy: "rrf",
+      rrfK: 60,
+      rerankTopN: 10,
+      limit: 5,
+      hybridWeight: 0.5,
+      bm25Weight: 0.5,
+      denseWeight: 0.5,
+      voyageWeight: 0,
+      taskType: "general",
+      scoreBreakdownLanes: laneBreakdowns(semantic, keyword),
+    });
+
+    expect(withBreakdown.map((candidate) => [candidate.id, candidate.score])).toEqual(
+      withoutBreakdown.map((candidate) => [candidate.id, candidate.score])
+    );
+    expect(withoutBreakdown.every((candidate) => candidate.scoreBreakdown === undefined)).toBe(true);
+    expect(withBreakdown.every((candidate) => candidate.scoreBreakdown !== undefined)).toBe(true);
+  });
+
+  it("records multiplicative test/doc chunk penalties when breakdown is enabled", () => {
+    const candidate: Candidate & { chunkKind: "Test"; scoreBreakdown: ScoreBreakdown } = {
+      id: "test",
+      score: 0.8,
+      chunkKind: "Test",
+      metadata: meta({
+        filePath: "/repo/tests/auth.test.ts",
+        name: "auth test",
+        chunkType: "function",
+        chunkKind: "Test",
+      }),
+      scoreBreakdown: {
+        lanes: { bm25: { score: 0.8, rank: 1 } },
+        fusion: { strategy: "rrf", score: 0.8, rank: 1 },
+        sources: ["bm25"],
+        stages: [],
+        preRerankScore: 0.8,
+        finalScore: 0.8,
+      },
+    };
+
+    const [, penalized] = applyChunkKindPenalty([
+      {
+        id: "source",
+        score: 0.9,
+        metadata: meta({ filePath: "/repo/src/auth.ts", name: "auth", chunkType: "function", chunkKind: "Code" }),
+      },
+      candidate,
+    ], "definition", "where is auth test");
+
+    expect(penalized?.score).toBe(0.4);
+    expect(penalized?.scoreBreakdown?.stages).toContainEqual(expect.objectContaining({
+      name: "pathAndKindSuppression",
+      kind: "multiply",
+      before: 0.8,
+      after: 0.4,
+      reason: expect.stringContaining("testDocChunkPenalty"),
+    }));
   });
 
   it("keeps both semantic-only and keyword-only candidates in top fused results", () => {
@@ -424,6 +533,20 @@ describe("retrieval ranking", () => {
 
   it("uses at least a -0.12 base penalty for unnamed other chunks", () => {
     expect(chunkTypeBoost("other")).toBeLessThanOrEqual(-0.12);
+  });
+
+  it("exports named load-bearing and dangerous scoring constants", () => {
+    expect(GRAPH_SOURCE_FLOOR).toBe(0.97);
+    expect(RELATIONSHIP_BIAS_SOURCE).toBe(0.6);
+    expect(CALLER_TARGET_PENALTY).toBe(0.51);
+    expect(GRAPH_TEST_DOC_FLOOR).toBe(0.72);
+    expect(SEMANTIC_TEST_DOC_PATH_PENALTY).toBe(0.35);
+    expect(SYMBOL_FALLBACK_EXACT_FLOOR).toBe(0.97);
+  });
+
+  it("marks scoring debt on extracted scoring constants", () => {
+    const source = readFileSync(new URL("../src/indexer/index.ts", import.meta.url), "utf8");
+    expect(source.match(/SCORING-DEBT/g)?.length ?? 0).toBeGreaterThanOrEqual(6);
   });
 
   it("applies hybrid ranking path for search and semantic-only rerank for findSimilar", () => {

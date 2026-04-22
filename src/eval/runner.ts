@@ -426,6 +426,7 @@ async function finalizeEvaluationRun(
       denseWeight: queryPlan.denseWeight,
       voyageWeight: queryPlan.voyageWeight,
       identifierBoost: queryPlan.identifierBoost,
+      includeScoreBreakdown: true,
     });
     const elapsed = performance.now() - start;
 
@@ -436,6 +437,7 @@ async function finalizeEvaluationRun(
       score: item.score,
       chunkType: item.chunkType,
       name: item.name,
+      scoreBreakdown: item.scoreBreakdown,
     }));
     const expandedMaterialized = searchResponse.expandedContext.map((item) => ({
       filePath: item.filePath,

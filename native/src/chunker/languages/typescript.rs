@@ -113,7 +113,9 @@ fn classify_constant_expression(node: Node<'_>, source: &str) -> Option<bool> {
             .map(str::trim)
             .filter(|text| *text == "undefined")
             .map(|_| false),
-        "member_expression" | "subscript_expression" | "meta_property" => Some(false),
+        "member_expression" | "subscript_expression" | "meta_property" | "new_expression" => {
+            Some(false)
+        }
         "unary_expression" => {
             let mut cursor = node.walk();
             let child = node.named_children(&mut cursor).next()?;
@@ -684,7 +686,7 @@ fn classify_ts_js_node_impl(
         "ambient_declaration" => classify_ambient_declaration(node, source, allow_commonjs),
         "export_statement" => classify_export_statement(node, source, allow_commonjs),
         "export_clause" => classify_export_clause(node, source),
-        "function_declaration" => {
+        "function_declaration" | "generator_function_declaration" => {
             let symbol_name = extract_name_by_fields(node, source, &["name"]);
             let delegate_target_name = symbol_name
                 .as_deref()

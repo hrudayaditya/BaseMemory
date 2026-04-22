@@ -4,10 +4,16 @@ import { parseConfig } from "../src/config/schema.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
+const indexerMocks = vi.hoisted(() => ({
+  searchDetailed: vi.fn(),
+}));
+
 vi.mock("../src/indexer/index.js", () => {
   class MockIndexer {
     initialize = vi.fn().mockResolvedValue(undefined);
-    searchDetailed = vi.fn().mockResolvedValue({
+    searchDetailed = indexerMocks.searchDetailed;
+    constructor() {
+      this.searchDetailed.mockResolvedValue({
       primaryResults: [
         {
           filePath: "src/auth.ts",
@@ -21,6 +27,34 @@ vi.mock("../src/indexer/index.js", () => {
           lane: "semantic",
           reranked: true,
           rerankerScore: 0.95,
+          scoreBreakdown: {
+            lanes: {
+              arctic: { score: 0.91, rank: 1 },
+              bm25: { score: 4.2, rank: 2 },
+            },
+            fusion: {
+              strategy: "rrf",
+              score: 0.88,
+              rank: 1,
+            },
+            sources: ["arctic", "bm25", "hybrid"],
+            stages: [
+              {
+                name: "finalReranker",
+                kind: "replace",
+                before: 0.88,
+                after: 0.95,
+                reason: "backend=fixed-score; rank=1",
+              },
+            ],
+            preRerankScore: 0.88,
+            reranker: {
+              score: 0.95,
+              rank: 1,
+              backend: "fixed-score",
+            },
+            finalScore: 0.95,
+          },
         },
       ],
       expandedContext: [],
@@ -36,6 +70,7 @@ vi.mock("../src/indexer/index.js", () => {
         backend: "transformers-cross-encoder",
       },
     });
+    }
     search = vi.fn().mockResolvedValue([
       {
         filePath: "src/auth.ts",
@@ -244,6 +279,7 @@ describe("MCP server tools and prompts", () => {
   let server: ReturnType<typeof createMcpServer>;
 
   beforeEach(async () => {
+    indexerMocks.searchDetailed.mockClear();
     const config = parseConfig({});
     server = createMcpServer("/tmp/test-project", config);
     client = new Client({ name: "test-client", version: "1.0.0" });
@@ -287,6 +323,23 @@ describe("MCP server tools and prompts", () => {
     expect(toolNames).toEqual(expectedNames);
   });
 
+  it("declares score_breakdown in the codebase_search output schema", async () => {
+    const tools = await client.listTools();
+    const searchTool = tools.tools.find((tool) => tool.name === "codebase_search") as {
+      outputSchema?: {
+        properties?: {
+          results?: {
+            items?: {
+              properties?: Record<string, unknown>;
+            };
+          };
+        };
+      };
+    } | undefined;
+
+    expect(searchTool?.outputSchema?.properties?.results?.items?.properties).toHaveProperty("score_breakdown");
+  });
+
   it("should register all 5 prompts", async () => {
     const prompts = await client.listPrompts();
 
@@ -310,9 +363,52 @@ describe("MCP server tools and prompts", () => {
     expect(content[0].type).toBe("text");
     expect(content[0].text).toContain("Found 1 results");
     expect(content[0].text).toContain("validateToken");
-    const structured = (result as { structuredContent?: { results?: Array<{ lane?: string; reranker_score?: number | null }> } }).structuredContent;
+    const structured = (result as { structuredContent?: { results?: Array<{ lane?: string; reranker_score?: number | null; score_breakdown?: unknown }> } }).structuredContent;
     expect(structured?.results?.[0]?.lane).toBe("semantic");
     expect(structured?.results?.[0]?.reranker_score).toBe(0.95);
+    expect(structured?.results?.[0]?.score_breakdown).toEqual(expect.objectContaining({
+      lanes: expect.any(Object),
+      fusion: expect.any(Object),
+      stages: expect.arrayContaining([
+        expect.objectContaining({ name: "finalReranker" }),
+      ]),
+      pre_rerank_score: 0.88,
+      final_score: 0.95,
+    }));
+    expect(indexerMocks.searchDetailed.mock.calls[0]?.[2]).toEqual(expect.objectContaining({
+      includeScoreBreakdown: true,
+    }));
+  });
+
+  it("omits score_breakdown and keeps breakdown disabled when codebase_search scores are not requested", async () => {
+    const result = await client.callTool({
+      name: "codebase_search",
+      arguments: { query: "test query" },
+    });
+
+    const structured = (result as { structuredContent?: { results?: Array<{ score_breakdown?: unknown; reranker_score?: number | null }> } }).structuredContent;
+    expect(structured?.results?.[0]).not.toHaveProperty("score_breakdown");
+    expect(structured?.results?.[0]?.reranker_score).toBeNull();
+    expect(indexerMocks.searchDetailed.mock.calls[0]?.[2]).toEqual(expect.objectContaining({
+      includeScoreBreakdown: false,
+    }));
+  });
+
+  it("keeps codebase_search result identity stable with and without score breakdown", async () => {
+    const withoutScores = await client.callTool({
+      name: "codebase_search",
+      arguments: { query: "test query" },
+    });
+    const withScores = await client.callTool({
+      name: "codebase_search",
+      arguments: { query: "test query", include_scores: true },
+    });
+
+    const withoutResult = (withoutScores as { structuredContent?: { results?: Array<{ file_path: string; start_line: number; end_line: number; reranker_score?: number | null }> } }).structuredContent?.results?.[0];
+    const withResult = (withScores as { structuredContent?: { results?: Array<{ file_path: string; start_line: number; end_line: number; reranker_score?: number | null }> } }).structuredContent?.results?.[0];
+    expect(withResult?.file_path).toBe(withoutResult?.file_path);
+    expect(withResult?.start_line).toBe(withoutResult?.start_line);
+    expect(withResult?.end_line).toBe(withoutResult?.end_line);
   });
 
   it("should execute codebase_peek tool", async () => {
