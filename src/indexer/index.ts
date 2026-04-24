@@ -43,6 +43,12 @@ import {
   type SearchTaskType,
 } from "./search-recipes.js";
 import {
+  classifyDefinitionWinnerCategory,
+  getDefinitionImplementationBonus,
+  getDefinitionImplementationPenalty,
+  isImplementationSeekingDefinitionQuery,
+} from "./definition-implementation-policy.js";
+import {
   VectorStore,
   InvertedIndex,
   Database,
@@ -117,6 +123,7 @@ const DETERMINISTIC_SORT_STAGE = "deterministicSortPreference";
 const DETERMINISTIC_INTENT_STAGE = "deterministicIntentLane";
 const PATH_AND_KIND_SUPPRESSION_STAGE = "pathAndKindSuppression";
 const STRUCTURAL_RELATIONSHIP_STAGE = "structuralRelationshipAdjustment";
+const DEFINITION_IMPLEMENTATION_POLICY_STAGE = "definitionImplementationPolicy";
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
@@ -825,6 +832,7 @@ type RankedCandidate = {
   score: number;
   metadata: RetrievalChunkMetadata;
   lane?: SearchResultLane;
+  identifierQuality?: IdentifierQualityLabel;
   relation?: "caller" | "callee";
   chunkKind?: ChunkKind;
   symbolKind?: ChunkSymbolKind;
@@ -1846,6 +1854,107 @@ export function applyChunkKindPenalty(
   return rescored.map((entry) => entry.candidate);
 }
 
+export function applyDefinitionImplementationPolicy(
+  candidates: RankedCandidate[],
+  query: string,
+  taskType: SearchTaskType,
+  graphDirection: GraphExpansionDirection,
+  includeScoreBreakdown: boolean = false
+): RankedCandidate[] {
+  if (
+    taskType !== "definition" ||
+    graphDirection !== "both" ||
+    candidates.length < 2 ||
+    !isImplementationSeekingDefinitionQuery(query)
+  ) {
+    return candidates;
+  }
+
+  const penalizedFiles = new Set<string>();
+  const penalized = candidates.map((candidate, originalIndex) => {
+    const penalty = getDefinitionImplementationPenalty({
+      query,
+      filePath: candidate.metadata.filePath,
+      chunkType: candidate.metadata.chunkType,
+      name: candidate.metadata.name,
+      identifierQuality: candidate.identifierQuality,
+      stages: candidate.scoreBreakdown?.stages,
+    });
+
+    const nextCandidate = penalty === 0
+      ? candidate
+      : {
+          ...candidate,
+          score: candidate.score - penalty,
+        };
+    if (penalty !== 0) {
+      penalizedFiles.add(candidate.metadata.filePath.replaceAll("\\", "/"));
+      if (includeScoreBreakdown) {
+        recordScoreStage(nextCandidate, {
+          name: DEFINITION_IMPLEMENTATION_POLICY_STAGE,
+          kind: "add",
+          before: candidate.score,
+          after: nextCandidate.score,
+          reason: `category=${classifyDefinitionWinnerCategory(candidate.metadata.filePath, candidate.metadata.chunkType, candidate.metadata.name)}; adjustment=-${penalty}`,
+        });
+      }
+    }
+
+    return {
+      candidate: nextCandidate,
+      originalIndex,
+    };
+  });
+
+  const rescored = penalized.map((entry) => {
+    const sameFilePenalized = penalizedFiles.has(entry.candidate.metadata.filePath.replaceAll("\\", "/"));
+    const bonus = sameFilePenalized
+      ? getDefinitionImplementationBonus({
+          query,
+          filePath: entry.candidate.metadata.filePath,
+          chunkType: entry.candidate.metadata.chunkType,
+          name: entry.candidate.metadata.name,
+          identifierQuality: entry.candidate.identifierQuality,
+          stages: entry.candidate.scoreBreakdown?.stages,
+          sameFilePenalized,
+        })
+      : 0;
+
+    const nextCandidate = bonus === 0
+      ? entry.candidate
+      : {
+          ...entry.candidate,
+          score: entry.candidate.score + bonus,
+        };
+    if (bonus !== 0 && includeScoreBreakdown) {
+      recordScoreStage(nextCandidate, {
+        name: DEFINITION_IMPLEMENTATION_POLICY_STAGE,
+        kind: "add",
+        before: entry.candidate.score,
+        after: nextCandidate.score,
+        reason: `category=implementation; adjustment=+${bonus}; sameFilePenalized=true`,
+      });
+    }
+
+    return {
+      candidate: nextCandidate,
+      originalIndex: entry.originalIndex,
+    };
+  });
+
+  rescored.sort((left, right) => {
+    if (right.candidate.score !== left.candidate.score) {
+      return right.candidate.score - left.candidate.score;
+    }
+    if (left.originalIndex !== right.originalIndex) {
+      return left.originalIndex - right.originalIndex;
+    }
+    return left.candidate.id.localeCompare(right.candidate.id);
+  });
+
+  return rescored.map((entry) => entry.candidate);
+}
+
 function applySemanticSourcePathPenalty(
   candidates: RankedCandidate[],
   taskType: SearchTaskType,
@@ -2501,6 +2610,7 @@ function buildDeterministicIdentifierPass(
       id: entry.candidate.id,
       score,
       metadata: entry.candidate.metadata,
+      identifierQuality: quality,
       scoreBreakdown: cloneScoreBreakdown(entry.candidate.scoreBreakdown),
     };
     if (includeScoreBreakdown) {
@@ -3036,6 +3146,7 @@ function promoteIdentifierMatches(
             id: chunk.chunkId,
             score: boostedScore,
             metadata,
+            identifierQuality: quality,
             chunkKind: (chunk.chunkKind as ChunkKind | undefined) ?? existing?.chunkKind ?? metadata.chunkKind,
             symbolKind: (chunk.symbolKind as ChunkSymbolKind | undefined) ?? existing?.symbolKind ?? metadata.symbolKind,
             scoreBreakdown: cloneScoreBreakdown(existing?.scoreBreakdown),
@@ -3099,6 +3210,7 @@ function promoteIdentifierMatches(
       id: existing.id,
       score: boostedScore,
       metadata: existing.metadata,
+      identifierQuality: quality,
       chunkKind: existing.chunkKind ?? candidate.chunkKind ?? existing.metadata.chunkKind,
       symbolKind: existing.symbolKind ?? candidate.symbolKind ?? existing.metadata.symbolKind,
       scoreBreakdown: cloneScoreBreakdown(existing.scoreBreakdown ?? candidate.scoreBreakdown),
@@ -3196,6 +3308,7 @@ function buildSymbolDefinitionLane(
           language: chunk.language,
           hash: chunk.embeddingInputHash,
         },
+        identifierQuality: exactName ? "exact-symbol" : undefined,
       };
       if (includeScoreBreakdown) {
         ensureScoreBreakdown(candidate, "symbol");
@@ -3304,6 +3417,7 @@ function buildSymbolDefinitionLane(
         id: candidate.id,
         score: laneScore,
         metadata: candidate.metadata,
+        identifierQuality: exactHintMatch ? "exact-symbol" : candidate.identifierQuality,
         scoreBreakdown: cloneScoreBreakdown(candidate.scoreBreakdown),
       };
       if (includeScoreBreakdown) {
@@ -3346,6 +3460,7 @@ function buildSymbolDefinitionLane(
           id: entry.candidate.id,
           score: Math.min(SYMBOL_OVERLAP_FALLBACK_CAP, Math.max(entry.candidate.score, SYMBOL_OVERLAP_FALLBACK_BASE + entry.overlapScore * SYMBOL_OVERLAP_FALLBACK_SCALE)),
           metadata: entry.candidate.metadata,
+          identifierQuality: entry.candidate.identifierQuality,
           scoreBreakdown: cloneScoreBreakdown(entry.candidate.scoreBreakdown),
         };
         if (includeScoreBreakdown) {
@@ -3426,6 +3541,7 @@ function buildIdentifierDefinitionLane(
       id: entry.candidate.id,
       score,
       metadata: entry.candidate.metadata,
+      identifierQuality: quality,
       scoreBreakdown: cloneScoreBreakdown(entry.candidate.scoreBreakdown),
     };
     if (includeScoreBreakdown) {
@@ -6014,9 +6130,16 @@ export class Indexer {
       taskType,
       recipe.pathPreference
     );
+    const filteredWithDefinitionPolicy = applyDefinitionImplementationPolicy(
+      filteredWithPathBias,
+      query,
+      taskType,
+      graphDirection,
+      includeScoreBreakdown
+    );
     const filtered = taskType === "semantic"
-      ? preferEarlierNamedChunkSlices(filteredWithPathBias)
-      : filteredWithPathBias;
+      ? preferEarlierNamedChunkSlices(filteredWithDefinitionPolicy)
+      : filteredWithDefinitionPolicy;
     const relationshipGraphAugmented = injectRelationshipGraphCandidates(
       query,
       filtered,

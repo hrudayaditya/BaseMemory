@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { ScoreBreakdown } from "../src/indexer/index.js";
 import type { ChunkMetadata } from "../src/native/index.js";
 import {
+  applyDefinitionImplementationPolicy,
   applyChunkKindPenalty,
   applyConservativeIdentifierRiskPolicyToAddScore,
   applyConservativeIdentifierRiskPolicyToSetScore,
@@ -32,7 +33,13 @@ import {
   getCompoundIdentifierSpecificity,
 } from "../src/indexer/index.js";
 
-type Candidate = { id: string; score: number; metadata: ChunkMetadata };
+type Candidate = {
+  id: string;
+  score: number;
+  metadata: ChunkMetadata;
+  identifierQuality?: string;
+  scoreBreakdown?: ScoreBreakdown;
+};
 const EQUAL_FUSION_WEIGHTS = { denseWeight: 0.5, bm25Weight: 0.5, voyageWeight: 0 } as const;
 
 function fuseTwoLaneRrf(
@@ -87,6 +94,21 @@ function laneBreakdowns(
   add("bm25", keyword);
   add("voyage", voyage);
   return byId;
+}
+
+function breakdown(score: number): ScoreBreakdown {
+  return {
+    lanes: {},
+    fusion: {
+      strategy: "rrf",
+      score,
+      rank: 1,
+    },
+    sources: ["hybrid"],
+    stages: [],
+    preRerankScore: score,
+    finalScore: score,
+  };
 }
 
 describe("retrieval ranking", () => {
@@ -1178,5 +1200,204 @@ describe("retrieval ranking", () => {
     expect(applyConservativeIdentifierRiskPolicyToAddScore(0.5, 0.875, "type-only", true)).toBeCloseTo(0.46);
     expect(applyConservativeIdentifierRiskPolicyToAddScore(0.5, 0.875, "exact-symbol", true)).toBe(0.875);
     expect(applyConservativeIdentifierRiskPolicyToAddScore(0.5, 0.875, "weak-substring", false)).toBe(0.875);
+  });
+
+  it("does not apply definition implementation policy to relationship queries", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "wrapper",
+        score: 0.9,
+        metadata: meta({ filePath: "/repo/src/init.ts", name: "export{Builder}", chunkType: "module" }),
+        scoreBreakdown: breakdown(0.9),
+      },
+      {
+        id: "impl",
+        score: 0.8,
+        metadata: meta({ filePath: "/repo/src/init.ts", name: "createBuilder", chunkType: "function" }),
+        scoreBreakdown: breakdown(0.8),
+      },
+    ];
+
+    const rescored = applyDefinitionImplementationPolicy(
+      candidates,
+      "what calls createBuilder",
+      "definition",
+      "caller",
+      true
+    );
+
+    expect(rescored.map((candidate) => candidate.score)).toEqual([0.9, 0.8]);
+  });
+
+  it("protects exact-symbol candidates from implementation penalties", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "type",
+        score: 0.9,
+        metadata: meta({ filePath: "/repo/src/http/types.ts", name: "TRPCRequestInfo", chunkType: "interface" }),
+        identifierQuality: "exact-symbol",
+        scoreBreakdown: breakdown(0.9),
+      },
+      {
+        id: "impl",
+        score: 0.8,
+        metadata: meta({ filePath: "/repo/src/http/client.ts", name: "getRequestInfo", chunkType: "function" }),
+        scoreBreakdown: breakdown(0.8),
+      },
+    ];
+
+    const rescored = applyDefinitionImplementationPolicy(
+      candidates,
+      "where is TRPCRequestInfo defined",
+      "definition",
+      "both",
+      true
+    );
+
+    expect(rescored.find((candidate) => candidate.id === "type")?.score).toBe(0.9);
+  });
+
+  it("penalizes wrapper-export candidates for implementation-seeking definition queries", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "wrapper",
+        score: 0.9,
+        metadata: meta({ filePath: "/repo/src/init.ts", name: "export{TRPCBuilder}", chunkType: "module" }),
+        scoreBreakdown: breakdown(0.9),
+      },
+      {
+        id: "impl",
+        score: 0.8,
+        metadata: meta({ filePath: "/repo/src/init.ts", name: "initTRPC", chunkType: "constant" }),
+        scoreBreakdown: breakdown(0.8),
+      },
+    ];
+
+    const rescored = applyDefinitionImplementationPolicy(
+      candidates,
+      "where is the builder factory defined",
+      "definition",
+      "both",
+      true
+    );
+
+    expect(rescored.find((candidate) => candidate.id === "wrapper")?.score).toBeCloseTo(0.85);
+  });
+
+  it("penalizes type-interface candidates for implementation-seeking definition queries", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "type",
+        score: 0.9,
+        metadata: meta({ filePath: "/repo/src/http/types.ts", name: "TRPCRequestInfo", chunkType: "interface" }),
+        scoreBreakdown: breakdown(0.9),
+      },
+      {
+        id: "impl",
+        score: 0.8,
+        metadata: meta({ filePath: "/repo/src/http/client.ts", name: "getRequestInfo", chunkType: "function" }),
+        scoreBreakdown: breakdown(0.8),
+      },
+    ];
+
+    const rescored = applyDefinitionImplementationPolicy(
+      candidates,
+      "where is the async routine that builds request info defined",
+      "definition",
+      "both",
+      true
+    );
+
+    expect(rescored.find((candidate) => candidate.id === "type")?.score).toBeCloseTo(0.84);
+  });
+
+  it("applies an implementation bonus in the same file as a penalized wrapper-export", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "wrapper",
+        score: 0.9,
+        metadata: meta({ filePath: "/repo/src/init.ts", name: "export{TRPCBuilder}", chunkType: "module" }),
+        scoreBreakdown: breakdown(0.9),
+      },
+      {
+        id: "impl",
+        score: 0.8,
+        metadata: meta({ filePath: "/repo/src/init.ts", name: "initTRPC", chunkType: "constant" }),
+        scoreBreakdown: breakdown(0.8),
+      },
+    ];
+
+    const rescored = applyDefinitionImplementationPolicy(
+      candidates,
+      "where is the builder factory defined",
+      "definition",
+      "both",
+      true
+    );
+
+    expect(rescored.find((candidate) => candidate.id === "impl")?.score).toBeCloseTo(0.86);
+  });
+
+  it("bypasses definition implementation policy for non-implementation shape queries", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "type",
+        score: 0.9,
+        metadata: meta({ filePath: "/repo/src/http/types.ts", name: "TRPCRequestInfo", chunkType: "interface" }),
+        scoreBreakdown: breakdown(0.9),
+      },
+      {
+        id: "impl",
+        score: 0.8,
+        metadata: meta({ filePath: "/repo/src/http/client.ts", name: "getRequestInfo", chunkType: "function" }),
+        scoreBreakdown: breakdown(0.8),
+      },
+    ];
+
+    const rescored = applyDefinitionImplementationPolicy(
+      candidates,
+      "what type represents request info",
+      "definition",
+      "both",
+      true
+    );
+
+    expect(rescored.map((candidate) => candidate.score)).toEqual([0.9, 0.8]);
+  });
+
+  it("records definition implementation policy stages when score breakdown is enabled", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "wrapper",
+        score: 0.9,
+        metadata: meta({ filePath: "/repo/src/init.ts", name: "export{TRPCBuilder}", chunkType: "module" }),
+        scoreBreakdown: breakdown(0.9),
+      },
+      {
+        id: "impl",
+        score: 0.8,
+        metadata: meta({ filePath: "/repo/src/init.ts", name: "initTRPC", chunkType: "constant" }),
+        scoreBreakdown: breakdown(0.8),
+      },
+    ];
+
+    const rescored = applyDefinitionImplementationPolicy(
+      candidates,
+      "where is the builder factory defined",
+      "definition",
+      "both",
+      true
+    );
+
+    const wrapperStage = rescored
+      .find((candidate) => candidate.id === "wrapper")
+      ?.scoreBreakdown?.stages.find((stage) => stage.name === "definitionImplementationPolicy");
+    const implStage = rescored
+      .find((candidate) => candidate.id === "impl")
+      ?.scoreBreakdown?.stages.find((stage) => stage.name === "definitionImplementationPolicy");
+
+    expect(wrapperStage?.before).toBe(0.9);
+    expect(wrapperStage?.after).toBeCloseTo(0.85);
+    expect(implStage?.after).toBeCloseTo(0.86);
   });
 });

@@ -216,8 +216,8 @@
       "expected": {
         "filePath": "src/indexer/index.ts",
         "symbol": "getActiveBranchKey",
-        "startLine": 3766,
-        "endLine": 3768
+        "startLine": 3864,
+        "endLine": 3866
       }
     },
     {
@@ -227,8 +227,8 @@
       "expected": {
         "filePath": "src/indexer/index.ts",
         "symbol": "materializeRankedResults",
-        "startLine": 5442,
-        "endLine": 5490
+        "startLine": 5540,
+        "endLine": 5588
       }
     },
     {

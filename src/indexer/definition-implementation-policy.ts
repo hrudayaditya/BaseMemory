@@ -17,8 +17,10 @@ export interface DefinitionPolicyCandidateInput {
   filePath: string;
   chunkType: string;
   name?: string | null;
+  identifierQuality?: string | null;
   stages?: DefinitionPolicyStageLike[] | null;
   expectedFilePath?: string | null;
+  sameFilePenalized?: boolean;
 }
 
 export interface DefinitionImplementationPolicy {
@@ -56,6 +58,10 @@ export function hasExactSymbolEvidence(stages: DefinitionPolicyStageLike[] | nul
   return (stages ?? []).some((stage) => /identifierQuality=exact-symbol\b/.test(stage.reason));
 }
 
+export function hasExactIdentifierQuality(identifierQuality?: string | null): boolean {
+  return identifierQuality === "exact-symbol";
+}
+
 export function classifyDefinitionWinnerCategory(
   filePath: string,
   chunkType: string,
@@ -80,7 +86,7 @@ export function getDefinitionImplementationPenalty(
   if (!isImplementationSeekingDefinitionQuery(input.query)) {
     return 0;
   }
-  if (hasExactSymbolEvidence(input.stages)) {
+  if (hasExactIdentifierQuality(input.identifierQuality) || hasExactSymbolEvidence(input.stages)) {
     return 0;
   }
 
@@ -105,7 +111,7 @@ export function getDefinitionImplementationBonus(
   if (!isImplementationSeekingDefinitionQuery(input.query)) {
     return 0;
   }
-  if (hasExactSymbolEvidence(input.stages)) {
+  if (hasExactIdentifierQuality(input.identifierQuality) || hasExactSymbolEvidence(input.stages)) {
     return 0;
   }
   if (classifyDefinitionWinnerCategory(input.filePath, input.chunkType, input.name) !== "implementation") {
@@ -113,6 +119,7 @@ export function getDefinitionImplementationBonus(
   }
 
   const sameExpectedFile = Boolean(
+    input.sameFilePenalized ||
     input.expectedFilePath &&
     input.filePath.replaceAll("\\", "/").endsWith(input.expectedFilePath.replaceAll("\\", "/"))
   );

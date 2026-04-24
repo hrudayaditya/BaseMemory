@@ -49,6 +49,14 @@ describe("definition implementation policy", () => {
         { reason: "identifierQuality=exact-symbol; matchedHints=trpcrequestinfo:exact-name" },
       ],
     }, CONSERVATIVE_DEFINITION_IMPLEMENTATION_POLICY)).toBe(0);
+
+    expect(getDefinitionImplementationPenalty({
+      query: "where is the helper that wraps responses defined",
+      filePath: "/repo/src/http/types.ts",
+      chunkType: "interface",
+      name: "TRPCRequestInfo",
+      identifierQuality: "exact-symbol",
+    }, CONSERVATIVE_DEFINITION_IMPLEMENTATION_POLICY)).toBe(0);
   });
 
   it("applies conservative penalties only to shape and wrapper categories", () => {
