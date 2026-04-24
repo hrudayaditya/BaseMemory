@@ -6,7 +6,11 @@ import type { ScoreBreakdown } from "../src/indexer/index.js";
 import type { ChunkMetadata } from "../src/native/index.js";
 import {
   applyChunkKindPenalty,
+  applyConservativeIdentifierRiskPolicyToAddScore,
+  applyConservativeIdentifierRiskPolicyToSetScore,
   CALLER_TARGET_PENALTY,
+  classifyCompoundIdentifierSpecificity,
+  classifyIdentifierQuality,
   extractFilePathHint,
   fuseResultsRrf,
   fuseResultsWeighted,
@@ -15,6 +19,7 @@ import {
   getChunkKindPenaltyFactor,
   RELATIONSHIP_BIAS_SOURCE,
   SEMANTIC_TEST_DOC_PATH_PENALTY,
+  shouldApplyExperimentalIdentifierRiskPolicy,
   SYMBOL_FALLBACK_EXACT_FLOOR,
   inferTaskType,
   matchesHardRetrievalFilters,
@@ -24,6 +29,7 @@ import {
   stripFilePathHint,
   rerankResults,
   chunkTypeBoost,
+  getCompoundIdentifierSpecificity,
 } from "../src/indexer/index.js";
 
 type Candidate = { id: string; score: number; metadata: ChunkMetadata };
@@ -962,6 +968,7 @@ describe("retrieval ranking", () => {
     expect(merged.map((r) => r.id)).toContain("noise");
   });
 
+
   it("builds fallback lane from implementation code-term hints when exact symbol names are unavailable", () => {
     const hybridLane: Candidate[] = [
       { id: "target", score: 0.65, metadata: meta({ filePath: "/repo/app/indexer/index.ts", name: "buildSymbolDefinitionLane", chunkType: "function" }) },
@@ -1091,5 +1098,85 @@ describe("retrieval ranking", () => {
   it("avoids false-positive bug inference for ordinary definition lookup queries", () => {
     expect(inferTaskType("where is rankHybridResults implementation")).toBe("general");
     expect(inferTaskType("what does the App component render?")).toBe("general");
+  });
+
+  it("keeps experimental identifier risk policy disabled for non-definition-risk queries", () => {
+    expect(shouldApplyExperimentalIdentifierRiskPolicy("what calls createProxy", "definition", true)).toBe(false);
+    expect(shouldApplyExperimentalIdentifierRiskPolicy("where is default model config", "definition", true)).toBe(false);
+    expect(shouldApplyExperimentalIdentifierRiskPolicy("what tests cover createProxy", "definition", true)).toBe(false);
+    expect(shouldApplyExperimentalIdentifierRiskPolicy("where is createProxy helper", "bug", true)).toBe(false);
+    expect(shouldApplyExperimentalIdentifierRiskPolicy("where is createProxy helper", "definition", false)).toBe(false);
+    expect(shouldApplyExperimentalIdentifierRiskPolicy("where is createProxy helper", "definition", true)).toBe(true);
+  });
+
+  it("labels exact symbols and weak substring identifier matches separately", () => {
+    const exactQuality = classifyIdentifierQuality(
+      "where is createProxy helper",
+      meta({ filePath: "/repo/src/createProxy.ts", name: "createProxy", chunkType: "function" }),
+      ["createproxy", "helper"]
+    );
+    const weakQuality = classifyIdentifierQuality(
+      "where is createProxy helper",
+      meta({ filePath: "/repo/src/proxy.ts", name: "createRecursiveProxy", chunkType: "function" }),
+      ["proxy"]
+    );
+
+    expect(exactQuality).toBe("exact-symbol");
+    expect(weakQuality).toBe("weak-substring");
+  });
+
+  it("classifies compound identifier specificity for generic, mixed, and strong compounds", () => {
+    expect(classifyCompoundIdentifierSpecificity(["trpc", "error"])).toEqual({
+      specificity: "generic-compound",
+      genericHints: ["trpc", "error"],
+      specificHints: [],
+    });
+    expect(classifyCompoundIdentifierSpecificity(["client", "websocket"])).toEqual({
+      specificity: "mixed-compound",
+      genericHints: ["client"],
+      specificHints: ["websocket"],
+    });
+    expect(classifyCompoundIdentifierSpecificity(["websocket", "grace"])).toEqual({
+      specificity: "strong-compound",
+      genericHints: [],
+      specificHints: ["websocket", "grace"],
+    });
+  });
+
+  it("derives compound specificity from candidate metadata and query hints", () => {
+    expect(getCompoundIdentifierSpecificity(
+      meta({ filePath: "/repo/src/TRPCClientError.ts", name: "isTRPCErrorResponse", chunkType: "function" }),
+      ["trpc", "json", "wire", "error"]
+    )).toBe("generic-compound");
+
+    expect(getCompoundIdentifierSpecificity(
+      meta({ filePath: "/repo/src/socket.ts", name: "createWebsocketGraceHandler", chunkType: "function" }),
+      ["websocket", "grace"]
+    )).toBe("strong-compound");
+  });
+
+  it("applies conservative identifier risk policy only to risky set scores", () => {
+    expect(applyConservativeIdentifierRiskPolicyToSetScore(0.82, 0.9765, "weak-substring", true)).toBe(0.9);
+    expect(applyConservativeIdentifierRiskPolicyToSetScore(0.93, 0.9765, "weak-substring", true)).toBe(0.93);
+    expect(applyConservativeIdentifierRiskPolicyToSetScore(1, 0.9765, "weak-substring", true)).toBe(0.9765);
+    expect(applyConservativeIdentifierRiskPolicyToSetScore(0.82, 0.9765, "compound-symbol", true, "generic-compound")).toBe(0.9765);
+    expect(applyConservativeIdentifierRiskPolicyToSetScore(0.82, 0.9765, "compound-symbol", true, "mixed-compound")).toBe(0.9765);
+    expect(applyConservativeIdentifierRiskPolicyToSetScore(0.82, 0.9765, "compound-symbol", true, "strong-compound")).toBe(0.9765);
+    expect(applyConservativeIdentifierRiskPolicyToSetScore(0.82, 0.963, "path-only", true)).toBe(0.88);
+    expect(applyConservativeIdentifierRiskPolicyToSetScore(0.5, 0.963, "path-only", true)).toBe(0.88);
+    expect(applyConservativeIdentifierRiskPolicyToSetScore(0.9, 0.9765, "type-only", true)).toBeCloseTo(0.86);
+    expect(applyConservativeIdentifierRiskPolicyToSetScore(1, 0.9765, "type-only", true)).toBeCloseTo(0.96);
+    expect(applyConservativeIdentifierRiskPolicyToSetScore(0.82, 0.99, "exact-symbol", true)).toBe(0.99);
+    expect(applyConservativeIdentifierRiskPolicyToSetScore(0.82, 0.9765, "weak-substring", false)).toBe(0.9765);
+  });
+
+  it("applies conservative identifier risk policy only to risky additive boosts", () => {
+    expect(applyConservativeIdentifierRiskPolicyToAddScore(0.5, 0.875, "weak-substring", true)).toBeCloseTo(0.59375);
+    expect(applyConservativeIdentifierRiskPolicyToAddScore(0.5, 0.875, "compound-symbol", true, "generic-compound")).toBe(0.875);
+    expect(applyConservativeIdentifierRiskPolicyToAddScore(0.5, 0.875, "compound-symbol", true, "mixed-compound")).toBe(0.875);
+    expect(applyConservativeIdentifierRiskPolicyToAddScore(0.5, 0.875, "path-only", true)).toBeCloseTo(0.55625);
+    expect(applyConservativeIdentifierRiskPolicyToAddScore(0.5, 0.875, "type-only", true)).toBeCloseTo(0.46);
+    expect(applyConservativeIdentifierRiskPolicyToAddScore(0.5, 0.875, "exact-symbol", true)).toBe(0.875);
+    expect(applyConservativeIdentifierRiskPolicyToAddScore(0.5, 0.875, "weak-substring", false)).toBe(0.875);
   });
 });

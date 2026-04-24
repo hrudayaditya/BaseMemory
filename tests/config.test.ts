@@ -271,6 +271,7 @@ describe("config schema", () => {
             rrfK: 80,
             rerankTopN: 12,
             contextLines: 10,
+            experimentalIdentifierRiskPolicy: true,
           },
         });
 
@@ -282,6 +283,7 @@ describe("config schema", () => {
         expect(config.search.rrfK).toBe(80);
         expect(config.search.rerankTopN).toBe(12);
         expect(config.search.contextLines).toBe(10);
+        expect(config.search.experimentalIdentifierRiskPolicy).toBe(true);
       });
 
       it("should use default search ranking config values", () => {
@@ -289,6 +291,7 @@ describe("config schema", () => {
         expect(config.search.fusionStrategy).toBe("rrf");
         expect(config.search.rrfK).toBe(60);
         expect(config.search.rerankTopN).toBe(20);
+        expect(config.search.experimentalIdentifierRiskPolicy).toBe(false);
       });
 
       it("should fallback fusionStrategy to default for invalid values", () => {

@@ -141,6 +141,9 @@ type IdentifierStageAudit = {
   additiveBoost: number | null;
   maxMatch: number | null;
   matchQuality: string;
+  compoundSpecificity: string | null;
+  compoundGenericHints: string[];
+  compoundSpecificHints: string[];
   pathMatchesFileHint: boolean | null;
   nameMatchesPrimary: boolean | null;
   exactIdentifierMatch: boolean | null;
@@ -272,6 +275,8 @@ function parseStringField(reason: string, field: string): string | null {
 }
 
 function classifyMatchQuality(stage: ScoreStage, maxMatch: number | null, exactIdentifierMatch: boolean | null): string {
+  const identifierQuality = parseStringField(stage.reason, "identifierQuality");
+  if (identifierQuality) return identifierQuality;
   if (stage.reason.includes("databaseSymbol=")) return "database-symbol";
   if (exactIdentifierMatch === true) return "exact-identifier";
   if (exactIdentifierMatch === false) return "fuzzy-identifier";
@@ -291,7 +296,9 @@ function resultMatchesExpectedFile(result: EvalResult, expected: Expected): bool
 }
 
 function isIdentifierStage(stage: ScoreStage): boolean {
-  return stage.reason.includes("deterministicIdentifierLane") || stage.reason.includes("identifierPromotion");
+  return stage.reason.includes("deterministicIdentifierLane") ||
+    stage.reason.includes("identifierPromotion") ||
+    stage.reason.includes("identifierDefinitionLane");
 }
 
 function auditIdentifierStages(query: PerQuery, golden: GoldenQuery): IdentifierStageAudit[] {
@@ -325,7 +332,11 @@ function auditIdentifierStages(query: PerQuery, golden: GoldenQuery): Identifier
         candidateMatchesExpectedFile: resultMatchesExpectedFile(result, golden.expected),
         queryIdentifiers: identifiers,
         matchedIdentifiers: matchedIdentifiersForResult(result, identifiers),
-        stageName: stage.reason.includes("deterministicIdentifierLane") ? "deterministicIdentifierLane" : "identifierPromotion",
+        stageName: stage.reason.includes("deterministicIdentifierLane")
+          ? "deterministicIdentifierLane"
+          : stage.reason.includes("identifierDefinitionLane")
+            ? "identifierDefinitionLane"
+            : "identifierPromotion",
         stageKind: stage.kind,
         before: stage.before,
         after: stage.after,
@@ -333,6 +344,15 @@ function auditIdentifierStages(query: PerQuery, golden: GoldenQuery): Identifier
         additiveBoost,
         maxMatch,
         matchQuality: classifyMatchQuality(stage, maxMatch, exactIdentifierMatch),
+        compoundSpecificity: parseStringField(stage.reason, "compoundSpecificity"),
+        compoundGenericHints: (parseStringField(stage.reason, "compoundGenericHints") ?? "none")
+          .split(",")
+          .map((value) => value.trim())
+          .filter((value) => value.length > 0 && value !== "none"),
+        compoundSpecificHints: (parseStringField(stage.reason, "compoundSpecificHints") ?? "none")
+          .split(",")
+          .map((value) => value.trim())
+          .filter((value) => value.length > 0 && value !== "none"),
         pathMatchesFileHint: parseBooleanField(stage.reason, "pathMatchesFileHint"),
         nameMatchesPrimary: parseBooleanField(stage.reason, "nameMatchesPrimary"),
         exactIdentifierMatch,
@@ -393,6 +413,8 @@ function main(): void {
   const floorDisplacedMap = new Map<string, number>();
   const qualityMap = new Map<string, number>();
   const qualityDisplacedMap = new Map<string, number>();
+  const compoundSpecificityMap = new Map<string, number>();
+  const compoundSpecificityDisplacedMap = new Map<string, number>();
   const chunkTypeDisplacedMap = new Map<string, number>();
   const expectedFileMap = new Map<string, number>();
   const expectedSymbolMap = new Map<string, number>();
@@ -401,11 +423,17 @@ function main(): void {
     const floorKey = row.scoreSetTo !== null ? row.scoreSetTo.toFixed(4) : `boost:${formatNullable(row.additiveBoost)}`;
     increment(floorMap, floorKey);
     increment(qualityMap, row.matchQuality);
+    if (row.compoundSpecificity) {
+      increment(compoundSpecificityMap, row.compoundSpecificity);
+    }
     increment(expectedFileMap, row.candidateMatchesExpectedFile ? "same expected file" : "wrong file");
     increment(expectedSymbolMap, row.candidateMatchesExpectedSymbol ? "expected symbol" : "wrong symbol");
     if (row.displacedExpected) {
       increment(floorDisplacedMap, floorKey);
       increment(qualityDisplacedMap, row.matchQuality);
+      if (row.compoundSpecificity) {
+        increment(compoundSpecificityDisplacedMap, row.compoundSpecificity);
+      }
       increment(chunkTypeDisplacedMap, row.candidateChunkType);
     }
   }
@@ -420,6 +448,8 @@ function main(): void {
   printMap("Displacing score set/boost distribution", floorDisplacedMap);
   printMap("Match quality distribution", qualityMap);
   printMap("Displacing match quality distribution", qualityDisplacedMap);
+  printMap("Compound specificity distribution", compoundSpecificityMap);
+  printMap("Displacing compound specificity distribution", compoundSpecificityDisplacedMap);
   printMap("Displacing chunk types", chunkTypeDisplacedMap);
   printMap("Expected file alignment", expectedFileMap);
   printMap("Expected symbol alignment", expectedSymbolMap);
@@ -436,6 +466,7 @@ function main(): void {
         `boost=${formatNullable(row.additiveBoost)}`,
         `maxMatch=${formatNullable(row.maxMatch)}`,
         `quality=${row.matchQuality}`,
+        `compoundSpecificity=${formatNullable(row.compoundSpecificity)}`,
         `nameMatchesPrimary=${formatNullable(row.nameMatchesPrimary)}`,
         `pathHint=${formatNullable(row.pathMatchesFileHint)}`,
         `exactIdentifier=${formatNullable(row.exactIdentifierMatch)}`,
@@ -446,6 +477,10 @@ function main(): void {
     console.log(`  query: ${row.query}`);
     console.log(`  identifiers: ${row.queryIdentifiers.join(", ") || "(none)"}`);
     console.log(`  matched: ${row.matchedIdentifiers.join(", ") || "(none)"}`);
+    if (row.compoundSpecificity) {
+      console.log(`  compound generic hints: ${row.compoundGenericHints.join(", ") || "(none)"}`);
+      console.log(`  compound specific hints: ${row.compoundSpecificHints.join(", ") || "(none)"}`);
+    }
     console.log(`  candidate: ${formatRelative(row.candidateFile, summary.projectRoot)} ${row.candidateName} ${row.candidateChunkType}`);
   }
 }

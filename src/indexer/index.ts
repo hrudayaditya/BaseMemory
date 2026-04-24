@@ -805,6 +805,20 @@ interface FailedBatch {
 type RetrievalChunkMetadata = GraphExpansionMetadata;
 type SearchResultLane = "bm25" | "semantic" | "hybrid";
 type ScoreBreakdownSource = "bm25" | "arctic" | "voyage" | "hybrid" | "graph" | "identifier" | "symbol";
+type IdentifierQualityLabel =
+  | "exact-symbol"
+  | "alias-symbol"
+  | "file-anchored-symbol"
+  | "compound-symbol"
+  | "weak-substring"
+  | "path-only"
+  | "type-only";
+
+export type CompoundIdentifierSpecificity =
+  | "strong-compound"
+  | "generic-compound"
+  | "mixed-compound"
+  | "not-compound";
 
 type RankedCandidate = {
   id: string;
@@ -925,6 +939,68 @@ const STOPWORDS = new Set([
   "find", "show", "get", "run", "use", "code", "function", "implementation",
   "retrieve", "results", "result", "search", "pipeline", "top", "in", "on", "of",
   "to", "by", "as", "or", "an", "a",
+]);
+
+const GENERIC_COMPOUND_IDENTIFIER_TERMS = new Set([
+  "api",
+  "app",
+  "auth",
+  "base",
+  "builder",
+  "cache",
+  "call",
+  "callback",
+  "client",
+  "config",
+  "context",
+  "core",
+  "data",
+  "default",
+  "error",
+  "event",
+  "factory",
+  "handler",
+  "helper",
+  "http",
+  "impl",
+  "implementation",
+  "info",
+  "input",
+  "internal",
+  "item",
+  "json",
+  "link",
+  "manager",
+  "message",
+  "model",
+  "module",
+  "options",
+  "output",
+  "parser",
+  "path",
+  "proxy",
+  "query",
+  "request",
+  "response",
+  "result",
+  "retry",
+  "route",
+  "router",
+  "schema",
+  "server",
+  "service",
+  "shape",
+  "state",
+  "transform",
+  "transformer",
+  "transport",
+  "trpc",
+  "type",
+  "types",
+  "utils",
+  "validate",
+  "validation",
+  "wire",
 ]);
 
 const TEST_PATH_SEGMENTS = [
@@ -2005,6 +2081,274 @@ function scoreIdentifierMatch(name: string | undefined, filePath: string, hints:
   return best;
 }
 
+function isTypeShapeChunkType(chunkType: string): boolean {
+  return chunkType === "interface" || chunkType === "type";
+}
+
+function isImplementationSeekingIdentifierQuery(query: string): boolean {
+  const lower = query.toLowerCase();
+  if (classifyQueryIntentRaw(query) !== "source") {
+    return false;
+  }
+
+  return /\b(?:function|method|helper|factory|routine|implementation|defined|where\s+does|throw|throws|build|builds|wrap|wraps|return|returns|create|creates|parse|parses|read|reads|call|calls)\b/.test(lower);
+}
+
+function collectIdentifierMatchDetails(
+  metadata: RetrievalChunkMetadata,
+  hints: string[],
+  aliases: string[] = []
+): {
+  exactNameHints: string[];
+  aliasHints: string[];
+  substringNameHints: string[];
+  pathHints: string[];
+} {
+  const nameLower = (metadata.name ?? "").toLowerCase();
+  const pathLower = metadata.filePath.toLowerCase();
+  const aliasValues = aliases.map((alias) => alias.toLowerCase());
+  const exactNameHints = new Set<string>();
+  const aliasHints = new Set<string>();
+  const substringNameHints = new Set<string>();
+  const pathHints = new Set<string>();
+
+  for (const hint of hints) {
+    const normalizedHint = hint.toLowerCase();
+    const variants = normalizeIdentifierVariants(normalizedHint);
+    for (const variant of variants) {
+      const normalizedVariant = variant.replace(/[^a-z0-9]/g, "");
+      const normalizedName = nameLower.replace(/[^a-z0-9]/g, "");
+      if (nameLower === variant || normalizedName === normalizedVariant) {
+        exactNameHints.add(normalizedHint);
+      } else if (aliasValues.some((alias) => alias === variant || alias.replace(/[^a-z0-9]/g, "") === normalizedVariant)) {
+        aliasHints.add(normalizedHint);
+      } else if (nameLower.includes(variant)) {
+        substringNameHints.add(normalizedHint);
+      } else if (pathLower.includes(variant)) {
+        pathHints.add(normalizedHint);
+      }
+    }
+  }
+
+  return {
+    exactNameHints: Array.from(exactNameHints),
+    aliasHints: Array.from(aliasHints),
+    substringNameHints: Array.from(substringNameHints),
+    pathHints: Array.from(pathHints),
+  };
+}
+
+function isGenericCompoundIdentifierTerm(term: string): boolean {
+  const normalized = term.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (normalized.length === 0) {
+    return true;
+  }
+  if (GENERIC_COMPOUND_IDENTIFIER_TERMS.has(normalized)) {
+    return true;
+  }
+  return normalized.length <= 4;
+}
+
+export function classifyCompoundIdentifierSpecificity(
+  matchedHints: string[]
+): {
+  specificity: CompoundIdentifierSpecificity;
+  genericHints: string[];
+  specificHints: string[];
+} {
+  if (matchedHints.length < 2) {
+    return {
+      specificity: "not-compound",
+      genericHints: [],
+      specificHints: [],
+    };
+  }
+
+  const genericHints: string[] = [];
+  const specificHints: string[] = [];
+  for (const hint of matchedHints) {
+    if (isGenericCompoundIdentifierTerm(hint)) {
+      genericHints.push(hint);
+    } else {
+      specificHints.push(hint);
+    }
+  }
+
+  if (specificHints.length === 0) {
+    return {
+      specificity: "generic-compound",
+      genericHints,
+      specificHints,
+    };
+  }
+  if (genericHints.length === 0) {
+    return {
+      specificity: "strong-compound",
+      genericHints,
+      specificHints,
+    };
+  }
+  return {
+    specificity: "mixed-compound",
+    genericHints,
+    specificHints,
+  };
+}
+
+export function getCompoundIdentifierSpecificity(
+  metadata: RetrievalChunkMetadata,
+  hints: string[],
+  aliases: string[] = []
+): CompoundIdentifierSpecificity {
+  const details = collectIdentifierMatchDetails(metadata, hints, aliases);
+  return classifyCompoundIdentifierSpecificity(details.substringNameHints).specificity;
+}
+
+export function classifyIdentifierQuality(
+  query: string,
+  metadata: RetrievalChunkMetadata,
+  hints: string[],
+  options: {
+    aliases?: string[];
+    pathMatchesFileHint?: boolean;
+    nameMatchesPrimary?: boolean;
+  } = {}
+): IdentifierQualityLabel {
+  const details = collectIdentifierMatchDetails(metadata, hints, options.aliases);
+  if (isImplementationSeekingIdentifierQuery(query) && isTypeShapeChunkType(metadata.chunkType)) {
+    return "type-only";
+  }
+  if (options.pathMatchesFileHint && options.nameMatchesPrimary) {
+    return "file-anchored-symbol";
+  }
+  if (details.exactNameHints.length > 0) {
+    return "exact-symbol";
+  }
+  if (details.aliasHints.length > 0) {
+    return "alias-symbol";
+  }
+  if (details.substringNameHints.length >= 2) {
+    return "compound-symbol";
+  }
+  if (details.substringNameHints.length === 0 && details.pathHints.length > 0) {
+    return "path-only";
+  }
+  return "weak-substring";
+}
+
+function formatIdentifierQualityReason(
+  query: string,
+  metadata: RetrievalChunkMetadata,
+  hints: string[],
+  options: {
+    aliases?: string[];
+    pathMatchesFileHint?: boolean;
+    nameMatchesPrimary?: boolean;
+  } = {}
+): string {
+  const quality = classifyIdentifierQuality(query, metadata, hints, options);
+  const details = collectIdentifierMatchDetails(metadata, hints, options.aliases);
+  const matched = [
+    ...details.exactNameHints.map((hint) => `${hint}:exact-name`),
+    ...details.aliasHints.map((hint) => `${hint}:alias`),
+    ...details.substringNameHints.map((hint) => `${hint}:name-substring`),
+    ...details.pathHints.map((hint) => `${hint}:path`),
+  ];
+
+  const baseReason = `identifierQuality=${quality}; matchedHints=${matched.length > 0 ? matched.join(",") : "none"}`;
+  if (quality !== "compound-symbol") {
+    return baseReason;
+  }
+
+  const compound = classifyCompoundIdentifierSpecificity(details.substringNameHints);
+  return `${baseReason}; compoundSpecificity=${compound.specificity}; compoundGenericHints=${compound.genericHints.length > 0 ? compound.genericHints.join(",") : "none"}; compoundSpecificHints=${compound.specificHints.length > 0 ? compound.specificHints.join(",") : "none"}`;
+}
+
+function isRiskyIdentifierQuality(
+  quality: IdentifierQualityLabel,
+  _compoundSpecificity: CompoundIdentifierSpecificity = "not-compound"
+): boolean {
+  return quality === "weak-substring" ||
+    quality === "path-only" ||
+    quality === "type-only";
+}
+
+export function shouldApplyExperimentalIdentifierRiskPolicy(
+  query: string,
+  taskType: SearchTaskType | undefined,
+  enabled: boolean
+): boolean {
+  if (!enabled || taskType !== "definition") {
+    return false;
+  }
+  if (inferRelationshipGraphDirection(query)) {
+    return false;
+  }
+  if (containsTestDebugSignals(query)) {
+    return false;
+  }
+  if (/\b(?:config|configuration|constant|default model|default provider)\b/i.test(query)) {
+    return false;
+  }
+  return classifyQueryIntentRaw(query) === "source";
+}
+
+export function applyConservativeIdentifierRiskPolicyToSetScore(
+  before: number,
+  after: number,
+  quality: IdentifierQualityLabel,
+  enabled: boolean,
+  compoundSpecificity: CompoundIdentifierSpecificity = "not-compound"
+): number {
+  if (!enabled || !isRiskyIdentifierQuality(quality, compoundSpecificity)) {
+    return after;
+  }
+
+  switch (quality) {
+    case "weak-substring":
+      return Math.min(after, Math.max(before, 0.9));
+    case "path-only":
+      return Math.min(after, Math.max(before, 0.88));
+    case "type-only":
+      return Math.min(after, Math.max(before, 0.86) - 0.04);
+    default:
+      return after;
+  }
+}
+
+export function applyConservativeIdentifierRiskPolicyToAddScore(
+  before: number,
+  after: number,
+  quality: IdentifierQualityLabel,
+  enabled: boolean,
+  compoundSpecificity: CompoundIdentifierSpecificity = "not-compound"
+): number {
+  if (!enabled || !isRiskyIdentifierQuality(quality, compoundSpecificity)) {
+    return after;
+  }
+
+  const delta = after - before;
+  switch (quality) {
+    case "weak-substring":
+      return before + delta * 0.25;
+    case "path-only":
+      return before + delta * 0.15;
+    case "type-only":
+      return before - 0.04;
+    default:
+      return after;
+  }
+}
+
+function formatIdentifierRiskPolicyReason(
+  originalScore: number,
+  adjustedScore: number
+): string {
+  return originalScore === adjustedScore
+    ? ""
+    : `; identifierRiskPolicy=conservative; originalIdentifierScore=${originalScore}; adjustedIdentifierScore=${adjustedScore}`;
+}
+
 function extractPrimaryIdentifierQueryHint(query: string): string | null {
   const identifiers = extractIdentifierHints(query);
   if (identifiers.length > 0) {
@@ -2063,7 +2407,8 @@ function buildDeterministicIdentifierPass(
   candidates: RankedCandidate[],
   limit: number,
   prioritizeSourcePaths: boolean = classifyQueryIntentRaw(query) === "source",
-  includeScoreBreakdown: boolean = false
+  includeScoreBreakdown: boolean = false,
+  experimentalIdentifierRiskPolicy: boolean = false
 ): RankedCandidate[] {
   if (!prioritizeSourcePaths) {
     return [];
@@ -2130,10 +2475,28 @@ function buildDeterministicIdentifierPass(
     })
     .slice(0, Math.max(limit * 2, 12));
 
+  const useIdentifierRiskPolicy = shouldApplyExperimentalIdentifierRiskPolicy(
+    query,
+    "definition",
+    experimentalIdentifierRiskPolicy
+  );
+
   return deterministic.map((entry) => {
-    const score = entry.pathMatchesFileHint && entry.nameMatchesPrimary
+    const originalScore = entry.pathMatchesFileHint && entry.nameMatchesPrimary
       ? DETERMINISTIC_IDENTIFIER_EXACT_FILE_HINT_SCORE
       : Math.min(1, DETERMINISTIC_IDENTIFIER_BASE_SCORE + entry.maxMatch * DETERMINISTIC_IDENTIFIER_MATCH_SCALE);
+    const quality = classifyIdentifierQuality(query, entry.candidate.metadata, hints, {
+      pathMatchesFileHint: entry.pathMatchesFileHint,
+      nameMatchesPrimary: entry.nameMatchesPrimary,
+    });
+    const compoundSpecificity = getCompoundIdentifierSpecificity(entry.candidate.metadata, hints);
+    const score = applyConservativeIdentifierRiskPolicyToSetScore(
+      entry.candidate.score,
+      originalScore,
+      quality,
+      useIdentifierRiskPolicy,
+      compoundSpecificity
+    );
     const candidate: RankedCandidate = {
       id: entry.candidate.id,
       score,
@@ -2147,7 +2510,10 @@ function buildDeterministicIdentifierPass(
         kind: "set",
         before: entry.candidate.score,
         after: score,
-        reason: `deterministicIdentifierLane: maxMatch=${entry.maxMatch}; pathMatchesFileHint=${entry.pathMatchesFileHint}; nameMatchesPrimary=${entry.nameMatchesPrimary}`,
+        reason: `deterministicIdentifierLane: maxMatch=${entry.maxMatch}; pathMatchesFileHint=${entry.pathMatchesFileHint}; nameMatchesPrimary=${entry.nameMatchesPrimary}; ${formatIdentifierQualityReason(query, entry.candidate.metadata, hints, {
+          pathMatchesFileHint: entry.pathMatchesFileHint,
+          nameMatchesPrimary: entry.nameMatchesPrimary,
+        })}${formatIdentifierRiskPolicyReason(originalScore, score)}`,
       });
     }
     return candidate;
@@ -2578,7 +2944,8 @@ function promoteIdentifierMatches(
   allowedChunkIds?: Set<string> | null,
   pathPreference: SearchPathPreference = classifyQueryIntentRaw(query) === "source" ? "source" : "auto",
   identifierBoost: number = 1,
-  includeScoreBreakdown: boolean = false
+  includeScoreBreakdown: boolean = false,
+  experimentalIdentifierRiskPolicy: boolean = false
 ): RankedCandidate[] {
   if (combined.length === 0) {
     return combined;
@@ -2593,6 +2960,11 @@ function promoteIdentifierMatches(
   if (identifierHints.length === 0) {
     return combined;
   }
+  const useIdentifierRiskPolicy = shouldApplyExperimentalIdentifierRiskPolicy(
+    query,
+    "definition",
+    experimentalIdentifierRiskPolicy
+  );
 
   const combinedById = new Map(combined.map((candidate) => [candidate.id, candidate]));
   const candidateUnion = new Map<string, RankedCandidate>();
@@ -2644,7 +3016,22 @@ function promoteIdentifierMatches(
           };
 
           const baselineScore = existing?.score ?? IDENTIFIER_DATABASE_BASELINE_SCORE;
-          const boostedScore = Math.min(1, baselineScore + IDENTIFIER_DATABASE_BASELINE_SCORE * Math.max(0, identifierBoost));
+          const originalBoostedScore = Math.min(1, baselineScore + IDENTIFIER_DATABASE_BASELINE_SCORE * Math.max(0, identifierBoost));
+          const quality = classifyIdentifierQuality(query, metadata, identifierHints, {
+            aliases: symbol.symbolAliases ?? [],
+          });
+          const compoundSpecificity = getCompoundIdentifierSpecificity(
+            metadata,
+            identifierHints,
+            symbol.symbolAliases ?? []
+          );
+          const boostedScore = applyConservativeIdentifierRiskPolicyToSetScore(
+            baselineScore,
+            originalBoostedScore,
+            quality,
+            useIdentifierRiskPolicy,
+            compoundSpecificity
+          );
           const nextCandidate: RankedCandidate = {
             id: chunk.chunkId,
             score: boostedScore,
@@ -2660,7 +3047,9 @@ function promoteIdentifierMatches(
               kind: "set",
               before: baselineScore,
               after: boostedScore,
-              reason: `identifierPromotion: databaseSymbol=${identifier}; identifierBoost=${identifierBoost}`,
+              reason: `identifierPromotion: databaseSymbol=${identifier}; identifierBoost=${identifierBoost}; ${formatIdentifierQualityReason(query, metadata, identifierHints, {
+                aliases: symbol.symbolAliases ?? [],
+              })}${formatIdentifierRiskPolicyReason(originalBoostedScore, boostedScore)}`,
             });
           }
           candidateUnion.set(chunk.chunkId, nextCandidate);
@@ -2695,7 +3084,17 @@ function promoteIdentifierMatches(
 
     const existing = combinedById.get(candidate.id) ?? candidate;
     const rescueBoost = (exactIdentifierMatch ? IDENTIFIER_EXACT_RESCUE_BOOST : IDENTIFIER_FUZZY_RESCUE_BOOST) * Math.max(0, identifierBoost);
-    const boostedScore = Math.min(1, Math.max(existing.score, candidate.score) + rescueBoost);
+    const before = Math.max(existing.score, candidate.score);
+    const originalBoostedScore = Math.min(1, before + rescueBoost);
+    const quality = classifyIdentifierQuality(query, existing.metadata, identifierHints);
+    const compoundSpecificity = getCompoundIdentifierSpecificity(existing.metadata, identifierHints);
+    const boostedScore = applyConservativeIdentifierRiskPolicyToAddScore(
+      before,
+      originalBoostedScore,
+      quality,
+      useIdentifierRiskPolicy,
+      compoundSpecificity
+    );
     const nextCandidate: RankedCandidate = {
       id: existing.id,
       score: boostedScore,
@@ -2709,9 +3108,9 @@ function promoteIdentifierMatches(
       recordScoreStage(nextCandidate, {
         name: DETERMINISTIC_INTENT_STAGE,
         kind: "add",
-        before: Math.max(existing.score, candidate.score),
+        before,
         after: boostedScore,
-        reason: `identifierPromotion: exactIdentifierMatch=${exactIdentifierMatch}; boost=${rescueBoost}`,
+        reason: `identifierPromotion: exactIdentifierMatch=${exactIdentifierMatch}; boost=${rescueBoost}; ${formatIdentifierQualityReason(query, existing.metadata, identifierHints)}${formatIdentifierRiskPolicyReason(originalBoostedScore, boostedScore)}`,
       });
     }
     promoted.push(nextCandidate);
@@ -2973,7 +3372,8 @@ function buildIdentifierDefinitionLane(
   candidates: RankedCandidate[],
   limit: number,
   prioritizeSourcePaths: boolean = classifyQueryIntentRaw(query) === "source",
-  includeScoreBreakdown: boolean = false
+  includeScoreBreakdown: boolean = false,
+  experimentalIdentifierRiskPolicy: boolean = false
 ): RankedCandidate[] {
   if (!prioritizeSourcePaths) {
     return [];
@@ -3005,8 +3405,23 @@ function buildIdentifierDefinitionLane(
     })
     .slice(0, Math.max(limit * 2, 10));
 
+  const useIdentifierRiskPolicy = shouldApplyExperimentalIdentifierRiskPolicy(
+    query,
+    "definition",
+    experimentalIdentifierRiskPolicy
+  );
+
   return scored.map((entry) => {
-    const score = Math.min(1, DETERMINISTIC_IDENTIFIER_BASE_SCORE + entry.matchScore * DETERMINISTIC_IDENTIFIER_MATCH_SCALE);
+    const originalScore = Math.min(1, DETERMINISTIC_IDENTIFIER_BASE_SCORE + entry.matchScore * DETERMINISTIC_IDENTIFIER_MATCH_SCALE);
+    const quality = classifyIdentifierQuality(query, entry.candidate.metadata, hints);
+    const compoundSpecificity = getCompoundIdentifierSpecificity(entry.candidate.metadata, hints);
+    const score = applyConservativeIdentifierRiskPolicyToSetScore(
+      entry.candidate.score,
+      originalScore,
+      quality,
+      useIdentifierRiskPolicy,
+      compoundSpecificity
+    );
     const candidate: RankedCandidate = {
       id: entry.candidate.id,
       score,
@@ -3020,7 +3435,7 @@ function buildIdentifierDefinitionLane(
         kind: "set",
         before: entry.candidate.score,
         after: score,
-        reason: `identifierDefinitionLane: matchScore=${entry.matchScore}`,
+        reason: `identifierDefinitionLane: matchScore=${entry.matchScore}; ${formatIdentifierQualityReason(query, entry.candidate.metadata, hints)}${formatIdentifierRiskPolicyReason(originalScore, score)}`,
       });
     }
     return candidate;
@@ -5312,6 +5727,9 @@ export class Indexer {
       taskType === "bug" ||
       queryIntent === "source";
     const identifierBoost = options?.identifierBoost ?? recipe.identifierBoost ?? 1.0;
+    const experimentalIdentifierRiskPolicy =
+      this.config.search.experimentalIdentifierRiskPolicy &&
+      shouldApplyExperimentalIdentifierRiskPolicy(query, taskType, true);
     const finalRerankTopN =
       options?.finalRerankTopN !== undefined
         ? options.finalRerankTopN
@@ -5520,7 +5938,8 @@ export class Indexer {
           metadataAllowedChunkIds,
           recipe.pathPreference,
           identifierBoost,
-          includeScoreBreakdown
+          includeScoreBreakdown,
+          experimentalIdentifierRiskPolicy
         )
       : combined;
 
@@ -5532,7 +5951,8 @@ export class Indexer {
           union,
           maxResults,
           sourceIntent,
-          includeScoreBreakdown
+          includeScoreBreakdown,
+          experimentalIdentifierRiskPolicy
         )
       : [];
 
@@ -5542,7 +5962,8 @@ export class Indexer {
           union,
           maxResults,
           sourceIntent,
-          includeScoreBreakdown
+          includeScoreBreakdown,
+          experimentalIdentifierRiskPolicy
         )
       : [];
 

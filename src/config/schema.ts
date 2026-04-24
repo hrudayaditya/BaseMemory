@@ -34,6 +34,7 @@ export interface SearchConfig {
   rrfK: number;
   rerankTopN: number;
   contextLines: number;
+  experimentalIdentifierRiskPolicy: boolean;
 }
 
 export type LogLevel = "error" | "warn" | "info" | "debug";
@@ -125,6 +126,7 @@ function getDefaultSearchConfig(): SearchConfig {
     rrfK: 60,
     rerankTopN: 20,
     contextLines: 0,
+    experimentalIdentifierRiskPolicy: false,
   };
 }
 
@@ -234,6 +236,10 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
     rrfK: typeof rawSearch.rrfK === "number" ? Math.max(1, Math.floor(rawSearch.rrfK)) : defaultSearch.rrfK,
     rerankTopN: typeof rawSearch.rerankTopN === "number" ? Math.min(200, Math.max(0, Math.floor(rawSearch.rerankTopN))) : defaultSearch.rerankTopN,
     contextLines: typeof rawSearch.contextLines === "number" ? Math.min(50, Math.max(0, rawSearch.contextLines)) : defaultSearch.contextLines,
+    experimentalIdentifierRiskPolicy:
+      typeof rawSearch.experimentalIdentifierRiskPolicy === "boolean"
+        ? rawSearch.experimentalIdentifierRiskPolicy
+        : defaultSearch.experimentalIdentifierRiskPolicy,
   };
 
   const rawDebug = (input.debug && typeof input.debug === "object" ? input.debug : {}) as Record<string, unknown>;

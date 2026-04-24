@@ -46,7 +46,7 @@
     {
       "id": "trpc-def-observable-factory",
       "source": "curated",
-      "query": "where is the small observable primitive used by client links and streaming implemented",
+      "query": "where is the observable factory function implemented",
       "queryType": "definition",
       "expected": {
         "filePath": "packages/server/src/observable/observable.ts",
@@ -56,7 +56,7 @@
     {
       "id": "trpc-def-tracked-envelope",
       "source": "curated",
-      "query": "where is the helper that wraps subscription payloads with an id for resumable SSE streams defined",
+      "query": "where is the tracked function defined",
       "queryType": "definition",
       "expected": {
         "filePath": "packages/server/src/unstable-core-do-not-import/stream/tracked.ts",
@@ -86,7 +86,7 @@
     {
       "id": "trpc-def-transform-wire-result",
       "source": "curated",
-      "query": "where is the function that unwraps batched or single TRPC wire JSON into an ok or error discriminant for the client defined",
+      "query": "where is transformResult implemented",
       "queryType": "definition",
       "expected": {
         "filePath": "packages/server/src/unstable-core-do-not-import/transformer.ts",
@@ -96,7 +96,7 @@
     {
       "id": "trpc-def-flat-proxy",
       "source": "curated",
-      "query": "where is the non-recursive proxy helper used alongside the recursive proxy utilities defined",
+      "query": "where is the non-recursive createFlatProxy helper defined",
       "queryType": "definition",
       "expected": {
         "filePath": "packages/server/src/unstable-core-do-not-import/createProxy.ts",
@@ -116,7 +116,7 @@
     {
       "id": "trpc-def-request-info-parser",
       "source": "curated",
-      "query": "where is the async routine that inspects method headers and body to build TRPCRequestInfo for HTTP calls defined",
+      "query": "where is getRequestInfo defined",
       "queryType": "definition",
       "expected": {
         "filePath": "packages/server/src/unstable-core-do-not-import/http/contentType.ts",
