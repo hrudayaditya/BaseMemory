@@ -1,0 +1,22 @@
+{
+  "embeddingProvider": "voyage",
+  "jinaApiKey": "jina_6f18a6d88a704ceb919177612790a4fdNHPyR1N-VYr4RMMwbxQb3D1BKOmc",
+  "jinaRerankerModel": "jina-reranker-v3",
+  "voyageApiKey": "pa-ffdIGkH4PmzFu0BnfZJ0Fpy64tzjTKgREyC3_cc0Sni",
+  "voyageModelId": "voyage-code-3",
+  "customProvider": {
+    "baseUrl": "http://127.0.0.1:11434/v1",
+    "model": "snowflake-arctic-embed2",
+    "dimensions": 1024,
+    "timeoutMs": 30000,
+    "concurrency": 8,
+    "requestIntervalMs": 10
+  },
+  "search": {
+    "rerankTopN": 10
+  },
+  "indexing": {
+    "autoIndex": true,
+    "watchFiles": true
+  }
+}
