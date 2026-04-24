@@ -224,7 +224,7 @@ export function buildPerQueryResult(
   k: number,
   effective?: Pick<
     PerQueryEvalResult,
-    "effectiveTaskType" | "effectiveFinalRerankTopN" | "effectiveGraphDepth"
+    "effectiveTaskType" | "subIntent" | "effectiveFinalRerankTopN" | "effectiveGraphDepth"
   >,
   expandedResults: PerQueryEvalResult["results"] = [],
   expandedRelations: string[] = [],
@@ -249,6 +249,7 @@ export function buildPerQueryResult(
     source: query.source,
     heuristic: query.heuristic,
     effectiveTaskType: effective?.effectiveTaskType,
+    subIntent: effective?.subIntent,
     effectiveFinalRerankTopN: effective?.effectiveFinalRerankTopN,
     effectiveGraphDepth: effective?.effectiveGraphDepth,
     latencyMs,

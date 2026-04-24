@@ -1,5 +1,5 @@
 import type { SearchConfig } from "../config/schema.js";
-import type { ScoreBreakdown } from "../indexer/index.js";
+import type { ScoreBreakdown, SubIntent } from "../indexer/index.js";
 import type { SearchTaskType } from "../indexer/search-recipes.js";
 
 export type GoldenQueryType =
@@ -95,6 +95,7 @@ export interface PerQueryEvalResult {
   source?: GoldenQuerySource;
   heuristic?: string;
   effectiveTaskType?: string;
+  subIntent?: SubIntent;
   effectiveFinalRerankTopN?: number;
   effectiveGraphDepth?: number;
   latencyMs: number;

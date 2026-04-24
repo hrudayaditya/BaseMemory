@@ -44,6 +44,8 @@ import {
 } from "./search-recipes.js";
 import {
   classifyDefinitionWinnerCategory,
+  hasExactIdentifierQuality,
+  hasExactSymbolEvidence,
   getDefinitionImplementationBonus,
   getDefinitionImplementationPenalty,
   isImplementationSeekingDefinitionQuery,
@@ -532,6 +534,7 @@ export interface SearchResponse {
   primaryResults: SearchResult[];
   expandedContext: GraphContextResult[];
   taskType: SearchTaskType;
+  subIntent: SubIntent;
   graphDirection: GraphExpansionDirection;
   timings?: {
     prefilterMs: number;
@@ -587,6 +590,7 @@ export interface ScoreBreakdown {
     strategy: "rrf" | "weighted";
     score: number;
     rank: number;
+    subIntent?: SubIntent;
   };
   sources: string[];
   stages: ScoreStage[];
@@ -826,6 +830,18 @@ export type CompoundIdentifierSpecificity =
   | "generic-compound"
   | "mixed-compound"
   | "not-compound";
+
+export type SubIntent =
+  | "definition:executable"
+  | "definition:declarative"
+  | "relationship:caller"
+  | "relationship:callee"
+  | "concept:implementation"
+  | "concept:architecture"
+  | "bug:error-source"
+  | "bug:behavior-owner"
+  | "test:discovery"
+  | null;
 
 type RankedCandidate = {
   id: string;
@@ -1859,27 +1875,57 @@ export function applyDefinitionImplementationPolicy(
   query: string,
   taskType: SearchTaskType,
   graphDirection: GraphExpansionDirection,
-  includeScoreBreakdown: boolean = false
+  includeScoreBreakdown: boolean = false,
+  subIntent: SubIntent = null
 ): RankedCandidate[] {
   if (
     taskType !== "definition" ||
     graphDirection !== "both" ||
     candidates.length < 2 ||
-    !isImplementationSeekingDefinitionQuery(query)
+    (subIntent !== "definition:declarative" && !isImplementationSeekingDefinitionQuery(query))
   ) {
     return candidates;
   }
 
   const penalizedFiles = new Set<string>();
   const penalized = candidates.map((candidate, originalIndex) => {
-    const penalty = getDefinitionImplementationPenalty({
-      query,
-      filePath: candidate.metadata.filePath,
-      chunkType: candidate.metadata.chunkType,
-      name: candidate.metadata.name,
-      identifierQuality: candidate.identifierQuality,
-      stages: candidate.scoreBreakdown?.stages,
-    });
+    const category = classifyDefinitionWinnerCategory(
+      candidate.metadata.filePath,
+      candidate.metadata.chunkType,
+      candidate.metadata.name
+    );
+    const hasExactEvidence =
+      hasExactIdentifierQuality(candidate.identifierQuality) ||
+      hasExactSymbolEvidence(candidate.scoreBreakdown?.stages);
+    let penalty = 0;
+
+    if (subIntent === "definition:executable" && !hasExactEvidence) {
+      switch (category) {
+        case "wrapper-export":
+          penalty = 0.12;
+          break;
+        case "type-interface":
+        case "options-shape":
+          penalty = 0.09;
+          break;
+        case "module":
+          penalty = 0.15;
+          break;
+        default:
+          penalty = 0;
+      }
+    } else if (subIntent === "definition:declarative") {
+      penalty = 0;
+    } else {
+      penalty = getDefinitionImplementationPenalty({
+        query,
+        filePath: candidate.metadata.filePath,
+        chunkType: candidate.metadata.chunkType,
+        name: candidate.metadata.name,
+        identifierQuality: candidate.identifierQuality,
+        stages: candidate.scoreBreakdown?.stages,
+      });
+    }
 
     const nextCandidate = penalty === 0
       ? candidate
@@ -1895,7 +1941,7 @@ export function applyDefinitionImplementationPolicy(
           kind: "add",
           before: candidate.score,
           after: nextCandidate.score,
-          reason: `category=${classifyDefinitionWinnerCategory(candidate.metadata.filePath, candidate.metadata.chunkType, candidate.metadata.name)}; adjustment=-${penalty}`,
+          reason: `subIntent=${subIntent ?? "null"}; category=${category}; adjustment=-${penalty}`,
         });
       }
     }
@@ -1907,18 +1953,37 @@ export function applyDefinitionImplementationPolicy(
   });
 
   const rescored = penalized.map((entry) => {
+    const category = classifyDefinitionWinnerCategory(
+      entry.candidate.metadata.filePath,
+      entry.candidate.metadata.chunkType,
+      entry.candidate.metadata.name
+    );
+    const hasExactEvidence =
+      hasExactIdentifierQuality(entry.candidate.identifierQuality) ||
+      hasExactSymbolEvidence(entry.candidate.scoreBreakdown?.stages);
     const sameFilePenalized = penalizedFiles.has(entry.candidate.metadata.filePath.replaceAll("\\", "/"));
-    const bonus = sameFilePenalized
-      ? getDefinitionImplementationBonus({
-          query,
-          filePath: entry.candidate.metadata.filePath,
-          chunkType: entry.candidate.metadata.chunkType,
-          name: entry.candidate.metadata.name,
-          identifierQuality: entry.candidate.identifierQuality,
-          stages: entry.candidate.scoreBreakdown?.stages,
-          sameFilePenalized,
-        })
-      : 0;
+    let bonus = 0;
+    if (subIntent === "definition:declarative") {
+      if (!hasExactEvidence && (category === "type-interface" || category === "options-shape")) {
+        bonus = 0.06;
+      }
+    } else if (subIntent === "definition:executable") {
+      if (!hasExactEvidence && sameFilePenalized && category === "implementation") {
+        bonus = 0.05;
+      }
+    } else {
+      bonus = sameFilePenalized
+        ? getDefinitionImplementationBonus({
+            query,
+            filePath: entry.candidate.metadata.filePath,
+            chunkType: entry.candidate.metadata.chunkType,
+            name: entry.candidate.metadata.name,
+            identifierQuality: entry.candidate.identifierQuality,
+            stages: entry.candidate.scoreBreakdown?.stages,
+            sameFilePenalized,
+          })
+        : 0;
+    }
 
     const nextCandidate = bonus === 0
       ? entry.candidate
@@ -1932,7 +1997,7 @@ export function applyDefinitionImplementationPolicy(
         kind: "add",
         before: entry.candidate.score,
         after: nextCandidate.score,
-        reason: `category=implementation; adjustment=+${bonus}; sameFilePenalized=true`,
+        reason: `subIntent=${subIntent ?? "null"}; category=${category}; adjustment=+${bonus}; sameFilePenalized=${sameFilePenalized}`,
       });
     }
 
@@ -2082,6 +2147,206 @@ export function inferTaskType(query: string, explicit?: SearchTaskType): SearchT
   }
 
   return "general";
+}
+
+function isDeclarativeDefinitionQuery(query: string): boolean {
+  const lower = query.toLowerCase();
+
+  if (
+    /\b(?:what|which)\s+type\b/.test(lower) ||
+    /\binterface\s+(?:for|of)\b/.test(lower) ||
+    /\bschema(?:\s+shape)?\s+(?:for|of)?\b/.test(lower) ||
+    /\bshape\s+of\b/.test(lower) ||
+    /\bcontract\s+(?:for|of)\b/.test(lower) ||
+    /\brepresents?\b/.test(lower)
+  ) {
+    return true;
+  }
+
+  return /\b(?:config|configuration|options?|params?|props?)\b/.test(lower) &&
+    /\b(?:type|interface|schema|shape|represents?)\b/.test(lower);
+}
+
+function isBugErrorSourceSubIntent(query: string): boolean {
+  if (containsBugStyleErrorMarkers(query)) {
+    return true;
+  }
+
+  if (/[`"'“”][^`"'“”]{3,}[`"'“”]/.test(query)) {
+    return true;
+  }
+
+  const lower = query.toLowerCase();
+  if (
+    /\bwhere\s+does\b.+\bthrow\b/.test(lower) ||
+    /\bwhere\s+does\s+bootstrapping\b/.test(lower) ||
+    /\bwhere\s+does\s+merging\b/.test(lower) ||
+    /\bwhere\s+does\s+shallow\b/.test(lower) ||
+    /\bwhere\s+does\s+the\s+plain\b/.test(lower) ||
+    /\bwhere\s+does\s+the\s+eventsource\b/.test(lower)
+  ) {
+    return true;
+  }
+
+  return (
+    /\b(?:throws?|exception|error(?:\s+message)?)\b/.test(lower) &&
+    /\b(?:[A-Z][A-Za-z0-9]+(?:Error|Exception)|[a-z_]+error)\b/.test(query)
+  );
+}
+
+function isBugBehaviorOwnerSubIntent(query: string): boolean {
+  const lower = query.toLowerCase();
+  return (
+    /\bwhy\s+does\b/.test(lower) ||
+    /\bwhat\s+causes\b/.test(lower) ||
+    /\bwhy\s+is\b.+\bnot\s+working\b/.test(lower) ||
+    /\bwhere\s+does\b.+\bgo\s+wrong\b/.test(lower) ||
+    /\bwhy\b.+\bfail(?:ing|s|ed)?\b/.test(lower) ||
+    /\bfind\s+the\s+code\s+responsible\s+for\b/.test(lower) ||
+    /\bfind\s+the\s+code\s+path\s+that\b/.test(lower) ||
+    /\bfind\s+the\b.+\bbug\b/.test(lower) ||
+    /\bfind\s+the\s+code\s+that\s+makes\b/.test(lower) ||
+    /\bfind\s+the\b.+\blogic\b.+\bshould\b/.test(lower) ||
+    /\bfallback\s+bug\b/.test(lower) ||
+    /\bleaking\s+.+\bfrom\s+another\s+branch\b/.test(lower) ||
+    /\breads?\b.+\binstead\s+of\b/.test(lower) ||
+    /\btransient\s+lock\s+contention\b/.test(lower)
+  );
+}
+
+function isTestDiscoverySubIntent(query: string): boolean {
+  const lower = query.toLowerCase();
+  return (
+    /\bwhat\s+tests?\s+cover\b/.test(lower) ||
+    /\btests?\s+for\b/.test(lower) ||
+    /\bspecs?\s+for\b/.test(lower) ||
+    /\bshow\s+me\s+the\s+tests?\s+covering\b/.test(lower) ||
+    /\bshow\s+me\s+the\b.+\btests?\b/.test(lower) ||
+    /\b(?:integration\s+)?tests?\s+exercise\b/.test(lower) ||
+    /\btests?\s+validate\b/.test(lower) ||
+    /\bwhere\s+are(?:\s+the)?\s+.+\s+tests?\b/.test(lower) ||
+    /\bcoverage\b/.test(lower)
+  );
+}
+
+function isConceptImplementationSubIntent(query: string): boolean {
+  const lower = query.toLowerCase();
+  return (
+    /\bwhere\s+does\s+the\s+(?:framework|runtime|server|client|system)\b/.test(lower) ||
+    /\bwhere\s+are\s+.+\s+processed\b/.test(lower) ||
+    /\bwhere\s+does\s+.+\s+get\b/.test(lower) ||
+    /\bwhere\s+do\s+.+\s+get\b/.test(lower) ||
+    /\bhow\s+does\b/.test(lower) ||
+    /\bhow\s+does\s+the\b/.test(lower) ||
+    /\bhow\s+is\b.+\bhandled\b/.test(lower) ||
+    /\bwhere\s+are\s+periodic\b/.test(lower) ||
+    /\bwhere\s+are\s+.+\s+merged\b/.test(lower) ||
+    /\bwhat\s+implements\b/.test(lower) ||
+    /\bwhere\s+is\b.+\bimplemented\b/.test(lower) ||
+    /\bimplementation\s+of\b/.test(lower) ||
+    /\bhow\b.+\bwork\b/.test(lower) ||
+    /\bfind\s+the\s+(?:tool|function|code)\s+that\b/.test(lower) ||
+    /\bwhat\s+function\s+writes\b/.test(lower) ||
+    /\bwhich\s+file\s+implements\b/.test(lower) ||
+    /\bwhich\s+tool\s+returns\b/.test(lower) ||
+    /\bwhich\s+tool\s+streams?\b/.test(lower)
+  );
+}
+
+function isConceptArchitectureSubIntent(query: string): boolean {
+  const lower = query.toLowerCase();
+  return (
+    /\bwhat\s+handles\b/.test(lower) ||
+    /\bwhat\s+owns\b/.test(lower) ||
+    /\bwhat\s+manages\b/.test(lower) ||
+    /\bwhat\s+is\s+responsible\s+for\b/.test(lower) ||
+    /\bwhich\s+(?:component|module|service)\b.+\bhandles\b/.test(lower) ||
+    /\bwhich\s+file\s+owns\b/.test(lower) ||
+    /\bwhich\s+file\s+is\s+responsible\s+for\b/.test(lower)
+  );
+}
+
+function isConfigDefinitionSubIntent(query: string): boolean {
+  const lower = query.toLowerCase();
+  const hasDefinitionFrame =
+    /\b(?:where|show\s+me\s+where)\b.+\bdefined\b/.test(lower) ||
+    /\bwhat\s+is\s+the\s+default\b/.test(lower);
+  const hasConfigSignal =
+    /\bconfig\b/.test(lower) ||
+    /\bdefault\b/.test(lower) ||
+    /\b(?:fusionstrategy|hybridweight|rrfk|reranktopn)\b/.test(lower) ||
+    /\b(?:sqlite_busy_timeout_ms|arctic_query_prefix|voyage_default_model_id)\b/.test(lower);
+  return hasDefinitionFrame && hasConfigSignal;
+}
+
+export function inferSubIntent(query: string, taskType: SearchTaskType): SubIntent {
+  if (query.trim().length === 0) {
+    return null;
+  }
+
+  const lower = query.toLowerCase();
+  if ((taskType === "general" || taskType === "semantic") && isConfigDefinitionSubIntent(query)) {
+    return "definition:declarative";
+  }
+  const hasDefinitionFrame =
+    /\bwhere\s+is\b.+\bdefined\b/.test(lower) ||
+    (/^\s*where\s+is\s+the\b/.test(lower) && /\bdefined\s*$/.test(lower));
+  if (taskType === "definition" && hasDefinitionFrame && isImplementationSeekingDefinitionQuery(query)) {
+    return "definition:executable";
+  }
+
+  const relationshipDirection = inferRelationshipGraphDirection(query);
+  if (taskType === "definition" && relationshipDirection === "caller") {
+    return "relationship:caller";
+  }
+  if (taskType === "definition" && relationshipDirection === "callee") {
+    return "relationship:callee";
+  }
+  if (
+    taskType === "definition" &&
+    (
+      /\bwhich\s+.+\s+handler\s+(?:bridges|forwards|wraps|awaits)\b/.test(lower) ||
+      /\bwhich\s+.+\s+adapter\b/.test(lower) ||
+      /\bwhich\s+.+\s+link\s+reads\b/.test(lower) ||
+      /\bwhich\s+.+\s+entrypoint\s+forwards\b/.test(lower) ||
+      /\bwhat\s+.+\s+handler\s+closure\b/.test(lower) ||
+      /\bwhat\s+.+\s+handler\s+bridges\b/.test(lower) ||
+      /\bwhat\s+exported\s+.+\s+entrypoint\b/.test(lower) ||
+      /\bwhat\s+async\s+generator\s+helper\b/.test(lower)
+    )
+  ) {
+    return "relationship:callee";
+  }
+
+  switch (taskType) {
+    case "definition":
+      if (isImplementationSeekingDefinitionQuery(query)) {
+        return "definition:executable";
+      }
+      if (isDeclarativeDefinitionQuery(query)) {
+        return "definition:declarative";
+      }
+      return null;
+    case "bug":
+      if (isBugErrorSourceSubIntent(query)) {
+        return "bug:error-source";
+      }
+      if (isBugBehaviorOwnerSubIntent(query)) {
+        return "bug:behavior-owner";
+      }
+      return null;
+    case "test_debug":
+      return isTestDiscoverySubIntent(query) ? "test:discovery" : null;
+    case "general":
+    case "semantic":
+      if (isConceptArchitectureSubIntent(query)) {
+        return "concept:architecture";
+      }
+      if (isConceptImplementationSubIntent(query)) {
+        return "concept:implementation";
+      }
+      return null;
+  }
 }
 
 function normalizeFusionWeights(
@@ -5541,7 +5806,8 @@ export class Indexer {
     candidates: RankedCandidate[],
     options: { metadataOnly: boolean; contextLines: number },
     fileContentCache: Map<string, string | null>,
-    storedChunkTexts: Map<string, string>
+    storedChunkTexts: Map<string, string>,
+    subIntent: SubIntent = null
   ): Promise<SearchResult[]> {
     return Promise.all(
       candidates.map(async (candidate) => {
@@ -5568,6 +5834,11 @@ export class Indexer {
           }
         }
 
+        const scoreBreakdown = cloneScoreBreakdown(candidate.scoreBreakdown);
+        if (scoreBreakdown) {
+          scoreBreakdown.fusion.subIntent = subIntent;
+        }
+
         return {
           filePath: candidate.metadata.filePath,
           startLine,
@@ -5581,7 +5852,7 @@ export class Indexer {
           chunkKind: candidate.chunkKind ?? candidate.metadata.chunkKind,
           symbolKind: candidate.symbolKind ?? candidate.metadata.symbolKind,
           name: candidate.metadata.name,
-          scoreBreakdown: cloneScoreBreakdown(candidate.scoreBreakdown),
+          scoreBreakdown,
         };
       })
     );
@@ -5770,6 +6041,7 @@ export class Indexer {
       database,
     } = await this.ensureInitialized();
     const taskType = inferTaskType(query, options?.taskType);
+    const subIntent = inferSubIntent(query, taskType);
     const voyageLaneConfigured = Boolean(voyageProvider && voyageStore && voyageModelId);
 
     if (query.trim().length === 0) {
@@ -5777,6 +6049,7 @@ export class Indexer {
         primaryResults: [],
         expandedContext: [],
         taskType,
+        subIntent,
         graphDirection: options?.graphDirection ?? "both",
         timings: {
           prefilterMs: 0,
@@ -5811,6 +6084,7 @@ export class Indexer {
         primaryResults: [],
         expandedContext: [],
         taskType,
+        subIntent,
         graphDirection: options?.graphDirection ?? "both",
         timings: {
           prefilterMs: 0,
@@ -5873,6 +6147,7 @@ export class Indexer {
         primaryResults: [],
         expandedContext: [],
         taskType,
+        subIntent,
         graphDirection: options?.graphDirection ?? "both",
         timings: {
           prefilterMs: Math.round(prefilterMs * 100) / 100,
@@ -6135,7 +6410,8 @@ export class Indexer {
       query,
       taskType,
       graphDirection,
-      includeScoreBreakdown
+      includeScoreBreakdown,
+      subIntent
     );
     const filtered = taskType === "semantic"
       ? preferEarlierNamedChunkSlices(filteredWithDefinitionPolicy)
@@ -6218,7 +6494,8 @@ export class Indexer {
       visiblePrimaryCandidates,
       { metadataOnly, contextLines },
       fileContentCache,
-      storedChunkTexts
+      storedChunkTexts,
+      subIntent
     );
 
     let expandedContext: GraphContextResult[] = [];
@@ -6235,6 +6512,7 @@ export class Indexer {
       primaryResults,
       expandedContext,
       taskType,
+      subIntent,
       graphDirection,
       timings: {
         prefilterMs: Math.round(prefilterMs * 100) / 100,

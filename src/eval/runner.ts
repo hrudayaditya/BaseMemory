@@ -451,6 +451,7 @@ async function finalizeEvaluationRun(
     perQuery.push(
       buildPerQueryResult(query, materialized, elapsed, 10, {
         effectiveTaskType: queryPlan.taskType,
+        subIntent: searchResponse.subIntent,
         effectiveFinalRerankTopN: queryPlan.finalRerankTopN,
         effectiveGraphDepth: queryPlan.graphDepth,
       }, expandedMaterialized, searchResponse.expandedContext.map((entry) => entry.relation), {

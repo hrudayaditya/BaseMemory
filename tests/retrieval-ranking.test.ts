@@ -1400,4 +1400,91 @@ describe("retrieval ranking", () => {
     expect(wrapperStage?.after).toBeCloseTo(0.85);
     expect(implStage?.after).toBeCloseTo(0.86);
   });
+
+  it("strengthens penalties for definition:executable sub-intent", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "wrapper",
+        score: 0.9,
+        metadata: meta({ filePath: "/repo/src/init.ts", name: "export{TRPCBuilder}", chunkType: "module" }),
+        scoreBreakdown: breakdown(0.9),
+      },
+      {
+        id: "impl",
+        score: 0.8,
+        metadata: meta({ filePath: "/repo/src/init.ts", name: "initTRPC", chunkType: "constant" }),
+        scoreBreakdown: breakdown(0.8),
+      },
+    ];
+
+    const rescored = applyDefinitionImplementationPolicy(
+      candidates,
+      "where is the builder factory defined",
+      "definition",
+      "both",
+      true,
+      "definition:executable"
+    );
+
+    expect(rescored.find((candidate) => candidate.id === "wrapper")?.score).toBeCloseTo(0.78);
+    expect(rescored.find((candidate) => candidate.id === "impl")?.score).toBeCloseTo(0.85);
+  });
+
+  it("inverts the policy for definition:declarative sub-intent", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "type",
+        score: 0.9,
+        metadata: meta({ filePath: "/repo/src/http/types.ts", name: "TRPCRequestInfo", chunkType: "interface" }),
+        scoreBreakdown: breakdown(0.9),
+      },
+      {
+        id: "impl",
+        score: 0.8,
+        metadata: meta({ filePath: "/repo/src/http/client.ts", name: "getRequestInfo", chunkType: "function" }),
+        scoreBreakdown: breakdown(0.8),
+      },
+    ];
+
+    const rescored = applyDefinitionImplementationPolicy(
+      candidates,
+      "what type represents request info",
+      "definition",
+      "both",
+      true,
+      "definition:declarative"
+    );
+
+    expect(rescored.find((candidate) => candidate.id === "type")?.score).toBeCloseTo(0.96);
+    expect(rescored.find((candidate) => candidate.id === "impl")?.score).toBeCloseTo(0.8);
+  });
+
+  it("uses base magnitudes when sub-intent is null", () => {
+    const candidates: Candidate[] = [
+      {
+        id: "wrapper",
+        score: 0.9,
+        metadata: meta({ filePath: "/repo/src/init.ts", name: "export{TRPCBuilder}", chunkType: "module" }),
+        scoreBreakdown: breakdown(0.9),
+      },
+      {
+        id: "impl",
+        score: 0.8,
+        metadata: meta({ filePath: "/repo/src/init.ts", name: "initTRPC", chunkType: "constant" }),
+        scoreBreakdown: breakdown(0.8),
+      },
+    ];
+
+    const rescored = applyDefinitionImplementationPolicy(
+      candidates,
+      "where is the builder factory defined",
+      "definition",
+      "both",
+      true,
+      null
+    );
+
+    expect(rescored.find((candidate) => candidate.id === "wrapper")?.score).toBeCloseTo(0.85);
+    expect(rescored.find((candidate) => candidate.id === "impl")?.score).toBeCloseTo(0.86);
+  });
 });

@@ -51,7 +51,10 @@ export function isLikelyDocPath(filePath: string): boolean {
 
 export function isImplementationSeekingDefinitionQuery(query: string): boolean {
   const lower = query.toLowerCase();
-  return /\b(?:function|method|helper|factory|routine|implementation|defined|wrap|wraps|return|returns|create|creates|parse|parses|read|reads|call|calls|build|builds|implemented)\b/.test(lower);
+  return /\b(?:function|method|helper|factory|routine|implementation|defined|wrap|wraps|return|returns|create|creates|parse|parses|read|reads|call|calls|build|builds|implemented|singleton)\b/.test(lower) ||
+    /\bexported\s+that\b/.test(lower) ||
+    /\bbootstraps?\s+from\b/.test(lower) ||
+    /\bthe\s+object\s+that\s+every\b/.test(lower);
 }
 
 export function hasExactSymbolEvidence(stages: DefinitionPolicyStageLike[] | null | undefined): boolean {

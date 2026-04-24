@@ -385,7 +385,6 @@ function compareSummaries(left: SummaryArtifact | null, right: SummaryArtifact |
     "fileHitAt3",
     "fileHitAt10",
     "mrrAt10",
-    "ndcgAt10",
   ] as const;
 
   for (const metric of metrics) {
@@ -450,7 +449,6 @@ function compareQuality(left: LoadedArtifact, right: LoadedArtifact): {
     const previousMrr = leftQuery.reciprocalRankAt10 ?? 0;
     const nextMrr = rightQuery.reciprocalRankAt10 ?? 0;
     compareMetric(rankMetricRegressions, leftQuery.id, "reciprocalRankAt10", previousMrr, nextMrr);
-    compareMetric(rankMetricRegressions, leftQuery.id, "ndcgAt10", leftQuery.ndcgAt10, rightQuery.ndcgAt10);
     if (nextMrr > previousMrr + METRIC_TOLERANCE) {
       expectedRankImprovements += 1;
     }

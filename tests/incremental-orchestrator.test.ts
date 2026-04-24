@@ -1074,6 +1074,7 @@ describe("incremental index orchestrator", () => {
       primaryResults: [],
       expandedContext: [],
       taskType: "general",
+      subIntent: null,
       graphDirection: "both",
       timings: {
         prefilterMs: 0,

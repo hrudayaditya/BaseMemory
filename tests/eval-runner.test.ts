@@ -128,6 +128,36 @@ describe("eval runner", () => {
   });
 
   it("runs eval and writes required artifacts", async () => {
+    writeFileSync(
+      path.join(tempDir, ".opencode", "codebase-index.json"),
+      JSON.stringify(
+        {
+          embeddingProvider: "custom",
+          customProvider: {
+            baseUrl: "http://localhost:11434/v1",
+            model: "mock-embedding-model",
+            dimensions: 8,
+          },
+          indexing: {
+            watchFiles: false,
+          },
+          eval: {
+            useQueryTypes: true,
+          },
+          search: {
+            maxResults: 10,
+            minScore: 0,
+            fusionStrategy: "rrf",
+            rrfK: 60,
+            rerankTopN: 20,
+          },
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+
     const result = await runEvaluation({
       projectRoot: tempDir,
       datasetPath: "benchmarks/golden/small.json",
@@ -137,22 +167,72 @@ describe("eval runner", () => {
     });
 
     expect(result.summary.queryCount).toBe(1);
-    expect(result.summary.searchConfig.effectiveTaskType).toBe("general");
-    expect(result.summary.searchConfig.effectiveFinalRerankTopN).toBe(10);
-    expect(result.summary.searchConfig.effectiveGraphDepth).toBe(0);
+    expect(result.summary.searchConfig.effectiveTaskType).toBe("definition");
+    expect(result.summary.searchConfig.effectiveFinalRerankTopN).toBe(20);
+    expect(result.summary.searchConfig.effectiveGraphDepth).toBe(1);
     expect(readFileSync(path.join(result.outputDir, "summary.json"), "utf-8")).toContain("\"metrics\"");
     expect(readFileSync(path.join(result.outputDir, "summary.md"), "utf-8")).toContain("# Evaluation Summary");
     expect(readFileSync(path.join(result.outputDir, "per-query.json"), "utf-8")).toContain("\"queries\"");
     const perQueryArtifact = JSON.parse(readFileSync(path.join(result.outputDir, "per-query.json"), "utf-8")) as {
-      queries: Array<{ prefilterMs?: number; results: Array<{ scoreBreakdown?: unknown }> }>;
+      queries: Array<{ prefilterMs?: number; subIntent?: string | null; results: Array<{ scoreBreakdown?: { fusion?: { subIntent?: string | null } } }> }>;
     };
     expect(perQueryArtifact.queries[0]?.prefilterMs).toBeDefined();
+    expect(perQueryArtifact.queries[0]?.subIntent).toBe("definition:executable");
     expect(perQueryArtifact.queries[0]?.results[0]?.scoreBreakdown).toEqual(expect.objectContaining({
       lanes: expect.any(Object),
-      fusion: expect.any(Object),
+      fusion: expect.objectContaining({
+        subIntent: "definition:executable",
+      }),
       stages: expect.any(Array),
       finalScore: expect.any(Number),
     }));
+  });
+
+  it("writes subIntent alongside effectiveTaskType in the per-query artifact", async () => {
+    writeFileSync(
+      path.join(tempDir, ".opencode", "codebase-index.json"),
+      JSON.stringify(
+        {
+          embeddingProvider: "custom",
+          customProvider: {
+            baseUrl: "http://localhost:11434/v1",
+            model: "mock-embedding-model",
+            dimensions: 8,
+          },
+          indexing: {
+            watchFiles: false,
+          },
+          eval: {
+            useQueryTypes: true,
+          },
+          search: {
+            maxResults: 10,
+            minScore: 0,
+            fusionStrategy: "rrf",
+            rrfK: 60,
+            rerankTopN: 20,
+          },
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+
+    const result = await runEvaluation({
+      projectRoot: tempDir,
+      datasetPath: "benchmarks/golden/small.json",
+      outputRoot: "benchmarks/results",
+      ciMode: false,
+      reindex: false,
+    });
+
+    const perQueryArtifact = JSON.parse(readFileSync(path.join(result.outputDir, "per-query.json"), "utf-8")) as {
+      queries: Array<{ effectiveTaskType?: string; subIntent?: string | null }>;
+    };
+
+    expect(perQueryArtifact.queries[0]?.effectiveTaskType).toBe("definition");
+    expect(perQueryArtifact.queries[0]?.subIntent).toBe("definition:executable");
   });
 
   it("uses the general task type for all eval queries when useQueryTypes is false", async () => {
