@@ -115,7 +115,7 @@ fn classify_python_type_alias(node: Node<'_>, source: &str) -> Option<SemanticIn
     })
 }
 
-fn classify_python_docstring(node: Node<'_>) -> Option<SemanticInfo> {
+fn classify_python_docstring(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
     if !is_python_docstring_statement(node) {
         return None;
     }
@@ -139,8 +139,19 @@ fn classify_python_docstring(node: Node<'_>) -> Option<SemanticInfo> {
         }
     }
 
+    let owner_name = match parent.kind() {
+        "function_definition" | "class_definition" => {
+            extract_name_by_fields(parent, source, &["name"])
+        }
+        "block" => parent
+            .parent()
+            .filter(|ancestor| matches!(ancestor.kind(), "function_definition" | "class_definition"))
+            .and_then(|ancestor| extract_name_by_fields(ancestor, source, &["name"])),
+        _ => None,
+    };
+
     Some(SemanticInfo {
-        symbol_name: None,
+        symbol_name: owner_name,
         symbol_aliases: Vec::new(),
         symbol_kind: Some(SymbolKind::Block),
         chunk_kind: ChunkKind::Doc,
@@ -216,7 +227,7 @@ fn classify_python_node(node: Node<'_>, source: &str) -> Option<SemanticInfo> {
         }),
         "assignment" => classify_python_assignment(node, source),
         "type_alias_statement" => classify_python_type_alias(node, source),
-        "expression_statement" => classify_python_docstring(node),
+        "expression_statement" => classify_python_docstring(node, source),
         "decorated_definition" => {
             let target = node
                 .child_by_field_name("definition")

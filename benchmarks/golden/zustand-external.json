@@ -1,0 +1,402 @@
+{
+  "version": "1.0.0",
+  "name": "zustand-external",
+  "description": "40-query external benchmark for Zustand",
+  "queries": [
+    {
+      "id": "zustand-def-vanilla-factory",
+      "source": "curated",
+      "query": "where is `createStoreImpl` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/vanilla.ts",
+        "symbol": "createStoreImpl"
+      }
+    },
+    {
+      "id": "zustand-def-state-updater",
+      "source": "curated",
+      "query": "where is `setState` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/vanilla.ts",
+        "symbol": "setState"
+      }
+    },
+    {
+      "id": "zustand-def-react-hook",
+      "source": "curated",
+      "query": "where is `useStore` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/react.ts",
+        "symbol": "useStore"
+      }
+    },
+    {
+      "id": "zustand-def-bound-store-builder",
+      "source": "curated",
+      "query": "where is `createImpl` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/react.ts",
+        "symbol": "createImpl"
+      }
+    },
+    {
+      "id": "zustand-def-equality-hook",
+      "source": "curated",
+      "query": "where is `useStoreWithEqualityFn` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/traditional.ts",
+        "symbol": "useStoreWithEqualityFn"
+      }
+    },
+    {
+      "id": "zustand-def-equality-factory",
+      "source": "curated",
+      "query": "where is `createWithEqualityFnImpl` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/traditional.ts",
+        "symbol": "createWithEqualityFnImpl"
+      }
+    },
+    {
+      "id": "zustand-def-json-storage-wrapper",
+      "source": "curated",
+      "query": "where is `createJSONStorage` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/middleware/persist.ts",
+        "symbol": "createJSONStorage"
+      }
+    },
+    {
+      "id": "zustand-def-persist-middleware",
+      "source": "curated",
+      "query": "where is `persistImpl` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/middleware/persist.ts",
+        "symbol": "persistImpl"
+      }
+    },
+    {
+      "id": "zustand-def-devtools-middleware",
+      "source": "curated",
+      "query": "where is `devtoolsImpl` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/middleware/devtools.ts",
+        "symbol": "devtoolsImpl"
+      }
+    },
+    {
+      "id": "zustand-def-redux-middleware",
+      "source": "curated",
+      "query": "where is `reduxImpl` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/middleware/redux.ts",
+        "symbol": "reduxImpl"
+      }
+    },
+    {
+      "id": "zustand-def-selector-subscribe",
+      "source": "curated",
+      "query": "where is `subscribeWithSelectorImpl` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/middleware/subscribeWithSelector.ts",
+        "symbol": "subscribeWithSelectorImpl"
+      }
+    },
+    {
+      "id": "zustand-def-shallow-compare",
+      "source": "curated",
+      "query": "where is `shallow` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/vanilla/shallow.ts",
+        "symbol": "shallow"
+      }
+    },
+    {
+      "id": "zustand-rel-react-create-calls-vanilla",
+      "source": "curated",
+      "query": "what function in the react binding constructs the underlying vanilla store instance",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/react.ts",
+        "symbol": "createImpl"
+      }
+    },
+    {
+      "id": "zustand-rel-traditional-create-calls-vanilla",
+      "source": "curated",
+      "query": "what function in the traditional api builds a store before wrapping it with selector equality support",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/traditional.ts",
+        "symbol": "createWithEqualityFnImpl"
+      }
+    },
+    {
+      "id": "zustand-rel-overload-dispatch",
+      "source": "curated",
+      "query": "where does the exported vanilla creator choose between immediate initialization and curried usage",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/vanilla.ts",
+        "symbol": "createStore"
+      }
+    },
+    {
+      "id": "zustand-rel-persist-default-storage",
+      "source": "curated",
+      "query": "which function initializes persistence by creating a default json localStorage adapter",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/middleware/persist.ts",
+        "symbol": "persistImpl"
+      }
+    },
+    {
+      "id": "zustand-rel-persist-thenable-use",
+      "source": "curated",
+      "query": "what function uses the thenable helper to normalize sync and async hydration reads",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/middleware/persist.ts",
+        "symbol": "persistImpl"
+      }
+    },
+    {
+      "id": "zustand-rel-devtools-connection-info",
+      "source": "curated",
+      "query": "what function asks for tracked or untracked devtools connection metadata before wiring listeners",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/middleware/devtools.ts",
+        "symbol": "devtoolsImpl"
+      }
+    },
+    {
+      "id": "zustand-rel-devtools-json-parser-caller",
+      "source": "curated",
+      "query": "what function invokes the json parsing helper when handling incoming redux devtools messages",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/middleware/devtools.ts",
+        "symbol": "devtoolsImpl"
+      }
+    },
+    {
+      "id": "zustand-rel-redux-dispatch-set",
+      "source": "curated",
+      "query": "where is reducer dispatch translated into a set call with the dispatched action metadata",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/middleware/redux.ts",
+        "symbol": "reduxImpl"
+      }
+    },
+    {
+      "id": "zustand-concept-initial-state-retention",
+      "source": "curated",
+      "query": "where is the original initial state captured so it can be returned later even after updates",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/vanilla.ts",
+        "symbol": "getInitialState"
+      }
+    },
+    {
+      "id": "zustand-concept-listener-lifecycle",
+      "source": "curated",
+      "query": "where is listener registration and unsubscribe cleanup handled for store subscriptions",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/vanilla.ts",
+        "symbol": "subscribe"
+      }
+    },
+    {
+      "id": "zustand-concept-sync-external-store",
+      "source": "curated",
+      "query": "where does the react integration subscribe and read selected snapshots through sync external store",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/react.ts",
+        "symbol": "useStore"
+      }
+    },
+    {
+      "id": "zustand-concept-selector-cache",
+      "source": "curated",
+      "query": "where is previous selector output cached so equal selections can reuse the prior reference",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/react/shallow.ts",
+        "symbol": "useShallow"
+      }
+    },
+    {
+      "id": "zustand-concept-iterable-shallow",
+      "source": "curated",
+      "query": "where is map-like entry comparison implemented for iterable shallow equality checks",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/vanilla/shallow.ts",
+        "symbol": "compareEntries"
+      }
+    },
+    {
+      "id": "zustand-concept-hydration-race-guard",
+      "source": "curated",
+      "query": "where are concurrent persistence hydration races prevented using a version counter",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/middleware/persist.ts",
+        "symbol": "hydrate"
+      }
+    },
+    {
+      "id": "zustand-concept-migration-on-version-mismatch",
+      "source": "curated",
+      "query": "where is persisted state migration performed when stored version differs from configured version",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/middleware/persist.ts",
+        "symbol": "hydrate"
+      }
+    },
+    {
+      "id": "zustand-concept-devtools-caller-label",
+      "source": "curated",
+      "query": "where does devtools derive an action label from the caller stack when no explicit action name is provided",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/middleware/devtools.ts",
+        "symbol": "findCallerName"
+      }
+    },
+    {
+      "id": "zustand-concept-devtools-multi-store-state",
+      "source": "curated",
+      "query": "where is combined state built for all tracked stores sharing one devtools connection",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/middleware/devtools.ts",
+        "symbol": "getTrackedConnectionState"
+      }
+    },
+    {
+      "id": "zustand-concept-immer-function-updater",
+      "source": "curated",
+      "query": "where are function updaters converted through immer produce before setting state",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/middleware/immer.ts",
+        "symbol": "immerImpl"
+      }
+    },
+    {
+      "id": "zustand-bug-ssr-set-state-throw",
+      "source": "curated",
+      "query": "where does zustand throw when code attempts to update store state during server-side rendering mode",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "src/middleware/ssrSafe.ts",
+        "symbol": "ssrSet"
+      }
+    },
+    {
+      "id": "zustand-bug-persist-storage-unavailable-warn",
+      "source": "curated",
+      "query": "where is the warning emitted when persist middleware cannot access the configured storage backend",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "src/middleware/persist.ts",
+        "symbol": "persistImpl"
+      }
+    },
+    {
+      "id": "zustand-bug-persist-migrate-missing-error",
+      "source": "curated",
+      "query": "where is the error logged when persisted state version mismatches and no migration function exists",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "src/middleware/persist.ts",
+        "symbol": "hydrate"
+      }
+    },
+    {
+      "id": "zustand-bug-devtools-action-format-error",
+      "source": "curated",
+      "query": "where is the unsupported action format error handled for incoming devtools action messages",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "src/middleware/devtools.ts",
+        "symbol": "devtoolsImpl"
+      }
+    },
+    {
+      "id": "zustand-bug-devtools-json-parse-error",
+      "source": "curated",
+      "query": "where is invalid json from redux devtools caught and logged",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "src/middleware/devtools.ts",
+        "symbol": "parseJsonThen"
+      }
+    },
+    {
+      "id": "zustand-test-store-construction",
+      "source": "curated",
+      "query": "what test file verifies that creating a vanilla store exposes getState setState getInitialState and subscribe",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/vanilla/basic.test.ts"
+      }
+    },
+    {
+      "id": "zustand-test-nan-no-update",
+      "source": "curated",
+      "query": "where are tests that confirm setting NaN to NaN does not notify subscribers",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/vanilla/basic.test.ts"
+      }
+    },
+    {
+      "id": "zustand-test-replace-without-merge",
+      "source": "curated",
+      "query": "what tests cover replacing state without object merging by passing the replace flag",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/vanilla/basic.test.ts"
+      }
+    },
+    {
+      "id": "zustand-test-null-state-support",
+      "source": "curated",
+      "query": "where are null assignment behaviors tested for both object and primitive store states",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/vanilla/basic.test.ts"
+      }
+    },
+    {
+      "id": "zustand-test-state-accessors",
+      "source": "curated",
+      "query": "what test file checks reading current state through both injected get and store.getState",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/vanilla/basic.test.ts"
+      }
+    }
+  ]
+}

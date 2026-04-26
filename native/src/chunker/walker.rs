@@ -96,6 +96,10 @@ impl<'a> WalkerContext<'a> {
             .map(|text| exceeds_budget(text, self.config))
             .unwrap_or(true)
     }
+
+    fn range_exceeds_hard_max(&self, start: usize, end: usize) -> bool {
+        self.range_non_whitespace_len(start, end) > self.config.max_chunk_chars_usize()
+    }
 }
 
 fn build_line_index(source: &str) -> Vec<usize> {
@@ -320,6 +324,38 @@ fn emit_gap(ctx: &WalkerContext<'_>, start: usize, end: usize, chunks: &mut Vec<
 
 fn is_js_like_language(language: &str) -> bool {
     matches!(language, "typescript" | "tsx" | "javascript" | "jsx")
+}
+
+fn supports_semantic_parent_header_gap(language: &str) -> bool {
+    is_js_like_language(language) || language == "python"
+}
+
+fn is_python_function_symbol(symbol_kind: Option<SymbolKind>) -> bool {
+    matches!(
+        symbol_kind,
+        Some(SymbolKind::Function) | Some(SymbolKind::Method) | Some(SymbolKind::Test)
+    )
+}
+
+fn capped_python_header_end(ctx: &WalkerContext<'_>, start: usize, end: usize) -> usize {
+    let max_chars = ctx.config.max_chunk_chars_usize().max(1);
+    let Some(text) = ctx.source.get(start..end) else {
+        return end;
+    };
+
+    let mut non_whitespace = 0usize;
+    let mut boundary = start;
+    for (offset, ch) in text.char_indices() {
+        if !ch.is_whitespace() {
+            non_whitespace += 1;
+            if non_whitespace > max_chars {
+                break;
+            }
+        }
+        boundary = start + offset + ch.len_utf8();
+    }
+
+    boundary.max(start).min(end)
 }
 
 fn extract_display_name_target(node: Node<'_>, source: &str) -> Option<String> {
@@ -616,22 +652,61 @@ fn split_oversized_leaf_node_by_statements(
 
 fn try_emit_semantic_parent_header_gap(
     ctx: &WalkerContext<'_>,
+    node: Node<'_>,
     cursor: usize,
     first_start: usize,
     template: &PendingChunk,
     chunks: &mut Vec<PendingChunk>,
-) -> bool {
-    if !is_js_like_language(ctx.language)
+) -> Option<usize> {
+    if !supports_semantic_parent_header_gap(ctx.language)
         || !chunks.is_empty()
         || template.symbol_name.is_none()
-        || template.symbol_kind != Some(SymbolKind::Class)
     {
-        return false;
+        return None;
     }
 
-    let header_text = ctx.slice(cursor, first_start).unwrap_or("");
-    if !header_text.contains("class ") || header_text.contains("export class") {
-        return false;
+    let header_end = if ctx.language == "python" {
+        if !ctx.range_exceeds_hard_max(template.start_byte, template.end_byte) {
+            return None;
+        }
+
+        match template.symbol_kind {
+            Some(SymbolKind::Class) => {
+                let header_text = ctx.slice(cursor, first_start).unwrap_or("");
+                if !header_text.contains("class ") {
+                    return None;
+                }
+                first_start
+            }
+            Some(SymbolKind::Function) | Some(SymbolKind::Method) | Some(SymbolKind::Test) => {
+                let body_start = node.child_by_field_name("body")?.start_byte();
+                if body_start <= cursor {
+                    return None;
+                }
+
+                let header_end = capped_python_header_end(ctx, cursor, body_start);
+                let header_text = ctx.slice(cursor, header_end).unwrap_or("");
+                if !header_text.contains("def ") {
+                    return None;
+                }
+                header_end
+            }
+            _ => return None,
+        }
+    } else {
+        if template.symbol_kind != Some(SymbolKind::Class) {
+            return None;
+        }
+
+        let header_text = ctx.slice(cursor, first_start).unwrap_or("");
+        if !header_text.contains("class ") || header_text.contains("export class") {
+            return None;
+        }
+        first_start
+    };
+
+    if header_end <= cursor {
+        return None;
     }
 
     chunks.push(PendingChunk {
@@ -642,9 +717,9 @@ fn try_emit_semantic_parent_header_gap(
         delegate_target_name: template.delegate_target_name.clone(),
         granularity: Granularity::Fine,
         start_byte: cursor,
-        end_byte: first_start,
+        end_byte: header_end,
     });
-    true
+    Some(header_end)
 }
 
 fn classify_statement_group_kind(
@@ -695,7 +770,13 @@ fn build_semantic_chunk(
     let node_start = attached_start(ctx, node);
     let node_end = node.end_byte();
     let split_children = find_split_children(ctx, node);
-    let should_prefer_children = info.coarse_eligible && !split_children.is_empty();
+    let is_oversized = ctx.range_exceeds_budget(node_start, node_end);
+    let is_hard_oversized = ctx.range_exceeds_hard_max(node_start, node_end);
+    let should_prefer_children = info.coarse_eligible
+        && !split_children.is_empty()
+        && !(ctx.language == "python"
+            && is_python_function_symbol(info.symbol_kind)
+            && !is_hard_oversized);
 
     let template = PendingChunk {
         symbol_name: info.symbol_name,
@@ -708,7 +789,7 @@ fn build_semantic_chunk(
         end_byte: node_end,
     };
 
-    if !ctx.range_exceeds_budget(node_start, node_end) && !should_prefer_children {
+    if !is_oversized && !should_prefer_children {
         return vec![PendingChunk {
             symbol_name: template.symbol_name,
             symbol_aliases: template.symbol_aliases,
@@ -782,17 +863,27 @@ fn build_semantic_chunk(
                 )
             {
             } else {
-                if !try_emit_semantic_parent_header_gap(
+                if let Some(header_end) = try_emit_semantic_parent_header_gap(
                     ctx,
+                    node,
                     cursor,
                     first_start,
                     &template,
                     &mut chunks,
-                ) && !try_attach_display_name_gap(ctx, node, cursor, first_start, &mut chunks)
-                {
+                ) {
+                    cursor = header_end;
+                } else if !try_attach_display_name_gap(ctx, node, cursor, first_start, &mut chunks) {
                     emit_gap(ctx, cursor, first_start, &mut chunks);
                 }
             }
+        }
+
+        child_chunks.retain(|chunk| chunk.end_byte > cursor);
+        if child_chunks.is_empty() {
+            continue;
+        }
+        if child_chunks[0].start_byte < cursor {
+            child_chunks[0].start_byte = cursor;
         }
 
         let child_end = child_chunks

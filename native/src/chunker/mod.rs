@@ -929,7 +929,7 @@ def my_fixture():
         return cls
 "#;
 
-        let chunks = chunk_file("example.py", "python", source, &ChunkConfig::default())
+        let chunks = chunk_file("example.py", "python", &source, &ChunkConfig::default())
             .unwrap_or_else(|err| panic!("{err}"));
         let method_chunk = named_fine_chunk(&chunks, "foo");
 
@@ -1323,17 +1323,26 @@ VALUE = 1
             .unwrap_or_else(|| panic!("missing module doc chunk"));
 
         assert_eq!(doc_chunk.symbol_kind, Some(SymbolKind::Block));
+        assert_eq!(doc_chunk.symbol_name, None);
         assert!(doc_chunk.text.contains("This module does X."));
     }
 
     #[test]
     fn captures_function_level_python_docstrings_as_doc_chunks() {
-        let source = r#"def render():
-    """Render docs."""
-    return "ok"
-"#;
+        let params = (0..30)
+            .map(|index| {
+                format!(
+                    "    arg_{index}: Annotated[str, \"{}\"] = \"{}\",\n",
+                    "payload".repeat(10),
+                    index
+                )
+            })
+            .collect::<String>();
+        let source = format!(
+            "def render(\n{params}) -> str:\n    \"\"\"Render docs.\"\"\"\n    return \"ok\"\n"
+        );
 
-        let chunks = chunk_file("example.py", "python", source, &ChunkConfig::default())
+        let chunks = chunk_file("example.py", "python", &source, &ChunkConfig::default())
             .unwrap_or_else(|err| panic!("{err}"));
         let doc_chunk = chunks
             .iter()
@@ -1345,6 +1354,7 @@ VALUE = 1
             .unwrap_or_else(|| panic!("missing function doc chunk"));
 
         assert_eq!(doc_chunk.symbol_kind, Some(SymbolKind::Block));
+        assert_eq!(doc_chunk.symbol_name.as_deref(), Some("render"));
     }
 
     #[test]
@@ -1356,7 +1366,7 @@ VALUE = 1
         return 1
 "#;
 
-        let chunks = chunk_file("example.py", "python", source, &ChunkConfig::default())
+        let chunks = chunk_file("example.py", "python", &source, &ChunkConfig::default())
             .unwrap_or_else(|err| panic!("{err}"));
         let doc_chunk = chunks
             .iter()
@@ -1368,6 +1378,44 @@ VALUE = 1
             .unwrap_or_else(|| panic!("missing class doc chunk"));
 
         assert_eq!(doc_chunk.symbol_kind, Some(SymbolKind::Block));
+        assert_eq!(doc_chunk.symbol_name.as_deref(), Some("Example"));
+    }
+
+    #[test]
+    fn python_function_without_docstring_produces_no_doc_chunk() {
+        let source = r#"def render():
+    return "ok"
+"#;
+
+        let chunks = chunk_file("example.py", "python", &source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(!chunks.iter().any(|chunk| chunk.chunk_kind == ChunkKind::Doc));
+    }
+
+    #[test]
+    fn nested_python_function_docstring_uses_immediate_parent_name() {
+        let params = (0..30)
+            .map(|index| {
+                format!(
+                    "        arg_{index}: Annotated[str, \"{}\"] = \"{}\",\n",
+                    "payload".repeat(10),
+                    index
+                )
+            })
+            .collect::<String>();
+        let source = format!(
+            "class Outer:\n    def inner(\n{params}    ) -> str:\n        \"\"\"Inner docs.\"\"\"\n        return \"ok\"\n"
+        );
+
+        let chunks = chunk_file("example.py", "python", &source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let doc_chunk = chunks
+            .iter()
+            .find(|chunk| chunk.chunk_kind == ChunkKind::Doc && chunk.text.contains("Inner docs."))
+            .unwrap_or_else(|| panic!("missing nested function doc chunk"));
+
+        assert_eq!(doc_chunk.symbol_name.as_deref(), Some("inner"));
     }
 
     #[test]
@@ -1378,7 +1426,7 @@ VALUE = 1
     return value
 "#;
 
-        let chunks = chunk_file("example.py", "python", source, &ChunkConfig::default())
+        let chunks = chunk_file("example.py", "python", &source, &ChunkConfig::default())
             .unwrap_or_else(|err| panic!("{err}"));
 
         assert!(!chunks.iter().any(|chunk| {
@@ -2227,6 +2275,210 @@ export type { TRPCBuilder };
     }
 
     #[test]
+    fn large_python_class_emits_named_header_chunk_when_body_splits() {
+        let methods = (0..80)
+            .map(|index| {
+                format!(
+                    "    def method_{index}(self):\n        return \"{}\"\n\n",
+                    "payload".repeat(8)
+                )
+            })
+            .collect::<String>();
+        let source = format!("class FastAPI:\n{methods}");
+        let config = ChunkConfig {
+            target_token_budget: 48,
+            max_chunk_chars: 240,
+            min_chunk_chars: 80,
+            merge_small_siblings: true,
+            attach_comments: true,
+            emit_coarse_chunks: true,
+        };
+
+        let chunks = chunk_file("applications.py", "python", &source, &config)
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let class_chunk = named_fine_chunk(&chunks, "FastAPI");
+        assert_eq!(class_chunk.symbol_kind, Some(SymbolKind::Class));
+        assert!(class_chunk.text.contains("class FastAPI:"));
+        assert!(!class_chunk.text.contains("def method_0"));
+    }
+
+    #[test]
+    fn large_python_class_header_chunk_preserves_exact_class_name() {
+        let methods = (0..60)
+            .map(|index| format!("    def method_{index}(self):\n        return {index}\n\n"))
+            .collect::<String>();
+        let source = format!("class APIRouter:\n{methods}");
+        let config = ChunkConfig {
+            target_token_budget: 48,
+            max_chunk_chars: 220,
+            min_chunk_chars: 80,
+            merge_small_siblings: true,
+            attach_comments: true,
+            emit_coarse_chunks: true,
+        };
+
+        let chunks = chunk_file("routing.py", "python", &source, &config)
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let class_chunk = named_fine_chunk(&chunks, "APIRouter");
+        assert_eq!(class_chunk.symbol_name.as_deref(), Some("APIRouter"));
+        assert_eq!(class_chunk.symbol_kind, Some(SymbolKind::Class));
+        assert!(class_chunk.text.contains("class APIRouter:"));
+    }
+
+    #[test]
+    fn large_python_function_emits_named_header_chunk_when_signature_splits() {
+        let params = (0..2)
+            .map(|index| {
+                format!(
+                    "    arg_{index}: Annotated[str, \"{}\"] = \"{}\",\n",
+                    "payload".repeat(4),
+                    index
+                )
+            })
+            .collect::<String>();
+        let body = (0..40)
+            .map(|index| format!("    value_{index} = arg_0\n"))
+            .collect::<String>();
+        let source = format!(
+            "def jsonable_encoder(\n{params}) -> dict[str, str]:\n    \"\"\"Serialize annotated data.\"\"\"\n{body}    return {{\"ok\": \"yes\"}}\n"
+        );
+        let config = ChunkConfig {
+            target_token_budget: 48,
+            max_chunk_chars: 320,
+            min_chunk_chars: 80,
+            merge_small_siblings: true,
+            attach_comments: true,
+            emit_coarse_chunks: true,
+        };
+
+        let chunks = chunk_file("encoders.py", "python", &source, &config)
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let function_chunk = named_fine_chunk(&chunks, "jsonable_encoder");
+        assert_eq!(function_chunk.symbol_kind, Some(SymbolKind::Function));
+        assert!(function_chunk.text.contains("def jsonable_encoder("));
+        assert!(!function_chunk.text.contains("return {\"ok\": \"yes\"}"));
+    }
+
+    #[test]
+    fn small_python_function_is_unchanged() {
+        let source = r#"def request_response(name: str) -> str:
+    """Return a response."""
+    return name
+"#;
+
+        let chunks = chunk_file("routing.py", "python", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let function_chunk = named_fine_chunk(&chunks, "request_response");
+        assert_eq!(function_chunk.symbol_kind, Some(SymbolKind::Function));
+        assert!(function_chunk.text.contains("return name"));
+        assert_eq!(
+            fine_chunks(&chunks)
+                .iter()
+                .filter(|chunk| chunk.symbol_name.as_deref() == Some("request_response"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn large_python_function_without_docstring_keeps_signature_only_header() {
+        let params = (0..40)
+            .map(|index| {
+                format!(
+                    "    arg_{index}: Annotated[str, \"{}\"] = \"{}\",\n",
+                    "payload".repeat(12),
+                    index
+                )
+            })
+            .collect::<String>();
+        let source = format!(
+            "def get_body_field(\n{params}) -> str:\n    return \"body\"\n"
+        );
+        let config = ChunkConfig {
+            target_token_budget: 48,
+            max_chunk_chars: 240,
+            min_chunk_chars: 80,
+            merge_small_siblings: true,
+            attach_comments: true,
+            emit_coarse_chunks: true,
+        };
+
+        let chunks = chunk_file("dependencies.py", "python", &source, &config)
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let function_chunk = named_fine_chunk(&chunks, "get_body_field");
+        assert!(function_chunk.text.contains("def get_body_field("));
+        assert!(!function_chunk.text.contains("return \"body\""));
+    }
+
+    #[test]
+    fn large_python_method_emits_named_header_chunk_when_signature_splits() {
+        let params = (0..35)
+            .map(|index| {
+                format!(
+                    "        arg_{index}: Annotated[str, \"{}\"] = \"{}\",\n",
+                    "payload".repeat(10),
+                    index
+                )
+            })
+            .collect::<String>();
+        let source = format!(
+            "class FastAPI:\n    def request_response(\n{params}    ) -> str:\n        \"\"\"Build a request handler.\"\"\"\n        return \"ok\"\n"
+        );
+        let config = ChunkConfig {
+            target_token_budget: 48,
+            max_chunk_chars: 240,
+            min_chunk_chars: 80,
+            merge_small_siblings: true,
+            attach_comments: true,
+            emit_coarse_chunks: true,
+        };
+
+        let chunks = chunk_file("applications.py", "python", &source, &config)
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let method_chunk = named_fine_chunk(&chunks, "request_response");
+        assert_eq!(method_chunk.symbol_kind, Some(SymbolKind::Method));
+        assert!(method_chunk.text.contains("def request_response("));
+        assert!(!method_chunk.text.contains("return \"ok\""));
+    }
+
+    #[test]
+    fn large_python_function_header_chunk_preserves_exact_name() {
+        let params = (0..32)
+            .map(|index| {
+                format!(
+                    "    arg_{index}: Annotated[str, \"{}\"] = \"{}\",\n",
+                    "payload".repeat(10),
+                    index
+                )
+            })
+            .collect::<String>();
+        let source = format!(
+            "def format_sse_event(\n{params}) -> str:\n    \"\"\"Format an SSE event.\"\"\"\n    return \"event\"\n"
+        );
+        let config = ChunkConfig {
+            target_token_budget: 48,
+            max_chunk_chars: 240,
+            min_chunk_chars: 80,
+            merge_small_siblings: true,
+            attach_comments: true,
+            emit_coarse_chunks: true,
+        };
+
+        let chunks = chunk_file("sse.py", "python", &source, &config)
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let function_chunk = named_fine_chunk(&chunks, "format_sse_event");
+        assert_eq!(function_chunk.symbol_name.as_deref(), Some("format_sse_event"));
+        assert_eq!(function_chunk.symbol_kind, Some(SymbolKind::Function));
+    }
+
+    #[test]
     fn keeps_python_init_in_class_chunk() {
         let source = r#"class ClientError:
     def __init__(self, cause):
@@ -2244,6 +2496,49 @@ export type { TRPCBuilder };
             .iter()
             .any(|chunk| chunk.granularity == Granularity::Fine
                 && chunk.symbol_name.as_deref() == Some("__init__")));
+    }
+
+    #[test]
+    fn small_python_class_does_not_emit_named_header_chunk() {
+        let source = r#"class FastAPI:
+    def route(self):
+        return "ok"
+"#;
+
+        let chunks = chunk_file("applications.py", "python", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let fine: Vec<&Chunk> = fine_chunks(&chunks);
+        assert!(!fine
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("FastAPI")));
+        assert!(fine
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("route")));
+    }
+
+    #[test]
+    fn large_typescript_class_header_chunk_still_emits() {
+        let methods = (0..60)
+            .map(|index| format!("  method{index}() {{ return {index}; }}\n"))
+            .collect::<String>();
+        let source = format!("class APIRouter {{\n{methods}}}\n");
+        let config = ChunkConfig {
+            target_token_budget: 48,
+            max_chunk_chars: 220,
+            min_chunk_chars: 80,
+            merge_small_siblings: true,
+            attach_comments: true,
+            emit_coarse_chunks: true,
+        };
+
+        let chunks = chunk_file("routing.ts", "typescript", &source, &config)
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let class_chunk = named_fine_chunk(&chunks, "APIRouter");
+        assert_eq!(class_chunk.symbol_kind, Some(SymbolKind::Class));
+        assert!(class_chunk.text.contains("class APIRouter"));
+        assert!(!class_chunk.text.contains("method0()"));
     }
 
     #[test]

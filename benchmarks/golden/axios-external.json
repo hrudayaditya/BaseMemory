@@ -6,7 +6,7 @@
     {
       "id": "axios-def-interceptor-use",
       "source": "curated",
-      "query": "where is the class that stores interceptor handlers and whose registration api records fulfilled and rejected pairs in an ordered handler list",
+      "query": "where is `InterceptorManager` implemented",
       "queryType": "definition",
       "expected": {
         "filePath": "lib/core/InterceptorManager.js",
@@ -16,7 +16,7 @@
     {
       "id": "axios-def-merge-config",
       "source": "curated",
-      "query": "where is the routine that folds two request option objects into a fresh config for a single send",
+      "query": "where is `mergeConfig` implemented",
       "queryType": "definition",
       "expected": {
         "filePath": "lib/core/mergeConfig.js",
@@ -26,7 +26,7 @@
     {
       "id": "axios-def-transform-data",
       "source": "curated",
-      "query": "where is the helper that walks transformRequest or transformResponse callables with normalized headers",
+      "query": "where is `transformData` implemented",
       "queryType": "definition",
       "expected": {
         "filePath": "lib/core/transformData.js",
@@ -36,7 +36,7 @@
     {
       "id": "axios-def-dispatch-request",
       "source": "curated",
-      "query": "where is the core routine that normalizes headers runs outbound transforms then hands off to the transport layer",
+      "query": "where is `dispatchRequest` implemented",
       "queryType": "definition",
       "expected": {
         "filePath": "lib/core/dispatchRequest.js",
@@ -46,7 +46,7 @@
     {
       "id": "axios-def-settle",
       "source": "curated",
-      "query": "where is the small helper that resolves or rejects based on validateStatus and http status",
+      "query": "where is `settle` defined",
       "queryType": "definition",
       "expected": {
         "filePath": "lib/core/settle.js",
@@ -56,7 +56,7 @@
     {
       "id": "axios-def-build-full-path",
       "source": "curated",
-      "query": "where is the function that joins base url with relative path while honoring allow absolute urls",
+      "query": "where is `buildFullPath` implemented",
       "queryType": "definition",
       "expected": {
         "filePath": "lib/core/buildFullPath.js",
@@ -66,7 +66,7 @@
     {
       "id": "axios-def-combine-urls",
       "source": "curated",
-      "query": "where is the helper that concatenates a base path string with a relative path segment",
+      "query": "where is `combineURLs` defined",
       "queryType": "definition",
       "expected": {
         "filePath": "lib/helpers/combineURLs.js",
@@ -76,7 +76,7 @@
     {
       "id": "axios-def-is-absolute-url",
       "source": "curated",
-      "query": "where is the predicate that decides if a string url already includes a scheme or protocol relative slashes",
+      "query": "where is `isAbsoluteURL` defined",
       "queryType": "definition",
       "expected": {
         "filePath": "lib/helpers/isAbsoluteURL.js",
@@ -86,7 +86,7 @@
     {
       "id": "axios-def-axios-error-class",
       "source": "curated",
-      "query": "where is the structured error type that carries config request response and static error code constants",
+      "query": "where is `AxiosError` defined",
       "queryType": "definition",
       "expected": {
         "filePath": "lib/core/AxiosError.js",
@@ -96,7 +96,7 @@
     {
       "id": "axios-def-axios-headers-class",
       "source": "curated",
-      "query": "where is the case insensitive header bag class with concat set and normalization helpers",
+      "query": "where is `AxiosHeaders` defined",
       "queryType": "definition",
       "expected": {
         "filePath": "lib/core/AxiosHeaders.js",
@@ -106,7 +106,7 @@
     {
       "id": "axios-def-bind-helper",
       "source": "curated",
-      "query": "where is the tiny helper that returns a wrapper calling a function with a fixed this context",
+      "query": "where is the `bind` function defined",
       "queryType": "definition",
       "expected": {
         "filePath": "lib/helpers/bind.js",
@@ -116,7 +116,7 @@
     {
       "id": "axios-def-cancel-token-class",
       "source": "curated",
-      "query": "where is the legacy cancellation object that exposes subscribe unsubscribe and an abort signal bridge",
+      "query": "where is `CancelToken` defined",
       "queryType": "definition",
       "expected": {
         "filePath": "lib/cancel/CancelToken.js",

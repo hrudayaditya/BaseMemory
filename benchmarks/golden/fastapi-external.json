@@ -1,0 +1,402 @@
+{
+  "version": "1.0.0",
+  "name": "fastapi-external",
+  "description": "40-query external benchmark for FastAPI",
+  "queries": [
+    {
+      "id": "fastapi-def-fastapi-class",
+      "source": "curated",
+      "query": "where is `FastAPI` class defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "fastapi/applications.py",
+        "symbol": "FastAPI"
+      }
+    },
+    {
+      "id": "fastapi-def-apirouter-class",
+      "source": "curated",
+      "query": "where is `APIRouter` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "fastapi/routing.py",
+        "symbol": "APIRouter"
+      }
+    },
+    {
+      "id": "fastapi-def-methods-with-body",
+      "source": "curated",
+      "query": "where is `METHODS_WITH_BODY` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "fastapi/openapi/constants.py",
+        "symbol": "METHODS_WITH_BODY"
+      }
+    },
+    {
+      "id": "fastapi-def-ref-template",
+      "source": "curated",
+      "query": "where is `REF_TEMPLATE` exported",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "fastapi/openapi/constants.py",
+        "symbol": "REF_TEMPLATE"
+      }
+    },
+    {
+      "id": "fastapi-def-create-model-field",
+      "source": "curated",
+      "query": "where is `create_model_field` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "fastapi/utils.py",
+        "symbol": "create_model_field"
+      }
+    },
+    {
+      "id": "fastapi-def-websocket-app-factory",
+      "source": "curated",
+      "query": "where is the websocket dependency app factory implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "fastapi/routing.py",
+        "symbol": "get_websocket_app"
+      }
+    },
+    {
+      "id": "fastapi-def-path-param-helper",
+      "source": "curated",
+      "query": "where is the helper that extracts path template parameter names defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "fastapi/utils.py",
+        "symbol": "get_path_param_names"
+      }
+    },
+    {
+  "id": "fastapi-def-deep-dict-update",
+  "source": "curated",
+  "query": "where is `deep_dict_update` defined",
+  "queryType": "definition",
+  "expected": {
+    "filePath": "fastapi/utils.py",
+    "symbol": "deep_dict_update"
+  }
+},
+    {
+  "id": "fastapi-def-oauth2-auth-error-builder",
+  "source": "curated",
+  "query": "where is `make_not_authenticated_error` defined",
+  "queryType": "definition",
+  "expected": {
+    "filePath": "fastapi/security/oauth2.py",
+    "symbol": "make_not_authenticated_error"
+  }
+},
+    {
+      "id": "fastapi-def-http-exception-handler",
+      "source": "curated",
+      "query": "where is `http_exception_handler` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "fastapi/exception_handlers.py",
+        "symbol": "http_exception_handler"
+      }
+    },
+    {
+      "id": "fastapi-def-decorated-callable-type",
+      "source": "curated",
+      "query": "where is `DecoratedCallable` type alias defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "fastapi/types.py",
+        "symbol": "DecoratedCallable"
+      }
+    },
+    {
+      "id": "fastapi-def-dependency-cache-key-type",
+      "source": "curated",
+      "query": "where is `DependencyCacheKey` type alias defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "fastapi/types.py",
+        "symbol": "DependencyCacheKey"
+      }
+    },
+    {
+      "id": "fastapi-rel-route-handler-adapter",
+      "source": "curated",
+      "query": "which function wraps endpoint coroutine handlers into a Request ASGI callable",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "fastapi/routing.py",
+        "symbol": "get_request_handler"
+      }
+    },
+    {
+  "id": "fastapi-rel-default-priority-selector",
+  "source": "curated",
+  "query": "where is `get_value_or_default` defined",
+  "queryType": "definition",
+  "expected": {
+    "filePath": "fastapi/utils.py",
+    "symbol": "get_value_or_default"
+  }
+},
+    {
+      "id": "fastapi-rel-websocket-decorator-target",
+      "source": "curated",
+      "query": "which method does router.websocket delegate to for creating websocket routes",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "fastapi/routing.py",
+        "symbol": "add_api_websocket_route"
+      }
+    },
+    {
+      "id": "fastapi-rel-docs-script-json-escape",
+      "source": "curated",
+      "query": "what helper escapes JSON before embedding docs config inside HTML script tags",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "fastapi/openapi/docs.py",
+        "symbol": "_html_safe_json"
+      }
+    },
+    {
+      "id": "fastapi-rel-openapi-path-builder",
+      "source": "curated",
+      "query": "which builder converts an APIRoute into OpenAPI path operation structures",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "fastapi/openapi/utils.py",
+        "symbol": "get_openapi_path"
+      }
+    },
+    {
+      "id": "fastapi-rel-auth-header-splitter",
+      "source": "curated",
+      "query": "which helper is shared by HTTP auth classes to split authorization header",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "fastapi/security/utils.py",
+        "symbol": "get_authorization_scheme_param"
+      }
+    },
+    {
+      "id": "fastapi-rel-operation-id-source",
+      "source": "curated",
+      "query": "what function supplies default unique operation IDs during route construction",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "fastapi/utils.py",
+        "symbol": "generate_unique_id"
+      }
+    },
+    {
+      "id": "fastapi-rel-app-router-mount",
+      "source": "curated",
+      "query": "which application method mounts an APIRouter onto the main app",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "fastapi/applications.py",
+        "symbol": "include_router"
+      }
+    },
+    {
+      "id": "fastapi-concept-json-encoding-core",
+      "source": "curated",
+      "query": "where does FastAPI convert arbitrary objects into JSON-compatible data",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "fastapi/encoders.py",
+        "symbol": "jsonable_encoder"
+      }
+    },
+    {
+      "id": "fastapi-concept-sse-wire-format",
+      "source": "curated",
+      "query": "where are server-sent events formatted into SSE wire bytes",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "fastapi/sse.py",
+        "symbol": "format_sse_event"
+      }
+    },
+    {
+      "id": "fastapi-concept-openapi-root-generator",
+      "source": "curated",
+      "query": "where is the full OpenAPI schema document assembled from routes",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "fastapi/openapi/utils.py",
+        "symbol": "get_openapi"
+      }
+    },
+    {
+      "id": "fastapi-concept-operation-metadata-builder",
+      "source": "curated",
+      "query": "where are operation tags summary and operationId metadata computed",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "fastapi/openapi/utils.py",
+        "symbol": "get_openapi_operation_metadata"
+      }
+    },
+    {
+      "id": "fastapi-concept-security-scheme-extractor",
+      "source": "curated",
+      "query": "where are security requirements transformed into OpenAPI security definitions",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "fastapi/openapi/utils.py",
+        "symbol": "get_openapi_security_definitions"
+      }
+    },
+    {
+      "id": "fastapi-concept-query-header-parser",
+      "source": "curated",
+      "query": "where are request query and header multidicts converted into typed parameters",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "fastapi/dependencies/utils.py",
+        "symbol": "request_params_to_args"
+      }
+    },
+    {
+      "id": "fastapi-concept-body-field-ownership",
+      "source": "curated",
+      "query": "where does dependency analysis decide the unified request body model field",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "fastapi/dependencies/utils.py",
+        "symbol": "get_body_field"
+      }
+    },
+    {
+      "id": "fastapi-concept-websocket-validation-close",
+      "source": "curated",
+      "query": "where are websocket validation errors converted into policy-violation close frames",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "fastapi/exception_handlers.py",
+        "symbol": "websocket_request_validation_exception_handler"
+      }
+    },
+    {
+      "id": "fastapi-concept-encoder-dispatch-table",
+      "source": "curated",
+      "query": "where is the type-to-encoder mapping regrouped by encoder callable",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "fastapi/encoders.py",
+        "symbol": "generate_encoders_by_class_tuples"
+      }
+    },
+    {
+      "id": "fastapi-concept-signature-type-resolution",
+      "source": "curated",
+      "query": "where are callable signatures resolved with evaluated type annotations",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "fastapi/dependencies/utils.py",
+        "symbol": "get_typed_signature"
+      }
+    },
+    {
+      "id": "fastapi-bug-multipart-missing-runtimeerror",
+      "source": "curated",
+      "query": "where does form parsing setup raise when python-multipart is missing",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "fastapi/dependencies/utils.py",
+        "symbol": "ensure_multipart_is_installed"
+      }
+    },
+    {
+      "id": "fastapi-bug-response-not-awaited",
+      "source": "curated",
+      "query": "where is FastAPIError raised when dependency-yield flow leaves response unawaited",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "fastapi/routing.py",
+        "symbol": "request_response"
+      }
+    },
+    {
+      "id": "fastapi-bug-dependency-scope-conflict",
+      "source": "curated",
+      "query": "where does dependency graph building throw for request-scope depending on function-scope",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "fastapi/dependencies/utils.py",
+        "symbol": "get_dependant"
+      }
+    },
+    {
+      "id": "fastapi-bug-sse-data-raw-data-conflict",
+      "source": "curated",
+      "query": "where does SSE validation throw if both data and raw_data are set",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "fastapi/sse.py",
+        "symbol": "_check_data_exclusive"
+      }
+    },
+    {
+      "id": "fastapi-bug-httpbasic-malformed-credentials",
+      "source": "curated",
+      "query": "where does HTTP Basic auth raise for malformed base64 credentials",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "fastapi/security/http.py",
+        "symbol": "__call__"
+      }
+    },
+    {
+      "id": "fastapi-test-unique-id-generation",
+      "source": "curated",
+      "query": "what tests cover custom operation ID generation behavior",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/test_generate_unique_id_function.py"
+      }
+    },
+    {
+      "id": "fastapi-test-multipart-install-checks",
+      "source": "curated",
+      "query": "what tests validate multipart dependency installation failure modes",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/test_multipart_installation.py"
+      }
+    },
+    {
+      "id": "fastapi-test-sse-formatting-stream",
+      "source": "curated",
+      "query": "what tests exercise SSE formatting and keepalive streaming behavior",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/test_sse.py"
+      }
+    },
+    {
+      "id": "fastapi-test-response-validation",
+      "source": "curated",
+      "query": "what tests cover response model validation error behavior",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/test_validate_response.py"
+      }
+    },
+    {
+      "id": "fastapi-test-httpbasic-realm",
+      "source": "curated",
+      "query": "what tests verify HTTP Basic realm challenge headers",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/test_security_http_basic_realm.py"
+      }
+    }
+  ]
+}

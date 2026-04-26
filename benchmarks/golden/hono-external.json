@@ -6,7 +6,7 @@
     {
       "id": "hono-def-main-class",
       "source": "curated",
-      "query": "where is the main app class that wires the default routers defined",
+      "query": "where is `Hono` defined",
       "queryType": "definition",
       "expected": {
         "filePath": "src/hono.ts",
@@ -25,7 +25,7 @@
     {
       "id": "hono-def-request-context",
       "source": "curated",
-      "query": "where is the request context object implemented",
+      "query": "where is `context` implemented",
       "queryType": "definition",
       "expected": {
         "filePath": "src/context.ts",
@@ -35,7 +35,7 @@
     {
       "id": "hono-def-request-wrapper",
       "source": "curated",
-      "query": "where is the framework request wrapper class implemented",
+      "query": "where is `HonoRequest` defined",
       "queryType": "definition",
       "expected": {
         "filePath": "src/request.ts",
@@ -45,7 +45,7 @@
     {
       "id": "hono-def-clone-raw-request",
       "source": "curated",
-      "query": "where is the helper that clones a consumed request body implemented",
+      "query": "where is `cloneRawRequest` implemented",
       "queryType": "definition",
       "expected": {
         "filePath": "src/request.ts",
@@ -55,7 +55,7 @@
     {
       "id": "hono-def-http-exception",
       "source": "curated",
-      "query": "where is the custom http exception type implemented",
+      "query": "where is `HTTPException` defined",
       "queryType": "definition",
       "expected": {
         "filePath": "src/http-exception.ts",
@@ -65,7 +65,7 @@
     {
       "id": "hono-def-validator-middleware",
       "source": "curated",
-      "query": "where is the generic request validation middleware implemented",
+      "query": "where is `validator` implemented",
       "queryType": "definition",
       "expected": {
         "filePath": "src/validator/validator.ts",
@@ -75,7 +75,7 @@
     {
       "id": "hono-def-basic-auth-middleware",
       "source": "curated",
-      "query": "where is the basic authentication middleware implemented",
+      "query": "where is `basicAuth` implemented",
       "queryType": "definition",
       "expected": {
         "filePath": "src/middleware/basic-auth/index.ts",
@@ -85,7 +85,7 @@
     {
       "id": "hono-def-jwt-middleware",
       "source": "curated",
-      "query": "where is the jwt authentication middleware implemented",
+      "query": "where is `jwt` implemented",
       "queryType": "definition",
       "expected": {
         "filePath": "src/middleware/jwt/jwt.ts",
@@ -95,7 +95,7 @@
     {
       "id": "hono-def-jwk-middleware",
       "source": "curated",
-      "query": "where is the jwk-based auth middleware implemented",
+      "query": "where is `jwk` implemented",
       "queryType": "definition",
       "expected": {
         "filePath": "src/middleware/jwk/jwk.ts",
@@ -105,7 +105,7 @@
     {
       "id": "hono-def-proxy-helper",
       "source": "curated",
-      "query": "where is the proxy fetch helper implemented",
+      "query": "where is `proxy` implemented",
       "queryType": "definition",
       "expected": {
         "filePath": "src/helper/proxy/index.ts",
@@ -115,7 +115,7 @@
     {
       "id": "hono-def-smart-router",
       "source": "curated",
-      "query": "where is the router that picks between routing strategies implemented",
+      "query": "where is `SmartRouter` defined",
       "queryType": "definition",
       "expected": {
         "filePath": "src/router/smart-router/router.ts",

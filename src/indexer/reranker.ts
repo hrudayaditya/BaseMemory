@@ -707,6 +707,7 @@ export class SearchReranker {
           failedBackend,
         };
       } catch (error) {
+        console.error('[reranker] Jina API failure:', getErrorMessage(error)); // ADD THIS LINE
         failedBackend = backend.name;
         if (backend instanceof JinaApiRerankerBackend) {
           this.reportHealth?.({
