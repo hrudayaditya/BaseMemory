@@ -569,6 +569,7 @@ export interface SearchOptions {
   taskType?: SearchTaskType;
   graphDepth?: number;
   graphDirection?: GraphExpansionDirection;
+  relationshipIntent?: boolean;
   includeScoreBreakdown?: boolean;
 }
 
@@ -6422,17 +6423,23 @@ export class Indexer {
     const filtered = taskType === "semantic"
       ? preferEarlierNamedChunkSlices(filteredWithDefinitionPolicy)
       : filteredWithDefinitionPolicy;
-    const relationshipGraphAugmented = injectRelationshipGraphCandidates(
-      query,
-      filtered,
-      database,
-      branch,
-      graphDepth,
-      graphDirection,
-      metadataAllowedChunkIds,
-      taskType,
-      includeScoreBreakdown
-    );
+    const shouldInjectGraph =
+      taskType !== "definition" ||
+      options?.graphDirection != null ||
+      options?.relationshipIntent === true;
+    const relationshipGraphAugmented = shouldInjectGraph
+      ? injectRelationshipGraphCandidates(
+          query,
+          filtered,
+          database,
+          branch,
+          graphDepth,
+          graphDirection,
+          metadataAllowedChunkIds,
+          taskType,
+          includeScoreBreakdown
+        )
+      : filtered;
     const callerChunkTexts = await this.batchFetchStoredChunkTexts(
       relationshipGraphAugmented.map((candidate) => candidate.metadata.hash)
     );

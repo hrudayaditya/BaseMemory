@@ -421,6 +421,7 @@ async function finalizeEvaluationRun(
       filterByBranch: queryPlan.filterByBranch,
       taskType: queryPlan.taskType,
       graphDepth: queryPlan.graphDepth,
+      relationshipIntent: query.queryType === "cross-file-relationship",
       finalRerankTopN: queryPlan.finalRerankTopN,
       bm25Weight: queryPlan.bm25Weight,
       denseWeight: queryPlan.denseWeight,

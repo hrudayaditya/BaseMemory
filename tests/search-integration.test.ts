@@ -113,6 +113,24 @@ describe("search integration", () => {
     });
   }
 
+  async function createSplitGraphIndexer(rootDir: string): Promise<Indexer> {
+    fs.mkdirSync(path.join(rootDir, "app", "split-graph"), { recursive: true });
+    fs.writeFileSync(
+      path.join(rootDir, "app", "split-graph", "metrics.ts"),
+      `export function computeMetrics(values: number[]) {\n  return values.reduce((total, value) => total + value, 0);\n}\n`,
+      "utf-8"
+    );
+    fs.writeFileSync(
+      path.join(rootDir, "app", "split-graph", "runner.ts"),
+      `import { computeMetrics } from "./metrics";\n\nexport function runMetrics(values: number[]) {\n  return computeMetrics(values);\n}\n`,
+      "utf-8"
+    );
+
+    const indexer = new Indexer(rootDir, createSearchTestConfig());
+    await indexer.index();
+    return indexer;
+  }
+
   beforeEach(() => {
     fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy.mockImplementation(async (_url, init) => {
@@ -2625,7 +2643,7 @@ export function graphOuterCaller(value: string) { return graphCallHelper(value);
         (stage.kind === "set-min" || stage.kind === "set") &&
         stage.reason.includes("graphInjection")
       )
-    )).toBe(true);
+    )).toBe(false);
 
     const calleeResponse = await indexer.searchDetailed("what does graphCallHelper call", 5, {
       metadataOnly: true,
@@ -2903,5 +2921,116 @@ export function graphCallHelper(value: string) { return graphTargetHelper(value)
 
     expect(response.graphDirection).toBe("caller");
     expect(response.expandedContext.some((entry) => entry.name === "runMetrics" && entry.relation === "caller")).toBe(true);
+  });
+
+  it("allows graph injection for definition queries when relationshipIntent is true", async () => {
+    const indexer = await createSplitGraphIndexer(tempDir);
+
+    const response = await indexer.searchDetailed("what calls computeMetrics", 10, {
+      metadataOnly: true,
+      filterByBranch: false,
+      taskType: "definition",
+      relationshipIntent: true,
+      includeScoreBreakdown: true,
+    });
+
+    expect(response.taskType).toBe("definition");
+    expect(response.graphDirection).toBe("caller");
+    expect(response.primaryResults.some((entry) =>
+      entry.scoreBreakdown?.stages.some((stage) =>
+        stage.name === "deterministicIntentLane" &&
+        (stage.kind === "set-min" || stage.kind === "set") &&
+        stage.reason.includes("graphInjection")
+      )
+    )).toBe(true);
+  });
+
+  it("suppresses graph injection for definition queries without relationshipIntent or explicit graphDirection", async () => {
+    const indexer = await createSplitGraphIndexer(tempDir);
+
+    const response = await indexer.searchDetailed("what calls computeMetrics", 10, {
+      metadataOnly: true,
+      filterByBranch: false,
+      taskType: "definition",
+      includeScoreBreakdown: true,
+    });
+
+    expect(response.taskType).toBe("definition");
+    expect(response.graphDirection).toBe("caller");
+    expect(response.primaryResults.some((entry) =>
+      entry.scoreBreakdown?.stages.some((stage) =>
+        stage.name === "deterministicIntentLane" &&
+        (stage.kind === "set-min" || stage.kind === "set") &&
+        stage.reason.includes("graphInjection")
+      )
+    )).toBe(false);
+  });
+
+  it("keeps explicit graphDirection as an unconditional override for definition queries", async () => {
+    const indexer = await createSplitGraphIndexer(tempDir);
+
+    const response = await indexer.searchDetailed("where is computeMetrics implementation", 10, {
+      metadataOnly: true,
+      filterByBranch: false,
+      taskType: "definition",
+      graphDirection: "caller",
+      includeScoreBreakdown: true,
+    });
+
+    expect(response.taskType).toBe("definition");
+    expect(response.graphDirection).toBe("caller");
+    expect(response.primaryResults.some((entry) =>
+      entry.scoreBreakdown?.stages.some((stage) =>
+        stage.name === "deterministicIntentLane" &&
+        (stage.kind === "set-min" || stage.kind === "set") &&
+        stage.reason.includes("graphInjection")
+      )
+    )).toBe(true);
+  });
+
+  it("leaves non-definition task types unaffected by the relationshipIntent suppression guard", async () => {
+    const indexer = await createSplitGraphIndexer(tempDir);
+
+    const withoutIntent = await indexer.searchDetailed("what calls computeMetrics", 10, {
+      metadataOnly: true,
+      filterByBranch: false,
+      taskType: "bug",
+      includeScoreBreakdown: true,
+    });
+    const withIntent = await indexer.searchDetailed("what calls computeMetrics", 10, {
+      metadataOnly: true,
+      filterByBranch: false,
+      taskType: "bug",
+      relationshipIntent: true,
+      includeScoreBreakdown: true,
+    });
+
+    expect(withoutIntent.taskType).toBe("bug");
+    expect(withIntent.taskType).toBe("bug");
+    expect(withoutIntent.graphDirection).toBe("caller");
+    expect(withIntent.graphDirection).toBe("caller");
+    expect(withoutIntent.primaryResults.map((entry) => `${entry.filePath}:${entry.startLine}:${entry.endLine}`)).toEqual(
+      withIntent.primaryResults.map((entry) => `${entry.filePath}:${entry.startLine}:${entry.endLine}`)
+    );
+  });
+
+  it("keeps MCP-style caller queries auto-inferred while suppressing definition graph injection without relationshipIntent", async () => {
+    const indexer = await createSplitGraphIndexer(tempDir);
+
+    const response = await indexer.searchDetailed("what calls computeMetrics", 10, {
+      metadataOnly: true,
+      filterByBranch: false,
+      includeScoreBreakdown: true,
+    });
+
+    expect(response.taskType).toBe("definition");
+    expect(response.graphDirection).toBe("caller");
+    expect(response.primaryResults.some((entry) =>
+      entry.scoreBreakdown?.stages.some((stage) =>
+        stage.name === "deterministicIntentLane" &&
+        (stage.kind === "set-min" || stage.kind === "set") &&
+        stage.reason.includes("graphInjection")
+      )
+    )).toBe(false);
   });
 });

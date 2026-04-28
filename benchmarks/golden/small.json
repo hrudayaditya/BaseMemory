@@ -216,8 +216,8 @@
       "expected": {
         "filePath": "src/indexer/index.ts",
         "symbol": "getActiveBranchKey",
-        "startLine": 4129,
-        "endLine": 4131
+        "startLine": 4130,
+        "endLine": 4132
       }
     },
     {
@@ -227,8 +227,8 @@
       "expected": {
         "filePath": "src/indexer/index.ts",
         "symbol": "materializeRankedResults",
-        "startLine": 5805,
-        "endLine": 5859
+        "startLine": 5806,
+        "endLine": 5860
       }
     },
     {
@@ -250,7 +250,7 @@
         "filePath": "src/eval/runner.ts",
         "symbol": "finalizeEvaluationRun",
         "startLine": 390,
-        "endLine": 547
+        "endLine": 548
       }
     },
     {
@@ -261,7 +261,7 @@
         "filePath": "src/eval/runner.ts",
         "symbol": "finalizeEvaluationRun",
         "startLine": 390,
-        "endLine": 547
+        "endLine": 548
       }
     },
     {
@@ -272,7 +272,7 @@
         "filePath": "src/eval/runner.ts",
         "symbol": "finalizeEvaluationRun",
         "startLine": 390,
-        "endLine": 547
+        "endLine": 548
       }
     },
     {

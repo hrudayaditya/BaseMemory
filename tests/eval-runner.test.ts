@@ -541,6 +541,112 @@ describe("eval runner", () => {
     expect(searchDetailedSpy.mock.calls[0]?.[2]?.finalRerankTopN).toBe(20);
   });
 
+  it("threads relationshipIntent only for cross-file-relationship eval queries", async () => {
+    const searchDetailedSpy = vi.spyOn(Indexer.prototype, "searchDetailed").mockImplementation(
+      async (_query, _limit, options) => ({
+        primaryResults: [],
+        expandedContext: [],
+        taskType: options?.taskType ?? "definition",
+        subIntent: null,
+        graphDirection: options?.graphDirection ?? "both",
+        timings: {
+          prefilterMs: 0,
+        },
+        retrieval: {
+          voyageLaneConfigured: false,
+          voyageLaneUsed: false,
+        },
+        reranker: {
+          applied: false,
+          backend: null,
+        },
+      })
+    );
+
+    writeFileSync(
+      path.join(tempDir, "benchmarks", "golden", "small.json"),
+      JSON.stringify(
+        {
+          version: "1.0.0",
+          name: "small",
+          queries: [
+            {
+              id: "rel1",
+              query: "what calls buildPerQueryResult",
+              queryType: "cross-file-relationship",
+              expected: {
+                filePath: "src/indexer/index.ts",
+                symbol: "rankHybridResults",
+              },
+            },
+            {
+              id: "def1",
+              query: "where is rankHybridResults implementation",
+              queryType: "definition",
+              expected: {
+                filePath: "src/indexer/index.ts",
+                symbol: "rankHybridResults",
+              },
+            },
+          ],
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+
+    writeFileSync(
+      path.join(tempDir, ".opencode", "codebase-index.json"),
+      JSON.stringify(
+        {
+          embeddingProvider: "custom",
+          customProvider: {
+            baseUrl: "http://localhost:11434/v1",
+            model: "mock-embedding-model",
+            dimensions: 8,
+          },
+          indexing: {
+            watchFiles: false,
+          },
+          eval: {
+            useQueryTypes: true,
+          },
+          search: {
+            maxResults: 10,
+            minScore: 0,
+            fusionStrategy: "rrf",
+            rrfK: 60,
+            rerankTopN: 20,
+          },
+        },
+        null,
+        2
+      ),
+      "utf-8"
+    );
+
+    await runEvaluation({
+      projectRoot: tempDir,
+      datasetPath: "benchmarks/golden/small.json",
+      outputRoot: "benchmarks/results",
+      ciMode: false,
+      reindex: false,
+    });
+
+    const relationshipCall = searchDetailedSpy.mock.calls.find(
+      (call) => call[0] === "what calls buildPerQueryResult"
+    );
+    const definitionCall = searchDetailedSpy.mock.calls.find(
+      (call) => call[0] === "where is rankHybridResults implementation"
+    );
+
+    expect(relationshipCall).toBeDefined();
+    expect(relationshipCall?.[2]?.relationshipIntent).toBe(true);
+    expect(definitionCall?.[2]?.relationshipIntent).toBe(false);
+    searchDetailedSpy.mockRestore();
+  });
+
   it("supports overriding eval taskType across all queries", async () => {
     const searchDetailedSpy = vi.spyOn(Indexer.prototype, "searchDetailed");
 
