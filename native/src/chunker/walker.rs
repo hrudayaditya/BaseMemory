@@ -7,7 +7,7 @@ use super::{
     Granularity, SymbolKind, FILE_MODULE_CONTEXT_MAX_NON_WHITESPACE_CHARS,
 };
 use crate::hasher::xxhash_content;
-use tree_sitter::{Node, Tree};
+use tree_sitter::{Node, Parser, Tree};
 
 #[derive(Debug, Clone)]
 struct PendingChunk {
@@ -28,6 +28,13 @@ struct WalkerContext<'a> {
     config: &'a ChunkConfig,
     policy: &'static LanguagePolicy,
     line_starts: Vec<usize>,
+}
+
+struct RustMacroRange {
+    macro_start: usize,
+    macro_end: usize,
+    body_start: usize,
+    body_end: usize,
 }
 
 impl<'a> WalkerContext<'a> {
@@ -1065,6 +1072,166 @@ fn maybe_emit_file_module_header_chunk(
     Ok(())
 }
 
+fn find_brace_token_tree_range(ctx: &WalkerContext<'_>, node: Node<'_>) -> Option<RustMacroRange> {
+    if ctx.language != "rust" || node.kind() != "macro_invocation" {
+        return None;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "token_tree" {
+            continue;
+        }
+        let text = ctx.slice(child.start_byte(), child.end_byte()).ok()?;
+        if text.len() >= 2 && text.starts_with('{') && text.ends_with('}') {
+            return Some(RustMacroRange {
+                macro_start: node.start_byte(),
+                macro_end: node.end_byte(),
+                body_start: child.start_byte() + 1,
+                body_end: child.end_byte().saturating_sub(1),
+            });
+        }
+    }
+
+    None
+}
+
+fn collect_rust_macro_ranges(ctx: &WalkerContext<'_>, node: Node<'_>, depth: usize, out: &mut Vec<RustMacroRange>) {
+    if depth > 2 {
+        return;
+    }
+
+    if let Some(range) = find_brace_token_tree_range(ctx, node) {
+        out.push(range);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_rust_macro_ranges(ctx, child, depth + 1, out);
+    }
+}
+
+fn ranges_overlap(start_a: usize, end_a: usize, start_b: usize, end_b: usize) -> bool {
+    start_a < end_b && start_b < end_a
+}
+
+fn parse_named_rust_macro_body_chunks(
+    ctx: &WalkerContext<'_>,
+    range: &RustMacroRange,
+) -> Option<Vec<Chunk>> {
+    if range.body_start >= range.body_end {
+        return None;
+    }
+
+    let interior = ctx.slice(range.body_start, range.body_end).ok()?;
+    let mut parser = Parser::new();
+    parser.set_language(&(ctx.policy.parser_language)()).ok()?;
+    let tree = parser.parse(interior, None)?;
+    if tree.root_node().has_error() {
+        return None;
+    }
+
+    let inner_ctx = WalkerContext {
+        file_path: ctx.file_path,
+        language: ctx.language,
+        source: interior,
+        config: ctx.config,
+        policy: ctx.policy,
+        line_starts: build_line_index(interior),
+    };
+
+    let mut pending = build_node_chunks(&inner_ctx, tree.root_node());
+    for chunk in &mut pending {
+        chunk.start_byte += range.body_start;
+        chunk.end_byte += range.body_start;
+    }
+    pending.sort_by_key(|chunk| (chunk.start_byte, chunk.end_byte, chunk.granularity as u8));
+
+    let chunks = pending
+        .into_iter()
+        .map(|chunk| ctx.finalize_chunk(chunk))
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let named_chunks: Vec<Chunk> = chunks
+        .into_iter()
+        .filter(|chunk| chunk.symbol_name.is_some())
+        .collect();
+    if named_chunks.is_empty() {
+        return None;
+    }
+
+    Some(named_chunks)
+}
+
+fn upgrade_rust_macro_anonymous_chunks(
+    ctx: &WalkerContext<'_>,
+    root: Node<'_>,
+    chunks: Vec<Chunk>,
+) -> Vec<Chunk> {
+    if ctx.language != "rust" {
+        return chunks;
+    }
+
+    let mut macro_ranges = Vec::new();
+    collect_rust_macro_ranges(ctx, root, 0, &mut macro_ranges);
+    if macro_ranges.is_empty() {
+        return chunks;
+    }
+
+    let upgrades: Vec<(RustMacroRange, Vec<Chunk>)> = macro_ranges
+        .into_iter()
+        .filter_map(|range| parse_named_rust_macro_body_chunks(ctx, &range).map(|named| (range, named)))
+        .collect();
+    if upgrades.is_empty() {
+        return chunks;
+    }
+
+    let mut upgraded = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let is_upgradeable_anon = chunk.symbol_name.is_none()
+            && chunk.chunk_kind == ChunkKind::Code
+            && chunk.granularity == Granularity::Fine
+            && chunk.symbol_kind == Some(SymbolKind::Block);
+        let replaced = is_upgradeable_anon
+            && upgrades.iter().any(|(range, named_chunks)| {
+                ranges_overlap(
+                    chunk.start_byte as usize,
+                    chunk.end_byte as usize,
+                    range.macro_start,
+                    range.macro_end,
+                ) && named_chunks.iter().any(|named| {
+                    ranges_overlap(
+                        chunk.start_byte as usize,
+                        chunk.end_byte as usize,
+                        named.start_byte as usize,
+                        named.end_byte as usize,
+                    )
+                })
+            });
+
+        if !replaced {
+            upgraded.push(chunk);
+        }
+    }
+
+    for (_range, named_chunks) in upgrades {
+        for named in named_chunks {
+            let duplicate = upgraded.iter().any(|existing| {
+                existing.start_byte == named.start_byte
+                    && existing.end_byte == named.end_byte
+                    && existing.granularity == named.granularity
+                    && existing.symbol_name == named.symbol_name
+            });
+            if !duplicate {
+                upgraded.push(named);
+            }
+        }
+    }
+
+    upgraded.sort_by_key(|chunk| (chunk.start_byte, chunk.end_byte, chunk.granularity as u8));
+    upgraded
+}
+
 pub fn chunk_tree(
     file_path: &str,
     language: &str,
@@ -1106,6 +1273,7 @@ pub fn chunk_tree(
     }
     let mut chunks =
         super::enforce_fine_chunk_max_size(file_path, language, source, config, chunks)?;
+    chunks = upgrade_rust_macro_anonymous_chunks(&ctx, root, chunks);
 
     if config.emit_coarse_chunks {
         for (node, info) in top_level_semantic_nodes(&ctx, root) {

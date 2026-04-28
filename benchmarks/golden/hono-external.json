@@ -6,7 +6,7 @@
     {
       "id": "hono-def-main-class",
       "source": "curated",
-      "query": "where is `Hono` defined",
+      "query": "where is the Hono class defined in hono.ts",
       "queryType": "definition",
       "expected": {
         "filePath": "src/hono.ts",
@@ -25,7 +25,7 @@
     {
       "id": "hono-def-request-context",
       "source": "curated",
-      "query": "where is `context` implemented",
+      "query": "where is Hono's Context class defined — the object passed to every route handler",
       "queryType": "definition",
       "expected": {
         "filePath": "src/context.ts",
@@ -125,7 +125,7 @@
     {
       "id": "hono-rel-parsebody-calls-form-parser",
       "source": "curated",
-      "query": "what calls the form data parser after checking content type",
+      "query": "what does parseBody call to handle form data after checking content type",
       "queryType": "cross-file-relationship",
       "expected": {
         "filePath": "src/utils/body.ts",
@@ -285,7 +285,7 @@
     {
       "id": "hono-bug-next-called-twice",
       "source": "curated",
-      "query": "where does middleware execution throw when next is called more than once",
+      "query": "where does dispatch in compose.ts throw an error when next() is called more than once",
       "queryType": "bug-error-lookup",
       "expected": {
         "filePath": "src/compose.ts",
@@ -305,7 +305,7 @@
     {
       "id": "hono-bug-invalid-connection-header-token",
       "source": "curated",
-      "query": "where does strict proxy mode throw for invalid connection header token syntax",
+      "query": "where does buildRequestInitFromRequest throw for invalid connection header token syntax in strict proxy mode",
       "queryType": "bug-error-lookup",
       "expected": {
         "filePath": "src/helper/proxy/index.ts",

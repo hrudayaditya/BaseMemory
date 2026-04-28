@@ -1,0 +1,382 @@
+{
+  "version": "1.0.0",
+  "name": "tokio-external",
+  "description": "40-query external benchmark for Tokio",
+  "queries": [
+    {
+      "id": "tokio-def-runtime-builder",
+      "source": "curated",
+      "query": "where is the `Builder` runtime configuration struct defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "tokio/src/runtime/builder.rs",
+        "symbol": "Builder"
+      }
+    },
+    {
+      "id": "tokio-def-runtime-struct",
+      "source": "curated",
+      "query": "where is the `Runtime` type implemented in runtime.rs",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "tokio/src/runtime/runtime.rs",
+        "symbol": "Runtime"
+      }
+    },
+    {
+      "id": "tokio-def-unhandled-panic",
+      "source": "curated",
+      "query": "where is `UnhandledPanic` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "tokio/src/runtime/builder.rs",
+        "symbol": "UnhandledPanic"
+      }
+    },
+    {
+      "id": "tokio-def-missing-context-string",
+      "source": "curated",
+      "query": "where is the no-reactor context error string constant defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "tokio/src/util/error.rs",
+        "symbol": "CONTEXT_MISSING_ERROR"
+      }
+    },
+    {
+      "id": "tokio-def-shutdown-error-string",
+      "source": "curated",
+      "query": "where is the runtime-shutdown error message constant defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "tokio/src/util/error.rs",
+        "symbol": "RUNTIME_SHUTTING_DOWN_ERROR"
+      }
+    },
+    {
+      "id": "tokio-def-interval-factory",
+      "source": "curated",
+      "query": "where is `interval` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "tokio/src/time/interval.rs",
+        "symbol": "interval"
+      }
+    },
+    {
+      "id": "tokio-def-oneshot-channel",
+      "source": "curated",
+      "query": "where is the `channel` function defined in oneshot.rs",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "tokio/src/sync/oneshot.rs",
+        "symbol": "channel"
+      }
+    },
+    {
+      "id": "tokio-def-cooperative-wrapper",
+      "source": "curated",
+      "query": "where is the cooperative future wrapper constructor implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "tokio/src/task/coop/mod.rs",
+        "symbol": "cooperative"
+      }
+    },
+    {
+      "id": "tokio-def-panic-payload-helper",
+      "source": "curated",
+      "query": "where is `panic_payload_as_str` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "tokio/src/runtime/task/error.rs",
+        "symbol": "panic_payload_as_str"
+      }
+    },
+    {
+      "id": "tokio-def-shutdown-io-check",
+      "source": "curated",
+      "query": "where is `is_rt_shutdown_err` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "tokio/src/runtime/runtime.rs",
+        "symbol": "is_rt_shutdown_err"
+      }
+    },
+    {
+      "id": "tokio-def-uid-type-alias",
+      "source": "curated",
+      "query": "where is `uid_t` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "tokio/src/net/unix/mod.rs",
+        "symbol": "uid_t"
+      }
+    },
+    {
+      "id": "tokio-def-gid-type-alias",
+      "source": "curated",
+      "query": "where is `gid_t` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "tokio/src/net/unix/mod.rs",
+        "symbol": "gid_t"
+      }
+    },
+    {
+      "id": "tokio-rel-reexported-spawn",
+      "source": "curated",
+      "query": "which function implementation backs the task module async task re-export",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "tokio/src/task/spawn.rs",
+        "symbol": "spawn"
+      }
+    },
+    {
+      "id": "tokio-rel-blocking-reexport",
+      "source": "curated",
+      "query": "which function implements the task api for running blocking closures",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "tokio/src/task/blocking.rs",
+        "symbol": "spawn_blocking"
+      }
+    },
+    {
+      "id": "tokio-rel-runtime-new-builder",
+      "source": "curated",
+      "query": "which constructor builds the default threaded runtime used by runtime new",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "tokio/src/runtime/builder.rs",
+        "symbol": "new_multi_thread"
+      }
+    },
+    {
+      "id": "tokio-rel-handle-enter-context",
+      "source": "curated",
+      "query": "what function installs the current scheduler handle for enter guards",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "tokio/src/runtime/context/current.rs",
+        "symbol": "try_set_current"
+      }
+    },
+    {
+      "id": "tokio-rel-runtime-spawn-named",
+      "source": "curated",
+      "query": "which handle method does `spawn_named` use after size-based boxing checks",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "tokio/src/runtime/handle.rs",
+        "symbol": "spawn_named"
+      }
+    },
+    {
+      "id": "tokio-rel-build-dispatch-threaded",
+      "source": "curated",
+      "query": "which function is called when builder build selects multithread kind",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "tokio/src/runtime/builder.rs",
+        "symbol": "build_threaded_runtime"
+      }
+    },
+    {
+      "id": "tokio-rel-interval-shared-init",
+      "source": "curated",
+      "query": "which helper initializes timer state shared by both interval constructors",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "tokio/src/time/interval.rs",
+        "symbol": "internal_interval_at"
+      }
+    },
+    {
+      "id": "tokio-rel-display-checker-used",
+      "source": "curated",
+      "query": "what does `display_eq` compare when checking against the shutdown marker string",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "tokio/src/runtime/runtime.rs",
+        "symbol": "display_eq"
+      }
+    },
+    {
+      "id": "tokio-concept-budget-remaining",
+      "source": "curated",
+      "query": "where does cooperative scheduling check if a task still has budget",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "tokio/src/task/coop/mod.rs",
+        "symbol": "has_budget_remaining"
+      }
+    },
+    {
+      "id": "tokio-concept-budget-decrement-poll",
+      "source": "curated",
+      "query": "where is budget consumed before polling cooperative work",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "tokio/src/task/coop/mod.rs",
+        "symbol": "poll_proceed"
+      }
+    },
+    {
+      "id": "tokio-concept-missed-tick-next-timeout",
+      "source": "curated",
+      "query": "where is interval catch-up strategy translated into the next timeout",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "tokio/src/time/interval.rs",
+        "symbol": "next_timeout"
+      }
+    },
+    {
+      "id": "tokio-concept-interval-polling-flow",
+      "source": "curated",
+      "query": "where does interval compute and schedule the following tick deadline",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "tokio/src/time/interval.rs",
+        "symbol": "poll_tick"
+      }
+    },
+    {
+      "id": "tokio-concept-nonpanicking-current-handle",
+      "source": "curated",
+      "query": "where is the non-panicking api for getting current runtime handle",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "tokio/src/runtime/handle.rs",
+        "symbol": "try_current"
+      }
+    },
+    {
+      "id": "tokio-concept-missing-context-classifier",
+      "source": "curated",
+      "query": "where is missing-runtime-context classification implemented for current-handle errors",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "tokio/src/runtime/handle.rs",
+        "symbol": "is_missing_context"
+      }
+    },
+    {
+      "id": "tokio-concept-time-bounded-shutdown",
+      "source": "curated",
+      "query": "where does runtime shutdown wait for blocking tasks with a timeout",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "tokio/src/runtime/runtime.rs",
+        "symbol": "shutdown_timeout"
+      }
+    },
+    {
+      "id": "tokio-concept-runtime-flavor-reporting",
+      "source": "curated",
+      "query": "where does a runtime handle report current-thread versus multi-thread flavor",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "tokio/src/runtime/handle.rs",
+        "symbol": "runtime_flavor"
+      }
+    },
+    {
+      "id": "tokio-concept-joinerror-panic-extract",
+      "source": "curated",
+      "query": "where does join error convert panic payload into result form",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "tokio/src/runtime/task/error.rs",
+        "symbol": "try_into_panic"
+      }
+    },
+    {
+      "id": "tokio-bug-worker-threads-zero",
+      "source": "curated",
+      "query": "where does runtime builder panic when worker threads is set to zero",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "tokio/src/runtime/builder.rs",
+        "symbol": "worker_threads"
+      }
+    },
+    {
+      "id": "tokio-bug-max-blocking-zero",
+      "source": "curated",
+      "query": "where does builder panic when max blocking threads is zero",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "tokio/src/runtime/builder.rs",
+        "symbol": "max_blocking_threads"
+      }
+    },
+    {
+      "id": "tokio-bug-enter-threadlocal-destroyed",
+      "source": "curated",
+      "query": "where does `enter` panic when the runtime context thread-local has been destroyed",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "tokio/src/runtime/handle.rs",
+        "symbol": "enter"
+      }
+    },
+    {
+      "id": "tokio-bug-enterguard-drop-order",
+      "source": "curated",
+      "query": "where is panic raised when enter guards are dropped out of order",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "tokio/src/runtime/context/current.rs",
+        "symbol": "drop"
+      }
+    },
+    {
+      "id": "tokio-test-file-io-buffering",
+      "source": "curated",
+      "query": "what tests cover async file read and write buffering behavior",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tokio/src/fs/file/tests.rs"
+      }
+    },
+    {
+      "id": "tokio-test-notify-primitive",
+      "source": "curated",
+      "query": "what tests exercise notify wakeup coordination semantics",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tokio/src/sync/tests/notify.rs"
+      }
+    },
+    {
+      "id": "tokio-test-semaphore-batch",
+      "source": "curated",
+      "query": "what tests validate batched semaphore acquisition behavior",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tokio/src/sync/tests/semaphore_batch.rs"
+      }
+    },
+    {
+      "id": "tokio-test-runtime-task-lifecycle",
+      "source": "curated",
+      "query": "what runtime tests cover task scheduling and lifecycle behavior",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tokio/src/runtime/tests/task.rs"
+      }
+    },
+    {
+      "id": "tokio-test-alt-timer-behavior",
+      "source": "curated",
+      "query": "what tests cover alternative timer runtime behavior",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tokio/src/runtime/time_alt/tests.rs"
+      }
+    }
+  ]
+}

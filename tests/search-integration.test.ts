@@ -92,6 +92,27 @@ describe("search integration", () => {
   let tempDir: string;
   let fetchSpy: ReturnType<typeof vi.spyOn>;
 
+  function createSearchTestConfig(rerankTopN: number = 20) {
+    return parseConfig({
+      embeddingProvider: "custom",
+      customProvider: {
+        baseUrl: "http://localhost:11434/v1",
+        model: "mock-embedding-model",
+        dimensions: 8,
+      },
+      indexing: {
+        watchFiles: false,
+      },
+      search: {
+        maxResults: 10,
+        minScore: 0,
+        fusionStrategy: "rrf",
+        rrfK: 60,
+        rerankTopN,
+      },
+    });
+  }
+
   beforeEach(() => {
     fetchSpy = vi.spyOn(globalThis, "fetch");
     fetchSpy.mockImplementation(async (_url, init) => {
@@ -900,6 +921,186 @@ export const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-2";
     expect(results.length).toBeGreaterThan(0);
     const topPaths = results.slice(0, 3).map((r) => r.filePath);
     expect(topPaths[0]).toContain("/app/indexer/index.ts");
+  });
+
+  it("excludes .d.ts chunks from the deterministic floor for definition queries", async () => {
+    fs.mkdirSync(path.join(tempDir, "lib", "core"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, "lib", "core", "Foo.js"),
+      `export class Foo {
+  run(value) {
+    return value;
+  }
+}
+`,
+      "utf-8"
+    );
+    fs.writeFileSync(
+      path.join(tempDir, "index.d.ts"),
+      `/** Foo implementation implementation implementation */
+export declare class Foo {
+  run(value: string): string;
+}
+`,
+      "utf-8"
+    );
+
+    const indexer = new Indexer(tempDir, createSearchTestConfig(0));
+    await indexer.index();
+
+    const response = await indexer.searchDetailed("where is Foo implementation", 10, {
+      metadataOnly: true,
+      filterByBranch: false,
+      includeScoreBreakdown: true,
+      taskType: "definition",
+      graphDepth: 0,
+    });
+
+    const dtsResult = response.primaryResults.find((entry) => entry.filePath.endsWith("index.d.ts"));
+    const jsResult = response.primaryResults.find((entry) => entry.filePath.endsWith(path.join("lib", "core", "Foo.js")));
+
+    expect(dtsResult).toBeDefined();
+    expect(jsResult).toBeDefined();
+    expect(dtsResult?.scoreBreakdown?.stages.some((stage) => stage.reason.includes("deterministicIdentifierLane:"))).toBe(false);
+    expect(jsResult?.scoreBreakdown?.stages.some((stage) => stage.reason.includes("deterministicIdentifierLane:"))).toBe(true);
+  });
+
+  it("allows .d.ts chunks in the deterministic floor for bug queries", async () => {
+    fs.mkdirSync(path.join(tempDir, "lib", "core"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, "lib", "core", "Foo.js"),
+      `export class Foo {
+  run(value) {
+    return value;
+  }
+}
+`,
+      "utf-8"
+    );
+    fs.writeFileSync(
+      path.join(tempDir, "index.d.ts"),
+      `/** Foo bug implementation implementation implementation */
+export declare class Foo {
+  run(value: string): string;
+}
+`,
+      "utf-8"
+    );
+
+    const indexer = new Indexer(tempDir, createSearchTestConfig(0));
+    await indexer.index();
+
+    const response = await indexer.searchDetailed("why does Foo fail", 10, {
+      metadataOnly: true,
+      filterByBranch: false,
+      includeScoreBreakdown: true,
+      taskType: "bug",
+      graphDepth: 0,
+    });
+
+    const dtsResult = response.primaryResults.find((entry) => entry.filePath.endsWith("index.d.ts"));
+    const jsResult = response.primaryResults.find((entry) => entry.filePath.endsWith(path.join("lib", "core", "Foo.js")));
+
+    expect(dtsResult).toBeDefined();
+    expect(jsResult).toBeDefined();
+    expect(dtsResult?.scoreBreakdown?.stages.some((stage) => stage.reason.includes("deterministicIdentifierLane:"))).toBe(true);
+  });
+
+  it("allows .d.ts chunks in the deterministic floor when graph direction is set", async () => {
+    fs.mkdirSync(path.join(tempDir, "lib", "core"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, "lib", "core", "Foo.js"),
+      `export class Foo {
+  run(value) {
+    return value;
+  }
+}
+`,
+      "utf-8"
+    );
+    fs.writeFileSync(
+      path.join(tempDir, "index.d.ts"),
+      `/** Foo implementation implementation implementation */
+export declare class Foo {
+  run(value: string): string;
+}
+`,
+      "utf-8"
+    );
+
+    const indexer = new Indexer(tempDir, createSearchTestConfig(0));
+    await indexer.index();
+
+    const response = await indexer.searchDetailed("where is Foo implementation", 10, {
+      metadataOnly: true,
+      filterByBranch: false,
+      includeScoreBreakdown: true,
+      taskType: "definition",
+      graphDirection: "caller",
+      graphDepth: 0,
+    });
+
+    const dtsResult = response.primaryResults.find((entry) => entry.filePath.endsWith("index.d.ts"));
+    expect(dtsResult).toBeDefined();
+    expect(dtsResult?.scoreBreakdown?.stages.some((stage) => stage.reason.includes("deterministicIdentifierLane:"))).toBe(true);
+  });
+
+  it("keeps js implementation deterministic floor behavior unchanged for definition queries", async () => {
+    fs.mkdirSync(path.join(tempDir, "lib", "core"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, "lib", "core", "Foo.js"),
+      `export class Foo {
+  run(value) {
+    return value;
+  }
+}
+`,
+      "utf-8"
+    );
+
+    const indexer = new Indexer(tempDir, createSearchTestConfig(0));
+    await indexer.index();
+
+    const response = await indexer.searchDetailed("where is Foo implementation", 10, {
+      metadataOnly: true,
+      filterByBranch: false,
+      includeScoreBreakdown: true,
+      taskType: "definition",
+      graphDepth: 0,
+    });
+
+    const jsResult = response.primaryResults.find((entry) => entry.filePath.endsWith(path.join("lib", "core", "Foo.js")));
+    expect(jsResult).toBeDefined();
+    expect(jsResult?.scoreBreakdown?.stages.some((stage) => stage.reason.includes("deterministicIdentifierLane:"))).toBe(true);
+  });
+
+  it("keeps non-.d.ts typescript files eligible for the deterministic floor in definition queries", async () => {
+    fs.mkdirSync(path.join(tempDir, "lib", "core"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, "lib", "core", "Foo.ts"),
+      `export class Foo {
+  run(value: string) {
+    return value;
+  }
+}
+`,
+      "utf-8"
+    );
+
+    const indexer = new Indexer(tempDir, createSearchTestConfig(0));
+    await indexer.index();
+
+    const response = await indexer.searchDetailed("where is Foo implementation", 10, {
+      metadataOnly: true,
+      filterByBranch: false,
+      includeScoreBreakdown: true,
+      taskType: "definition",
+      graphDepth: 0,
+    });
+
+    const tsResult = response.primaryResults.find((entry) => entry.filePath.endsWith(path.join("lib", "core", "Foo.ts")));
+    expect(tsResult).toBeDefined();
+    expect(tsResult?.scoreBreakdown?.stages.some((stage) => stage.reason.includes("deterministicIdentifierLane:"))).toBe(true);
   });
 
   it("uses different runtime fusion weights for definition and general search", async () => {

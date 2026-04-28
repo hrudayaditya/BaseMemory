@@ -143,9 +143,9 @@ export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndex
     "codebase_search",
     {
       description:
-        "Search codebase by MEANING, not keywords. Returns full code content. For just finding WHERE code is (saves ~90% tokens), use codebase_peek instead.",
+        "Search codebase by MEANING, Keywords. Returns full code content. For just finding WHERE code is (saves ~90% tokens), use codebase_peek instead.",
       inputSchema: {
-        query: z.string().describe("Natural language description of what code you're looking for. Describe behavior, not syntax."),
+        query: z.string().describe("Sescription of what code you're looking for. Describe behavior, a slight hint of syntax."),
         limit: z.number().optional().default(5).describe("Maximum number of results to return"),
         fileType: z.string().optional().describe("Filter by file extension (e.g., 'ts', 'py', 'rs')"),
         directory: z.string().optional().describe("Filter by directory path (e.g., 'src/utils', 'lib')"),
@@ -272,9 +272,9 @@ export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndex
 
   server.tool(
     "codebase_peek",
-    "Quick lookup of code locations by meaning. Returns only metadata (file, line, name, type) WITHOUT code content. Saves ~90% tokens vs codebase_search.",
+    "Quick lookup of code locations by meaning, defintion or keywords. Returns only metadata (file, line, name, type) WITHOUT code content. Saves ~90% tokens vs codebase_search.",
     {
-      query: z.string().describe("Natural language description of what code you're looking for."),
+      query: z.string().describe("Description of what code you're looking for."),
       limit: z.number().optional().default(10).describe("Maximum number of results to return"),
       fileType: z.string().optional().describe("Filter by file extension (e.g., 'ts', 'py', 'rs')"),
       directory: z.string().optional().describe("Filter by directory path (e.g., 'src/utils', 'lib')"),
@@ -508,7 +508,7 @@ export function createMcpServer(projectRoot: string, config: ParsedCodebaseIndex
     "implementation_lookup",
     "Jump to symbol definition. Find WHERE something is defined. Returns the authoritative source location(s). Prefers real implementation files over tests, docs, examples, and fixtures.",
     {
-      query: z.string().describe("Symbol name or natural language description (e.g., 'validateToken', 'where is the payment handler defined')"),
+      query: z.string().describe("Symbol name or description (e.g., 'validateToken', 'where is the payment handler defined')"),
       limit: z.number().optional().default(5).describe("Maximum number of results"),
       fileType: z.string().optional().describe("Filter by file extension (e.g., 'ts', 'py')"),
       directory: z.string().optional().describe("Filter by directory path (e.g., 'src/utils')"),

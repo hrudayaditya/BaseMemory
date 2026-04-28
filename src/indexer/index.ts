@@ -6126,7 +6126,8 @@ export class Indexer {
         : taskType === "general" && queryIntent === "doc_test" && options?.definitionIntent !== true
           ? 0
           : recipe.finalRerankTopN;
-    const graphDirection = options?.graphDirection ?? inferRelationshipGraphDirection(query) ?? "both";
+    const inferredGraphDirection = options?.graphDirection ?? inferRelationshipGraphDirection(query);
+    const graphDirection = inferredGraphDirection ?? "both";
     const graphDepth = Math.max(0, Math.min(2, options?.graphDepth ?? recipe.graphDepth ?? 0));
     const prefilterStartTime = performance.now();
     const metadataAllowedChunkIds = await this.buildAllowedChunkIds(database, branch, {
@@ -6336,10 +6337,15 @@ export class Indexer {
 
     const union = unionCandidates(semanticCandidates, voyageCandidates, keywordCandidates);
 
+    const deterministicIdentifierCandidates =
+      taskType === "definition" && inferredGraphDirection == null
+        ? union.filter((candidate) => !candidate.metadata.filePath.endsWith(".d.ts"))
+        : union;
+
     const deterministicIdentifierLane = recipe.enableDeterministicIdentifierLane
       ? buildDeterministicIdentifierPass(
           query,
-          union,
+          deterministicIdentifierCandidates,
           maxResults,
           sourceIntent,
           includeScoreBreakdown,

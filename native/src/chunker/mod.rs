@@ -822,6 +822,8 @@ pub fn chunk_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::policy::{extract_name_by_fields, SemanticInfo};
+
     fn fine_chunks(chunks: &[Chunk]) -> Vec<&Chunk> {
         chunks
             .iter()
@@ -852,6 +854,47 @@ mod tests {
                 chunk.chunk_kind == ChunkKind::File && chunk.symbol_name.as_deref() == Some(name)
             })
             .unwrap_or_else(|| panic!("missing file chunk for {name}"))
+    }
+
+    fn find_named_descendant<'tree>(
+        node: tree_sitter::Node<'tree>,
+        source: &str,
+        kind: &str,
+        name: &str,
+    ) -> Option<tree_sitter::Node<'tree>> {
+        if node.kind() == kind
+            && extract_name_by_fields(node, source, &["name", "property"]).as_deref() == Some(name)
+        {
+            return Some(node);
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if let Some(found) = find_named_descendant(child, source, kind, name) {
+                return Some(found);
+            }
+        }
+
+        None
+    }
+
+    fn classify_named_node(
+        language: &str,
+        source: &str,
+        kind: &str,
+        name: &str,
+    ) -> Option<SemanticInfo> {
+        let policy = get_policy(language).unwrap_or_else(|| panic!("missing policy for {language}"));
+        let mut parser = Parser::new();
+        parser
+            .set_language(&(policy.parser_language)())
+            .unwrap_or_else(|err| panic!("{err}"));
+        let tree = parser
+            .parse(source, None)
+            .unwrap_or_else(|| panic!("failed to parse {language} source"));
+        let node = find_named_descendant(tree.root_node(), source, kind, name)
+            .unwrap_or_else(|| panic!("missing {kind} named {name}"));
+        (policy.classify_node)(node, source)
     }
 
     #[test]
@@ -1111,6 +1154,148 @@ fn captures_module_level_python_docstrings_as_doc_chunks() {}
         assert_eq!(impl_chunk.symbol_kind, Some(SymbolKind::Block));
         assert_eq!(impl_chunk.chunk_kind, ChunkKind::Code);
         assert_eq!(impl_chunk.granularity, Granularity::Coarse);
+    }
+
+    #[test]
+    fn spawn_surfaces_after_macro_reparse_upgrade() {
+        let source = r#"cfg_rt! {
+    pub fn spawn() {}
+}
+"#;
+
+        let chunks = chunk_file("spawn.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let spawn_chunk = named_fine_chunk(&chunks, "spawn");
+        assert_eq!(spawn_chunk.symbol_kind, Some(SymbolKind::Function));
+        assert_eq!(spawn_chunk.start_line, 2);
+    }
+
+    #[test]
+    fn preserves_existing_named_chunks_while_adding_macro_named_chunks() {
+        let source = r#"pub fn top_level() {}
+
+cfg_rt! {
+    pub fn spawn() {}
+}
+"#;
+
+        let chunks = chunk_file("mixed.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(fine_chunks(&chunks)
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("top_level")));
+        assert!(fine_chunks(&chunks)
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("spawn")));
+        assert!(fine_chunks(&chunks)
+            .iter()
+            .filter(|chunk| chunk.symbol_name.is_some())
+            .count()
+            >= 2);
+    }
+
+    #[test]
+    fn macro_reparse_parse_failure_keeps_anonymous_chunk() {
+        let source = r#"cfg_rt! {
+    $x:expr => $x
+}
+"#;
+
+        let chunks = chunk_file("broken.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(fine_chunks(&chunks)
+            .iter()
+            .any(|chunk| chunk.symbol_name.is_none() && chunk.symbol_kind == Some(SymbolKind::Block)));
+        assert!(!fine_chunks(&chunks)
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("spawn")));
+    }
+
+    #[test]
+    fn non_brace_macros_are_unaffected() {
+        let source = r#"fn values() -> Vec<i32> {
+    let items = vec![1, 2];
+    println!("{:?}", items);
+    items
+}
+"#;
+
+        let chunks = chunk_file("values.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let values_chunk = named_fine_chunk(&chunks, "values");
+        assert_eq!(values_chunk.symbol_kind, Some(SymbolKind::Function));
+        assert!(values_chunk.text.contains("vec![1, 2]"));
+    }
+
+    #[test]
+    fn deep_function_body_macros_do_not_upgrade() {
+        let source = r#"fn outer() {
+    cfg_rt! {
+        pub fn hidden() {}
+    }
+}
+"#;
+
+        let chunks = chunk_file("hidden.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(!fine_chunks(&chunks)
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("hidden")));
+        assert!(fine_chunks(&chunks)
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("outer")));
+    }
+
+    #[test]
+    fn macro_reparse_preserves_original_line_numbers() {
+        let source = format!(
+            "{}cfg_rt! {{\n    pub fn spawn() {{}}\n}}\n",
+            "\n".repeat(172)
+        );
+
+        let chunks = chunk_file("spawn.rs", "rust", &source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let spawn_chunk = named_fine_chunk(&chunks, "spawn");
+        assert_eq!(spawn_chunk.start_line, 174);
+        assert_eq!(spawn_chunk.end_line, 174);
+    }
+
+    #[test]
+    fn macro_free_rust_files_are_unchanged() {
+        let source = r#"pub struct Config;
+
+pub fn spawn() {}
+"#;
+
+        let chunks = chunk_file("plain.rs", "rust", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert!(fine_chunks(&chunks)
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("Config")));
+        assert!(fine_chunks(&chunks)
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("spawn")));
+    }
+
+    #[test]
+    fn non_rust_files_are_unaffected_by_macro_upgrade_pass() {
+        let source = r#"def spawn():
+    return 42
+"#;
+
+        let chunks = chunk_file("spawn.py", "python", source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let spawn_chunk = named_fine_chunk(&chunks, "spawn");
+        assert_eq!(spawn_chunk.symbol_kind, Some(SymbolKind::Function));
+        assert_eq!(fine_chunks(&chunks).len(), 1);
     }
 
     #[test]
@@ -2625,6 +2810,103 @@ function _parse(input: string) {
         assert!(merged_chunk.text.trim_start().starts_with("function parse(input: string)"));
         assert!(merged_chunk.text.contains("function _parse(input: string)"));
         assert_eq!(merged_chunk.symbol_aliases, vec!["_parse".to_string()]);
+    }
+
+    #[test]
+    fn method_delegation_wrapper_detected() {
+        let source = r#"class Client {
+  request(args: string) {
+    return this._request(args);
+  }
+
+  _request(args: string) {
+    return args.trim();
+  }
+}
+"#;
+
+        let info = classify_named_node("typescript", source, "method_definition", "request")
+            .unwrap_or_else(|| panic!("missing semantic info for request"));
+        assert_eq!(info.symbol_name.as_deref(), Some("request"));
+        assert_eq!(info.symbol_kind, Some(SymbolKind::Method));
+        assert_eq!(info.delegate_target_name.as_deref(), Some("_request"));
+    }
+
+    #[test]
+    fn method_delegation_wrapper_merged() {
+        let repeated = "    total += args.length;\n".repeat(40);
+        let source = format!(
+            "class Client {{\n  request(args: string) {{\n    return this._request(args);\n  }}\n\n  _request(args: string) {{\n    let total = 0;\n{repeated}    return total;\n  }}\n}}\n"
+        );
+
+        let chunks = chunk_file("client.ts", "typescript", &source, &ChunkConfig::default())
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        let merged_chunk = named_fine_chunk(&chunks, "request");
+        assert!(merged_chunk.text.contains("request(args: string)"));
+        assert!(merged_chunk.text.contains("return this._request(args);"));
+        assert!(merged_chunk.text.contains("_request(args: string)"));
+        assert_eq!(merged_chunk.symbol_kind, Some(SymbolKind::Method));
+        assert_eq!(merged_chunk.symbol_aliases, vec!["_request".to_string()]);
+        assert!(!fine_chunks(&chunks)
+            .iter()
+            .any(|chunk| chunk.symbol_name.as_deref() == Some("_request")));
+    }
+
+    #[test]
+    fn method_non_wrapper_unaffected() {
+        let source = r#"class Client {
+  request(args: string) {
+    const result = this._request(args);
+    return result;
+  }
+}
+"#;
+
+        let info = classify_named_node("typescript", source, "method_definition", "request")
+            .unwrap_or_else(|| panic!("missing semantic info for request"));
+        assert_eq!(info.delegate_target_name, None);
+    }
+
+    #[test]
+    fn constructor_always_suppressed() {
+        let source = r#"class Client {
+  constructor(args: string) {
+    return this._init(args);
+  }
+}
+"#;
+
+        let info = classify_named_node("typescript", source, "method_definition", "constructor");
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn function_declaration_unaffected() {
+        let source = r#"function parse(input: string) {
+  return _parse(input);
+}
+"#;
+
+        let info = classify_named_node("typescript", source, "function_declaration", "parse")
+            .unwrap_or_else(|| panic!("missing semantic info for parse"));
+        assert_eq!(info.symbol_name.as_deref(), Some("parse"));
+        assert_eq!(info.symbol_kind, Some(SymbolKind::Function));
+        assert_eq!(info.delegate_target_name.as_deref(), Some("_parse"));
+    }
+
+    #[test]
+    fn member_expression_non_this_unaffected() {
+        let source = r#"class Client {
+  request(args: string) {
+    return other._request(args);
+  }
+}
+"#;
+
+        let info = classify_named_node("typescript", source, "method_definition", "request")
+            .unwrap_or_else(|| panic!("missing semantic info for request"));
+        assert_eq!(info.delegate_target_name, None);
     }
 
     #[test]

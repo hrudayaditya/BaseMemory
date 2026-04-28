@@ -288,7 +288,19 @@ fn delegation_target_for_call(node: Node<'_>, source: &str) -> Option<String> {
     }
 
     let function = node.child_by_field_name("function")?;
-    identifier_text(function, source)
+    identifier_text(function, source).or_else(|| {
+        if function.kind() != "member_expression" {
+            return None;
+        }
+
+        let object = function.child_by_field_name("object")?;
+        if object.kind() != "this" {
+            return None;
+        }
+
+        let property = function.child_by_field_name("property")?;
+        identifier_text(property, source)
+    })
 }
 
 fn delegation_target_for_statement(node: Node<'_>, source: &str) -> Option<String> {
@@ -705,13 +717,16 @@ fn classify_ts_js_node_impl(
             if symbol_name.as_deref() == Some("constructor") {
                 return None;
             }
+            let delegate_target_name = symbol_name
+                .as_deref()
+                .and_then(|name| delegation_target_for_function_like(node, source, name));
             Some(SemanticInfo {
                 symbol_name,
                 symbol_aliases: Vec::new(),
                 symbol_kind: Some(SymbolKind::Method),
                 chunk_kind: ChunkKind::Code,
                 coarse_eligible: false,
-                delegate_target_name: None,
+                delegate_target_name,
             })
         }
         "class_declaration" | "abstract_class_declaration" => Some(SemanticInfo {
