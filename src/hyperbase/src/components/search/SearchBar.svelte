@@ -3,11 +3,12 @@
   import { isAbortError, searchSymbols } from '../../api/client';
   import { SEARCH_DEBOUNCE_MS } from '../../lib/constants';
   import { nodeColor, shortPath } from '../../lib/graph-utils';
-  import { activeBranch, graphDepth, loadNeighborhoodGraph } from '../../stores/graph';
+  import { activeBranch, graphDepth, loadDirectoryGraph, loadNeighborhoodGraph } from '../../stores/graph';
   import { selectNode } from '../../stores/selection';
-  import { searchOpen, searchQuery, searchResults } from '../../stores/ui';
+  import { searchFocusNonce, searchOpen, searchQuery, searchResults } from '../../stores/ui';
   import type { SearchResult } from '../../types';
 
+  let inputElement: HTMLInputElement;
   let currentBranch = '';
   let currentDepth = 1;
   let currentQuery = '';
@@ -30,6 +31,10 @@
     }),
     searchResults.subscribe((value) => {
       currentResults = value;
+    }),
+    searchFocusNonce.subscribe(() => {
+      inputElement?.focus();
+      inputElement?.select();
     }),
   ];
 
@@ -97,6 +102,17 @@
     searchQuery.set(result.name);
   }
 
+  async function openResultDirectory(result: SearchResult, event: MouseEvent) {
+    event.stopPropagation();
+    if (!currentBranch) return;
+    const normalized = result.filePath.replace(/\\/g, '/');
+    const boundary = normalized.lastIndexOf('/');
+    const directoryPath = boundary >= 0 ? normalized.slice(0, boundary) : normalized;
+    await loadDirectoryGraph(directoryPath, currentBranch);
+    searchOpen.set(false);
+    searchQuery.set(result.name);
+  }
+
   async function handleKeydown(event: KeyboardEvent) {
     if (!currentResults.length) return;
 
@@ -132,6 +148,7 @@
       on:input={handleInput}
       on:keydown={handleKeydown}
       on:focus={() => searchOpen.set(currentResults.length > 0)}
+      bind:this={inputElement}
     />
     {#if searchLoading}
       <span class="spinner" aria-hidden="true"></span>
@@ -141,19 +158,26 @@
   {#if $searchOpen && currentResults.length > 0}
     <div class="search-results">
       {#each currentResults as result, index}
-        <button
-          type="button"
+        <div
+          role="button"
+          tabindex="0"
           class:selected={index === highlightedIndex}
           class="result-row"
           on:mouseenter={() => (highlightedIndex = index)}
           on:click={() => void selectResult(result)}
+          on:keydown={(event) => event.key === 'Enter' && void selectResult(result)}
         >
           <div class="result-header">
             <span class="result-name">{result.name}</span>
             <span class="kind-badge" style={`background:${nodeColor(result.kind)};`}>{result.kind}</span>
           </div>
-          <div class="result-path">{shortPath(result.filePath)}</div>
-        </button>
+          <div class="result-footer">
+            <div class="result-path">{shortPath(result.filePath)}</div>
+            <button class="directory-link" type="button" on:click={(event) => void openResultDirectory(result, event)}>
+              Open directory
+            </button>
+          </div>
+        </div>
       {/each}
     </div>
   {/if}
@@ -220,6 +244,7 @@
     border: 0;
     padding: 12px 14px;
     transition: background var(--transition-fast);
+    cursor: pointer;
   }
 
   .result-row:hover,
@@ -252,6 +277,22 @@
     margin-top: 4px;
     color: var(--text-muted);
     font-size: 12px;
+  }
+
+  .result-footer {
+    margin-top: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-sm);
+  }
+
+  .directory-link {
+    border: 0;
+    background: transparent;
+    color: var(--text-accent);
+    font-size: 12px;
+    padding: 0;
   }
 
   @keyframes spin {

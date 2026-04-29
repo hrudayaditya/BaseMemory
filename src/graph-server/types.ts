@@ -43,6 +43,8 @@ export type GraphNode = {
   language: string;
   startLine: number;
   degree: number;
+  role?: "internal" | "external-caller" | "external-callee" | "external-bidirectional";
+  depth?: number;
 };
 
 export type GraphEdge = {
@@ -54,6 +56,7 @@ export type GraphEdge = {
   callerFilePath: string | null;
   targetFilePath: string | null;
   line: number;
+  boundary?: "internal" | "incoming" | "outgoing";
 };
 
 export type NeighborhoodResponse = {
@@ -82,6 +85,13 @@ export type PathResponse = {
   found: boolean;
   exhausted: boolean;
   path: PathNode[];
+  edges: GraphEdge[];
+};
+
+export type DirectoryGraphResponse = {
+  directoryPath: string;
+  truncated: boolean;
+  nodes: GraphNode[];
   edges: GraphEdge[];
 };
 
@@ -158,6 +168,7 @@ export interface GraphQueryService {
   getResolvedEdgeCount(branch: string): number;
   getSymbolById(branch: string, symbolId: string): GraphSymbolRow | undefined;
   getSymbolsByIds(branch: string, symbolIds: Iterable<string>): Map<string, GraphSymbolRow>;
+  getSymbolsByDirectoryPrefix(branch: string, directoryPath: string): GraphSymbolRow[];
   searchSymbols(branch: string, query: string): GraphSymbolRow[];
   getCallerCount(branch: string, symbolId: string): number;
   getCalleeCount(branch: string, symbolId: string): number;

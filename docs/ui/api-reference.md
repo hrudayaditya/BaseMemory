@@ -6,6 +6,7 @@ Base URL:
 
 All routes are `GET`.
 All graph routes are branch-aware.
+The browser UI calls these routes through [src/hyperbase/src/api/client.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/api/client.ts).
 
 ## Branch behavior
 
@@ -121,18 +122,19 @@ Errors:
 
 ## `GET /api/neighborhood/:id?branch=<branch>&depth=<1|2|3>`
 
-The main graph endpoint.
+The main symbol graph endpoint.
 
 Rules:
 
 - default depth: `1`
 - max depth: `3`
-- BFS on resolved callers and resolved callees
+- BFS expands resolved callers and resolved callees
 - node cap: `300`
-- if cap is hit, `truncated: true`
-- unresolved edges are only included when both endpoints are already in the collected node set
+- if the cap is hit, `truncated: true`
+- unresolved edges are added after the resolved BFS pass
 - unresolved edges never create new nodes
-- node `degree` counts resolved edges only
+- unresolved edges are represented honestly with `to: null`
+- node `degree` counts resolved incident edges only
 
 Response:
 
@@ -154,7 +156,7 @@ Response:
   ],
   "edges": [
     {
-      "id": "edge_123",
+      "id": "edge_resolved",
       "from": "sym_a",
       "to": "sym_b",
       "callType": "Call",
@@ -162,10 +164,25 @@ Response:
       "callerFilePath": "/repo/src/a.ts",
       "targetFilePath": "/repo/src/b.ts",
       "line": 42
+    },
+    {
+      "id": "edge_unresolved",
+      "from": "sym_a",
+      "to": null,
+      "callType": "Call",
+      "isResolved": false,
+      "callerFilePath": "/repo/src/a.ts",
+      "targetFilePath": null,
+      "line": 43
     }
   ]
 }
 ```
+
+Client note:
+
+- the UI’s Graphology builder skips unresolved edges with `to: null`
+- they remain in the API payload for inspection and future rendering work
 
 Errors:
 
@@ -206,11 +223,11 @@ Response:
 }
 ```
 
-Reserved next route:
+Reserved route space:
 
 - `/api/graph/directory/:path`
 
-It is not implemented in Phase 1.
+It is still not implemented.
 
 ## `GET /api/blast-radius/:id?branch=<branch>`
 
@@ -241,13 +258,14 @@ Response:
 
 ## `GET /api/path?from=<id>&to=<id>&branch=<branch>`
 
-Shortest path search over resolved edges.
+Shortest path over resolved edges.
 
-Rules:
+Current implementation details that matter:
 
 - traverses both directions
-- visited-node cap: `1000`
-- if cap is hit before a path is found, `exhausted: true`
+- batches frontier expansion per hop
+- does not issue per-node DB queries during BFS
+- hard stop at `1000` visited nodes
 
 Found response:
 
@@ -300,7 +318,7 @@ Errors:
 
 ## `GET /api/peek/:symbolId?branch=<branch>`
 
-Returns code content for the smallest chunk containing the symbol span.
+Returns source content for the smallest chunk containing the symbol span.
 
 Rules:
 
@@ -352,8 +370,9 @@ Response:
 
 ## Notes for UI builders
 
-- Use `/api/graph/full` for the initial galaxy view.
-- Use `/api/neighborhood/:id` when the user zooms into a symbol.
-- Treat `isResolved: false` edges as lower-confidence links.
-- Do not assume symbol names are unique.
-- Always keep the branch in client state.
+- use `/api/graph/full` for the first render
+- use `/api/search` to get symbol ids
+- use `/api/neighborhood/:id` when the user drills into a symbol
+- keep unresolved edges in your data model even if your concrete graph renderer skips them
+- do not assume symbol names are unique
+- always keep branch in client state

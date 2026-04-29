@@ -8,6 +8,7 @@ import { fileURLToPath } from "url";
 
 import {
   buildBlastRadiusGraph,
+  buildDirectoryGraph,
   buildFullGraph,
   buildNeighborhoodGraph,
   buildShortestPath,
@@ -215,7 +216,22 @@ export function createGraphServer(options: GraphServerOptions): GraphServerInsta
     res.json(neighborhood);
   }));
 
-  // Reserved route space for Phase 2: /api/graph/directory/:path (solar-system zoom level).
+  app.get("/api/graph/directory", (req, res) => withBranch(req, res, (branch) => {
+    const directoryPath = typeof req.query.path === "string" ? req.query.path.trim() : "";
+    if (!directoryPath) {
+      sendError(res, 400, "INVALID_INPUT", "Missing query parameter: path");
+      return;
+    }
+
+    const directoryGraph = buildDirectoryGraph(queries, branch, directoryPath);
+    if (!directoryGraph) {
+      sendError(res, 404, "NOT_FOUND", `Unknown directory: ${directoryPath}`);
+      return;
+    }
+
+    res.json(directoryGraph);
+  }));
+
   app.get("/api/graph/full", (req, res) => withBranch(req, res, (branch) => {
     res.json(buildFullGraph(queries, branch));
   }));

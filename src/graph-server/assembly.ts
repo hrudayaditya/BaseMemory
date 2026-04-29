@@ -6,6 +6,7 @@ import {
   type GraphNode,
   type GraphQueryService,
   type GraphSymbolRow,
+  type DirectoryGraphResponse,
   type NeighborhoodResponse,
   type PathResponse,
 } from "./types.js";
@@ -13,6 +14,7 @@ import {
 export const MAX_NEIGHBORHOOD_DEPTH = 3;
 export const MAX_NEIGHBORHOOD_NODES = 300;
 export const MAX_BLAST_RADIUS_NODES = 500;
+export const MAX_DIRECTORY_NODES = 10_000;
 export const MAX_PATH_VISITED_NODES = 1000;
 
 function sortNodes(nodes: GraphNode[]): GraphNode[] {
@@ -37,7 +39,11 @@ function sortEdges(edges: GraphEdge[]): GraphEdge[] {
   );
 }
 
-function makeNode(row: GraphSymbolRow, degree: number = 0): GraphNode {
+function makeNode(
+  row: GraphSymbolRow,
+  degree: number = 0,
+  extras: Partial<Pick<GraphNode, "role" | "depth">> = {}
+): GraphNode {
   return {
     id: row.id,
     name: row.name,
@@ -46,6 +52,7 @@ function makeNode(row: GraphSymbolRow, degree: number = 0): GraphNode {
     language: row.language,
     startLine: row.start_line,
     degree,
+    ...extras,
   };
 }
 
@@ -83,6 +90,18 @@ function toDirectoryPath(filePath: string): string {
   const normalized = filePath.replace(/\\/g, "/");
   const index = normalized.lastIndexOf("/");
   return index >= 0 ? normalized.slice(0, index) : ".";
+}
+
+type ExternalRole = "external-caller" | "external-callee" | "external-bidirectional";
+
+function mergeExternalRole(
+  current: ExternalRole | undefined,
+  next: Exclude<ExternalRole, "external-bidirectional">
+): ExternalRole {
+  if (!current || current === next) {
+    return next;
+  }
+  return "external-bidirectional";
 }
 
 export function buildNeighborhoodGraph(
@@ -222,7 +241,11 @@ export function buildBlastRadiusGraph(
   }
 
   const degrees = queries.getDegrees(branch, nodesById.keys());
-  const nodes = sortNodes(Array.from(nodesById.values(), (row) => makeNode(row, degrees.get(row.id) ?? 0)));
+  const nodes = sortNodes(
+    Array.from(nodesById.values(), (row) =>
+      makeNode(row, degrees.get(row.id) ?? 0, { depth: depths.get(row.id) ?? 0 })
+    )
+  );
   const edges = sortEdges(Array.from(edgesById.values()));
   const depthMap = Object.fromEntries(Array.from(depths.entries()).sort((a, b) => a[0].localeCompare(b[0])));
 
@@ -232,6 +255,104 @@ export function buildBlastRadiusGraph(
     nodes,
     edges,
     depth: depthMap,
+  };
+}
+
+export function buildDirectoryGraph(
+  queries: GraphQueryService,
+  branch: string,
+  directoryPath: string
+): DirectoryGraphResponse | null {
+  const internalRows = queries.getSymbolsByDirectoryPrefix(branch, directoryPath);
+  if (internalRows.length === 0) {
+    return null;
+  }
+
+  const internalIds = new Set(internalRows.map((row) => row.id));
+  const nodesById = new Map<string, GraphSymbolRow>(internalRows.map((row) => [row.id, row]));
+  const edgesById = new Map<string, GraphEdge>();
+  const rolesById = new Map<string, ExternalRole>();
+  const incidentRows = queries.getResolvedIncident(branch, internalIds);
+  const unresolvedRows = queries.getUnresolvedOutgoing(branch, internalIds);
+  const externalIds = new Set<string>();
+  let truncated = false;
+
+  for (const row of incidentRows) {
+    const edge = makeResolvedEdge(row);
+    if (!edge || !edge.to) {
+      continue;
+    }
+
+    const fromInternal = internalIds.has(edge.from);
+    const toInternal = internalIds.has(edge.to);
+
+    if (fromInternal && toInternal) {
+      edge.boundary = "internal";
+      edgesById.set(edge.id, edge);
+      continue;
+    }
+
+    if (fromInternal && !toInternal) {
+      edge.boundary = "outgoing";
+      externalIds.add(edge.to);
+      rolesById.set(edge.to, mergeExternalRole(rolesById.get(edge.to), "external-callee"));
+      edgesById.set(edge.id, edge);
+      continue;
+    }
+
+    if (!fromInternal && toInternal) {
+      edge.boundary = "incoming";
+      externalIds.add(edge.from);
+      rolesById.set(edge.from, mergeExternalRole(rolesById.get(edge.from), "external-caller"));
+      edgesById.set(edge.id, edge);
+    }
+  }
+
+  for (const row of unresolvedRows) {
+    if (!internalIds.has(row.from_symbol_id)) {
+      continue;
+    }
+
+    const edge = makeUnresolvedEdge(row);
+    edge.boundary = "outgoing";
+    edgesById.set(edge.id, edge);
+  }
+
+  const externalRows = queries.getSymbolsByIds(branch, externalIds);
+  for (const [nodeId, row] of externalRows) {
+    if (nodesById.has(nodeId)) {
+      continue;
+    }
+    if (nodesById.size >= MAX_DIRECTORY_NODES) {
+      truncated = true;
+      break;
+    }
+    nodesById.set(nodeId, row);
+  }
+
+  const filteredEdges = Array.from(edgesById.values()).filter((edge) => {
+    if (!nodesById.has(edge.from)) {
+      return false;
+    }
+    if (!edge.to) {
+      return true;
+    }
+    return nodesById.has(edge.to);
+  });
+  const degrees = queries.getDegrees(branch, nodesById.keys());
+  const nodes = sortNodes(
+    Array.from(nodesById.values(), (row) =>
+      makeNode(row, degrees.get(row.id) ?? 0, {
+        role: internalIds.has(row.id) ? "internal" : rolesById.get(row.id),
+      })
+    )
+  );
+
+  return {
+    directoryPath,
+    truncated,
+    nodes,
+    edges: sortEdges(filteredEdges),
   };
 }
 

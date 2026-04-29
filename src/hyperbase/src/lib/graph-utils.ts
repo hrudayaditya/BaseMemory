@@ -1,5 +1,8 @@
 import Graph from 'graphology';
 import type {
+  BlastRadiusResponse,
+  DirectoryGraphResponse,
+  PathNode,
   FileEdge,
   FileGraphNodeAttributes,
   FileNode,
@@ -35,6 +38,17 @@ export function fileDirectory(filePath: string): string {
   return trimmed.slice(0, 2).join('/') || parts.slice(-2).join('/');
 }
 
+function buildDegreeMap(nodes: string[], edges: Array<{ from: string; to: string }>): Map<string, number> {
+  const degreeMap = new Map<string, number>(nodes.map((nodeId) => [nodeId, 0]));
+
+  edges.forEach((edge) => {
+    degreeMap.set(edge.from, (degreeMap.get(edge.from) ?? 0) + 1);
+    degreeMap.set(edge.to, (degreeMap.get(edge.to) ?? 0) + 1);
+  });
+
+  return degreeMap;
+}
+
 export function stringToHue(str: string): number {
   let hash = 0;
   for (let i = 0; i < str.length; i += 1) {
@@ -66,6 +80,18 @@ export function languageColor(language: string): string {
   return fallbackPalette[stringToHue(language) % fallbackPalette.length] ?? theme.language.default;
 }
 
+export function inferLanguageFromPath(filePath: string): string {
+  const normalized = filePath.toLowerCase();
+  if (normalized.endsWith('.ts') || normalized.endsWith('.tsx')) return 'typescript';
+  if (normalized.endsWith('.js') || normalized.endsWith('.jsx') || normalized.endsWith('.mjs') || normalized.endsWith('.cjs')) {
+    return 'javascript';
+  }
+  if (normalized.endsWith('.rs')) return 'rust';
+  if (normalized.endsWith('.py')) return 'python';
+  if (normalized.endsWith('.go')) return 'go';
+  return 'default';
+}
+
 function seededUnit(seed: string): number {
   let hash = 2166136261;
   for (let index = 0; index < seed.length; index += 1) {
@@ -80,6 +106,27 @@ function seededPosition(nodeId: string, contentId: string, axis: 'x' | 'y'): num
   return seededUnit(seed) * 1000 - 500;
 }
 
+function seededRange(seed: string, min: number, max: number): number {
+  return min + seededUnit(seed) * (max - min);
+}
+
+function blastDepthColor(depth: number): string {
+  const theme = getTheme();
+  if (depth <= 0) {
+    return theme.analytics.hotspot;
+  }
+  if (depth === 1) {
+    return theme.analytics.blastDepth1;
+  }
+  if (depth === 2) {
+    return theme.analytics.blastDepth2;
+  }
+  if (depth === 3) {
+    return theme.analytics.blastDepth3;
+  }
+  return theme.analytics.blastDepthBeyond;
+}
+
 export function buildGraphologyInstance(
   nodes: FileNode[],
   edges: FileEdge[],
@@ -88,6 +135,11 @@ export function buildGraphologyInstance(
   const theme = getTheme();
   const graph = new Graph<FileGraphNodeAttributes, GraphEdgeAttributes>({ type: 'directed', multi: false });
   const maxSymbolCount = Math.max(...nodes.map((node) => node.symbolCount), 1);
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const degreeMap = buildDegreeMap(
+    nodes.map((node) => node.id),
+    edges
+  );
 
   nodes.forEach((node) => {
     graph.addNode(node.id, {
@@ -100,17 +152,23 @@ export function buildGraphologyInstance(
       language: node.language,
       symbolCount: node.symbolCount,
       directory: node.directory,
+      degree: degreeMap.get(node.id) ?? 0,
       highlighted: false,
       dimmed: false,
     });
   });
 
   edges.forEach((edge) => {
-    if (graph.hasNode(edge.from) && graph.hasNode(edge.to)) {
+    const fromNode = nodeById.get(edge.from);
+    const toNode = nodeById.get(edge.to);
+    if (graph.hasNode(edge.from) && graph.hasNode(edge.to) && fromNode && toNode) {
       graph.addEdge(edge.from, edge.to, {
         size: Math.min(Math.max(Math.log(edge.callCount + 1), 1), 4),
         color: theme.edge.file,
         isResolved: true,
+        callCount: edge.callCount,
+        callerFilePath: fromNode.filePath,
+        targetFilePath: toNode.filePath,
         highlighted: false,
       });
     }
@@ -142,6 +200,9 @@ export function buildNeighborhoodGraphologyInstance(
       degree: node.degree,
       startLine: node.startLine,
       name: node.name,
+      role: node.role,
+      depth: node.depth,
+      layoutRole: node.role,
       community: node.community,
       communityColor: undefined,
       highlighted: false,
@@ -174,6 +235,192 @@ export function buildNeighborhoodGraphologyInstance(
         size: edge.isResolved ? 1.5 : 0.75,
         color: edge.isResolved ? theme.edge.resolved : theme.edge.unresolved,
         isResolved: edge.isResolved,
+        callCount: 1,
+        callerFilePath: edge.callerFilePath,
+        targetFilePath: edge.targetFilePath,
+        highlighted: false,
+      });
+    }
+  });
+
+  return graph;
+}
+
+function directorySeedPosition(
+  nodeId: string,
+  contentId: string,
+  role: SymbolGraphNodeAttributes['layoutRole']
+): { x: number; y: number } {
+  if (!role || role === 'internal') {
+    return {
+      x: seededRange(`${contentId}:${nodeId}:directory:center:x`, -180, 180),
+      y: seededRange(`${contentId}:${nodeId}:directory:center:y`, -140, 140),
+    };
+  }
+
+  const radius = seededRange(`${contentId}:${nodeId}:directory:radius`, 320, 460);
+  const angle =
+    role === 'external-caller'
+      ? seededRange(`${contentId}:${nodeId}:directory:angle`, Math.PI * 0.65, Math.PI * 1.35)
+      : role === 'external-callee'
+        ? seededRange(`${contentId}:${nodeId}:directory:angle`, -Math.PI * 0.35, Math.PI * 0.35)
+        : seededRange(`${contentId}:${nodeId}:directory:angle`, Math.PI * 1.35, Math.PI * 1.65);
+
+  return {
+    x: Math.cos(angle) * radius,
+    y: Math.sin(angle) * radius,
+  };
+}
+
+export function buildBlastRadiusGraphologyInstance(
+  payload: BlastRadiusResponse,
+  contentId: string
+): Graph<SymbolGraphNodeAttributes, GraphEdgeAttributes> {
+  const graph = buildNeighborhoodGraphologyInstance(payload.nodes, payload.edges, contentId);
+
+  payload.nodes.forEach((node) => {
+    if (!graph.hasNode(node.id)) {
+      return;
+    }
+
+    const depth = payload.depth[node.id] ?? node.depth ?? 0;
+    graph.mergeNodeAttributes(node.id, {
+      color: blastDepthColor(depth),
+      depth,
+      role: node.role,
+    });
+  });
+
+  return graph;
+}
+
+export function buildDirectoryGraphologyInstance(
+  payload: DirectoryGraphResponse,
+  contentId: string
+): Graph<SymbolGraphNodeAttributes, GraphEdgeAttributes> {
+  const graph = new Graph<SymbolGraphNodeAttributes, GraphEdgeAttributes>({ type: 'directed', multi: false });
+  const theme = getTheme();
+  const maxDegree = Math.max(...payload.nodes.map((node) => node.degree), 1);
+  const collapsedEdges = new Map<
+    string,
+    {
+      edge: GraphEdge;
+      callCount: number;
+    }
+  >();
+
+  payload.nodes.forEach((node) => {
+    const position = directorySeedPosition(node.id, contentId, node.role);
+    const isInternal = !node.role || node.role === 'internal';
+    graph.addNode(node.id, {
+      label: nodeLabel(node.name, node.filePath),
+      color: isInternal ? nodeColor(node.kind) : theme.node.default,
+      size: isInternal ? nodeSize(node.degree, maxDegree) : Math.max(4, nodeSize(node.degree, maxDegree) * 0.7),
+      x: node.x ?? position.x,
+      y: node.y ?? position.y,
+      filePath: node.filePath,
+      language: node.language,
+      kind: node.kind,
+      degree: node.degree,
+      startLine: node.startLine,
+      name: node.name,
+      role: node.role,
+      layoutRole: node.role,
+      community: node.community,
+      communityColor: undefined,
+      highlighted: false,
+      dimmed: false,
+    });
+  });
+
+  payload.edges.forEach((edge) => {
+    if (!edge.to) {
+      return;
+    }
+
+    const pairKey = `${edge.from}->${edge.to}`;
+    const existing = collapsedEdges.get(pairKey);
+    if (!existing) {
+      collapsedEdges.set(pairKey, { edge, callCount: 1 });
+      return;
+    }
+
+    existing.callCount += 1;
+  });
+
+  collapsedEdges.forEach(({ edge, callCount }) => {
+    if (edge.to && graph.hasNode(edge.from) && graph.hasNode(edge.to)) {
+      graph.addEdgeWithKey(edge.id, edge.from, edge.to, {
+        size: edge.boundary === 'internal' ? 1.4 : 0.9,
+        color:
+          edge.boundary === 'internal'
+            ? theme.edge.resolved
+            : edge.boundary === 'incoming'
+              ? theme.analytics.couplingCross
+              : theme.node.dimmed,
+        isResolved: edge.isResolved,
+        callCount,
+        callerFilePath: edge.callerFilePath,
+        targetFilePath: edge.targetFilePath,
+        boundary: edge.boundary,
+        highlighted: false,
+      });
+    }
+  });
+
+  return graph;
+}
+
+export function buildPathGraphologyInstance(
+  nodes: PathNode[],
+  edges: GraphEdge[],
+  contentId: string
+): Graph<SymbolGraphNodeAttributes, GraphEdgeAttributes> {
+  const theme = getTheme();
+  const graph = new Graph<SymbolGraphNodeAttributes, GraphEdgeAttributes>({ type: 'directed', multi: false });
+  const degreeMap = new Map<string, number>();
+  const spacing = 160;
+  const offset = ((nodes.length - 1) * spacing) / 2;
+
+  edges.forEach((edge) => {
+    if (!edge.to) {
+      return;
+    }
+
+    degreeMap.set(edge.from, (degreeMap.get(edge.from) ?? 0) + 1);
+    degreeMap.set(edge.to, (degreeMap.get(edge.to) ?? 0) + 1);
+  });
+
+  nodes.forEach((node, index) => {
+    const language = inferLanguageFromPath(node.filePath);
+    graph.addNode(node.id, {
+      label: nodeLabel(node.name, node.filePath),
+      color: nodeColor('function'),
+      size: nodeSize(degreeMap.get(node.id) ?? 1, Math.max(...degreeMap.values(), 1)),
+      x: index * spacing - offset,
+      y: seededPosition(node.id, contentId, 'y') * 0.12,
+      filePath: node.filePath,
+      language,
+      kind: 'function',
+      degree: degreeMap.get(node.id) ?? 0,
+      startLine: 0,
+      name: node.name,
+      community: undefined,
+      communityColor: undefined,
+      highlighted: false,
+      dimmed: false,
+    });
+  });
+
+  edges.forEach((edge) => {
+    if (edge.to && graph.hasNode(edge.from) && graph.hasNode(edge.to)) {
+      graph.addEdgeWithKey(edge.id, edge.from, edge.to, {
+        size: 2,
+        color: theme.edge.path,
+        isResolved: edge.isResolved,
+        callCount: 1,
+        callerFilePath: edge.callerFilePath,
+        targetFilePath: edge.targetFilePath,
         highlighted: false,
       });
     }

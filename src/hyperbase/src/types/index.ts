@@ -7,6 +7,8 @@ export interface GraphNode {
   startLine: number;
   degree: number;
   community?: number;
+  role?: 'internal' | 'external-caller' | 'external-callee' | 'external-bidirectional';
+  depth?: number;
   x?: number;
   y?: number;
 }
@@ -19,6 +21,7 @@ export interface GraphEdge {
   isResolved: boolean;
   callerFilePath: string | null;
   targetFilePath: string | null;
+  boundary?: 'internal' | 'incoming' | 'outgoing';
   line: number;
 }
 
@@ -87,6 +90,13 @@ export interface BlastRadiusResponse {
   depth: Record<string, number>;
 }
 
+export interface DirectoryGraphResponse {
+  directoryPath: string;
+  truncated: boolean;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
 export interface PathNode {
   id: string;
   name: string;
@@ -99,6 +109,13 @@ export interface PathResponse {
   path: PathNode[];
   edges: GraphEdge[];
 }
+
+export type CurrentGraphPayload =
+  | { kind: 'galaxy'; payload: FullGraphResponse }
+  | { kind: 'neighborhood'; payload: NeighborhoodResponse }
+  | { kind: 'blast-radius'; payload: BlastRadiusResponse }
+  | { kind: 'directory'; payload: DirectoryGraphResponse }
+  | { kind: 'path'; payload: PathResponse };
 
 export interface HealthResponse {
   status: string;
@@ -119,6 +136,8 @@ export interface FileGraphNodeAttributes {
   language: string;
   symbolCount: number;
   directory: string;
+  degree: number;
+  layoutRole?: 'internal' | 'external-caller' | 'external-callee' | 'external-bidirectional';
   highlighted?: boolean;
   dimmed?: boolean;
 }
@@ -135,6 +154,9 @@ export interface SymbolGraphNodeAttributes {
   degree: number;
   startLine: number;
   name: string;
+  role?: 'internal' | 'external-caller' | 'external-callee' | 'external-bidirectional';
+  depth?: number;
+  layoutRole?: 'internal' | 'external-caller' | 'external-callee' | 'external-bidirectional';
   community?: number;
   communityColor?: string;
   highlighted?: boolean;
@@ -145,15 +167,24 @@ export interface GraphEdgeAttributes {
   size: number;
   color: string;
   isResolved: boolean;
+  callCount?: number;
+  callerFilePath?: string | null;
+  targetFilePath?: string | null;
+  boundary?: 'internal' | 'incoming' | 'outgoing';
   highlighted?: boolean;
 }
 
 export interface UrlState {
   branch?: string;
   symbolId?: string;
+  fromId?: string;
+  toId?: string;
+  directoryPath?: string;
+  focus?: boolean;
+  focusedIds?: string[];
   depth?: number;
   view?: string;
 }
 
-export type Overlay = 'none' | 'community' | 'degree' | 'language';
+export type Overlay = 'none' | 'community' | 'degree' | 'language' | 'coupling' | 'dead' | 'hotspot';
 export type ZoomLevel = 'galaxy' | 'solar' | 'atom';

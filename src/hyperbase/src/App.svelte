@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { get } from 'svelte/store';
   import { onDestroy, onMount } from 'svelte';
   import GraphCanvas from './components/canvas/GraphCanvas.svelte';
   import WorkerLayout from './components/canvas/WorkerLayout.svelte';
@@ -6,67 +7,247 @@
   import DetailPanel from './components/panels/DetailPanel.svelte';
   import ControlBar from './components/controls/ControlBar.svelte';
   import Minimap from './components/minimap/Minimap.svelte';
+  import ShortcutHelpModal from './components/overlays/ShortcutHelpModal.svelte';
+  import AnnotationEditorModal from './components/overlays/AnnotationEditorModal.svelte';
+  import HandoffModal from './components/overlays/HandoffModal.svelte';
+  import ViewHeader from './components/overlays/ViewHeader.svelte';
+  import { OVERLAY_ORDER } from './lib/constants';
   import { readUrlState, writeUrlState } from './lib/url-state';
   import {
     activeBranch,
+    currentView,
+    currentViewInfo,
     focusedSymbolId,
+    graphDepth,
     graphError,
     graphLoading,
     graphTruncated,
-    graphDepth,
     initializeGraph,
+    loadBlastRadiusGraph,
+    loadGalaxyGraph,
     retryGraphLoad,
+    setGraphOverlay,
+    sigmaInstance,
   } from './stores/graph';
-  import { selectNode } from './stores/selection';
+  import { clearSelectedNode, selectedNodeId, selectNode } from './stores/selection';
+  import {
+    activeOverlay,
+    cancelPathFinding,
+    closeSearchDropdown,
+    closeHandoffModal,
+    focusMode,
+    focusedNodeIds,
+    pathFindingHint,
+    pathFindingMode,
+    requestSearchFocus,
+    setFocusMode,
+    shortcutHelpOpen,
+    startPathFinding,
+  } from './stores/ui';
 
   let truncationDismissed = false;
+  let urlSyncReady = false;
   let currentBranch = '';
   let currentFocusedSymbolId: string | null = null;
   let currentDepth = 1;
+  let currentGraphView = 'galaxy';
+  let currentViewDetails = get(currentViewInfo);
+  let currentFocusMode = false;
+  let currentFocusedNodeIds = new Set<string>();
+
+  function syncUrlState() {
+    if (!urlSyncReady) {
+      return;
+    }
+
+    const pathState =
+      currentViewDetails.kind === 'path'
+        ? {
+            fromId: currentViewDetails.fromId,
+            toId: currentViewDetails.toId,
+          }
+        : {};
+
+    const directoryState =
+      currentViewDetails.kind === 'directory'
+        ? {
+            directoryPath: currentViewDetails.directoryPath,
+          }
+        : {};
+
+    writeUrlState({
+      branch: currentBranch,
+      symbolId: currentFocusedSymbolId ?? undefined,
+      focus: currentFocusMode && currentFocusedNodeIds.size > 0,
+      focusedIds: currentFocusMode && currentFocusedNodeIds.size > 0 ? Array.from(currentFocusedNodeIds) : undefined,
+      depth: currentDepth,
+      view: currentGraphView,
+      ...pathState,
+      ...directoryState,
+    });
+  }
 
   const unsubscribers = [
     activeBranch.subscribe((branch) => {
       currentBranch = branch;
-      writeUrlState({
-        branch,
-        symbolId: currentFocusedSymbolId ?? undefined,
-        depth: currentDepth,
-        view: currentFocusedSymbolId ? 'atom' : 'galaxy',
-      });
+      syncUrlState();
     }),
     focusedSymbolId.subscribe((symbolId) => {
       currentFocusedSymbolId = symbolId;
-      writeUrlState({
-        branch: currentBranch,
-        symbolId: symbolId ?? undefined,
-        depth: currentDepth,
-        view: symbolId ? 'atom' : 'galaxy',
-      });
+      syncUrlState();
     }),
     graphDepth.subscribe((depth) => {
       currentDepth = depth;
-      writeUrlState({
-        branch: currentBranch,
-        symbolId: currentFocusedSymbolId ?? undefined,
-        depth,
-        view: currentFocusedSymbolId ? 'atom' : 'galaxy',
-      });
+      syncUrlState();
+    }),
+    currentView.subscribe((view) => {
+      currentGraphView = view;
+      truncationDismissed = false;
+      syncUrlState();
+    }),
+    currentViewInfo.subscribe((info) => {
+      currentViewDetails = info;
+      syncUrlState();
+    }),
+    focusMode.subscribe((value) => {
+      currentFocusMode = value;
+      syncUrlState();
+    }),
+    focusedNodeIds.subscribe((value) => {
+      currentFocusedNodeIds = value;
+      syncUrlState();
     }),
   ];
 
   async function boot() {
     const urlState = readUrlState();
     await initializeGraph(urlState);
-    if (urlState.symbolId) {
+    if (urlState.view === 'path' && urlState.fromId) {
+      await selectNode(urlState.fromId);
+    } else if (urlState.symbolId) {
       await selectNode(urlState.symbolId);
+    }
+    if (urlState.focus && urlState.focusedIds && urlState.focusedIds.length > 0) {
+      setFocusMode(true, urlState.focusedIds);
+      if (!urlState.symbolId && !urlState.fromId) {
+        await selectNode(urlState.focusedIds[0] ?? null);
+      }
+    }
+    urlSyncReady = true;
+    syncUrlState();
+  }
+
+  function isEditableTarget(target: EventTarget | null): boolean {
+    const element = target instanceof HTMLElement ? target : null;
+    if (!element) {
+      return false;
+    }
+
+    return Boolean(element.closest('input, textarea, select, [contenteditable="true"]'));
+  }
+
+  async function handleKeydown(event: KeyboardEvent) {
+    if (event.key === '?' || (event.key === '/' && event.shiftKey)) {
+      if (!isEditableTarget(event.target)) {
+        event.preventDefault();
+        shortcutHelpOpen.set(true);
+      }
+      return;
+    }
+
+    if (event.key === '/') {
+      if (!isEditableTarget(event.target)) {
+        event.preventDefault();
+        requestSearchFocus();
+      }
+      return;
+    }
+
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      shortcutHelpOpen.set(false);
+      closeHandoffModal();
+      closeSearchDropdown();
+      cancelPathFinding();
+      setFocusMode(false);
+      clearSelectedNode();
+      return;
+    }
+
+    if (isEditableTarget(event.target)) {
+      return;
+    }
+
+    if (event.key === ' ') {
+      event.preventDefault();
+      await get(sigmaInstance)?.getCamera().animatedReset();
+      return;
+    }
+
+    if (event.key.toLowerCase() === 'g') {
+      event.preventDefault();
+      await loadGalaxyGraph();
+      return;
+    }
+
+    if (event.key.toLowerCase() === 'p') {
+      event.preventDefault();
+      const selectedId = get(selectedNodeId) ?? get(focusedSymbolId);
+      if (!selectedId || selectedId.startsWith('file::')) {
+        pathFindingHint.set('Select a symbol, then press P to choose a path source.');
+        return;
+      }
+
+      startPathFinding(selectedId);
+      pathFindingHint.set('Path mode active. Click a second node to complete the path.');
+      return;
+    }
+
+    if (event.key.toLowerCase() === 'r') {
+      event.preventDefault();
+      const selectedId = get(selectedNodeId);
+      if (!selectedId || selectedId.startsWith('file::')) {
+        pathFindingHint.set('Select a symbol before opening blast radius.');
+        return;
+      }
+
+      await loadBlastRadiusGraph(selectedId);
+      return;
+    }
+
+    if (event.key.toLowerCase() === 'f') {
+      event.preventDefault();
+      if (get(focusMode)) {
+        setFocusMode(false);
+        return;
+      }
+
+      const selectedId = get(selectedNodeId);
+      if (!selectedId) {
+        pathFindingHint.set('Select a node before entering focus mode.');
+        return;
+      }
+
+      setFocusMode(true, [selectedId]);
+      return;
+    }
+
+    if (event.key.toLowerCase() === 'd') {
+      event.preventDefault();
+      const currentOverlay = get(activeOverlay);
+      const currentIndex = OVERLAY_ORDER.indexOf(currentOverlay);
+      const nextOverlay = OVERLAY_ORDER[(currentIndex + 1) % OVERLAY_ORDER.length] ?? 'none';
+      setGraphOverlay(nextOverlay);
     }
   }
 
   onMount(() => {
     void boot();
+    document.addEventListener('keydown', handleKeydown);
   });
 
   onDestroy(() => {
+    document.removeEventListener('keydown', handleKeydown);
     unsubscribers.forEach((unsubscribe) => unsubscribe());
   });
 </script>
@@ -76,8 +257,12 @@
   <WorkerLayout />
   <SearchBar />
   <ControlBar />
+  <ViewHeader />
   <DetailPanel />
   <Minimap />
+  <ShortcutHelpModal open={$shortcutHelpOpen} onClose={() => shortcutHelpOpen.set(false)} />
+  <AnnotationEditorModal />
+  <HandoffModal />
 
   {#if $graphLoading}
     <div class="overlay">
@@ -100,8 +285,26 @@
 
   {#if $graphTruncated && !truncationDismissed}
     <div class="truncation-banner">
-      <span>Graph truncated at 300 nodes. Zoom in and search for specific symbols to explore further.</span>
+      <span>
+        {#if $currentView === 'galaxy'}
+          Graph truncated at 300 nodes. Zoom in and search for specific symbols to explore further.
+        {:else if $currentView === 'atom'}
+          Neighborhood truncated at 300 nodes. Reduce depth or open connected symbols individually.
+        {:else if $currentView === 'blast'}
+          Blast radius truncated at 500 nodes. Start from a narrower symbol to inspect the full dependency cone.
+        {:else if $currentView === 'directory'}
+          Directory view truncated at 10,000 nodes. Narrow the module scope to inspect every connected symbol.
+        {:else}
+          Graph truncated.
+        {/if}
+      </span>
       <button type="button" on:click={() => (truncationDismissed = true)}>Dismiss</button>
+    </div>
+  {/if}
+
+  {#if $pathFindingMode || $pathFindingHint}
+    <div class="path-hint">
+      {$pathFindingHint ?? 'Path mode active. Click a second node to complete the path.'}
     </div>
   {/if}
 </div>
@@ -189,6 +392,20 @@
     background: transparent;
     color: var(--node-constant);
     font-weight: 600;
+  }
+
+  .path-hint {
+    position: fixed;
+    bottom: 64px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
+    color: var(--text-primary);
+    padding: 10px 14px;
+    z-index: var(--z-controls);
   }
 
   @keyframes spin {

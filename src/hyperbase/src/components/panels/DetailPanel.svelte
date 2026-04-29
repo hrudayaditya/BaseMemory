@@ -1,5 +1,7 @@
 <script lang="ts">
-  import { activeBranch, graphDepth, loadNeighborhoodGraph } from '../../stores/graph';
+  import { activeBranch, graphDepth, loadBlastRadiusGraph, loadDirectoryGraph, loadNeighborhoodGraph } from '../../stores/graph';
+  import { openAnnotationEditor, selectedAnnotation } from '../../lib/annotations';
+  import { openGeneratedHandoff } from '../../lib/handoff-actions';
   import {
     clearSelectedNode,
     detailLoading,
@@ -22,8 +24,28 @@
     await selectNode($selectedNodeId);
   }
 
+  async function openBlastRadius() {
+    if (!$selectedNodeId || !$activeBranch || $selectedNodeId.startsWith('file::')) return;
+    await loadBlastRadiusGraph($selectedNodeId, $activeBranch);
+    await selectNode($selectedNodeId);
+  }
+
+  async function openDirectory() {
+    const filePath = String($selectedNodeData?.filePath ?? '');
+    if (!filePath || !$activeBranch) return;
+    const normalized = filePath.replace(/\\/g, '/');
+    const boundary = normalized.lastIndexOf('/');
+    const directoryPath = boundary >= 0 ? normalized.slice(0, boundary) : normalized;
+    await loadDirectoryGraph(directoryPath, $activeBranch);
+  }
+
   function closePanel() {
     clearSelectedNode();
+  }
+
+  function editAnnotation() {
+    if (!$selectedNodeId) return;
+    openAnnotationEditor($selectedNodeId, $selectedAnnotation?.note ?? '');
   }
 </script>
 
@@ -46,6 +68,13 @@
       <p class="meta-line">Symbols: {String($selectedNodeData.symbolCount ?? '0')}</p>
       <p class="meta-line">Directory: {String($selectedNodeData.directory ?? '')}</p>
     </div>
+    <div class="section actions">
+      <button class="action-button primary" type="button" on:click={() => void openDirectory()}>Open directory</button>
+      <button class="action-button" type="button" on:click={editAnnotation}>
+        {$selectedAnnotation ? 'Edit note' : 'Add note'}
+      </button>
+      <button class="action-button" type="button" on:click={() => openGeneratedHandoff([$selectedNodeId!])}>Generate handoff</button>
+    </div>
   {:else if $selectedSymbolDetail}
     <div class="section">
       <div class="kind-badge">{$selectedSymbolDetail.kind}</div>
@@ -67,6 +96,11 @@
 
     <div class="section actions">
       <button class="action-button primary" type="button" on:click={() => void setAsCenter()}>Set as center</button>
+      <button class="action-button accent" type="button" on:click={() => void openBlastRadius()}>Blast radius</button>
+      <button class="action-button" type="button" on:click={editAnnotation}>
+        {$selectedAnnotation ? 'Edit note' : 'Add note'}
+      </button>
+      <button class="action-button" type="button" on:click={() => openGeneratedHandoff([$selectedNodeId!])}>Generate handoff</button>
       <a
         class="action-button"
         href={`vscode://file/${$selectedSymbolDetail.filePath}:${$selectedSymbolDetail.startLine}`}
@@ -81,6 +115,14 @@
     </div>
   {:else}
     <div class="section">Select a symbol to inspect its callers, callees, and source preview.</div>
+  {/if}
+
+  {#if $selectedAnnotation}
+    <div class="section">
+      <h3>Note</h3>
+      <p class="note-copy">{$selectedAnnotation.note}</p>
+      <button class="action-button" type="button" on:click={editAnnotation}>Edit note</button>
+    </div>
   {/if}
 </aside>
 
@@ -194,6 +236,11 @@
     border-color: transparent;
   }
 
+  .action-button.accent {
+    border-color: color-mix(in srgb, var(--analytics-blast-depth-1) 40%, transparent);
+    color: var(--analytics-blast-depth-1);
+  }
+
   .code-preview {
     margin: var(--space-sm) 0 0;
     background: var(--bg-primary);
@@ -206,6 +253,13 @@
     max-height: 300px;
     overflow: auto;
     padding: var(--space-md);
+    white-space: pre-wrap;
+  }
+
+  .note-copy {
+    margin: 0 0 var(--space-md);
+    color: var(--text-primary);
+    line-height: 1.6;
     white-space: pre-wrap;
   }
 </style>

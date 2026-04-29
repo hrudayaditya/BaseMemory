@@ -49,6 +49,43 @@ function deltaPositionsFor(
   return positions;
 }
 
+function projectBoundaryNodes(graph: Graph): void {
+  let maxRadius = 0;
+  graph.forEachNode((_node, attributes) => {
+    const radius = Math.hypot(attributes.x, attributes.y);
+    maxRadius = Math.max(maxRadius, radius);
+  });
+
+  const boundaryRadius = Math.max(maxRadius * 1.08, 360);
+
+  graph.forEachNode((node, attributes) => {
+    const role = (attributes.layoutRole ?? attributes.role) as string | undefined;
+    if (!role || role === 'internal') {
+      return;
+    }
+
+    const seed = `${node}:${role}`;
+    let hash = 2166136261;
+    for (let index = 0; index < seed.length; index += 1) {
+      hash ^= seed.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    const unit = (hash >>> 0) / 0xffffffff;
+
+    const angle =
+      role === 'external-caller'
+        ? Math.PI * (0.7 + unit * 0.6)
+        : role === 'external-callee'
+          ? Math.PI * (-0.3 + unit * 0.6)
+          : Math.PI * (1.35 + unit * 0.3);
+
+    graph.mergeNodeAttributes(node, {
+      x: Math.cos(angle) * boundaryRadius,
+      y: Math.sin(angle) * boundaryRadius,
+    });
+  });
+}
+
 self.onmessage = (event: MessageEvent<WorkerMessage>) => {
   const payload = event.data;
   if (payload.type === 'communities') {
@@ -105,8 +142,10 @@ self.onmessage = (event: MessageEvent<WorkerMessage>) => {
     return;
   }
 
+  projectBoundaryNodes(graph);
+
   self.postMessage({
     type: 'done',
-    positions: previousPositions,
+    positions: positionsFor(graph),
   });
 };

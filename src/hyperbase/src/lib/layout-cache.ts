@@ -91,3 +91,16 @@ export function persistLayoutSnapshot(
     // Ignore storage quota or serialization failures; layout persistence is opportunistic.
   }
 }
+
+export function captureLayoutSnapshot(graph: Graph): Record<string, { x: number; y: number }> {
+  const positions: Record<string, { x: number; y: number }> = {};
+
+  graph.forEachNode((nodeId, attributes) => {
+    const position = attributes as { x?: unknown; y?: unknown };
+    if (typeof position.x === 'number' && Number.isFinite(position.x) && typeof position.y === 'number' && Number.isFinite(position.y)) {
+      positions[nodeId] = { x: position.x, y: position.y };
+    }
+  });
+
+  return positions;
+}

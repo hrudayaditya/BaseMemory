@@ -41,6 +41,18 @@ export interface HyperbaseTheme {
     go: string;
     default: string;
   };
+  analytics: {
+    degreeLow: string;
+    degreeHigh: string;
+    couplingSame: string;
+    couplingCross: string;
+    couplingHot: string;
+    hotspot: string;
+    blastDepth1: string;
+    blastDepth2: string;
+    blastDepth3: string;
+    blastDepthBeyond: string;
+  };
   border: {
     base: string;
     accent: string;
@@ -95,6 +107,18 @@ const FALLBACK_THEME: HyperbaseTheme = {
     python: '#34d399',
     go: '#7dd3fc',
     default: '#94a3b8',
+  },
+  analytics: {
+    degreeLow: '#5aa8ff',
+    degreeHigh: '#ff7a1a',
+    couplingSame: 'rgba(255, 255, 255, 0.08)',
+    couplingCross: 'rgba(79, 156, 249, 0.82)',
+    couplingHot: 'rgba(251, 191, 36, 0.92)',
+    hotspot: '#ffffff',
+    blastDepth1: '#ef4444',
+    blastDepth2: '#f97316',
+    blastDepth3: '#fbbf24',
+    blastDepthBeyond: 'rgba(251, 191, 36, 0.48)',
   },
   border: {
     base: 'rgba(255, 255, 255, 0.08)',
@@ -159,6 +183,18 @@ export function initializeTheme(root: HTMLElement = document.documentElement): H
       python: readToken(styles, '--language-python', FALLBACK_THEME.language.python),
       go: readToken(styles, '--language-go', FALLBACK_THEME.language.go),
       default: readToken(styles, '--language-default', FALLBACK_THEME.language.default),
+    },
+    analytics: {
+      degreeLow: readToken(styles, '--analytics-degree-low', FALLBACK_THEME.analytics.degreeLow),
+      degreeHigh: readToken(styles, '--analytics-degree-high', FALLBACK_THEME.analytics.degreeHigh),
+      couplingSame: readToken(styles, '--analytics-coupling-same', FALLBACK_THEME.analytics.couplingSame),
+      couplingCross: readToken(styles, '--analytics-coupling-cross', FALLBACK_THEME.analytics.couplingCross),
+      couplingHot: readToken(styles, '--analytics-coupling-hot', FALLBACK_THEME.analytics.couplingHot),
+      hotspot: readToken(styles, '--analytics-hotspot', FALLBACK_THEME.analytics.hotspot),
+      blastDepth1: readToken(styles, '--analytics-blast-depth-1', FALLBACK_THEME.analytics.blastDepth1),
+      blastDepth2: readToken(styles, '--analytics-blast-depth-2', FALLBACK_THEME.analytics.blastDepth2),
+      blastDepth3: readToken(styles, '--analytics-blast-depth-3', FALLBACK_THEME.analytics.blastDepth3),
+      blastDepthBeyond: readToken(styles, '--analytics-blast-depth-beyond', FALLBACK_THEME.analytics.blastDepthBeyond),
     },
     border: {
       base: readToken(styles, '--border', FALLBACK_THEME.border.base),

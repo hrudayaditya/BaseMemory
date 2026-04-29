@@ -6,8 +6,11 @@ import { join } from "path";
 
 import { createGraphServer } from "../src/graph-server.js";
 import type {
+  BlastRadiusResponse,
+  DirectoryGraphResponse,
   HealthResponse,
   NeighborhoodResponse,
+  PathResponse,
   SearchResult,
 } from "../src/hyperbase/src/types/index.ts";
 
@@ -214,5 +217,39 @@ describe("graph server integration", () => {
       depth: 1,
     });
     expect(wrapped.body.graph).toEqual(bare.body);
+  });
+
+  it("integration_directory_endpoint_returns_internal_and_external_roles", async () => {
+    const response = await getJson<DirectoryGraphResponse>(
+      `/api/graph/directory?path=${encodeURIComponent(join(ctx.root, "repo", "src", "core"))}`
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body.directoryPath.endsWith("/src/core")).toBe(true);
+    expect(response.body.nodes.some((node) => node.role === "internal")).toBe(true);
+    expect(response.body.nodes.some((node) => node.role === "external-caller")).toBe(true);
+    expect(response.body.edges.some((edge) => edge.boundary === "incoming")).toBe(true);
+    expect(response.body.edges.some((edge) => edge.boundary === "outgoing")).toBe(true);
+    expect(response.body.edges.some((edge) => edge.isResolved === false && edge.to === null)).toBe(true);
+  });
+
+  it("integration_blast_radius_endpoint_returns_parseable_depth_map", async () => {
+    const response = await getJson<BlastRadiusResponse>("/api/blast-radius/sym_center");
+
+    expect(response.status).toBe(200);
+    expect(response.body.symbolId).toBe("sym_center");
+    expect(response.body.nodes.some((node) => node.id === "sym_center")).toBe(true);
+    expect(response.body.depth.sym_center).toBe(0);
+    expect(response.body.edges.length).toBeGreaterThan(0);
+  });
+
+  it("integration_path_endpoint_returns_parseable_shortest_path", async () => {
+    const response = await getJson<PathResponse>("/api/path?from=sym_caller&to=sym_helper");
+
+    expect(response.status).toBe(200);
+    expect(response.body.path.map((node) => node.id)).toEqual(["sym_caller", "sym_center", "sym_helper"]);
+    expect(response.body.edges).toHaveLength(2);
+    expect(response.body.found).toBe(true);
+    expect(response.body.exhausted).toBe(false);
   });
 });

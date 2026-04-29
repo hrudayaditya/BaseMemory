@@ -1,248 +1,219 @@
 # Developer Guide
 
-## File layout
+## Commands
 
-Phase 1 server files:
-
-- [src/graph-server.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/graph-server.ts)
-- [scripts/start-graph.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/scripts/start-graph.ts)
-- [src/graph-ui/index.html](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/graph-ui/index.html)
-- [tests/graph-server.test.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/tests/graph-server.test.ts)
-
-Runtime script:
-
-- `npm run graph`
-
-## What the server actually is
-
-HyperBase Phase 1 is:
-
-- an Express server
-- backed directly by `better-sqlite3`
-- serving static UI files from `src/graph-ui/`
-- exposing graph endpoints under `/api`
-
-It is intentionally separate from MCP.
-
-That separation is correct:
-
-- MCP is the agent integration surface
-- HyperBase is the human and UI graph surface
-
-The bridge between them is `/api/mcp/neighborhood/:id`, which returns the canonical graph JSON envelope.
-
-## Startup model
-
-The launcher in [scripts/start-graph.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/scripts/start-graph.ts):
-
-1. looks for a DB path override in CLI args
-2. tries a few config keys in `.opencode/codebase-index.json`
-3. falls back to `.opencode/index/codebase.db`
-4. spawns [src/graph-server.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/graph-server.ts) through `tsx`
-
-Current repo reality:
-
-- BaseMemory’s `.opencode/codebase-index.json` does not define a DB path today
-- the normal path is still `.opencode/index/codebase.db`
-
-## CLI flags
-
-`src/graph-server.ts` supports:
-
-- `--db <path>`
-- `--branch <branch>`
-- `--port <n>`
-
-Defaults:
-
-- DB: `.opencode/index/codebase.db`
-- branch: first branch found in the DB
-- port: `7842`
-
-## Branch handling
-
-Every branch-aware route uses the same rule:
-
-- omitted `branch` query param: use server default branch
-- present but unknown `branch`: return `400 BRANCH_NOT_FOUND`
-
-The branch list is built at startup from:
-
-- `call_edges.branch`
-- plus `branch_symbols.branch` as fallback
-
-## Data model
-
-Use `symbols` as graph nodes.
-Use `call_edges` as graph edges.
-Use `chunks` only when you need retrieval-aligned code previews.
-
-Why:
-
-- graph structure is symbol-level
-- `call_edges.to_symbol_id` points at `symbols.id`
-- `chunks` represent retrieval/code spans, not graph identity
-
-## Query strategy
-
-All DB statements are prepared once at startup in `prepareStatements(...)`.
-
-Important design choice:
-
-- the BFS endpoints do not concatenate arbitrary SQL lists
-- they pass JSON arrays into prepared statements
-- SQLite expands them with `json_each(?)`
-
-That keeps the queries reusable while still allowing frontier batches.
-
-## Graph behaviors that matter
-
-### Neighborhood
-
-`/api/neighborhood/:id`
-
-- BFS on resolved callers and resolved callees
-- node cap `300`
-- unresolved edges are added only after BFS
-- unresolved edges never create new nodes
-- degree counts resolved edges only
-
-This is the core invariant set for the UI.
-
-### Blast radius
-
-`/api/blast-radius/:id`
-
-- callers only
-- resolved edges only
-- node cap `500`
-- returns depth by node id
-
-This is the right primitive for impact analysis.
-
-### Path
-
-`/api/path`
-
-- shortest path over resolved edges
-- traverses both directions
-- hard stop at `1000` visited nodes
-
-This is a UI feature primitive, not a general graph analytics engine.
-
-### Full graph
-
-`/api/graph/full`
-
-- file-level nodes
-- cross-file resolved edges only
-- same-file edges excluded
-
-This is the Phase 1 galaxy-view payload.
-
-## Error model
-
-Only these error codes are used:
-
-- `INVALID_INPUT`
-- `BRANCH_NOT_FOUND`
-- `NOT_FOUND`
-- `DB_ERROR`
-- `INTERNAL_ERROR`
-
-Do not invent new codes casually. Keep the API predictable for the future UI and MCP consumers.
-
-## Testing model
-
-Tests live in [tests/graph-server.test.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/tests/graph-server.test.ts).
-
-Important detail:
-
-- the sandbox used for CI-like runs here blocks listening sockets
-- the tests therefore exercise the Express app fully in-process using mocked request/response objects
-- this is why the suite is stable even when localhost binding is unavailable
-
-That is the right test shape for route behavior.
-
-For manual verification, the real server still runs normally with `npm run graph`.
-
-## How to extend HyperBase safely
-
-When adding a new endpoint:
-
-1. decide whether it is symbol-level or file-level
-2. keep branch handling consistent with existing routes
-3. prepare the SQL at startup
-4. avoid ad hoc SQL string construction for list inputs
-5. add one focused endpoint test and one failure-mode test
-6. document the new route in [api-reference.md](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/docs/ui/api-reference.md)
-
-## Best next additions
-
-These are the most natural Phase 2 server additions:
-
-- `/api/graph/directory/:path`
-- `/api/search/semantic?q=...`
-- `/api/symbol/:id/callers`
-- `/api/symbol/:id/callees`
-- `/api/export/subgraph`
-
-The most important missing one is:
-
-- `/api/graph/directory/:path`
-
-That is the bridge between the file-level galaxy view and the symbol-level neighborhood view.
-
-## Integration points
-
-For a browser UI:
-
-- start with `/api/graph/full`
-- search with `/api/search`
-- drill into `/api/neighborhood/:id`
-- use `/api/peek/:id` for the detail panel
-
-For future agent tooling:
-
-- use `/api/mcp/neighborhood/:id`
-- treat `schema: "hyperbase-graph-v1"` as the canonical graph envelope
-
-## What not to do
-
-- Do not build the UI directly on raw SQLite queries from the browser.
-- Do not treat unresolved edges as equivalent to resolved edges.
-- Do not assume names are unique across files.
-- Do not render the entire symbol graph by default.
-- Do not bypass the branch parameter in the client state model.
-
-## Useful commands
-
-Start the server:
+Start the graph server:
 
 ```bash
 npm run graph
 ```
 
-Use a specific branch:
+Build the browser UI:
 
 ```bash
-npm run graph -- --branch after-tune/refactor
+npm run hyperbase:build
 ```
 
-Use a different port:
-
-```bash
-npm run graph -- --port 9000
-```
-
-Run all tests:
+Run the full test suite:
 
 ```bash
 npm run test:run
 ```
 
-Run only the HyperBase route suite:
+Run the route-focused suite:
 
 ```bash
-npx vitest run tests/graph-server.test.ts
+npx vitest run tests/graph-server.test.ts tests/graph-server-integration.test.ts
 ```
+
+Run the UI in dev mode:
+
+```bash
+cd src/hyperbase
+npm run dev
+```
+
+## What runs where
+
+Server:
+
+- [src/graph-server.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/graph-server.ts)
+- [src/graph-server/queries.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/graph-server/queries.ts)
+- [src/graph-server/assembly.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/graph-server/assembly.ts)
+- [src/graph-server/types.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/graph-server/types.ts)
+
+UI:
+
+- [src/hyperbase/src/App.svelte](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/App.svelte)
+- [src/hyperbase/src/stores/graph.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/stores/graph.ts)
+- [src/hyperbase/src/stores/selection.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/stores/selection.ts)
+- [src/hyperbase/src/components](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/components)
+- [src/hyperbase/src/workers/layout.worker.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/workers/layout.worker.ts)
+
+Shared browser-side infrastructure:
+
+- [src/hyperbase/src/api/client.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/api/client.ts)
+- [src/hyperbase/src/lib/graph-utils.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/lib/graph-utils.ts)
+- [src/hyperbase/src/lib/layout-cache.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/lib/layout-cache.ts)
+- [src/hyperbase/src/lib/theme.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/lib/theme.ts)
+- [src/hyperbase/src/lib/url-state.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/lib/url-state.ts)
+
+Launcher:
+
+- [scripts/start-graph.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/scripts/start-graph.ts)
+
+## Current server structure
+
+The graph server is no longer a monolith.
+
+Layer split:
+
+- query layer: prepared SQLite statements and typed row-returning methods in [queries.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/graph-server/queries.ts)
+- graph assembly layer: BFS, node/edge shaping, truncation, unresolved-edge policy, and shortest-path logic in [assembly.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/graph-server/assembly.ts)
+- handler layer: Express routes, input validation, branch resolution, and JSON serialization in [src/graph-server.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/graph-server.ts)
+
+That boundary matters. If you add a new endpoint, keep SQL out of the handler and keep HTTP out of the assembly layer.
+
+## Current UI structure
+
+Graph loading is controller-owned.
+
+The authoritative loading module is the `GraphController` class in [src/hyperbase/src/stores/graph.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/stores/graph.ts).
+
+It owns:
+
+- branch initialization
+- graph loads
+- cancellation of in-flight graph requests
+- graph identity
+- graph error/loading/truncation state
+- community computation scheduling
+
+Components do not fetch graph data directly.
+They dispatch intent through exported controller functions:
+
+- `initializeGraph(...)`
+- `loadGalaxyGraph(...)`
+- `loadNeighborhoodGraph(...)`
+- `changeActiveBranch(...)`
+- `changeGraphDepth(...)`
+- `retryGraphLoad()`
+- `setGraphOverlay(...)`
+
+Detail loading is separate. It lives in [src/hyperbase/src/stores/selection.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/stores/selection.ts), which owns symbol detail and peek fetch cancellation.
+
+## Graph identity
+
+HyperBase uses two graph identities:
+
+- `graphContentId`
+- `graphLoadId`
+
+`graphContentId` is deterministic. It is derived from:
+
+- view kind
+- branch
+- neighborhood center + depth when relevant
+- sorted node keys
+- sorted edge keys
+
+It is used for:
+
+- deterministic layout seeding
+- layout cache keys
+- cross-reload and cross-tab layout stability
+
+`graphLoadId` is a monotonic per-load revision.
+
+It is used for:
+
+- worker restart semantics
+- ignoring stale worker/controller results tied to an older load
+
+## Layout system
+
+Initial positions are deterministic.
+
+The seed boundary is the graph builder in [src/hyperbase/src/lib/graph-utils.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/lib/graph-utils.ts).
+The worker does not invent its own randomness anymore.
+
+Layout flow:
+
+1. controller computes `graphContentId`
+2. graph builder assigns seeded node positions from that content id
+3. `layout-cache.ts` checks `localStorage`
+4. if a cached layout exists for `hyperbase:layout:v1:${graphContentId}`, positions are restored and the worker is skipped
+5. otherwise the worker runs ForceAtlas2 from the deterministic seed positions
+6. the worker posts deltas during layout and a full snapshot on `done`
+7. the main thread persists the final snapshot
+
+The layout cache is opportunistic. Corrupt or mismatched cache entries are discarded.
+
+## Theme system
+
+The token system is enforced at runtime now.
+
+Tokens live in:
+
+- [src/hyperbase/src/styles/tokens.css](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/styles/tokens.css)
+
+Runtime theme loading lives in:
+
+- [src/hyperbase/src/lib/theme.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/lib/theme.ts)
+
+Use the theme object for:
+
+- Sigma colors
+- canvas/minimap colors
+- derived palette choices such as community colors
+
+Do not add hardcoded color literals back into renderer or canvas code.
+
+## Tests
+
+There are now two server test layers.
+
+Unit-style route and behavior tests:
+
+- [tests/graph-server.test.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/tests/graph-server.test.ts)
+
+These still use in-process request/response mocking. They are fast and good for graph logic and route behavior.
+
+Real HTTP integration tests:
+
+- [tests/graph-server-integration.test.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/tests/graph-server-integration.test.ts)
+
+These:
+
+- start a real Express server on an ephemeral port
+- make real HTTP requests with `fetch`
+- validate health, search, neighborhood, one error case, and the MCP wrapper
+- parse responses using HyperBase’s TypeScript API types
+
+In sandboxed environments that block `listen(2)`, these tests need to run outside the sandbox. Do not replace them with mocked requests just to make the environment quieter.
+
+## Safe extension rules
+
+If you add a new graph view or trigger:
+
+1. add a controller command instead of fetching from a component
+2. decide whether it needs a new `GraphLoadTarget` variant
+3. extend `graphContentId` generation so identical content stays identical
+4. keep the worker/cache behavior aligned with that content id
+5. keep URL state in sync if the view should be shareable
+
+If you add a new endpoint:
+
+1. add SQL to the query layer
+2. add graph shaping to the assembly layer if needed
+3. keep the handler thin
+4. add both a fast route test and a real HTTP integration test when the route is user-facing
+5. update [api-reference.md](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/docs/ui/api-reference.md)
+
+## Things that are intentionally not finished
+
+- `Degree` and `Language` overlays have UI toggles but no visual transform yet
+- `/api/graph/directory/:path` is still reserved, not implemented
+- unresolved `to: null` edges are preserved in API responses but skipped by the concrete Graphology renderer
+
+Those are current system facts, not future promises.

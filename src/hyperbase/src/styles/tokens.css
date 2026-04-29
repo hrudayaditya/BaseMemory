@@ -36,6 +36,17 @@
   --language-go: #7dd3fc;
   --language-default: #94a3b8;
 
+  --analytics-degree-low: #5aa8ff;
+  --analytics-degree-high: #ff7a1a;
+  --analytics-coupling-same: rgba(255, 255, 255, 0.08);
+  --analytics-coupling-cross: rgba(79, 156, 249, 0.82);
+  --analytics-coupling-hot: rgba(251, 191, 36, 0.92);
+  --analytics-hotspot: #ffffff;
+  --analytics-blast-depth-1: #ef4444;
+  --analytics-blast-depth-2: #f97316;
+  --analytics-blast-depth-3: #fbbf24;
+  --analytics-blast-depth-beyond: rgba(251, 191, 36, 0.48);
+
   --minimap-background: #161b22;
   --minimap-edge: rgba(255, 255, 255, 0.08);
   --minimap-viewport-fill: rgba(79, 156, 249, 0.12);

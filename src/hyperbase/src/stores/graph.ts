@@ -1,11 +1,14 @@
 import Graph from 'graphology';
 import type Sigma from 'sigma';
 import { derived, get, writable } from 'svelte/store';
-import { fetchBranches, fetchFullGraph, fetchNeighborhood, isAbortError } from '../api/client';
-import { buildGraphologyInstance, buildNeighborhoodGraphologyInstance } from '../lib/graph-utils';
+import { fetchBlastRadius, fetchBranches, fetchDirectoryGraph, fetchFullGraph, fetchNeighborhood, fetchPath, isAbortError } from '../api/client';
+import { buildBlastRadiusGraphologyInstance, buildDirectoryGraphologyInstance, buildGraphologyInstance, buildNeighborhoodGraphologyInstance, buildPathGraphologyInstance } from '../lib/graph-utils';
 import { restoreLayoutSnapshot } from '../lib/layout-cache';
 import { communityColorFor } from '../lib/theme';
 import type {
+  BlastRadiusResponse,
+  CurrentGraphPayload,
+  DirectoryGraphResponse,
   FileEdge,
   FileGraphNodeAttributes,
   FileNode,
@@ -13,6 +16,7 @@ import type {
   GraphEdgeAttributes,
   NeighborhoodResponse,
   Overlay,
+  PathResponse,
   SymbolGraphNodeAttributes,
   UrlState,
   ZoomLevel,
@@ -30,7 +34,30 @@ type GraphLoadTarget =
       branch: string;
       symbolId: string;
       depth: number;
+    }
+  | {
+      kind: 'blast-radius';
+      branch: string;
+      symbolId: string;
+    }
+  | {
+      kind: 'path';
+      branch: string;
+      fromId: string;
+      toId: string;
+    }
+  | {
+      kind: 'directory';
+      branch: string;
+      directoryPath: string;
     };
+
+export type ViewInfo =
+  | { kind: 'galaxy' }
+  | { kind: 'atom'; symbolId: string; symbolName: string }
+  | { kind: 'blast'; symbolId: string; symbolName: string; truncated: boolean }
+  | { kind: 'path'; fromId: string; toId: string; fromName: string; toName: string; hopCount: number; found: boolean; exhausted: boolean }
+  | { kind: 'directory'; directoryPath: string; truncated: boolean };
 
 type HyperGraph = Graph<FileGraphNodeAttributes | SymbolGraphNodeAttributes, GraphEdgeAttributes>;
 
@@ -48,6 +75,9 @@ export const activeBranch = writable<string>('');
 export const availableBranches = writable<string[]>([]);
 export const focusedSymbolId = writable<string | null>(null);
 export const zoomLevel = writable<ZoomLevel>('galaxy');
+export const currentView = writable<string>('galaxy');
+export const currentViewInfo = writable<ViewInfo>({ kind: 'galaxy' });
+export const currentGraphPayload = writable<CurrentGraphPayload | null>(null);
 
 export const graphNodeCount = writable<number>(0);
 export const graphEdgeCount = writable<number>(0);
@@ -82,7 +112,13 @@ function createGraphContentId(target: GraphLoadTarget, nodes: string[], edges: s
   const head =
     target.kind === 'galaxy'
       ? [`view:${target.kind}`, `branch:${target.branch}`]
-      : [`view:${target.kind}`, `branch:${target.branch}`, `symbol:${target.symbolId}`, `depth:${target.depth}`];
+      : target.kind === 'neighborhood'
+        ? [`view:${target.kind}`, `branch:${target.branch}`, `symbol:${target.symbolId}`, `depth:${target.depth}`]
+        : target.kind === 'blast-radius'
+          ? [`view:${target.kind}`, `branch:${target.branch}`, `symbol:${target.symbolId}`]
+          : target.kind === 'path'
+            ? [`view:${target.kind}`, `branch:${target.branch}`, `from:${target.fromId}`, `to:${target.toId}`]
+            : [`view:${target.kind}`, `branch:${target.branch}`, `directory:${target.directoryPath}`];
 
   return stableHash([...head, ...nodes, ...edges]);
 }
@@ -98,6 +134,24 @@ function fullGraphContentId(target: GraphLoadTarget, payload: FullGraphResponse)
 function neighborhoodGraphContentId(target: GraphLoadTarget, payload: NeighborhoodResponse): string {
   const nodeKeys = payload.nodes.map((node) => `${node.id}:${node.name}:${node.degree}`).sort();
   const edgeKeys = payload.edges.map((edge) => `${edge.id}:${edge.from}:${edge.to ?? 'null'}:${edge.isResolved}`).sort();
+  return createGraphContentId(target, nodeKeys, edgeKeys);
+}
+
+function blastRadiusGraphContentId(target: GraphLoadTarget, payload: BlastRadiusResponse): string {
+  const nodeKeys = payload.nodes.map((node) => `${node.id}:${node.name}:${node.degree}`).sort();
+  const edgeKeys = payload.edges.map((edge) => `${edge.id}:${edge.from}:${edge.to ?? 'null'}:${edge.isResolved}`).sort();
+  return createGraphContentId(target, nodeKeys, edgeKeys);
+}
+
+function pathGraphContentId(target: GraphLoadTarget, payload: PathResponse): string {
+  const nodeKeys = payload.path.map((node) => `${node.id}:${node.name}:${node.filePath}`).sort();
+  const edgeKeys = payload.edges.map((edge) => `${edge.id}:${edge.from}:${edge.to ?? 'null'}:${edge.isResolved}`).sort();
+  return createGraphContentId(target, nodeKeys, edgeKeys);
+}
+
+function directoryGraphContentId(target: GraphLoadTarget, payload: DirectoryGraphResponse): string {
+  const nodeKeys = payload.nodes.map((node) => `${node.id}:${node.name}:${node.role ?? 'internal'}:${node.degree}`).sort();
+  const edgeKeys = payload.edges.map((edge) => `${edge.id}:${edge.from}:${edge.to ?? 'null'}:${edge.boundary ?? 'internal'}`).sort();
   return createGraphContentId(target, nodeKeys, edgeKeys);
 }
 
@@ -141,7 +195,13 @@ class GraphController {
       graphDepth.set(depth);
       this.initialized = true;
 
-      if (initialUrlState.symbolId) {
+      if (initialUrlState.view === 'blast' && initialUrlState.symbolId) {
+        await this.loadBlastRadius(initialUrlState.symbolId, branch);
+      } else if (initialUrlState.view === 'path' && initialUrlState.fromId && initialUrlState.toId) {
+        await this.loadPath(initialUrlState.fromId, initialUrlState.toId, branch);
+      } else if (initialUrlState.view === 'directory' && initialUrlState.directoryPath) {
+        await this.loadDirectory(initialUrlState.directoryPath, branch);
+      } else if (initialUrlState.symbolId) {
         await this.loadNeighborhood(initialUrlState.symbolId, { branch, depth });
       } else {
         await this.loadGalaxy(branch);
@@ -189,6 +249,8 @@ class GraphController {
         edgeCount: payload.edges.length,
         truncated: false,
         fileGraph: payload,
+        payload: { kind: 'galaxy', payload },
+        viewInfo: { kind: 'galaxy' },
       });
     } catch (error) {
       this.handleGraphLoadError(error, load.revision);
@@ -244,6 +306,171 @@ class GraphController {
         nodeCount: payload.nodes.length,
         edgeCount: payload.edges.length,
         truncated: payload.truncated,
+        payload: { kind: 'neighborhood', payload },
+        viewInfo: {
+          kind: 'atom',
+          symbolId,
+          symbolName: payload.nodes.find((node) => node.id === symbolId)?.name ?? symbolId,
+        },
+      });
+    } catch (error) {
+      this.handleGraphLoadError(error, load.revision);
+    }
+  }
+
+  async loadBlastRadius(symbolId: string, branch = get(activeBranch)): Promise<void> {
+    if (!symbolId || !branch) {
+      graphError.set('Cannot load blast radius without a symbol and branch');
+      return;
+    }
+
+    const target: GraphLoadTarget = {
+      kind: 'blast-radius',
+      branch,
+      symbolId,
+    };
+
+    this.currentTarget = target;
+    this.lastUrlState = {
+      branch,
+      symbolId,
+      view: 'blast',
+    };
+
+    const load = this.beginGraphLoad();
+
+    try {
+      const payload = await fetchBlastRadius(symbolId, branch, load.abortController.signal);
+      if (!this.isActiveGraphLoad(load.revision, load.abortController.signal)) {
+        return;
+      }
+
+      const contentId = blastRadiusGraphContentId(target, payload);
+      const graph = buildBlastRadiusGraphologyInstance(payload, contentId);
+      const layoutCacheHit = restoreLayoutSnapshot(graph, contentId);
+      this.commitGraphLoad({
+        graph,
+        target,
+        contentId,
+        layoutCacheHit,
+        nodeCount: payload.nodes.length,
+        edgeCount: payload.edges.length,
+        truncated: payload.truncated,
+        payload: { kind: 'blast-radius', payload },
+        viewInfo: {
+          kind: 'blast',
+          symbolId,
+          symbolName: payload.nodes.find((node) => node.id === symbolId)?.name ?? symbolId,
+          truncated: payload.truncated,
+        },
+      });
+    } catch (error) {
+      this.handleGraphLoadError(error, load.revision);
+    }
+  }
+
+  async loadPath(fromId: string, toId: string, branch = get(activeBranch)): Promise<void> {
+    if (!fromId || !toId || !branch) {
+      graphError.set('Cannot load a path without a source, target, and branch');
+      return;
+    }
+
+    const target: GraphLoadTarget = {
+      kind: 'path',
+      branch,
+      fromId,
+      toId,
+    };
+
+    this.currentTarget = target;
+    this.lastUrlState = {
+      branch,
+      symbolId: fromId,
+      fromId,
+      toId,
+      view: 'path',
+    };
+
+    const load = this.beginGraphLoad();
+
+    try {
+      const payload = await fetchPath(fromId, toId, branch, load.abortController.signal);
+      if (!this.isActiveGraphLoad(load.revision, load.abortController.signal)) {
+        return;
+      }
+
+      const contentId = pathGraphContentId(target, payload);
+      const graph = buildPathGraphologyInstance(payload.path, payload.edges, contentId);
+      const layoutCacheHit = restoreLayoutSnapshot(graph, contentId);
+      this.commitGraphLoad({
+        graph,
+        target,
+        contentId,
+        layoutCacheHit,
+        nodeCount: payload.path.length,
+        edgeCount: payload.edges.length,
+        truncated: false,
+        payload: { kind: 'path', payload },
+        viewInfo: {
+          kind: 'path',
+          fromId,
+          toId,
+          fromName: payload.path[0]?.name ?? fromId,
+          toName: payload.path[payload.path.length - 1]?.name ?? toId,
+          hopCount: Math.max(payload.path.length - 1, 0),
+          found: payload.found,
+          exhausted: payload.exhausted,
+        },
+      });
+    } catch (error) {
+      this.handleGraphLoadError(error, load.revision);
+    }
+  }
+
+  async loadDirectory(directoryPath: string, branch = get(activeBranch)): Promise<void> {
+    if (!directoryPath || !branch) {
+      graphError.set('Cannot load a directory view without a directory and branch');
+      return;
+    }
+
+    const target: GraphLoadTarget = {
+      kind: 'directory',
+      branch,
+      directoryPath,
+    };
+
+    this.currentTarget = target;
+    this.lastUrlState = {
+      branch,
+      directoryPath,
+      view: 'directory',
+    };
+
+    const load = this.beginGraphLoad();
+
+    try {
+      const payload = await fetchDirectoryGraph(directoryPath, branch, load.abortController.signal);
+      if (!this.isActiveGraphLoad(load.revision, load.abortController.signal)) {
+        return;
+      }
+
+      const contentId = directoryGraphContentId(target, payload);
+      const graph = buildDirectoryGraphologyInstance(payload, contentId);
+      const layoutCacheHit = restoreLayoutSnapshot(graph, contentId);
+      this.commitGraphLoad({
+        graph,
+        target,
+        contentId,
+        layoutCacheHit,
+        nodeCount: payload.nodes.length,
+        edgeCount: payload.edges.length,
+        truncated: payload.truncated,
+        payload: { kind: 'directory', payload },
+        viewInfo: {
+          kind: 'directory',
+          directoryPath,
+          truncated: payload.truncated,
+        },
       });
     } catch (error) {
       this.handleGraphLoadError(error, load.revision);
@@ -261,6 +488,21 @@ class GraphController {
         branch,
         depth: get(graphDepth),
       });
+      return;
+    }
+
+    if (this.currentTarget?.kind === 'blast-radius') {
+      await this.loadBlastRadius(this.currentTarget.symbolId, branch);
+      return;
+    }
+
+    if (this.currentTarget?.kind === 'path') {
+      await this.loadPath(this.currentTarget.fromId, this.currentTarget.toId, branch);
+      return;
+    }
+
+    if (this.currentTarget?.kind === 'directory') {
+      await this.loadDirectory(this.currentTarget.directoryPath, branch);
       return;
     }
 
@@ -295,6 +537,21 @@ class GraphController {
 
     if (this.currentTarget?.kind === 'galaxy') {
       await this.loadGalaxy(this.currentTarget.branch);
+      return;
+    }
+
+    if (this.currentTarget?.kind === 'blast-radius') {
+      await this.loadBlastRadius(this.currentTarget.symbolId, this.currentTarget.branch);
+      return;
+    }
+
+    if (this.currentTarget?.kind === 'path') {
+      await this.loadPath(this.currentTarget.fromId, this.currentTarget.toId, this.currentTarget.branch);
+      return;
+    }
+
+    if (this.currentTarget?.kind === 'directory') {
+      await this.loadDirectory(this.currentTarget.directoryPath, this.currentTarget.branch);
       return;
     }
 
@@ -340,6 +597,8 @@ class GraphController {
     nodeCount: number;
     edgeCount: number;
     truncated: boolean;
+    viewInfo: ViewInfo;
+    payload: CurrentGraphPayload;
     fileGraph?: FullGraphResponse;
   }): void {
     if (options.fileGraph) {
@@ -360,7 +619,26 @@ class GraphController {
     graphNodeCount.set(options.nodeCount);
     graphEdgeCount.set(options.edgeCount);
     graphTruncated.set(options.truncated);
-    focusedSymbolId.set(options.target.kind === 'neighborhood' ? options.target.symbolId : null);
+    currentGraphPayload.set(options.payload);
+    currentViewInfo.set(options.viewInfo);
+    currentView.set(
+      options.target.kind === 'galaxy'
+        ? 'galaxy'
+        : options.target.kind === 'neighborhood'
+          ? 'atom'
+          : options.target.kind === 'blast-radius'
+            ? 'blast'
+            : options.target.kind === 'path'
+              ? 'path'
+              : 'directory'
+    );
+    focusedSymbolId.set(
+      options.target.kind === 'neighborhood' || options.target.kind === 'blast-radius'
+        ? options.target.symbolId
+        : options.target.kind === 'path'
+          ? options.target.fromId
+          : null
+    );
     graphLoading.set(false);
 
     if (get(activeOverlay) === 'community') {
@@ -430,6 +708,9 @@ export const initializeGraph = (initialUrlState?: UrlState) => graphController.i
 export const loadGalaxyGraph = (branch?: string) => graphController.loadGalaxy(branch);
 export const loadNeighborhoodGraph = (symbolId: string, options?: { branch?: string; depth?: number }) =>
   graphController.loadNeighborhood(symbolId, options);
+export const loadBlastRadiusGraph = (symbolId: string, branch?: string) => graphController.loadBlastRadius(symbolId, branch);
+export const loadPathGraph = (fromId: string, toId: string, branch?: string) => graphController.loadPath(fromId, toId, branch);
+export const loadDirectoryGraph = (directoryPath: string, branch?: string) => graphController.loadDirectory(directoryPath, branch);
 export const changeActiveBranch = (branch: string) => graphController.changeBranch(branch);
 export const changeGraphDepth = (depth: number) => graphController.changeDepth(depth);
 export const retryGraphLoad = () => graphController.retry();

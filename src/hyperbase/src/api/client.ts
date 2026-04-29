@@ -1,5 +1,6 @@
 import type {
   BlastRadiusResponse,
+  DirectoryGraphResponse,
   FullGraphResponse,
   NeighborhoodResponse,
   PathResponse,
@@ -76,6 +77,17 @@ export async function fetchPeek(symbolId: string, branch: string, signal?: Abort
 export async function fetchBlastRadius(id: string, branch: string, signal?: AbortSignal): Promise<BlastRadiusResponse> {
   return request<BlastRadiusResponse>(
     `/blast-radius/${encodeURIComponent(id)}?branch=${encodeURIComponent(branch)}`,
+    signal
+  );
+}
+
+export async function fetchDirectoryGraph(
+  directoryPath: string,
+  branch: string,
+  signal?: AbortSignal
+): Promise<DirectoryGraphResponse> {
+  return request<DirectoryGraphResponse>(
+    `/graph/directory?path=${encodeURIComponent(directoryPath)}&branch=${encodeURIComponent(branch)}`,
     signal
   );
 }
