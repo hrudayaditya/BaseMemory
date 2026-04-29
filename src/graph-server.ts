@@ -517,7 +517,7 @@ export function createGraphServer(options: GraphServerOptions): GraphServerInsta
   const app = express();
   const server = createServer(app);
   const port = options.port ?? DEFAULT_PORT;
-  const graphUiDir = join(dirname(fileURLToPath(import.meta.url)), "graph-ui");
+  const graphUiDir = join(dirname(fileURLToPath(import.meta.url)), "hyperbase", "dist");
 
   app.use(cors());
   app.use(express.json());

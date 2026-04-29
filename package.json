@@ -41,6 +41,7 @@
     "dev": "tsup --watch",
     "eval": "npx tsx src/cli.ts eval run",
     "graph": "tsx scripts/start-graph.ts",
+    "hyperbase:build": "cd src/hyperbase && npm run build",
     "eval:smoke": "npx tsx src/cli.ts eval run --config .github/eval-config.json --reindex --dataset benchmarks/golden/small.json",
     "eval:ci": "npx tsx src/cli.ts eval run --reindex --ci --budget benchmarks/budgets/default.json --against benchmarks/baselines/eval-baseline-summary.json",
     "eval:ci:ollama": "npx tsx src/cli.ts eval run --config .github/eval-ollama-config.json --reindex --ci --budget benchmarks/budgets/default.json --against benchmarks/baselines/eval-baseline-summary.json",
