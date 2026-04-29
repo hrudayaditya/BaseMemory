@@ -3,6 +3,7 @@ import type Sigma from 'sigma';
 import { derived, get, writable } from 'svelte/store';
 import { fetchBranches, fetchFullGraph, fetchNeighborhood, isAbortError } from '../api/client';
 import { buildGraphologyInstance, buildNeighborhoodGraphologyInstance } from '../lib/graph-utils';
+import { restoreLayoutSnapshot } from '../lib/layout-cache';
 import { communityColorFor } from '../lib/theme';
 import type {
   FileEdge,
@@ -52,6 +53,7 @@ export const graphNodeCount = writable<number>(0);
 export const graphEdgeCount = writable<number>(0);
 export const graphLoadId = writable<number>(0);
 export const graphContentId = writable<string | null>(null);
+export const graphLayoutCacheHit = writable<boolean>(false);
 export const graphRefreshNonce = writable<number>(0);
 
 export const cameraState = writable<{ x: number; y: number; ratio: number; angle: number }>({
@@ -177,10 +179,12 @@ class GraphController {
 
       const contentId = fullGraphContentId(target, payload);
       const graph = buildGraphologyInstance(payload.nodes, payload.edges, contentId);
+      const layoutCacheHit = restoreLayoutSnapshot(graph, contentId);
       this.commitGraphLoad({
         graph,
         target,
         contentId,
+        layoutCacheHit,
         nodeCount: payload.nodes.length,
         edgeCount: payload.edges.length,
         truncated: false,
@@ -231,10 +235,12 @@ class GraphController {
 
       const contentId = neighborhoodGraphContentId(target, payload);
       const graph = buildNeighborhoodGraphologyInstance(payload.nodes, payload.edges, contentId);
+      const layoutCacheHit = restoreLayoutSnapshot(graph, contentId);
       this.commitGraphLoad({
         graph,
         target,
         contentId,
+        layoutCacheHit,
         nodeCount: payload.nodes.length,
         edgeCount: payload.edges.length,
         truncated: payload.truncated,
@@ -330,6 +336,7 @@ class GraphController {
     graph: HyperGraph;
     target: GraphLoadTarget;
     contentId: string;
+    layoutCacheHit: boolean;
     nodeCount: number;
     edgeCount: number;
     truncated: boolean;
@@ -348,6 +355,7 @@ class GraphController {
 
     graphInstance.set(options.graph);
     graphContentId.set(options.contentId);
+    graphLayoutCacheHit.set(options.layoutCacheHit);
     graphLoadId.set(this.graphLoadRevision);
     graphNodeCount.set(options.nodeCount);
     graphEdgeCount.set(options.edgeCount);

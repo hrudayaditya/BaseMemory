@@ -2,13 +2,12 @@ import Graph from 'graphology';
 import louvain from 'graphology-communities-louvain';
 import forceAtlas2, { inferSettings } from 'graphology-layout-forceatlas2';
 import type { SerializedGraph } from 'graphology-types';
-import { LAYOUT_WORKER_BATCH } from '../lib/constants';
+import { LAYOUT_POST_EPSILON, LAYOUT_WORKER_BATCH } from '../lib/constants';
 
 type StartMessage = {
   type: 'start';
   graph: SerializedGraph;
   iterations: number;
-  seed?: string | null;
 };
 
 type StopMessage = {
@@ -21,32 +20,31 @@ type CommunityMessage = {
 };
 
 type WorkerMessage = StartMessage | StopMessage | CommunityMessage;
+type PositionMap = Record<string, { x: number; y: number }>;
 
-function seededUnit(seed: string): number {
-  let hash = 2166136261;
-  for (let index = 0; index < seed.length; index += 1) {
-    hash ^= seed.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0) / 0xffffffff;
-}
-
-function seedGraphPositions(graph: Graph, seed: string | null | undefined): void {
-  if (!seed) {
-    return;
-  }
-
-  graph.forEachNode((node) => {
-    const x = seededUnit(`${seed}:${node}:x`) * 1000 - 500;
-    const y = seededUnit(`${seed}:${node}:y`) * 1000 - 500;
-    graph.mergeNodeAttributes(node, { x, y });
-  });
-}
-
-function positionsFor(graph: Graph): Record<string, { x: number; y: number }> {
+function positionsFor(graph: Graph): PositionMap {
   const positions: Record<string, { x: number; y: number }> = {};
   graph.forEachNode((node, attributes) => {
     positions[node] = { x: attributes.x, y: attributes.y };
+  });
+  return positions;
+}
+
+function deltaPositionsFor(
+  graph: Graph,
+  previous: PositionMap,
+  epsilon: number
+): PositionMap {
+  const positions: PositionMap = {};
+  graph.forEachNode((node, attributes) => {
+    const last = previous[node];
+    if (
+      !last ||
+      Math.abs(attributes.x - last.x) > epsilon ||
+      Math.abs(attributes.y - last.y) > epsilon
+    ) {
+      positions[node] = { x: attributes.x, y: attributes.y };
+    }
   });
   return positions;
 }
@@ -70,25 +68,45 @@ self.onmessage = (event: MessageEvent<WorkerMessage>) => {
 
   const graph = new Graph();
   graph.import(payload.graph);
-  seedGraphPositions(graph, payload.seed);
 
   const settings = inferSettings(graph);
   let completed = 0;
+  let stopped = false;
+  let previousPositions: PositionMap = {};
 
-  while (completed < payload.iterations) {
+  const stopHandler = (stopEvent: MessageEvent<WorkerMessage>) => {
+    if (stopEvent.data.type === 'stop') {
+      stopped = true;
+    }
+  };
+
+  self.addEventListener('message', stopHandler as EventListener);
+
+  while (completed < payload.iterations && !stopped) {
     const batch = Math.min(LAYOUT_WORKER_BATCH, payload.iterations - completed);
     forceAtlas2.assign(graph, { iterations: batch, settings });
     completed += batch;
 
+    const positions = previousPositions && completed < payload.iterations
+      ? deltaPositionsFor(graph, previousPositions, LAYOUT_POST_EPSILON)
+      : positionsFor(graph);
+    previousPositions = positionsFor(graph);
+
     self.postMessage({
       type: 'progress',
-      positions: positionsFor(graph),
+      positions,
       iteration: completed,
     });
   }
 
+  self.removeEventListener('message', stopHandler as EventListener);
+
+  if (stopped) {
+    return;
+  }
+
   self.postMessage({
     type: 'done',
-    positions: positionsFor(graph),
+    positions: previousPositions,
   });
 };

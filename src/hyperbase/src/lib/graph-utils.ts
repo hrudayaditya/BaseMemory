@@ -75,11 +75,7 @@ function seededUnit(seed: string): number {
   return (hash >>> 0) / 0xffffffff;
 }
 
-function seededPosition(nodeId: string, contentId: string | undefined, axis: 'x' | 'y'): number {
-  if (!contentId) {
-    return Math.random() * 1000 - 500;
-  }
-
+function seededPosition(nodeId: string, contentId: string, axis: 'x' | 'y'): number {
   const seed = `${contentId}:${nodeId}:${axis}`;
   return seededUnit(seed) * 1000 - 500;
 }
@@ -87,7 +83,7 @@ function seededPosition(nodeId: string, contentId: string | undefined, axis: 'x'
 export function buildGraphologyInstance(
   nodes: FileNode[],
   edges: FileEdge[],
-  contentId?: string
+  contentId: string
 ): Graph<FileGraphNodeAttributes, GraphEdgeAttributes> {
   const theme = getTheme();
   const graph = new Graph<FileGraphNodeAttributes, GraphEdgeAttributes>({ type: 'directed', multi: false });
@@ -126,7 +122,7 @@ export function buildGraphologyInstance(
 export function buildNeighborhoodGraphologyInstance(
   nodes: GraphNode[],
   edges: GraphEdge[],
-  contentId?: string
+  contentId: string
 ): Graph<SymbolGraphNodeAttributes, GraphEdgeAttributes> {
   const theme = getTheme();
   const graph = new Graph<SymbolGraphNodeAttributes, GraphEdgeAttributes>({ type: 'directed', multi: false });

@@ -1,7 +1,8 @@
 <script lang="ts">
   import type Graph from 'graphology';
   import { onDestroy } from 'svelte';
-  import { graphContentId, graphInstance, graphLoadId, sigmaInstance } from '../../stores/graph';
+  import { persistLayoutSnapshot } from '../../lib/layout-cache';
+  import { graphContentId, graphInstance, graphLayoutCacheHit, graphLoadId, sigmaInstance } from '../../stores/graph';
   import { LAYOUT_ITERATIONS } from '../../lib/constants';
   import type { FileGraphNodeAttributes, GraphEdgeAttributes, SymbolGraphNodeAttributes } from '../../types';
 
@@ -10,25 +11,27 @@
   let worker: Worker | null = null;
   let layoutRunning = false;
   let currentGraph: HyperGraph | null = null;
-  let currentSeed: string | null = null;
+  let currentContentId: string | null = null;
   let currentLoadId = 0;
+  let currentLayoutCacheHit = false;
 
   function stopWorker() {
     if (worker) {
+      worker.postMessage({ type: 'stop' });
       worker.terminate();
       worker = null;
     }
     layoutRunning = false;
   }
 
-  function startWorker(graph: HyperGraph, seed: string | null) {
+  function startWorker(graph: HyperGraph) {
     stopWorker();
     worker = new Worker(new URL('../../workers/layout.worker.ts', import.meta.url), { type: 'module' });
     layoutRunning = true;
 
     worker.onmessage = (event) => {
       const payload = event.data as
-        | { type: 'progress'; positions: Record<string, { x: number; y: number }> }
+        | { type: 'progress'; positions: Record<string, { x: number; y: number }>; iteration: number }
         | { type: 'done'; positions: Record<string, { x: number; y: number }> };
 
       Object.entries(payload.positions).forEach(([node, position]) => {
@@ -44,6 +47,9 @@
 
       if (payload.type === 'done') {
         layoutRunning = false;
+        if (currentContentId) {
+          persistLayoutSnapshot(currentContentId, payload.positions);
+        }
       }
     };
 
@@ -51,7 +57,6 @@
       type: 'start',
       graph: graph.export(),
       iterations: LAYOUT_ITERATIONS,
-      seed,
     });
   }
 
@@ -63,7 +68,10 @@
       }
     }),
     graphContentId.subscribe((contentId) => {
-      currentSeed = contentId;
+      currentContentId = contentId;
+    }),
+    graphLayoutCacheHit.subscribe((cacheHit) => {
+      currentLayoutCacheHit = cacheHit;
     }),
     graphLoadId.subscribe((loadId) => {
       if (!currentGraph || loadId === 0 || loadId === currentLoadId) {
@@ -71,7 +79,16 @@
       }
 
       currentLoadId = loadId;
-      startWorker(currentGraph, currentSeed);
+      if (currentLayoutCacheHit) {
+        stopWorker();
+        sigmaInstance.update((sigma) => {
+          sigma?.refresh();
+          return sigma;
+        });
+        return;
+      }
+
+      startWorker(currentGraph);
     }),
   ];
 

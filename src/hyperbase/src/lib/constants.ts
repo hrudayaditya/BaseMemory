@@ -4,5 +4,6 @@ export const TRUNCATION_WARNING_THRESHOLD = 250;
 export const SEARCH_DEBOUNCE_MS = 200;
 export const LAYOUT_ITERATIONS = 500;
 export const LAYOUT_WORKER_BATCH = 50;
+export const LAYOUT_POST_EPSILON = 0.25;
 export const ZOOM_GALAXY_THRESHOLD = 0.3;
 export const ZOOM_ATOM_THRESHOLD = 1.5;
