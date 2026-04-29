@@ -1,19 +1,11 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { fetchNeighborhood, searchSymbols } from '../../api/client';
+  import { isAbortError, searchSymbols } from '../../api/client';
   import { SEARCH_DEBOUNCE_MS } from '../../lib/constants';
-  import { buildNeighborhoodGraphologyInstance, nodeColor, shortPath } from '../../lib/graph-utils';
-  import {
-    activeBranch,
-    focusedSymbolId,
-    graphEdgeCount,
-    graphInstance,
-    graphLoading,
-    graphNodeCount,
-    graphTruncated,
-  } from '../../stores/graph';
-  import { selectedNodeId } from '../../stores/selection';
-  import { graphDepth, searchOpen, searchQuery, searchResults } from '../../stores/ui';
+  import { nodeColor, shortPath } from '../../lib/graph-utils';
+  import { activeBranch, graphDepth, loadNeighborhoodGraph } from '../../stores/graph';
+  import { selectNode } from '../../stores/selection';
+  import { searchOpen, searchQuery, searchResults } from '../../stores/ui';
   import type { SearchResult } from '../../types';
 
   let currentBranch = '';
@@ -23,6 +15,8 @@
   let highlightedIndex = -1;
   let searchLoading = false;
   let debounceHandle: ReturnType<typeof setTimeout> | null = null;
+  let searchAbortController: AbortController | null = null;
+  let searchRevision = 0;
 
   const unsubscribers = [
     activeBranch.subscribe((value) => {
@@ -41,20 +35,40 @@
 
   async function runSearch(query: string) {
     if (!query.trim() || !currentBranch) {
+      searchAbortController?.abort();
       searchResults.set([]);
       searchOpen.set(false);
       highlightedIndex = -1;
       return;
     }
 
+    searchAbortController?.abort();
+    const abortController = new AbortController();
+    searchAbortController = abortController;
+    const revision = searchRevision + 1;
+    searchRevision = revision;
     searchLoading = true;
+
     try {
-      const results = await searchSymbols(query.trim(), currentBranch);
+      const results = await searchSymbols(query.trim(), currentBranch, abortController.signal);
+      const stillCurrent = searchRevision === revision && !abortController.signal.aborted;
+      if (!stillCurrent) {
+        return;
+      }
+
       searchResults.set(results.slice(0, 10));
       searchOpen.set(true);
       highlightedIndex = results.length > 0 ? 0 : -1;
+    } catch (error) {
+      if (!isAbortError(error)) {
+        searchResults.set([]);
+        searchOpen.set(false);
+        highlightedIndex = -1;
+      }
     } finally {
-      searchLoading = false;
+      if (searchRevision === revision) {
+        searchLoading = false;
+      }
     }
   }
 
@@ -68,27 +82,19 @@
     }
 
     debounceHandle = setTimeout(() => {
-      runSearch(value);
+      void runSearch(value);
     }, SEARCH_DEBOUNCE_MS);
   }
 
   async function selectResult(result: SearchResult) {
     if (!currentBranch) return;
-    graphLoading.set(true);
-    try {
-      const neighborhood = await fetchNeighborhood(result.id, currentBranch, currentDepth);
-      const graph = buildNeighborhoodGraphologyInstance(neighborhood.nodes, neighborhood.edges);
-      graphInstance.set(graph);
-      graphNodeCount.set(neighborhood.nodes.length);
-      graphEdgeCount.set(neighborhood.edges.length);
-      graphTruncated.set(neighborhood.truncated);
-      focusedSymbolId.set(result.id);
-      selectedNodeId.set(result.id);
-      searchOpen.set(false);
-      searchQuery.set(result.name);
-    } finally {
-      graphLoading.set(false);
-    }
+    await loadNeighborhoodGraph(result.id, {
+      branch: currentBranch,
+      depth: currentDepth,
+    });
+    await selectNode(result.id);
+    searchOpen.set(false);
+    searchQuery.set(result.name);
   }
 
   async function handleKeydown(event: KeyboardEvent) {
@@ -111,6 +117,7 @@
 
   onDestroy(() => {
     if (debounceHandle) clearTimeout(debounceHandle);
+    searchAbortController?.abort();
     unsubscribers.forEach((unsubscribe) => unsubscribe());
   });
 </script>
@@ -139,7 +146,7 @@
           class:selected={index === highlightedIndex}
           class="result-row"
           on:mouseenter={() => (highlightedIndex = index)}
-          on:click={() => selectResult(result)}
+          on:click={() => void selectResult(result)}
         >
           <div class="result-header">
             <span class="result-name">{result.name}</span>

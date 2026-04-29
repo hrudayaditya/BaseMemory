@@ -6,154 +6,64 @@
   import DetailPanel from './components/panels/DetailPanel.svelte';
   import ControlBar from './components/controls/ControlBar.svelte';
   import Minimap from './components/minimap/Minimap.svelte';
-  import { fetchBranches, fetchFullGraph, fetchNeighborhood } from './api/client';
-  import { buildGraphologyInstance, buildNeighborhoodGraphologyInstance } from './lib/graph-utils';
   import { readUrlState, writeUrlState } from './lib/url-state';
   import {
     activeBranch,
-    availableBranches,
-    fileEdges,
-    fileNodes,
     focusedSymbolId,
-    graphEdgeCount,
     graphError,
-    graphInstance,
     graphLoading,
-    graphNodeCount,
     graphTruncated,
+    graphDepth,
+    initializeGraph,
+    retryGraphLoad,
   } from './stores/graph';
-  import { selectedNodeId } from './stores/selection';
-  import { graphDepth } from './stores/ui';
+  import { selectNode } from './stores/selection';
 
-  let mounted = false;
-  let branch = '';
-  let depth = 1;
-  let centerSymbolId: string | null = null;
   let truncationDismissed = false;
-
-  async function loadGalaxyView(nextBranch: string) {
-    graphLoading.set(true);
-    graphError.set(null);
-    try {
-      const fullGraph = await fetchFullGraph(nextBranch);
-      fileNodes.set(fullGraph.nodes);
-      fileEdges.set(fullGraph.edges);
-      const graph = buildGraphologyInstance(fullGraph.nodes, fullGraph.edges);
-      graphInstance.set(graph);
-      graphNodeCount.set(fullGraph.nodes.length);
-      graphEdgeCount.set(fullGraph.edges.length);
-      graphTruncated.set(false);
-      focusedSymbolId.set(null);
-    } catch (error) {
-      graphError.set(error instanceof Error ? error.message : 'Failed to load graph');
-    } finally {
-      graphLoading.set(false);
-    }
-  }
-
-  async function loadNeighborhoodView(symbolId: string, nextBranch: string, nextDepth: number) {
-    graphLoading.set(true);
-    graphError.set(null);
-    try {
-      const neighborhood = await fetchNeighborhood(symbolId, nextBranch, nextDepth);
-      const graph = buildNeighborhoodGraphologyInstance(neighborhood.nodes, neighborhood.edges);
-      graphInstance.set(graph);
-      graphNodeCount.set(neighborhood.nodes.length);
-      graphEdgeCount.set(neighborhood.edges.length);
-      graphTruncated.set(neighborhood.truncated);
-      focusedSymbolId.set(symbolId);
-    } catch (error) {
-      graphError.set(error instanceof Error ? error.message : 'Failed to load neighborhood');
-    } finally {
-      graphLoading.set(false);
-    }
-  }
-
-  async function loadInitial() {
-    graphLoading.set(true);
-    graphError.set(null);
-
-    try {
-      const branches = await fetchBranches();
-      availableBranches.set(branches);
-
-      const urlState = readUrlState();
-      const initialBranch = urlState.branch && branches.includes(urlState.branch) ? urlState.branch : branches[0] ?? '';
-      const initialDepth = urlState.depth && [1, 2, 3].includes(urlState.depth) ? urlState.depth : 1;
-
-      activeBranch.set(initialBranch);
-      graphDepth.set(initialDepth);
-
-      if (urlState.symbolId) {
-        selectedNodeId.set(urlState.symbolId);
-        await loadNeighborhoodView(urlState.symbolId, initialBranch, initialDepth);
-      } else {
-        await loadGalaxyView(initialBranch);
-      }
-    } catch (error) {
-      graphError.set(error instanceof Error ? error.message : 'Failed to load graph');
-      graphLoading.set(false);
-    }
-  }
-
-  function retry() {
-    if (centerSymbolId && branch) {
-      void loadNeighborhoodView(centerSymbolId, branch, depth);
-    } else if (branch) {
-      void loadGalaxyView(branch);
-    } else {
-      void loadInitial();
-    }
-  }
+  let currentBranch = '';
+  let currentFocusedSymbolId: string | null = null;
+  let currentDepth = 1;
 
   const unsubscribers = [
-    activeBranch.subscribe((value) => {
-      branch = value;
-      if (!mounted || !value) return;
-      if (centerSymbolId) {
-        void loadNeighborhoodView(centerSymbolId, value, depth);
-      } else {
-        void loadGalaxyView(value);
-      }
-    }),
-    graphDepth.subscribe((value) => {
-      depth = value;
-      if (!mounted || !centerSymbolId || !branch) return;
-      void loadNeighborhoodView(centerSymbolId, branch, value);
-    }),
-    focusedSymbolId.subscribe((value) => {
-      centerSymbolId = value;
-      if (!mounted) return;
+    activeBranch.subscribe((branch) => {
+      currentBranch = branch;
       writeUrlState({
         branch,
-        symbolId: value ?? undefined,
-        depth,
-        view: value ? 'atom' : 'galaxy',
+        symbolId: currentFocusedSymbolId ?? undefined,
+        depth: currentDepth,
+        view: currentFocusedSymbolId ? 'atom' : 'galaxy',
       });
     }),
-    activeBranch.subscribe((value) => {
-      if (!mounted) return;
+    focusedSymbolId.subscribe((symbolId) => {
+      currentFocusedSymbolId = symbolId;
       writeUrlState({
-        branch: value,
-        symbolId: centerSymbolId ?? undefined,
-        depth,
-        view: centerSymbolId ? 'atom' : 'galaxy',
+        branch: currentBranch,
+        symbolId: symbolId ?? undefined,
+        depth: currentDepth,
+        view: symbolId ? 'atom' : 'galaxy',
       });
     }),
-    graphDepth.subscribe((value) => {
-      if (!mounted) return;
+    graphDepth.subscribe((depth) => {
+      currentDepth = depth;
       writeUrlState({
-        branch,
-        symbolId: centerSymbolId ?? undefined,
-        depth: value,
-        view: centerSymbolId ? 'atom' : 'galaxy',
+        branch: currentBranch,
+        symbolId: currentFocusedSymbolId ?? undefined,
+        depth,
+        view: currentFocusedSymbolId ? 'atom' : 'galaxy',
       });
     }),
   ];
 
-  onMount(async () => {
-    mounted = true;
-    await loadInitial();
+  async function boot() {
+    const urlState = readUrlState();
+    await initializeGraph(urlState);
+    if (urlState.symbolId) {
+      await selectNode(urlState.symbolId);
+    }
+  }
+
+  onMount(() => {
+    void boot();
   });
 
   onDestroy(() => {
@@ -183,7 +93,7 @@
       <div class="error-card">
         <h2>Could not load HyperBase</h2>
         <p>{$graphError}</p>
-        <button type="button" on:click={retry}>Retry</button>
+        <button type="button" on:click={() => void retryGraphLoad()}>Retry</button>
       </div>
     </div>
   {/if}
@@ -265,22 +175,20 @@
     display: flex;
     align-items: center;
     gap: var(--space-md);
-    max-width: 760px;
-    background: color-mix(in srgb, var(--node-constant) 12%, var(--bg-secondary));
-    border: 1px solid color-mix(in srgb, var(--node-constant) 35%, transparent);
-    color: var(--node-constant);
-    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--node-constant) 14%, var(--bg-secondary));
+    border: 1px solid color-mix(in srgb, var(--node-constant) 38%, transparent);
+    border-radius: var(--radius-lg);
+    padding: 12px 16px;
+    color: var(--text-primary);
+    z-index: var(--z-search);
     box-shadow: var(--shadow-sm);
-    padding: 10px 14px;
-    z-index: var(--z-controls);
   }
 
   .truncation-banner button {
     border: 0;
-    border-radius: var(--radius-sm);
     background: transparent;
-    color: inherit;
-    padding: 4px 8px;
+    color: var(--node-constant);
+    font-weight: 600;
   }
 
   @keyframes spin {

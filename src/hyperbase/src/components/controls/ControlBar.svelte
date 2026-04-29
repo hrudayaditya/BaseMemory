@@ -1,6 +1,15 @@
 <script lang="ts">
-  import { activeBranch, availableBranches, graphStats, graphTruncated } from '../../stores/graph';
-  import { activeOverlay, graphDepth } from '../../stores/ui';
+  import {
+    activeBranch,
+    availableBranches,
+    changeActiveBranch,
+    changeGraphDepth,
+    graphDepth,
+    graphStats,
+    graphTruncated,
+    setGraphOverlay,
+  } from '../../stores/graph';
+  import { activeOverlay } from '../../stores/ui';
 
   const depthOptions = [1, 2, 3];
   const overlays = [
@@ -14,7 +23,11 @@
 <div class="control-bar">
   <div class="group">
     <label for="branch-select">Branch</label>
-    <select id="branch-select" bind:value={$activeBranch}>
+    <select
+      id="branch-select"
+      value={$activeBranch}
+      on:change={(event) => void changeActiveBranch((event.currentTarget as HTMLSelectElement).value)}
+    >
       {#each $availableBranches as branch}
         <option value={branch}>{branch}</option>
       {/each}
@@ -29,7 +42,7 @@
           type="button"
           class:active={$graphDepth === option}
           class="pill"
-          on:click={() => graphDepth.set(option)}
+          on:click={() => void changeGraphDepth(option)}
         >
           {option}
         </button>
@@ -45,7 +58,7 @@
           type="button"
           class:active={$activeOverlay === overlay.key}
           class="pill"
-          on:click={() => activeOverlay.set(overlay.key)}
+          on:click={() => setGraphOverlay(overlay.key)}
         >
           {overlay.label}
         </button>

@@ -1,89 +1,29 @@
 <script lang="ts">
-  import { fetchNeighborhood, fetchPeek, fetchSymbol } from '../../api/client';
-  import { buildNeighborhoodGraphologyInstance, shortPath } from '../../lib/graph-utils';
+  import { activeBranch, graphDepth, loadNeighborhoodGraph } from '../../stores/graph';
   import {
-    activeBranch,
-    focusedSymbolId,
-    graphEdgeCount,
-    graphInstance,
-    graphLoading,
-    graphNodeCount,
-    graphTruncated,
-  } from '../../stores/graph';
-  import {
+    clearSelectedNode,
     detailLoading,
     selectedNodeData,
     selectedNodeId,
     selectedSymbolDetail,
     selectedSymbolPeek,
+    selectNode,
   } from '../../stores/selection';
   import { sidebarOpen } from '../../stores/ui';
-  import { graphDepth } from '../../stores/ui';
-
-  let branch = '';
-  let depth = 1;
-  let selectedId: string | null = null;
-  let localNodeData: Record<string, unknown> | null = null;
-
-  activeBranch.subscribe((value) => {
-    branch = value;
-  });
-
-  graphDepth.subscribe((value) => {
-    depth = value;
-  });
-
-  selectedNodeData.subscribe((value) => {
-    localNodeData = value as Record<string, unknown> | null;
-  });
-
-  selectedNodeId.subscribe(async (value) => {
-    selectedId = value;
-    if (!value) {
-      selectedSymbolDetail.set(null);
-      selectedSymbolPeek.set(null);
-      sidebarOpen.set(false);
-      return;
-    }
-
-    if (value.startsWith('file::')) {
-      selectedSymbolDetail.set(null);
-      selectedSymbolPeek.set(null);
-      sidebarOpen.set(true);
-      return;
-    }
-
-    detailLoading.set(true);
-    sidebarOpen.set(true);
-
-    try {
-      const [detail, peek] = await Promise.all([fetchSymbol(value, branch), fetchPeek(value, branch)]);
-      selectedSymbolDetail.set(detail);
-      selectedSymbolPeek.set(peek);
-    } finally {
-      detailLoading.set(false);
-    }
-  });
+  import { shortPath } from '../../lib/graph-utils';
 
   async function setAsCenter() {
-    if (!selectedId || !branch || selectedId.startsWith('file::')) return;
+    if (!$selectedNodeId || !$activeBranch || $selectedNodeId.startsWith('file::')) return;
 
-    graphLoading.set(true);
-    try {
-      const neighborhood = await fetchNeighborhood(selectedId, branch, depth);
-      const graph = buildNeighborhoodGraphologyInstance(neighborhood.nodes, neighborhood.edges);
-      graphInstance.set(graph);
-      graphNodeCount.set(neighborhood.nodes.length);
-      graphEdgeCount.set(neighborhood.edges.length);
-      graphTruncated.set(neighborhood.truncated);
-      focusedSymbolId.set(selectedId);
-    } finally {
-      graphLoading.set(false);
-    }
+    await loadNeighborhoodGraph($selectedNodeId, {
+      branch: $activeBranch,
+      depth: $graphDepth,
+    });
+    await selectNode($selectedNodeId);
   }
 
   function closePanel() {
-    selectedNodeId.set(null);
+    clearSelectedNode();
   }
 </script>
 
@@ -91,20 +31,20 @@
   <div class="panel-header">
     <div>
       <p class="eyebrow">Inspector</p>
-      <h2>{$selectedSymbolDetail?.name ?? (localNodeData?.label as string | undefined) ?? 'Node detail'}</h2>
+      <h2>{$selectedSymbolDetail?.name ?? (($selectedNodeData?.label as string | undefined) ?? 'Node detail')}</h2>
     </div>
     <button class="close-button" type="button" on:click={closePanel}>×</button>
   </div>
 
   {#if $detailLoading}
     <div class="section">Loading details…</div>
-  {:else if selectedId?.startsWith('file::') && localNodeData}
+  {:else if $selectedNodeId?.startsWith('file::') && $selectedNodeData}
     <div class="section">
       <div class="kind-badge">file</div>
-      <p class="meta-line">{shortPath(String(localNodeData.filePath ?? ''))}</p>
-      <p class="meta-line">Language: {String(localNodeData.language ?? 'unknown')}</p>
-      <p class="meta-line">Symbols: {String(localNodeData.symbolCount ?? '0')}</p>
-      <p class="meta-line">Directory: {String(localNodeData.directory ?? '')}</p>
+      <p class="meta-line">{shortPath(String($selectedNodeData.filePath ?? ''))}</p>
+      <p class="meta-line">Language: {String($selectedNodeData.language ?? 'unknown')}</p>
+      <p class="meta-line">Symbols: {String($selectedNodeData.symbolCount ?? '0')}</p>
+      <p class="meta-line">Directory: {String($selectedNodeData.directory ?? '')}</p>
     </div>
   {:else if $selectedSymbolDetail}
     <div class="section">
@@ -126,7 +66,7 @@
     </div>
 
     <div class="section actions">
-      <button class="action-button primary" type="button" on:click={setAsCenter}>Set as center</button>
+      <button class="action-button primary" type="button" on:click={() => void setAsCenter()}>Set as center</button>
       <a
         class="action-button"
         href={`vscode://file/${$selectedSymbolDetail.filePath}:${$selectedSymbolDetail.startLine}`}
@@ -259,16 +199,13 @@
     background: var(--bg-primary);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    padding: var(--space-md);
+    color: var(--text-primary);
+    font-family: 'SFMono-Regular', ui-monospace, monospace;
+    font-size: 12px;
+    line-height: 1.55;
     max-height: 300px;
     overflow: auto;
-    color: var(--text-primary);
-    font-size: 12px;
-    line-height: 1.5;
-  }
-
-  h3 {
-    margin: 0;
-    font-size: 16px;
+    padding: var(--space-md);
+    white-space: pre-wrap;
   }
 </style>

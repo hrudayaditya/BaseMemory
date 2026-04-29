@@ -1,80 +1,60 @@
 <script lang="ts">
+  import type Graph from 'graphology';
   import { onDestroy, onMount } from 'svelte';
   import Sigma from 'sigma';
-  import louvain from 'graphology-communities-louvain';
-  import { activeOverlay, sidebarOpen } from '../../stores/ui';
+  import { sidebarOpen, activeOverlay } from '../../stores/ui';
   import {
     cameraState,
     graphInstance,
+    graphRefreshNonce,
     sigmaInstance,
     zoomLevel,
   } from '../../stores/graph';
-  import { hoveredNodeId, selectedNodeData, selectedNodeId } from '../../stores/selection';
-  import { buildSigmaSettings } from '../../lib/sigma-config';
-  import { stringToHue } from '../../lib/graph-utils';
+  import { hoveredNodeId, selectedNodeId, selectNode } from '../../stores/selection';
+  import { buildSigmaSettings, type RenderSnapshot } from '../../lib/sigma-config';
   import { ZOOM_ATOM_THRESHOLD, ZOOM_GALAXY_THRESHOLD } from '../../lib/constants';
+  import type { FileGraphNodeAttributes, GraphEdgeAttributes, SymbolGraphNodeAttributes } from '../../types';
+
+  type HyperGraph = Graph<FileGraphNodeAttributes | SymbolGraphNodeAttributes, GraphEdgeAttributes>;
 
   let container: HTMLDivElement;
   let sigma: Sigma | null = null;
   let resizeObserver: ResizeObserver | null = null;
-  let currentGraph: ReturnType<typeof $graphInstance> | null = null;
+  let currentGraph: HyperGraph | null = null;
   let currentSelectedNodeId: string | null = null;
   let currentHoveredNodeId: string | null = null;
-  let currentOverlay: string = 'none';
+  let currentOverlay = 'none';
   let cameraCleanup: (() => void) | null = null;
+  let renderSnapshot: RenderSnapshot = {
+    activeNodeId: null,
+    connectedNodeIds: new Set<string>(),
+    connectedEdgeIds: new Set<string>(),
+    overlay: 'none',
+  };
 
-  function applyOverlay() {
-    if (!currentGraph) return;
+  function recomputeRenderSnapshot() {
+    const activeNodeId = currentHoveredNodeId ?? currentSelectedNodeId;
+    const connectedNodeIds = new Set<string>();
+    const connectedEdgeIds = new Set<string>();
 
-    if (currentOverlay === 'community') {
-      const communities = louvain(currentGraph);
-      currentGraph.forEachNode((node, attributes) => {
-        const community = communities[node];
-        const hue = stringToHue(String(community));
-        currentGraph?.mergeNodeAttributes(node, {
-          community,
-          communityColor: `hsl(${hue}, 78%, 62%)`,
-          color: attributes.color,
-        });
+    if (currentGraph && activeNodeId && currentGraph.hasNode(activeNodeId)) {
+      connectedNodeIds.add(activeNodeId);
+      currentGraph.forEachNeighbor(activeNodeId, (neighbor) => {
+        connectedNodeIds.add(neighbor);
       });
-    } else {
-      currentGraph.forEachNode((node) => {
-        currentGraph?.mergeNodeAttributes(node, { communityColor: undefined, community: undefined });
-      });
-    }
-  }
-
-  function applyHighlightState() {
-    if (!currentGraph || !sigma) return;
-
-    const activeNode = currentHoveredNodeId ?? currentSelectedNodeId;
-    const connectedNodes = new Set<string>();
-    const connectedEdges = new Set<string>();
-
-    if (activeNode && currentGraph.hasNode(activeNode)) {
-      connectedNodes.add(activeNode);
-      currentGraph.forEachNeighbor(activeNode, (neighbor) => {
-        connectedNodes.add(neighbor);
-      });
-      currentGraph.forEachEdge(activeNode, (edge) => {
-        connectedEdges.add(edge);
+      currentGraph.forEachEdge(activeNodeId, (edge) => {
+        connectedEdgeIds.add(edge);
       });
     }
 
-    currentGraph.forEachNode((node) => {
-      currentGraph?.mergeNodeAttributes(node, {
-        highlighted: activeNode !== null && node === activeNode,
-        dimmed: activeNode !== null && !connectedNodes.has(node),
-      });
-    });
+    renderSnapshot = {
+      activeNodeId,
+      connectedNodeIds,
+      connectedEdgeIds,
+      overlay: currentOverlay,
+    };
 
-    currentGraph.forEachEdge((edge) => {
-      currentGraph?.mergeEdgeAttributes(edge, {
-        highlighted: activeNode !== null && connectedEdges.has(edge),
-      });
-    });
-
-    sigma.refresh();
+    sigma?.refresh();
   }
 
   function updateZoomLevel() {
@@ -109,18 +89,20 @@
     const graphUnsubscribe = graphInstance.subscribe((graph) => {
       currentGraph = graph;
 
-      if (!container || !graph) return;
-
-      applyOverlay();
+      if (!container || !graph) {
+        return;
+      }
 
       if (!sigma) {
-        sigma = new Sigma(graph, container, buildSigmaSettings());
+        sigma = new Sigma(graph, container, buildSigmaSettings(() => renderSnapshot));
         sigmaInstance.set(sigma);
 
         sigma.on('clickNode', ({ node }) => {
-          selectedNodeId.set(node);
-          selectedNodeData.set(graph.getNodeAttributes(node));
           sidebarOpen.set(true);
+          const nextNodeData = currentGraph?.hasNode(node)
+            ? (currentGraph.getNodeAttributes(node) as Record<string, unknown>)
+            : null;
+          void selectNode(node, nextNodeData);
         });
 
         sigma.on('enterNode', ({ node }) => {
@@ -135,29 +117,28 @@
       } else {
         sigma.setGraph(graph);
         bindCamera();
-        sigma.refresh();
       }
 
-      applyHighlightState();
+      recomputeRenderSnapshot();
     });
 
     const selectedUnsubscribe = selectedNodeId.subscribe((value) => {
       currentSelectedNodeId = value;
-      if (currentGraph && value && currentGraph.hasNode(value)) {
-        selectedNodeData.set(currentGraph.getNodeAttributes(value));
-      }
-      applyHighlightState();
+      recomputeRenderSnapshot();
     });
 
     const hoveredUnsubscribe = hoveredNodeId.subscribe((value) => {
       currentHoveredNodeId = value;
-      applyHighlightState();
+      recomputeRenderSnapshot();
     });
 
     const overlayUnsubscribe = activeOverlay.subscribe((value) => {
       currentOverlay = value;
-      applyOverlay();
-      applyHighlightState();
+      recomputeRenderSnapshot();
+    });
+
+    const refreshUnsubscribe = graphRefreshNonce.subscribe(() => {
+      sigma?.refresh();
     });
 
     resizeObserver = new ResizeObserver(() => {
@@ -167,6 +148,7 @@
     resizeObserver.observe(container);
 
     return () => {
+      refreshUnsubscribe();
       overlayUnsubscribe();
       hoveredUnsubscribe();
       selectedUnsubscribe();

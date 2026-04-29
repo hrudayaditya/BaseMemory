@@ -49,9 +49,28 @@ export function languageColor(language: string): string {
   return LANGUAGE_COLORS[language] ?? `hsl(${stringToHue(language)}, 65%, 58%)`;
 }
 
+function seededUnit(seed: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash ^= seed.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) / 0xffffffff;
+}
+
+function seededPosition(nodeId: string, contentId: string | undefined, axis: 'x' | 'y'): number {
+  if (!contentId) {
+    return Math.random() * 1000 - 500;
+  }
+
+  const seed = `${contentId}:${nodeId}:${axis}`;
+  return seededUnit(seed) * 1000 - 500;
+}
+
 export function buildGraphologyInstance(
   nodes: FileNode[],
-  edges: FileEdge[]
+  edges: FileEdge[],
+  contentId?: string
 ): Graph<FileGraphNodeAttributes, GraphEdgeAttributes> {
   const graph = new Graph<FileGraphNodeAttributes, GraphEdgeAttributes>({ type: 'directed', multi: false });
   const maxSymbolCount = Math.max(...nodes.map((node) => node.symbolCount), 1);
@@ -61,8 +80,8 @@ export function buildGraphologyInstance(
       label: node.filePath.split('/').slice(-1)[0] ?? node.filePath,
       color: languageColor(node.language),
       size: nodeSize(node.symbolCount, maxSymbolCount),
-      x: Math.random() * 1000 - 500,
-      y: Math.random() * 1000 - 500,
+      x: seededPosition(node.id, contentId, 'x'),
+      y: seededPosition(node.id, contentId, 'y'),
       filePath: node.filePath,
       language: node.language,
       symbolCount: node.symbolCount,
@@ -88,18 +107,20 @@ export function buildGraphologyInstance(
 
 export function buildNeighborhoodGraphologyInstance(
   nodes: GraphNode[],
-  edges: GraphEdge[]
+  edges: GraphEdge[],
+  contentId?: string
 ): Graph<SymbolGraphNodeAttributes, GraphEdgeAttributes> {
   const graph = new Graph<SymbolGraphNodeAttributes, GraphEdgeAttributes>({ type: 'directed', multi: false });
   const maxDegree = Math.max(...nodes.map((node) => node.degree), 1);
+  const collapsedEdges = new Map<string, GraphEdge>();
 
   nodes.forEach((node) => {
     graph.addNode(node.id, {
       label: nodeLabel(node.name, node.filePath),
       color: nodeColor(node.kind),
       size: nodeSize(node.degree, maxDegree),
-      x: node.x ?? Math.random() * 1000 - 500,
-      y: node.y ?? Math.random() * 1000 - 500,
+      x: node.x ?? seededPosition(node.id, contentId, 'x'),
+      y: node.y ?? seededPosition(node.id, contentId, 'y'),
       filePath: node.filePath,
       language: node.language,
       kind: node.kind,
@@ -114,6 +135,21 @@ export function buildNeighborhoodGraphologyInstance(
   });
 
   edges.forEach((edge) => {
+    const pairKey = `${edge.from}->${edge.to}`;
+    const existing = collapsedEdges.get(pairKey);
+    if (!existing) {
+      collapsedEdges.set(pairKey, edge);
+      return;
+    }
+
+    if (existing.isResolved || !edge.isResolved) {
+      return;
+    }
+
+    collapsedEdges.set(pairKey, edge);
+  });
+
+  collapsedEdges.forEach((edge) => {
     if (graph.hasNode(edge.from) && graph.hasNode(edge.to)) {
       graph.addEdgeWithKey(edge.id, edge.from, edge.to, {
         size: edge.isResolved ? 1.5 : 0.75,

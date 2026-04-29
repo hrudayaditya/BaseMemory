@@ -1,11 +1,17 @@
 <script lang="ts">
+  import type Graph from 'graphology';
   import { onDestroy } from 'svelte';
-  import { graphInstance, sigmaInstance } from '../../stores/graph';
+  import { graphContentId, graphInstance, graphLoadId, sigmaInstance } from '../../stores/graph';
   import { LAYOUT_ITERATIONS } from '../../lib/constants';
+  import type { FileGraphNodeAttributes, GraphEdgeAttributes, SymbolGraphNodeAttributes } from '../../types';
+
+  type HyperGraph = Graph<FileGraphNodeAttributes | SymbolGraphNodeAttributes, GraphEdgeAttributes>;
 
   let worker: Worker | null = null;
   let layoutRunning = false;
-  let currentGraphKey = '';
+  let currentGraph: HyperGraph | null = null;
+  let currentSeed: string | null = null;
+  let currentLoadId = 0;
 
   function stopWorker() {
     if (worker) {
@@ -15,7 +21,7 @@
     layoutRunning = false;
   }
 
-  function startWorker(graph: NonNullable<Awaited<ReturnType<typeof graphInstance.subscribe>>>) {
+  function startWorker(graph: HyperGraph, seed: string | null) {
     stopWorker();
     worker = new Worker(new URL('../../workers/layout.worker.ts', import.meta.url), { type: 'module' });
     layoutRunning = true;
@@ -45,26 +51,32 @@
       type: 'start',
       graph: graph.export(),
       iterations: LAYOUT_ITERATIONS,
+      seed,
     });
   }
 
-  const unsubscribe = graphInstance.subscribe((graph) => {
-    if (!graph) {
-      stopWorker();
-      return;
-    }
+  const unsubscribers = [
+    graphInstance.subscribe((graph) => {
+      currentGraph = graph;
+      if (!graph) {
+        stopWorker();
+      }
+    }),
+    graphContentId.subscribe((contentId) => {
+      currentSeed = contentId;
+    }),
+    graphLoadId.subscribe((loadId) => {
+      if (!currentGraph || loadId === 0 || loadId === currentLoadId) {
+        return;
+      }
 
-    const nextKey = `${graph.order}:${graph.size}`;
-    if (nextKey === currentGraphKey) {
-      return;
-    }
-
-    currentGraphKey = nextKey;
-    startWorker(graph);
-  });
+      currentLoadId = loadId;
+      startWorker(currentGraph, currentSeed);
+    }),
+  ];
 
   onDestroy(() => {
-    unsubscribe();
+    unsubscribers.forEach((unsubscribe) => unsubscribe());
     stopWorker();
   });
 </script>
