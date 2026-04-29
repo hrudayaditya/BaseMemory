@@ -2,13 +2,13 @@ import Graph from 'graphology';
 import type Sigma from 'sigma';
 import { derived, get, writable } from 'svelte/store';
 import { fetchBranches, fetchFullGraph, fetchNeighborhood, isAbortError } from '../api/client';
-import { buildGraphologyInstance, buildNeighborhoodGraphologyInstance, stringToHue } from '../lib/graph-utils';
+import { buildGraphologyInstance, buildNeighborhoodGraphologyInstance } from '../lib/graph-utils';
+import { communityColorFor } from '../lib/theme';
 import type {
   FileEdge,
   FileGraphNodeAttributes,
   FileNode,
   FullGraphResponse,
-  GraphEdge,
   GraphEdgeAttributes,
   NeighborhoodResponse,
   Overlay,
@@ -76,46 +76,6 @@ function stableHash(parts: string[]): string {
   return `g${(hash >>> 0).toString(36)}`;
 }
 
-function hslToHex(hue: number, saturation: number, lightness: number): string {
-  const s = saturation / 100;
-  const l = lightness / 100;
-  const chroma = (1 - Math.abs(2 * l - 1)) * s;
-  const section = hue / 60;
-  const x = chroma * (1 - Math.abs((section % 2) - 1));
-
-  let red = 0;
-  let green = 0;
-  let blue = 0;
-
-  if (section >= 0 && section < 1) {
-    red = chroma;
-    green = x;
-  } else if (section < 2) {
-    red = x;
-    green = chroma;
-  } else if (section < 3) {
-    green = chroma;
-    blue = x;
-  } else if (section < 4) {
-    green = x;
-    blue = chroma;
-  } else if (section < 5) {
-    red = x;
-    blue = chroma;
-  } else {
-    red = chroma;
-    blue = x;
-  }
-
-  const match = l - chroma / 2;
-  const toHex = (value: number) =>
-    Math.round((value + match) * 255)
-      .toString(16)
-      .padStart(2, '0');
-
-  return `#${toHex(red)}${toHex(green)}${toHex(blue)}`;
-}
-
 function createGraphContentId(target: GraphLoadTarget, nodes: string[], edges: string[]): string {
   const head =
     target.kind === 'galaxy'
@@ -135,7 +95,7 @@ function fullGraphContentId(target: GraphLoadTarget, payload: FullGraphResponse)
 
 function neighborhoodGraphContentId(target: GraphLoadTarget, payload: NeighborhoodResponse): string {
   const nodeKeys = payload.nodes.map((node) => `${node.id}:${node.name}:${node.degree}`).sort();
-  const edgeKeys = payload.edges.map((edge) => `${edge.id}:${edge.from}:${edge.to}:${edge.isResolved}`).sort();
+  const edgeKeys = payload.edges.map((edge) => `${edge.id}:${edge.from}:${edge.to ?? 'null'}:${edge.isResolved}`).sort();
   return createGraphContentId(target, nodeKeys, edgeKeys);
 }
 
@@ -435,10 +395,9 @@ class GraphController {
           return;
         }
 
-        const hue = stringToHue(String(community));
         graph.mergeNodeAttributes(nodeId, {
           community,
-          communityColor: hslToHex(hue, 78, 62),
+          communityColor: communityColorFor(String(community)),
         });
       });
 

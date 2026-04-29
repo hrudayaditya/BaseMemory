@@ -3,6 +3,7 @@
   --bg-secondary: #161b22;
   --bg-tertiary: #21262d;
   --bg-hover: #30363d;
+  --bg-overlay: rgba(13, 17, 23, 0.55);
 
   --text-primary: #e6edf3;
   --text-secondary: #8b949e;
@@ -18,11 +19,27 @@
   --node-interface: #a78bfa;
   --node-type: #c4b5fd;
   --node-default: #94a3b8;
+  --node-highlight: #ffffff;
+  --node-dimmed: rgba(148, 163, 184, 0.15);
 
+  --edge-file: rgba(255, 255, 255, 0.08);
+  --edge-default: rgba(255, 255, 255, 0.12);
   --edge-resolved: rgba(255, 255, 255, 0.15);
   --edge-unresolved: rgba(255, 255, 255, 0.04);
   --edge-highlighted: rgba(79, 156, 249, 0.8);
   --edge-path: rgba(251, 191, 36, 0.9);
+
+  --language-typescript: #4f9cf9;
+  --language-javascript: #fbbf24;
+  --language-rust: #f97316;
+  --language-python: #34d399;
+  --language-go: #7dd3fc;
+  --language-default: #94a3b8;
+
+  --minimap-background: #161b22;
+  --minimap-edge: rgba(255, 255, 255, 0.08);
+  --minimap-viewport-fill: rgba(79, 156, 249, 0.12);
+  --minimap-viewport-stroke: rgba(79, 156, 249, 0.8);
 
   --border: rgba(255, 255, 255, 0.08);
   --border-accent: rgba(79, 156, 249, 0.4);

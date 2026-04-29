@@ -1,55 +1,77 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
+  import { getTheme } from '../../lib/theme';
   import { cameraState, graphInstance, sigmaInstance } from '../../stores/graph';
+  import type Sigma from 'sigma';
+
+  const MINIMAP_WIDTH = 180;
+  const MINIMAP_HEIGHT = 120;
+  const MINIMAP_CAMERA = { x: 0.5, y: 0.5, ratio: 1, angle: 0 };
 
   let canvas: HTMLCanvasElement;
   let graph: ReturnType<typeof $graphInstance> | null = null;
-  let camera = { x: 0.5, y: 0.5, ratio: 1, angle: 0 };
+  let sigma: Sigma | null = null;
+
+  function minimapOverride(renderer: Sigma) {
+    return {
+      cameraState: MINIMAP_CAMERA,
+      viewportDimensions: { width: MINIMAP_WIDTH, height: MINIMAP_HEIGHT },
+      graphDimensions: renderer.getGraphDimensions(),
+      padding: 0,
+    };
+  }
+
+  function scaleFromSigmaViewport(renderer: Sigma, point: { x: number; y: number }) {
+    const dimensions = renderer.getDimensions();
+    return {
+      x: (point.x / dimensions.width) * MINIMAP_WIDTH,
+      y: (point.y / dimensions.height) * MINIMAP_HEIGHT,
+    };
+  }
+
+  function scaleToSigmaViewport(renderer: Sigma, point: { x: number; y: number }) {
+    const dimensions = renderer.getDimensions();
+    return {
+      x: (point.x / MINIMAP_WIDTH) * dimensions.width,
+      y: (point.y / MINIMAP_HEIGHT) * dimensions.height,
+    };
+  }
+
+  function graphToMinimap(renderer: Sigma, point: { x: number; y: number }) {
+    const projected = renderer.graphToViewport(point, minimapOverride(renderer));
+    return scaleFromSigmaViewport(renderer, projected);
+  }
+
+  function framedToMinimap(renderer: Sigma, point: { x: number; y: number }) {
+    const projected = renderer.framedGraphToViewport(point, minimapOverride(renderer));
+    return scaleFromSigmaViewport(renderer, projected);
+  }
 
   function draw() {
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
+    const theme = getTheme();
 
     const width = canvas.width;
     const height = canvas.height;
 
     ctx.clearRect(0, 0, width, height);
-    ctx.fillStyle = '#161b22';
+    ctx.fillStyle = theme.minimap.background;
     ctx.fillRect(0, 0, width, height);
 
-    if (!graph || graph.order === 0) {
+    if (!graph || graph.order === 0 || !sigma) {
       return;
     }
 
-    let minX = Infinity;
-    let maxX = -Infinity;
-    let minY = Infinity;
-    let maxY = -Infinity;
-
-    graph.forEachNode((_node, attributes) => {
-      minX = Math.min(minX, attributes.x);
-      maxX = Math.max(maxX, attributes.x);
-      minY = Math.min(minY, attributes.y);
-      maxY = Math.max(maxY, attributes.y);
-    });
-
-    const spanX = Math.max(maxX - minX, 1);
-    const spanY = Math.max(maxY - minY, 1);
-
-    const toCanvas = (x: number, y: number) => ({
-      x: ((x - minX) / spanX) * width,
-      y: ((y - minY) / spanY) * height,
-    });
-
-    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.strokeStyle = theme.minimap.edge;
     ctx.lineWidth = 1;
     graph.forEachEdge((_edge, attributes, source, target) => {
       const sourcePos = graph?.getNodeAttributes(source);
       const targetPos = graph?.getNodeAttributes(target);
       if (!sourcePos || !targetPos) return;
-      const a = toCanvas(sourcePos.x, sourcePos.y);
-      const b = toCanvas(targetPos.x, targetPos.y);
+      const a = graphToMinimap(sigma, sourcePos);
+      const b = graphToMinimap(sigma, targetPos);
       ctx.beginPath();
       ctx.moveTo(a.x, a.y);
       ctx.lineTo(b.x, b.y);
@@ -57,33 +79,45 @@
     });
 
     graph.forEachNode((_node, attributes) => {
-      const point = toCanvas(attributes.x, attributes.y);
+      const point = graphToMinimap(sigma, attributes);
       ctx.fillStyle = attributes.color;
       ctx.beginPath();
       ctx.arc(point.x, point.y, 2, 0, Math.PI * 2);
       ctx.fill();
     });
 
-    const viewportWidth = Math.max(width * 0.22 / camera.ratio, 18);
-    const viewportHeight = Math.max(height * 0.22 / camera.ratio, 12);
-    const centerX = width * camera.x;
-    const centerY = height * camera.y;
+    const stageDimensions = sigma.getDimensions();
+    const viewportCorners = [
+      sigma.viewportToFramedGraph({ x: 0, y: 0 }),
+      sigma.viewportToFramedGraph({ x: stageDimensions.width, y: 0 }),
+      sigma.viewportToFramedGraph({ x: stageDimensions.width, y: stageDimensions.height }),
+      sigma.viewportToFramedGraph({ x: 0, y: stageDimensions.height }),
+    ].map((point) => framedToMinimap(sigma, point));
 
-    ctx.fillStyle = 'rgba(79,156,249,0.12)';
-    ctx.strokeStyle = 'rgba(79,156,249,0.8)';
+    ctx.fillStyle = theme.minimap.viewportFill;
+    ctx.strokeStyle = theme.minimap.viewportStroke;
     ctx.lineWidth = 1;
-    ctx.fillRect(centerX - viewportWidth / 2, centerY - viewportHeight / 2, viewportWidth, viewportHeight);
-    ctx.strokeRect(centerX - viewportWidth / 2, centerY - viewportHeight / 2, viewportWidth, viewportHeight);
+    ctx.beginPath();
+    ctx.moveTo(viewportCorners[0].x, viewportCorners[0].y);
+    for (let index = 1; index < viewportCorners.length; index += 1) {
+      ctx.lineTo(viewportCorners[index].x, viewportCorners[index].y);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
   }
 
   function handleClick(event: MouseEvent) {
-    const sigma = $sigmaInstance;
     if (!sigma || !canvas) return;
 
     const rect = canvas.getBoundingClientRect();
-    const x = (event.clientX - rect.left) / rect.width;
-    const y = (event.clientY - rect.top) / rect.height;
-    sigma.getCamera().animate({ x, y }, { duration: 250 });
+    const minimapPoint = {
+      x: ((event.clientX - rect.left) / rect.width) * MINIMAP_WIDTH,
+      y: ((event.clientY - rect.top) / rect.height) * MINIMAP_HEIGHT,
+    };
+    const sigmaViewportPoint = scaleToSigmaViewport(sigma, minimapPoint);
+    const framedPoint = sigma.viewportToFramedGraph(sigmaViewportPoint, minimapOverride(sigma));
+    sigma.getCamera().animate({ x: framedPoint.x, y: framedPoint.y }, { duration: 250 });
   }
 
   const graphUnsubscribe = graphInstance.subscribe((value) => {
@@ -92,7 +126,12 @@
   });
 
   const cameraUnsubscribe = cameraState.subscribe((value) => {
-    camera = value;
+    void value;
+    draw();
+  });
+
+  const sigmaUnsubscribe = sigmaInstance.subscribe((value) => {
+    sigma = value;
     draw();
   });
 
@@ -103,10 +142,11 @@
   onDestroy(() => {
     graphUnsubscribe();
     cameraUnsubscribe();
+    sigmaUnsubscribe();
   });
 </script>
 
-<canvas bind:this={canvas} width="180" height="120" class="minimap" on:click={handleClick}></canvas>
+<canvas bind:this={canvas} width={MINIMAP_WIDTH} height={MINIMAP_HEIGHT} class="minimap" on:click={handleClick}></canvas>
 
 <style>
   .minimap {

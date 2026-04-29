@@ -8,10 +8,12 @@ import type {
   GraphNode,
   SymbolGraphNodeAttributes,
 } from '../types';
-import { LANGUAGE_COLORS, MAX_NODE_SIZE, MIN_NODE_SIZE, NODE_COLOR_DEFAULT, NODE_COLORS } from './constants';
+import { MAX_NODE_SIZE, MIN_NODE_SIZE } from './constants';
+import { getTheme } from './theme';
 
 export function nodeColor(kind: string): string {
-  return NODE_COLORS[kind] ?? NODE_COLOR_DEFAULT;
+  const theme = getTheme();
+  return theme.node[kind as keyof typeof theme.node] ?? theme.node.default;
 }
 
 export function nodeSize(degree: number, maxDegree: number): number {
@@ -46,7 +48,22 @@ export function nodeLabel(name: string, filePath: string): string {
 }
 
 export function languageColor(language: string): string {
-  return LANGUAGE_COLORS[language] ?? `hsl(${stringToHue(language)}, 65%, 58%)`;
+  const theme = getTheme();
+  const known = theme.language[language as keyof typeof theme.language];
+  if (known) {
+    return known;
+  }
+
+  const fallbackPalette = [
+    theme.language.typescript,
+    theme.language.javascript,
+    theme.language.rust,
+    theme.language.python,
+    theme.language.go,
+    theme.language.default,
+  ];
+
+  return fallbackPalette[stringToHue(language) % fallbackPalette.length] ?? theme.language.default;
 }
 
 function seededUnit(seed: string): number {
@@ -72,6 +89,7 @@ export function buildGraphologyInstance(
   edges: FileEdge[],
   contentId?: string
 ): Graph<FileGraphNodeAttributes, GraphEdgeAttributes> {
+  const theme = getTheme();
   const graph = new Graph<FileGraphNodeAttributes, GraphEdgeAttributes>({ type: 'directed', multi: false });
   const maxSymbolCount = Math.max(...nodes.map((node) => node.symbolCount), 1);
 
@@ -95,7 +113,7 @@ export function buildGraphologyInstance(
     if (graph.hasNode(edge.from) && graph.hasNode(edge.to)) {
       graph.addEdge(edge.from, edge.to, {
         size: Math.min(Math.max(Math.log(edge.callCount + 1), 1), 4),
-        color: 'rgba(255,255,255,0.08)',
+        color: theme.edge.file,
         isResolved: true,
         highlighted: false,
       });
@@ -110,6 +128,7 @@ export function buildNeighborhoodGraphologyInstance(
   edges: GraphEdge[],
   contentId?: string
 ): Graph<SymbolGraphNodeAttributes, GraphEdgeAttributes> {
+  const theme = getTheme();
   const graph = new Graph<SymbolGraphNodeAttributes, GraphEdgeAttributes>({ type: 'directed', multi: false });
   const maxDegree = Math.max(...nodes.map((node) => node.degree), 1);
   const collapsedEdges = new Map<string, GraphEdge>();
@@ -135,6 +154,10 @@ export function buildNeighborhoodGraphologyInstance(
   });
 
   edges.forEach((edge) => {
+    if (!edge.to) {
+      return;
+    }
+
     const pairKey = `${edge.from}->${edge.to}`;
     const existing = collapsedEdges.get(pairKey);
     if (!existing) {
@@ -150,10 +173,10 @@ export function buildNeighborhoodGraphologyInstance(
   });
 
   collapsedEdges.forEach((edge) => {
-    if (graph.hasNode(edge.from) && graph.hasNode(edge.to)) {
+    if (edge.to && graph.hasNode(edge.from) && graph.hasNode(edge.to)) {
       graph.addEdgeWithKey(edge.id, edge.from, edge.to, {
         size: edge.isResolved ? 1.5 : 0.75,
-        color: edge.isResolved ? 'rgba(255,255,255,0.15)' : 'rgba(255,255,255,0.04)',
+        color: edge.isResolved ? theme.edge.resolved : theme.edge.unresolved,
         isResolved: edge.isResolved,
         highlighted: false,
       });

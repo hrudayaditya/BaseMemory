@@ -271,12 +271,12 @@ describe("graph server", () => {
     const response = await invoke("/api/neighborhood/sym_center", { depth: 1 });
     expect(response.status).toBe(200);
     const nodes = new Set((response.body as { nodes: Array<{ id: string }> }).nodes.map((node) => node.id));
-    const unresolvedEdges = (response.body as { edges: Array<{ from: string; to: string; isResolved: boolean }> }).edges
+    const unresolvedEdges = (response.body as { edges: Array<{ from: string; to: string | null; isResolved: boolean }> }).edges
       .filter((edge) => edge.isResolved === false);
     expect(unresolvedEdges.length).toBeGreaterThan(0);
     for (const edge of unresolvedEdges) {
       expect(nodes.has(edge.from)).toBe(true);
-      expect(nodes.has(edge.to)).toBe(true);
+      expect(edge.to).toBeNull();
     }
   });
 

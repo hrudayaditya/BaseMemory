@@ -120,7 +120,7 @@
     inset: 0;
     display: grid;
     place-items: center;
-    background: rgba(13, 17, 23, 0.55);
+    background: var(--bg-overlay);
     backdrop-filter: blur(6px);
     z-index: var(--z-modal);
   }

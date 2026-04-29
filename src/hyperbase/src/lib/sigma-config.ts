@@ -1,4 +1,5 @@
 import type { Settings } from 'sigma/settings';
+import { getTheme } from './theme';
 
 export interface RenderSnapshot {
   activeNodeId: string | null;
@@ -8,25 +9,23 @@ export interface RenderSnapshot {
 }
 
 export function buildSigmaSettings(getSnapshot: () => RenderSnapshot): Partial<Settings> {
+  const theme = getTheme();
+
   return {
     renderEdgeLabels: false,
-    defaultEdgeColor: 'rgba(255,255,255,0.12)',
-    defaultNodeColor: '#94a3b8',
+    defaultEdgeColor: theme.edge.default,
+    defaultNodeColor: theme.node.default,
     labelFont: 'Inter, system-ui, sans-serif',
     labelSize: 11,
     labelWeight: '500',
-    labelColor: { color: '#e6edf3' },
+    labelColor: { color: theme.text.primary },
     edgeReducer: (edge, data) => {
       const snapshot = getSnapshot();
       const highlighted = snapshot.activeNodeId !== null && snapshot.connectedEdgeIds.has(edge);
 
       return {
         ...data,
-        color: highlighted
-          ? 'rgba(79,156,249,0.8)'
-          : data.isResolved
-            ? 'rgba(255,255,255,0.12)'
-            : 'rgba(255,255,255,0.03)',
+        color: highlighted ? theme.edge.highlighted : data.isResolved ? theme.edge.default : theme.edge.unresolved,
         size: highlighted ? Math.max((data.size as number) * 1.8, 2) : data.isResolved ? 1 : 0.5,
       };
     },
@@ -38,7 +37,7 @@ export function buildSigmaSettings(getSnapshot: () => RenderSnapshot): Partial<S
 
       return {
         ...data,
-        color: highlighted ? '#ffffff' : dimmed ? 'rgba(148,163,184,0.15)' : color,
+        color: highlighted ? theme.node.highlight : dimmed ? theme.node.dimmed : color,
         size: highlighted ? (data.size as number) * 1.4 : data.size,
       };
     },

@@ -14,7 +14,7 @@ export interface GraphNode {
 export interface GraphEdge {
   id: string;
   from: string;
-  to: string;
+  to: string | null;
   callType: string;
   isResolved: boolean;
   callerFilePath: string | null;
