@@ -45,6 +45,7 @@
   let contextMenuNodeId: string | null = null;
   let renderSnapshot: RenderSnapshot = {
     activeNodeId: null,
+    selectionNodeId: null,
     connectedNodeIds: new Set<string>(),
     connectedEdgeIds: new Set<string>(),
     overlay: 'none',
@@ -55,6 +56,8 @@
     hotspotNodeIds: new Set<string>(),
     edgeCallCountMax: 1,
   };
+  let selectedConnectedNodeIds = new Set<string>();
+  let selectedConnectedEdgeIds = new Set<string>();
 
   type EntityType = 'directory' | 'file' | 'symbol';
 
@@ -124,25 +127,32 @@
     closeContextMenu();
   }
 
-  function recomputeRenderSnapshot() {
-    const activeNodeId = currentHoveredNodeId ?? currentSelectedNodeId;
+  function recomputeSelectedAdjacency() {
     const connectedNodeIds = new Set<string>();
     const connectedEdgeIds = new Set<string>();
 
-    if (currentGraph && activeNodeId && currentGraph.hasNode(activeNodeId)) {
-      connectedNodeIds.add(activeNodeId);
-      currentGraph.forEachNeighbor(activeNodeId, (neighbor) => {
+    if (currentGraph && currentSelectedNodeId && currentGraph.hasNode(currentSelectedNodeId)) {
+      connectedNodeIds.add(currentSelectedNodeId);
+      currentGraph.forEachNeighbor(currentSelectedNodeId, (neighbor) => {
         connectedNodeIds.add(neighbor);
       });
-      currentGraph.forEachEdge(activeNodeId, (edge) => {
+      currentGraph.forEachEdge(currentSelectedNodeId, (edge) => {
         connectedEdgeIds.add(edge);
       });
     }
 
+    selectedConnectedNodeIds = connectedNodeIds;
+    selectedConnectedEdgeIds = connectedEdgeIds;
+  }
+
+  function recomputeRenderSnapshot() {
+    const activeNodeId = currentHoveredNodeId ?? currentSelectedNodeId;
+
     renderSnapshot = {
       activeNodeId,
-      connectedNodeIds,
-      connectedEdgeIds,
+      selectionNodeId: currentSelectedNodeId,
+      connectedNodeIds: selectedConnectedNodeIds,
+      connectedEdgeIds: selectedConnectedEdgeIds,
       overlay: currentOverlay,
       focusMode: currentFocusMode,
       focusedNodeIds: currentFocusedNodeIds,
@@ -205,8 +215,11 @@
     const graphUnsubscribe = graphInstance.subscribe((graph) => {
       currentGraph = graph;
       recomputeOverlayMetrics();
+      recomputeSelectedAdjacency();
 
       if (!container || !graph) {
+        recomputeRenderSnapshot();
+        recomputeAnnotationBadges();
         return;
       }
 
@@ -375,6 +388,7 @@
 
     const selectedUnsubscribe = selectedNodeId.subscribe((value) => {
       currentSelectedNodeId = value;
+      recomputeSelectedAdjacency();
       recomputeRenderSnapshot();
     });
 

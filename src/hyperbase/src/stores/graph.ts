@@ -848,6 +848,7 @@ class GraphController {
 
     this.graphLoadRevision = nextRevision(this.graphLoadRevision);
     this.communityComputedForLoadId = null;
+    const previousGraph = get(graphInstance);
 
     graphInstance.set(options.graph);
     graphContentId.set(options.contentId);
@@ -892,6 +893,10 @@ class GraphController {
 
     if (get(activeOverlay) === 'community') {
       this.computeCommunities(options.graph, this.graphLoadRevision);
+    }
+
+    if (previousGraph && previousGraph !== options.graph) {
+      previousGraph.clear();
     }
   }
 

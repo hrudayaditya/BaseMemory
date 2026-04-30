@@ -22,6 +22,21 @@ type CommunityMessage = {
 type WorkerMessage = StartMessage | StopMessage | CommunityMessage;
 type PositionMap = Record<string, { x: number; y: number }>;
 
+type ProgressMessage = {
+  type: 'progress';
+  positions: PositionMap;
+  iteration: number;
+  maxDelta: number;
+};
+
+type DoneMessage = {
+  type: 'done';
+  positions: PositionMap;
+  iteration: number;
+  converged: boolean;
+  maxDelta: number;
+};
+
 function positionsFor(graph: Graph): PositionMap {
   const positions: Record<string, { x: number; y: number }> = {};
   graph.forEachNode((node, attributes) => {
@@ -47,6 +62,34 @@ function deltaPositionsFor(
     }
   });
   return positions;
+}
+
+function maxDeltaFor(current: PositionMap, previous: PositionMap): number {
+  let maxDelta = 0;
+  for (const [node, position] of Object.entries(current)) {
+    const last = previous[node];
+    if (!last) {
+      return Number.POSITIVE_INFINITY;
+    }
+
+    const delta = Math.hypot(position.x - last.x, position.y - last.y);
+    maxDelta = Math.max(maxDelta, delta);
+  }
+
+  return maxDelta;
+}
+
+function convergenceThresholdForOrder(order: number): number {
+  if (order < 30) {
+    return 1;
+  }
+  if (order <= 100) {
+    return 0.5;
+  }
+  if (order <= 300) {
+    return 0.34;
+  }
+  return 0.24;
 }
 
 function projectBoundaryNodes(graph: Graph): void {
@@ -109,7 +152,12 @@ self.onmessage = (event: MessageEvent<WorkerMessage>) => {
   const settings = inferSettings(graph);
   let completed = 0;
   let stopped = false;
-  let previousPositions: PositionMap = {};
+  let previousPositions = positionsFor(graph);
+  let finalPositions = previousPositions;
+  let lastMaxDelta = Number.POSITIVE_INFINITY;
+  let converged = false;
+  const minimumIterationsBeforeConvergence = Math.min(payload.iterations, LAYOUT_WORKER_BATCH * 2);
+  const convergenceThreshold = convergenceThresholdForOrder(graph.order);
 
   const stopHandler = (stopEvent: MessageEvent<WorkerMessage>) => {
     if (stopEvent.data.type === 'stop') {
@@ -124,16 +172,26 @@ self.onmessage = (event: MessageEvent<WorkerMessage>) => {
     forceAtlas2.assign(graph, { iterations: batch, settings });
     completed += batch;
 
-    const positions = previousPositions && completed < payload.iterations
-      ? deltaPositionsFor(graph, previousPositions, LAYOUT_POST_EPSILON)
-      : positionsFor(graph);
-    previousPositions = positionsFor(graph);
+    finalPositions = positionsFor(graph);
+    lastMaxDelta = maxDeltaFor(finalPositions, previousPositions);
 
-    self.postMessage({
+    const positions = completed < payload.iterations
+      ? deltaPositionsFor(graph, previousPositions, LAYOUT_POST_EPSILON)
+      : finalPositions;
+    previousPositions = finalPositions;
+
+    const progressMessage: ProgressMessage = {
       type: 'progress',
       positions,
       iteration: completed,
-    });
+      maxDelta: lastMaxDelta,
+    };
+    self.postMessage(progressMessage);
+
+    if (completed >= minimumIterationsBeforeConvergence && lastMaxDelta <= convergenceThreshold) {
+      converged = true;
+      break;
+    }
   }
 
   self.removeEventListener('message', stopHandler as EventListener);
@@ -143,9 +201,14 @@ self.onmessage = (event: MessageEvent<WorkerMessage>) => {
   }
 
   projectBoundaryNodes(graph);
+  finalPositions = positionsFor(graph);
 
-  self.postMessage({
+  const doneMessage: DoneMessage = {
     type: 'done',
-    positions: positionsFor(graph),
-  });
+    positions: finalPositions,
+    iteration: completed,
+    converged,
+    maxDelta: lastMaxDelta,
+  };
+  self.postMessage(doneMessage);
 };

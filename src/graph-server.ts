@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync } from "fs";
 import { createServer } from "http";
 import { IncomingForm } from "formidable";
 import { tmpdir } from "os";
+import { performance } from "perf_hooks";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 
@@ -64,6 +65,40 @@ function readFileLines(filePath: string, startLine: number, endLine: number): st
 
 function isSqliteError(error: unknown): error is Error {
   return error instanceof Error && "code" in error;
+}
+
+function graphCountsFor(
+  payload:
+    | { nodes: unknown[]; edges: unknown[] }
+    | { path: unknown[]; edges: unknown[] }
+): { nodeCount: number; edgeCount: number } {
+  if ("nodes" in payload) {
+    return {
+      nodeCount: payload.nodes.length,
+      edgeCount: payload.edges.length,
+    };
+  }
+
+  return {
+    nodeCount: payload.path.length,
+    edgeCount: payload.edges.length,
+  };
+}
+
+function logLargeAssembly(
+  endpoint: string,
+  startedAt: number,
+  payload:
+    | { nodes: unknown[]; edges: unknown[] }
+    | { path: unknown[]; edges: unknown[] }
+): void {
+  const { nodeCount, edgeCount } = graphCountsFor(payload);
+  if (edgeCount <= 100) {
+    return;
+  }
+
+  const elapsed = Math.round(performance.now() - startedAt);
+  console.log(`[HyperBase timing] endpoint=${endpoint} nodes=${nodeCount} edges=${edgeCount} assemblyMs=${elapsed}`);
 }
 
 function parseArgs(argv: string[]): GraphServerOptions {
@@ -252,7 +287,15 @@ export function createGraphServer(options: GraphServerOptions): GraphServerInsta
     return symbol;
   }
 
-  app.get("/api/health", (_req, res) => {
+  app.get("/api/health", (req, res) => {
+    if (currentState) {
+      const branch = resolveBranch(currentState, req.query.branch);
+      if (!branch) {
+        sendError(res, 400, "BRANCH_NOT_FOUND", `Unknown branch: ${String(req.query.branch)}`);
+        return;
+      }
+    }
+
     const info = createDbInfo(currentState);
     res.json({
       status: "ok",
@@ -418,12 +461,14 @@ export function createGraphServer(options: GraphServerOptions): GraphServerInsta
       return;
     }
 
+    const startedAt = performance.now();
     const neighborhood = buildNeighborhoodGraph(state.queries, branch, req.params.id, depth);
     if (!neighborhood) {
       sendError(res, 404, "NOT_FOUND", `Unknown symbol: ${req.params.id}`);
       return;
     }
 
+    logLargeAssembly("/api/neighborhood/:id", startedAt, neighborhood);
     res.json(neighborhood);
   }));
 
@@ -434,12 +479,14 @@ export function createGraphServer(options: GraphServerOptions): GraphServerInsta
       return;
     }
 
+    const startedAt = performance.now();
     const directoryGraph = buildDirectoryGraph(state.queries, branch, directoryPath);
     if (!directoryGraph) {
       sendError(res, 404, "NOT_FOUND", `Unknown directory: ${directoryPath}`);
       return;
     }
 
+    logLargeAssembly("/api/graph/directory", startedAt, directoryGraph);
     res.json(directoryGraph);
   }));
 
@@ -450,30 +497,40 @@ export function createGraphServer(options: GraphServerOptions): GraphServerInsta
       return;
     }
 
+    const startedAt = performance.now();
     const fileGraph = buildFileGraph(state.queries, branch, filePath);
     if (!fileGraph) {
       sendError(res, 404, "NOT_FOUND", `Unknown file: ${filePath}`);
       return;
     }
 
+    logLargeAssembly("/api/graph/file", startedAt, fileGraph);
     res.json(fileGraph);
   }));
 
   app.get("/api/graph/overview", (req, res) => withBranch(req, res, (state, branch) => {
-    res.json(buildOverviewGraph(state.queries, branch));
+    const startedAt = performance.now();
+    const overview = buildOverviewGraph(state.queries, branch);
+    logLargeAssembly("/api/graph/overview", startedAt, overview);
+    res.json(overview);
   }));
 
   app.get("/api/graph/full", (req, res) => withBranch(req, res, (state, branch) => {
-    res.json(buildFullGraph(state.queries, branch));
+    const startedAt = performance.now();
+    const fullGraph = buildFullGraph(state.queries, branch);
+    logLargeAssembly("/api/graph/full", startedAt, fullGraph);
+    res.json(fullGraph);
   }));
 
   app.get("/api/blast-radius/:id", (req, res) => withBranch(req, res, (state, branch) => {
+    const startedAt = performance.now();
     const blast = buildBlastRadiusGraph(state.queries, branch, req.params.id);
     if (!blast) {
       sendError(res, 404, "NOT_FOUND", `Unknown symbol: ${req.params.id}`);
       return;
     }
 
+    logLargeAssembly("/api/blast-radius/:id", startedAt, blast);
     res.json(blast);
   }));
 
@@ -485,12 +542,14 @@ export function createGraphServer(options: GraphServerOptions): GraphServerInsta
       return;
     }
 
+    const startedAt = performance.now();
     const pathResponse = buildShortestPath(state.queries, branch, fromId, toId);
     if (pathResponse === "NOT_FOUND") {
       sendError(res, 404, "NOT_FOUND", "One or both symbols do not exist");
       return;
     }
 
+    logLargeAssembly("/api/path", startedAt, pathResponse);
     res.json(pathResponse);
   }));
 
@@ -533,12 +592,14 @@ export function createGraphServer(options: GraphServerOptions): GraphServerInsta
       return;
     }
 
+    const startedAt = performance.now();
     const neighborhood = buildNeighborhoodGraph(state.queries, branch, req.params.id, depth);
     if (!neighborhood) {
       sendError(res, 404, "NOT_FOUND", `Unknown symbol: ${req.params.id}`);
       return;
     }
 
+    logLargeAssembly("/api/mcp/neighborhood/:id", startedAt, neighborhood);
     res.json({
       schema: "hyperbase-graph-v1",
       generatedAt: new Date().toISOString(),

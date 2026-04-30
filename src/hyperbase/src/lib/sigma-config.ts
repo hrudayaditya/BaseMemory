@@ -6,6 +6,7 @@ import type { GraphEdgeAttributes, Overlay } from '../types';
 
 export interface RenderSnapshot {
   activeNodeId: string | null;
+  selectionNodeId: string | null;
   connectedNodeIds: Set<string>;
   connectedEdgeIds: Set<string>;
   overlay: Overlay;
@@ -30,7 +31,7 @@ export function buildSigmaSettings(getSnapshot: () => RenderSnapshot): Partial<S
     labelColor: { color: theme.text.primary },
     edgeReducer: (edge, data) => {
       const snapshot = getSnapshot();
-      const highlighted = snapshot.activeNodeId !== null && snapshot.connectedEdgeIds.has(edge);
+      const highlighted = snapshot.selectionNodeId !== null && snapshot.connectedEdgeIds.has(edge);
       const focusDimmed = snapshot.focusMode && !snapshot.connectedEdgeIds.has(edge);
       const baseAppearance =
         snapshot.overlay === 'coupling'
@@ -53,7 +54,7 @@ export function buildSigmaSettings(getSnapshot: () => RenderSnapshot): Partial<S
     nodeReducer: (node, data) => {
       const snapshot = getSnapshot();
       const highlighted = snapshot.activeNodeId !== null && node === snapshot.activeNodeId;
-      const dimmed = snapshot.activeNodeId !== null && !snapshot.connectedNodeIds.has(node);
+      const dimmed = snapshot.selectionNodeId !== null && !snapshot.connectedNodeIds.has(node);
       const focusDimmed = snapshot.focusMode && !snapshot.focusedNodeIds.has(node);
       const deadDimmed = snapshot.overlay === 'dead' && snapshot.deadNodeIds.has(node);
       const isHotspot = snapshot.overlay === 'hotspot' && snapshot.hotspotNodeIds.has(node);

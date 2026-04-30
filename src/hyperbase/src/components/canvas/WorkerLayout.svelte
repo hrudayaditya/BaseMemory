@@ -44,8 +44,8 @@
 
     worker.onmessage = (event) => {
       const payload = event.data as
-        | { type: 'progress'; positions: Record<string, { x: number; y: number }>; iteration: number }
-        | { type: 'done'; positions: Record<string, { x: number; y: number }> };
+        | { type: 'progress'; positions: Record<string, { x: number; y: number }>; iteration: number; maxDelta: number }
+        | { type: 'done'; positions: Record<string, { x: number; y: number }>; iteration: number; converged: boolean; maxDelta: number };
 
       Object.entries(payload.positions).forEach(([node, position]) => {
         if (graph.hasNode(node)) {
