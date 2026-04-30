@@ -1,13 +1,27 @@
 import Graph from 'graphology';
 import type Sigma from 'sigma';
 import { derived, get, writable } from 'svelte/store';
-import { fetchBlastRadius, fetchBranches, fetchDirectoryGraph, fetchFullGraph, fetchNeighborhood, fetchPath, isAbortError } from '../api/client';
+import {
+  fetchBlastRadius,
+  fetchBranches,
+  fetchDbInfo,
+  fetchDemoRepos,
+  fetchDirectoryGraph,
+  fetchFullGraph,
+  fetchNeighborhood,
+  fetchPath,
+  isAbortError,
+  selectDemoDatabase,
+  uploadDatabase,
+} from '../api/client';
 import { buildBlastRadiusGraphologyInstance, buildDirectoryGraphologyInstance, buildGraphologyInstance, buildNeighborhoodGraphologyInstance, buildPathGraphologyInstance } from '../lib/graph-utils';
 import { restoreLayoutSnapshot } from '../lib/layout-cache';
 import { communityColorFor } from '../lib/theme';
 import type {
   BlastRadiusResponse,
   CurrentGraphPayload,
+  DbInfoResponse,
+  DemoRepoInfo,
   DirectoryGraphResponse,
   FileEdge,
   FileGraphNodeAttributes,
@@ -78,6 +92,9 @@ export const zoomLevel = writable<ZoomLevel>('galaxy');
 export const currentView = writable<string>('galaxy');
 export const currentViewInfo = writable<ViewInfo>({ kind: 'galaxy' });
 export const currentGraphPayload = writable<CurrentGraphPayload | null>(null);
+export const currentDatabaseInfo = writable<DbInfoResponse | null>(null);
+export const demoRepos = writable<DemoRepoInfo[]>([]);
+export const showLanding = writable<boolean>(false);
 
 export const graphNodeCount = writable<number>(0);
 export const graphEdgeCount = writable<number>(0);
@@ -169,6 +186,7 @@ class GraphController {
   private communityComputedForLoadId: number | null = null;
   private currentTarget: GraphLoadTarget | null = null;
   private lastUrlState: UrlState = {};
+  private latestDbInfo: DbInfoResponse | null = null;
 
   async initialize(initialUrlState: UrlState = {}): Promise<void> {
     this.lastUrlState = initialUrlState;
@@ -180,6 +198,34 @@ class GraphController {
     graphError.set(null);
 
     try {
+      const dbInfo = await fetchDbInfo(branchesAbortController.signal);
+      if (branchesAbortController.signal.aborted) {
+        return;
+      }
+
+      this.latestDbInfo = dbInfo;
+      currentDatabaseInfo.set(dbInfo);
+      showLanding.set(!dbInfo.available);
+      if (!dbInfo.available) {
+        graphInstance.set(null);
+        focusedSymbolId.set(null);
+        graphNodeCount.set(0);
+        graphEdgeCount.set(0);
+        graphTruncated.set(false);
+        currentGraphPayload.set(null);
+        currentViewInfo.set({ kind: 'galaxy' });
+        currentView.set('galaxy');
+        const demos = await fetchDemoRepos(branchesAbortController.signal);
+        if (!branchesAbortController.signal.aborted) {
+          demoRepos.set(demos);
+          availableBranches.set([]);
+          activeBranch.set('');
+          graphLoading.set(false);
+        }
+        this.initialized = true;
+        return;
+      }
+
       const branches = await fetchBranches(branchesAbortController.signal);
       if (branchesAbortController.signal.aborted) {
         return;
@@ -193,6 +239,7 @@ class GraphController {
 
       activeBranch.set(branch);
       graphDepth.set(depth);
+      demoRepos.set(await fetchDemoRepos(branchesAbortController.signal).catch(() => []));
       this.initialized = true;
 
       if (initialUrlState.view === 'blast' && initialUrlState.symbolId) {
@@ -477,6 +524,42 @@ class GraphController {
     }
   }
 
+  async selectDemo(demoId: string): Promise<void> {
+    graphLoading.set(true);
+    graphError.set(null);
+    try {
+      const dbInfo = await selectDemoDatabase(demoId);
+      this.latestDbInfo = dbInfo;
+      currentDatabaseInfo.set(dbInfo);
+      availableBranches.set(dbInfo.branches);
+      activeBranch.set(dbInfo.branch ?? '');
+      showLanding.set(false);
+      this.initialized = true;
+      await this.loadGalaxy(dbInfo.branch ?? '');
+    } catch (error) {
+      graphError.set(error instanceof Error ? error.message : 'Failed to load demo database.');
+      graphLoading.set(false);
+    }
+  }
+
+  async uploadDb(file: File): Promise<void> {
+    graphLoading.set(true);
+    graphError.set(null);
+    try {
+      const dbInfo = await uploadDatabase(file);
+      this.latestDbInfo = dbInfo;
+      currentDatabaseInfo.set(dbInfo);
+      availableBranches.set(dbInfo.branches);
+      activeBranch.set(dbInfo.branch ?? '');
+      showLanding.set(false);
+      this.initialized = true;
+      await this.loadGalaxy(dbInfo.branch ?? '');
+    } catch (error) {
+      graphError.set(error instanceof Error ? error.message : "This file doesn't look like a HyperBase index. Make sure to select a `.opencode/index/codebase.db` file.");
+      graphLoading.set(false);
+    }
+  }
+
   async changeBranch(branch: string): Promise<void> {
     activeBranch.set(branch);
     if (!this.initialized) {
@@ -640,6 +723,14 @@ class GraphController {
           : null
     );
     graphLoading.set(false);
+    showLanding.set(false);
+    if (this.latestDbInfo) {
+      currentDatabaseInfo.set({
+        ...this.latestDbInfo,
+        available: true,
+        branch: options.target.branch,
+      });
+    }
 
     if (get(activeOverlay) === 'community') {
       this.computeCommunities(options.graph, this.graphLoadRevision);
@@ -715,3 +806,5 @@ export const changeActiveBranch = (branch: string) => graphController.changeBran
 export const changeGraphDepth = (depth: number) => graphController.changeDepth(depth);
 export const retryGraphLoad = () => graphController.retry();
 export const setGraphOverlay = (overlay: Overlay) => graphController.setOverlay(overlay);
+export const selectDemoGraph = (demoId: string) => graphController.selectDemo(demoId);
+export const uploadDatabaseGraph = (file: File) => graphController.uploadDb(file);

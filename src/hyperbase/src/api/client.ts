@@ -1,5 +1,7 @@
 import type {
   BlastRadiusResponse,
+  DbInfoResponse,
+  DemoRepoInfo,
   DirectoryGraphResponse,
   FullGraphResponse,
   NeighborhoodResponse,
@@ -31,6 +33,41 @@ async function request<T>(path: string, signal?: AbortSignal): Promise<T> {
     throw new ApiError(body.code ?? 'UNKNOWN', body.error ?? res.statusText);
   }
   return res.json() as Promise<T>;
+}
+
+async function requestWithInit<T>(path: string, init: RequestInit): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, init);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new ApiError(body.code ?? 'UNKNOWN', body.error ?? res.statusText);
+  }
+  return res.json() as Promise<T>;
+}
+
+export async function fetchDbInfo(signal?: AbortSignal): Promise<DbInfoResponse> {
+  return request<DbInfoResponse>('/db/info', signal);
+}
+
+export async function fetchDemoRepos(signal?: AbortSignal): Promise<DemoRepoInfo[]> {
+  const response = await request<{ demos: DemoRepoInfo[] }>('/db/demos', signal);
+  return response.demos;
+}
+
+export async function selectDemoDatabase(demoId: string): Promise<DbInfoResponse> {
+  return requestWithInit<DbInfoResponse>('/db/select', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ demoId }),
+  });
+}
+
+export async function uploadDatabase(file: File): Promise<DbInfoResponse> {
+  const form = new FormData();
+  form.append('file', file);
+  return requestWithInit<DbInfoResponse>('/db/upload', {
+    method: 'POST',
+    body: form,
+  });
 }
 
 export async function fetchBranches(signal?: AbortSignal): Promise<string[]> {

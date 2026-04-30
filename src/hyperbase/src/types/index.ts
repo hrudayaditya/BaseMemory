@@ -119,11 +119,30 @@ export type CurrentGraphPayload =
 
 export interface HealthResponse {
   status: string;
-  dbPath: string;
-  branch: string;
+  dbPath: string | null;
+  branch: string | null;
   symbolCount: number;
   resolvedEdgeCount: number;
   version: string;
+}
+
+export interface DbInfoResponse {
+  available: boolean;
+  dbPath: string | null;
+  branch: string | null;
+  symbolCount: number;
+  resolvedEdgeCount: number;
+  branches: string[];
+  version: string;
+}
+
+export interface DemoRepoInfo {
+  id: string;
+  name: string;
+  language: string;
+  description: string;
+  fileCount: number;
+  symbolCount: number;
 }
 
 export interface FileGraphNodeAttributes {
@@ -132,6 +151,7 @@ export interface FileGraphNodeAttributes {
   size: number;
   x: number;
   y: number;
+  entityType: 'file' | 'directory';
   filePath: string;
   language: string;
   symbolCount: number;
@@ -148,6 +168,7 @@ export interface SymbolGraphNodeAttributes {
   size: number;
   x: number;
   y: number;
+  entityType: 'symbol' | 'file' | 'directory';
   filePath: string;
   language: string;
   kind: string;

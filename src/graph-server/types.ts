@@ -4,6 +4,8 @@ export type ErrorCode =
   | "INVALID_INPUT"
   | "BRANCH_NOT_FOUND"
   | "NOT_FOUND"
+  | "NO_DATABASE"
+  | "DB_SWITCH_IN_PROGRESS"
   | "DB_ERROR"
   | "INTERNAL_ERROR";
 
@@ -146,17 +148,43 @@ export type FullGraphResponse = {
 };
 
 export type GraphServerOptions = {
-  dbPath: string;
+  dbPath?: string;
   branch?: string;
   port?: number;
+};
+
+export type GraphServerState = {
+  db: Database.Database;
+  queries: GraphQueryService;
+  branches: string[];
+  defaultBranch: string;
+  dbPath: string;
+  activeRequests: number;
+  retired: boolean;
+};
+
+export type GraphDbInfoResponse = {
+  available: boolean;
+  dbPath: string | null;
+  branch: string | null;
+  symbolCount: number;
+  resolvedEdgeCount: number;
+  branches: string[];
+  version: string;
+};
+
+export type GraphDemoRepo = {
+  id: string;
+  name: string;
+  language: string;
+  description: string;
+  dbPath: string;
 };
 
 export type GraphServerInstance = {
   app: import("express").Express;
   server: import("http").Server;
-  db: Database.Database;
-  defaultBranch: string;
-  dbPath: string;
+  getCurrentState: () => GraphServerState | null;
   port: number;
   start: () => Promise<void>;
   close: () => Promise<void>;

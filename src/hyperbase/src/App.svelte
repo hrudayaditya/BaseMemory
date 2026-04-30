@@ -9,8 +9,9 @@
   import Minimap from './components/minimap/Minimap.svelte';
   import ShortcutHelpModal from './components/overlays/ShortcutHelpModal.svelte';
   import AnnotationEditorModal from './components/overlays/AnnotationEditorModal.svelte';
-  import HandoffModal from './components/overlays/HandoffModal.svelte';
-  import ViewHeader from './components/overlays/ViewHeader.svelte';
+import HandoffModal from './components/overlays/HandoffModal.svelte';
+import ViewHeader from './components/overlays/ViewHeader.svelte';
+import LandingScreen from './components/overlays/LandingScreen.svelte';
   import { OVERLAY_ORDER } from './lib/constants';
   import { readUrlState, writeUrlState } from './lib/url-state';
   import {
@@ -27,6 +28,7 @@
     loadGalaxyGraph,
     retryGraphLoad,
     setGraphOverlay,
+    showLanding,
     sigmaInstance,
   } from './stores/graph';
   import { clearSelectedNode, selectedNodeId, selectNode } from './stores/selection';
@@ -253,13 +255,17 @@
 </script>
 
 <div class="app">
-  <GraphCanvas />
-  <WorkerLayout />
-  <SearchBar />
-  <ControlBar />
-  <ViewHeader />
-  <DetailPanel />
-  <Minimap />
+  {#if $showLanding}
+    <LandingScreen />
+  {:else}
+    <GraphCanvas />
+    <WorkerLayout />
+    <SearchBar />
+    <ControlBar />
+    <ViewHeader />
+    <DetailPanel />
+    <Minimap />
+  {/if}
   <ShortcutHelpModal open={$shortcutHelpOpen} onClose={() => shortcutHelpOpen.set(false)} />
   <AnnotationEditorModal />
   <HandoffModal />
