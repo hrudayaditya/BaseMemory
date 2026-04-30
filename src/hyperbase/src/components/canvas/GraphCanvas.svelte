@@ -4,8 +4,33 @@
   import { get } from 'svelte/store';
   import Sigma from 'sigma';
   import ContextMenu from '../overlays/ContextMenu.svelte';
-  import { activeOverlay, focusMode, focusedNodeIds, pathFindingHint, pathFindingMode, pathFindingSource, sidebarOpen } from '../../stores/ui';
-  import { activeBranch, cameraState, currentView, focusedSymbolId, graphContentId, graphInstance, graphRefreshNonce, loadDirectoryGraph, loadFileGraph, loadPathGraph, sigmaInstance, zoomLevel } from '../../stores/graph';
+  import {
+    activeOverlay,
+    cinematicFocusRequest,
+    clearCinematicFocus,
+    focusMode,
+    focusedNodeIds,
+    pathFindingHint,
+    pathFindingMode,
+    pathFindingSource,
+    sidebarOpen,
+  } from '../../stores/ui';
+  import {
+    activeBranch,
+    cameraState,
+    currentView,
+    focusedSymbolId,
+    graphContentId,
+    graphInstance,
+    graphLayoutRunning,
+    graphRefreshNonce,
+    graphSettledNodeIds,
+    loadDirectoryGraph,
+    loadFileGraph,
+    loadPathGraph,
+    sigmaInstance,
+    zoomLevel,
+  } from '../../stores/graph';
   import { hoveredNodeId, selectedNodeId, selectNode } from '../../stores/selection';
   import { buildSigmaSettings, type RenderSnapshot } from '../../lib/sigma-config';
   import { DRAG_CLICK_SUPPRESSION_DISTANCE, ZOOM_ATOM_THRESHOLD, ZOOM_GALAXY_THRESHOLD } from '../../lib/constants';
@@ -32,6 +57,9 @@
   let currentPathFindingSource: string | null = null;
   let currentFocusMode = false;
   let currentFocusedNodeIds = new Set<string>();
+  let currentLayoutRunning = false;
+  let currentSettledNodeIds = new Set<string>();
+  let currentCinematicFocus: { nodeId: string; reason: 'search'; ratio?: number } | null = null;
   let cameraCleanup: (() => void) | null = null;
   let draggedNodeId: string | null = null;
   let dragStartViewport: { x: number; y: number } | null = null;
@@ -39,6 +67,14 @@
   let dragCameraPanningEnabled = true;
   let currentAnnotations: Record<string, AnnotationEntry> = {};
   let annotationBadges: Array<{ nodeId: string; x: number; y: number }> = [];
+  let pulseMarker: { nodeId: string; x: number; y: number } | null = null;
+  let blastGlowMarker: { nodeId: string; x: number; y: number } | null = null;
+  let currentPulseNodeId: string | null = null;
+  let pulseTimeout: ReturnType<typeof setTimeout> | null = null;
+  let blastRevealTimers: Array<ReturnType<typeof setTimeout>> = [];
+  let currentBlastRevealDepth = Number.POSITIVE_INFINITY;
+  let currentBlastCenterNodeId: string | null = null;
+  let blastAnimationContentId: string | null = null;
   let contextMenuOpen = false;
   let contextMenuX = 0;
   let contextMenuY = 0;
@@ -55,6 +91,10 @@
     deadNodeIds: new Set<string>(),
     hotspotNodeIds: new Set<string>(),
     edgeCallCountMax: 1,
+    layoutRunning: false,
+    settledNodeIds: new Set<string>(),
+    blastRevealDepth: Number.POSITIVE_INFINITY,
+    pulseNodeId: null,
   };
   let selectedConnectedNodeIds = new Set<string>();
   let selectedConnectedEdgeIds = new Set<string>();
@@ -105,6 +145,38 @@
     });
 
     annotationBadges = nextBadges;
+  }
+
+  function recomputeHeroMarkers() {
+    if (!sigma || !currentGraph) {
+      pulseMarker = null;
+      blastGlowMarker = null;
+      return;
+    }
+
+    pulseMarker = null;
+    if (currentPulseNodeId && currentGraph.hasNode(currentPulseNodeId)) {
+      const displayData = sigma.getNodeDisplayData(currentPulseNodeId);
+      if (displayData) {
+        pulseMarker = {
+          nodeId: currentPulseNodeId,
+          x: displayData.x,
+          y: displayData.y,
+        };
+      }
+    }
+
+    blastGlowMarker = null;
+    if (currentGraphView === 'blast' && currentBlastCenterNodeId && currentGraph.hasNode(currentBlastCenterNodeId)) {
+      const displayData = sigma.getNodeDisplayData(currentBlastCenterNodeId);
+      if (displayData) {
+        blastGlowMarker = {
+          nodeId: currentBlastCenterNodeId,
+          x: displayData.x,
+          y: displayData.y,
+        };
+      }
+    }
   }
 
   function closeContextMenu() {
@@ -160,9 +232,111 @@
       deadNodeIds: currentOverlayMetrics.deadNodeIds,
       hotspotNodeIds: currentOverlayMetrics.hotspotNodeIds,
       edgeCallCountMax: currentOverlayMetrics.edgeCallCountMax,
+      layoutRunning: currentLayoutRunning,
+      settledNodeIds: currentSettledNodeIds,
+      blastRevealDepth: currentBlastRevealDepth,
+      pulseNodeId: currentPulseNodeId,
     };
 
     sigma?.refresh();
+  }
+
+  function clearBlastRevealAnimation() {
+    blastRevealTimers.forEach((timer) => clearTimeout(timer));
+    blastRevealTimers = [];
+    currentBlastRevealDepth = Number.POSITIVE_INFINITY;
+  }
+
+  function resolveBlastCenterNodeId(): string | null {
+    if (!currentGraph || currentGraphView !== 'blast') {
+      return null;
+    }
+
+    let centerNodeId: string | null = null;
+    currentGraph.forEachNode((node, attributes) => {
+      if (typeof (attributes as { depth?: unknown }).depth === 'number' && (attributes as { depth: number }).depth === 0) {
+        centerNodeId = node;
+      }
+    });
+    return centerNodeId;
+  }
+
+  function startBlastRevealAnimation() {
+    clearBlastRevealAnimation();
+    currentBlastCenterNodeId = resolveBlastCenterNodeId();
+
+    if (currentGraphView !== 'blast' || !currentGraph) {
+      currentBlastRevealDepth = Number.POSITIVE_INFINITY;
+      recomputeHeroMarkers();
+      recomputeRenderSnapshot();
+      return;
+    }
+
+    currentBlastRevealDepth = 0;
+    const sequence = [
+      { depth: 1, delay: 180 },
+      { depth: 2, delay: 470 },
+      { depth: 3, delay: 820 },
+      { depth: Number.POSITIVE_INFINITY, delay: 1100 },
+    ];
+
+    blastRevealTimers = sequence.map(({ depth, delay }) =>
+      setTimeout(() => {
+        currentBlastRevealDepth = depth;
+        recomputeRenderSnapshot();
+      }, delay)
+    );
+
+    recomputeHeroMarkers();
+    recomputeRenderSnapshot();
+  }
+
+  function triggerNodePulse(nodeId: string) {
+    if (pulseTimeout) {
+      clearTimeout(pulseTimeout);
+      pulseTimeout = null;
+    }
+
+    currentPulseNodeId = nodeId;
+    recomputeHeroMarkers();
+    recomputeRenderSnapshot();
+
+    pulseTimeout = setTimeout(() => {
+      currentPulseNodeId = null;
+      recomputeHeroMarkers();
+      recomputeRenderSnapshot();
+    }, 760);
+  }
+
+  function maybeRunCinematicFocus() {
+    if (!sigma || !currentGraph || !currentCinematicFocus || currentLayoutRunning) {
+      return;
+    }
+
+    const { nodeId, ratio } = currentCinematicFocus;
+    if (!currentGraph.hasNode(nodeId)) {
+      return;
+    }
+
+    const displayData = sigma.getNodeDisplayData(nodeId);
+    if (!displayData) {
+      return;
+    }
+
+    currentCinematicFocus = null;
+    clearCinematicFocus();
+
+    sigma.getCamera().animate(
+      {
+        x: displayData.x,
+        y: displayData.y,
+        ratio: Math.max(Math.min(ratio ?? 0.72, 1.15), 0.46),
+      },
+      { duration: 620 },
+      () => {
+        triggerNodePulse(nodeId);
+      }
+    );
   }
 
   function updateZoomLevel() {
@@ -187,6 +361,7 @@
         cameraState.set(state);
         updateZoomLevel();
         recomputeAnnotationBadges();
+        recomputeHeroMarkers();
       };
 
     camera.on('updated', handleUpdated);
@@ -216,10 +391,13 @@
       currentGraph = graph;
       recomputeOverlayMetrics();
       recomputeSelectedAdjacency();
+      currentBlastCenterNodeId = resolveBlastCenterNodeId();
 
       if (!container || !graph) {
+        currentBlastCenterNodeId = null;
         recomputeRenderSnapshot();
         recomputeAnnotationBadges();
+        recomputeHeroMarkers();
         return;
       }
 
@@ -374,6 +552,8 @@
 
         renderer.on('afterRender', () => {
           recomputeAnnotationBadges();
+          recomputeHeroMarkers();
+          maybeRunCinematicFocus();
         });
 
         bindCamera();
@@ -382,8 +562,19 @@
         bindCamera();
       }
 
+      if (currentGraphView === 'blast' && currentContentId && blastAnimationContentId !== currentContentId) {
+        blastAnimationContentId = currentContentId;
+        startBlastRevealAnimation();
+      } else if (currentGraphView !== 'blast') {
+        blastAnimationContentId = null;
+        currentBlastCenterNodeId = null;
+        clearBlastRevealAnimation();
+      }
+
       recomputeRenderSnapshot();
       recomputeAnnotationBadges();
+      recomputeHeroMarkers();
+      maybeRunCinematicFocus();
     });
 
     const selectedUnsubscribe = selectedNodeId.subscribe((value) => {
@@ -430,6 +621,18 @@
 
     const currentViewUnsubscribe = currentView.subscribe((value) => {
       currentGraphView = value;
+      if (value === 'blast') {
+        if (currentContentId) {
+          blastAnimationContentId = currentContentId;
+        }
+        startBlastRevealAnimation();
+      } else {
+        blastAnimationContentId = null;
+        currentBlastCenterNodeId = null;
+        clearBlastRevealAnimation();
+        recomputeHeroMarkers();
+        recomputeRenderSnapshot();
+      }
     });
 
     const refreshUnsubscribe = graphRefreshNonce.subscribe(() => {
@@ -440,6 +643,22 @@
     const annotationsUnsubscribe = annotations.subscribe((value) => {
       currentAnnotations = value;
       recomputeAnnotationBadges();
+    });
+
+    const layoutRunningUnsubscribe = graphLayoutRunning.subscribe((value) => {
+      currentLayoutRunning = value;
+      recomputeRenderSnapshot();
+      maybeRunCinematicFocus();
+    });
+
+    const settledNodeIdsUnsubscribe = graphSettledNodeIds.subscribe((value) => {
+      currentSettledNodeIds = value;
+      recomputeRenderSnapshot();
+    });
+
+    const cinematicFocusUnsubscribe = cinematicFocusRequest.subscribe((value) => {
+      currentCinematicFocus = value;
+      maybeRunCinematicFocus();
     });
 
     resizeObserver = new ResizeObserver(() => {
@@ -458,6 +677,9 @@
       contentUnsubscribe();
       currentViewUnsubscribe();
       refreshUnsubscribe();
+      cinematicFocusUnsubscribe();
+      settledNodeIdsUnsubscribe();
+      layoutRunningUnsubscribe();
       overlayUnsubscribe();
       hoveredUnsubscribe();
       selectedUnsubscribe();
@@ -466,6 +688,10 @@
   });
 
   onDestroy(() => {
+    if (pulseTimeout) {
+      clearTimeout(pulseTimeout);
+    }
+    clearBlastRevealAnimation();
     endDrag();
     resizeObserver?.disconnect();
     cameraCleanup?.();
@@ -478,6 +704,14 @@
   <div bind:this={container} class:path-finding={currentPathFindingMode} class="graph-canvas"></div>
 
   <div class="annotation-layer" aria-hidden="true">
+    {#if blastGlowMarker}
+      <div class="blast-glow" style={`left:${blastGlowMarker.x}px; top:${blastGlowMarker.y}px;`}></div>
+    {/if}
+
+    {#if pulseMarker}
+      <div class="pulse-ring" style={`left:${pulseMarker.x}px; top:${pulseMarker.y}px;`}></div>
+    {/if}
+
     {#each annotationBadges as badge (badge.nodeId)}
       <div class="annotation-badge" style={`left:${badge.x}px; top:${badge.y}px;`}></div>
     {/each}
@@ -527,5 +761,58 @@
     border: 2px solid var(--bg-primary);
     transform: translate(-50%, -50%);
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--node-constant) 35%, transparent);
+  }
+
+  .pulse-ring,
+  .blast-glow {
+    position: absolute;
+    transform: translate(-50%, -50%);
+    border-radius: 999px;
+  }
+
+  .pulse-ring {
+    width: 26px;
+    height: 26px;
+    border: 2px solid color-mix(in srgb, var(--text-accent) 72%, transparent);
+    box-shadow: 0 0 0 6px color-mix(in srgb, var(--text-accent) 18%, transparent);
+    animation: node-pulse 720ms ease-out forwards;
+  }
+
+  .blast-glow {
+    width: 54px;
+    height: 54px;
+    background: radial-gradient(circle, color-mix(in srgb, var(--analytics-blast-depth-1) 48%, transparent) 0%, transparent 70%);
+    filter: blur(2px);
+    animation: blast-glow 1.8s ease-in-out infinite;
+  }
+
+  @keyframes node-pulse {
+    0% {
+      opacity: 0;
+      transform: translate(-50%, -50%) scale(0.8);
+    }
+
+    20% {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+    }
+
+    100% {
+      opacity: 0;
+      transform: translate(-50%, -50%) scale(1.85);
+    }
+  }
+
+  @keyframes blast-glow {
+    0%,
+    100% {
+      opacity: 0.45;
+      transform: translate(-50%, -50%) scale(0.92);
+    }
+
+    50% {
+      opacity: 0.85;
+      transform: translate(-50%, -50%) scale(1.08);
+    }
   }
 </style>

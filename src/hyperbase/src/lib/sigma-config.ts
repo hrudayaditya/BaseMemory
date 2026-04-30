@@ -1,5 +1,5 @@
 import type { Settings } from 'sigma/settings';
-import { getTheme } from './theme';
+import { getTheme, withAlpha } from './theme';
 import { couplingAppearance, degreeOverlayColor } from './overlays';
 import { languageColor } from './graph-utils';
 import type { GraphEdgeAttributes, Overlay } from '../types';
@@ -16,6 +16,10 @@ export interface RenderSnapshot {
   deadNodeIds: Set<string>;
   hotspotNodeIds: Set<string>;
   edgeCallCountMax: number;
+  layoutRunning: boolean;
+  settledNodeIds: Set<string>;
+  blastRevealDepth: number;
+  pulseNodeId: string | null;
 }
 
 export function buildSigmaSettings(getSnapshot: () => RenderSnapshot): Partial<Settings> {
@@ -45,6 +49,8 @@ export function buildSigmaSettings(getSnapshot: () => RenderSnapshot): Partial<S
         ...data,
         color: highlighted
           ? theme.edge.highlighted
+          : snapshot.layoutRunning
+            ? withAlpha(baseAppearance.color, 0.18)
           : focusDimmed
             ? theme.edge.unresolved
             : baseAppearance.color,
@@ -59,6 +65,10 @@ export function buildSigmaSettings(getSnapshot: () => RenderSnapshot): Partial<S
       const deadDimmed = snapshot.overlay === 'dead' && snapshot.deadNodeIds.has(node);
       const isHotspot = snapshot.overlay === 'hotspot' && snapshot.hotspotNodeIds.has(node);
       const isBlastCenter = typeof data.depth === 'number' && data.depth === 0;
+      const hiddenByBlastRipple =
+        typeof data.depth === 'number' && data.depth > Math.max(snapshot.blastRevealDepth, 0);
+      const pulseTarget = snapshot.pulseNodeId === node;
+      const unsettled = snapshot.layoutRunning && !snapshot.settledNodeIds.has(node);
 
       const color =
         snapshot.overlay === 'community' && typeof data.communityColor === 'string'
@@ -73,13 +83,30 @@ export function buildSigmaSettings(getSnapshot: () => RenderSnapshot): Partial<S
 
       const size = highlighted
         ? (data.size as number) * 1.4
+        : pulseTarget
+          ? (data.size as number) * 1.3
         : isHotspot || isBlastCenter
           ? (data.size as number) * 1.35
+          : hiddenByBlastRipple
+            ? (data.size as number) * 0.75
+            : unsettled
+              ? (data.size as number) * 0.9
           : data.size;
+
+      const finalColor =
+        highlighted
+          ? theme.node.highlight
+          : focusDimmed || dimmed || deadDimmed
+            ? theme.node.dimmed
+            : hiddenByBlastRipple
+              ? withAlpha(color, 0.08)
+              : unsettled
+                ? withAlpha(color, 0.26)
+                : color;
 
       return {
         ...data,
-        color: highlighted ? theme.node.highlight : focusDimmed || dimmed || deadDimmed ? theme.node.dimmed : color,
+        color: finalColor,
         size,
         forceLabel: isHotspot || isBlastCenter,
         highlighted: highlighted || isHotspot || isBlastCenter,

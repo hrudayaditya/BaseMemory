@@ -5,7 +5,7 @@
   import { nodeColor, shortPath } from '../../lib/graph-utils';
   import { activeBranch, graphDepth, loadDirectoryGraph, loadNeighborhoodGraph } from '../../stores/graph';
   import { selectNode } from '../../stores/selection';
-  import { searchFocusNonce, searchOpen, searchQuery, searchResults } from '../../stores/ui';
+  import { requestCinematicFocus, searchFocusNonce, searchOpen, searchQuery, searchResults } from '../../stores/ui';
   import type { SearchResult } from '../../types';
 
   let inputElement: HTMLInputElement;
@@ -93,6 +93,7 @@
 
   async function selectResult(result: SearchResult) {
     if (!currentBranch) return;
+    requestCinematicFocus(result.id, 'search', 0.72);
     await loadNeighborhoodGraph(result.id, {
       branch: currentBranch,
       depth: currentDepth,
@@ -234,6 +235,7 @@
     border-radius: var(--radius-lg);
     overflow: hidden;
     box-shadow: var(--shadow-lg);
+    animation: fade-in 180ms ease;
   }
 
   .result-row {
@@ -245,11 +247,36 @@
     padding: 12px 14px;
     transition: background var(--transition-fast);
     cursor: pointer;
+    animation: fade-up 180ms ease both;
   }
 
   .result-row:hover,
   .result-row.selected {
     background: var(--bg-hover);
+  }
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes fade-up {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
   }
 
   .result-header {

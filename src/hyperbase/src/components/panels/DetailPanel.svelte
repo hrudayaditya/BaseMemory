@@ -105,8 +105,8 @@
     </div>
 
     <div class="section actions">
+      <button class="action-button blast-hero" type="button" on:click={() => void openBlastRadius()}>Blast Radius</button>
       <button class="action-button primary" type="button" on:click={() => void setAsCenter()}>Set as center</button>
-      <button class="action-button accent" type="button" on:click={() => void openBlastRadius()}>Blast radius</button>
       <button class="action-button" type="button" on:click={editAnnotation}>
         {$selectedAnnotation ? 'Edit note' : 'Add note'}
       </button>
@@ -173,8 +173,9 @@
 
   h2 {
     margin: 0;
-    font-size: 24px;
-    line-height: 1.2;
+    font-size: 26px;
+    line-height: 1.1;
+    letter-spacing: -0.02em;
   }
 
   .close-button {
@@ -188,6 +189,14 @@
   .section {
     padding: var(--space-lg);
     border-bottom: 1px solid var(--border);
+  }
+
+  h3 {
+    margin: 0 0 10px;
+    font-size: 15px;
+    line-height: 1.2;
+    font-weight: 700;
+    letter-spacing: 0.01em;
   }
 
   .kind-badge {
@@ -205,6 +214,7 @@
   .meta-line {
     color: var(--text-secondary);
     margin: 10px 0 0;
+    line-height: 1.55;
   }
 
   .meta-grid {
@@ -238,6 +248,7 @@
     background: var(--bg-tertiary);
     border: 1px solid var(--border);
     color: var(--text-primary);
+    font-weight: 600;
   }
 
   .action-button.primary {
@@ -246,9 +257,16 @@
     border-color: transparent;
   }
 
-  .action-button.accent {
-    border-color: color-mix(in srgb, var(--analytics-blast-depth-1) 40%, transparent);
-    color: var(--analytics-blast-depth-1);
+  .blast-hero {
+    width: 100%;
+    justify-content: space-between;
+    background:
+      linear-gradient(135deg,
+        color-mix(in srgb, var(--analytics-blast-depth-1) 82%, transparent),
+        color-mix(in srgb, var(--analytics-blast-depth-2) 86%, transparent));
+    border-color: transparent;
+    color: white;
+    box-shadow: 0 16px 32px color-mix(in srgb, var(--analytics-blast-depth-1) 22%, transparent);
   }
 
   .code-preview {

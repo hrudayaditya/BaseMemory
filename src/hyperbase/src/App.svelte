@@ -9,9 +9,9 @@
   import Minimap from './components/minimap/Minimap.svelte';
   import ShortcutHelpModal from './components/overlays/ShortcutHelpModal.svelte';
   import AnnotationEditorModal from './components/overlays/AnnotationEditorModal.svelte';
-import HandoffModal from './components/overlays/HandoffModal.svelte';
-import ViewHeader from './components/overlays/ViewHeader.svelte';
-import LandingScreen from './components/overlays/LandingScreen.svelte';
+  import HandoffModal from './components/overlays/HandoffModal.svelte';
+  import ViewHeader from './components/overlays/ViewHeader.svelte';
+  import LandingScreen from './components/overlays/LandingScreen.svelte';
   import { OVERLAY_ORDER } from './lib/constants';
   import { readUrlState, writeUrlState } from './lib/url-state';
   import {
@@ -22,6 +22,7 @@ import LandingScreen from './components/overlays/LandingScreen.svelte';
     graphDepth,
     graphError,
     graphLoading,
+    graphNodeCount,
     graphTruncated,
     initializeGraph,
     loadBlastRadiusGraph,
@@ -56,6 +57,26 @@ import LandingScreen from './components/overlays/LandingScreen.svelte';
   let currentViewDetails = get(currentViewInfo);
   let currentFocusMode = false;
   let currentFocusedNodeIds = new Set<string>();
+
+  function humanGraphError(message: string | null): string {
+    if (!message) {
+      return 'HyperBase hit an unexpected error while loading the graph. Retry the action and keep the server running.';
+    }
+
+    if (message.includes('Failed to fetch')) {
+      return "HyperBase couldn't reach the graph server. Make sure the server is running, then retry.";
+    }
+
+    if (message.includes('No database loaded')) {
+      return 'Load a demo repo or upload a `codebase.db` file to begin exploring the graph.';
+    }
+
+    if (message.includes("doesn't look like a HyperBase index")) {
+      return "This file doesn't look like a HyperBase index. Make sure to select a `.opencode/index/codebase.db` file.";
+    }
+
+    return message;
+  }
 
   function syncUrlState() {
     if (!urlSyncReady) {
@@ -291,21 +312,46 @@ import LandingScreen from './components/overlays/LandingScreen.svelte';
   <AnnotationEditorModal />
   <HandoffModal />
 
-  {#if $graphLoading}
+  {#if $graphLoading && $graphNodeCount === 0}
     <div class="overlay">
-      <div class="loading-card">
-        <span class="spinner" aria-hidden="true"></span>
-        <p>Loading codebase graph…</p>
+      <div class="loading-card constellation-card">
+        <div class="constellation" aria-hidden="true">
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+        </div>
+        <p class="eyebrow">HyperBase</p>
+        <h2>Mapping the codebase</h2>
+        <p>Reading symbols, relationships, and module structure…</p>
       </div>
+    </div>
+  {:else if $graphLoading}
+    <div class="transition-chip">
+      <span class="transition-dot" aria-hidden="true"></span>
+      <span>Refining the graph…</span>
     </div>
   {/if}
 
   {#if $graphError}
     <div class="overlay">
       <div class="error-card">
-        <h2>Could not load HyperBase</h2>
-        <p>{$graphError}</p>
+        <p class="eyebrow">HyperBase</p>
+        <h2>Couldn’t load this view</h2>
+        <p>{humanGraphError($graphError)}</p>
         <button type="button" on:click={() => void retryGraphLoad()}>Retry</button>
+      </div>
+    </div>
+  {/if}
+
+  {#if !$showLanding && !$graphLoading && !$graphError && $graphNodeCount === 0}
+    <div class="empty-state">
+      <div class="empty-card">
+        <p class="eyebrow">HyperBase</p>
+        <h2>This codebase has no indexed symbols yet</h2>
+        <p>Run `opencode index` to generate a graph, then reload HyperBase.</p>
       </div>
     </div>
   {/if}
@@ -359,12 +405,12 @@ import LandingScreen from './components/overlays/LandingScreen.svelte';
 
   .loading-card,
   .error-card {
-    min-width: 320px;
+    min-width: 360px;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
+    border-radius: 24px;
     box-shadow: var(--shadow-lg);
-    padding: var(--space-xl);
+    padding: 32px;
     text-align: center;
   }
 
@@ -374,29 +420,116 @@ import LandingScreen from './components/overlays/LandingScreen.svelte';
     color: var(--text-secondary);
   }
 
+  .loading-card h2,
   .error-card h2 {
-    margin: 0 0 var(--space-sm);
+    margin: 8px 0 12px;
+    font-size: 28px;
+    line-height: 1.1;
   }
 
   .error-card button {
-    margin-top: var(--space-md);
+    margin-top: 18px;
     border: 0;
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-lg);
     background: var(--text-accent);
     color: var(--bg-primary);
-    padding: 10px 14px;
-    font-weight: 600;
+    padding: 12px 16px;
+    font-weight: 700;
   }
 
-  .spinner {
-    display: inline-block;
-    width: 22px;
-    height: 22px;
-    margin-bottom: var(--space-sm);
+  .eyebrow {
+    margin: 0;
+    color: var(--text-accent);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  .constellation-card {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .constellation {
+    position: relative;
+    height: 72px;
+    margin-bottom: 8px;
+  }
+
+  .constellation span {
+    position: absolute;
+    width: 8px;
+    height: 8px;
     border-radius: 999px;
-    border: 3px solid var(--border);
-    border-top-color: var(--text-accent);
-    animation: spin 0.9s linear infinite;
+    background: color-mix(in srgb, var(--text-accent) 78%, white);
+    box-shadow: 0 0 0 10px color-mix(in srgb, var(--text-accent) 10%, transparent);
+    animation: drift 2.6s ease-in-out infinite;
+  }
+
+  .constellation span:nth-child(1) { left: 8%; top: 48%; animation-delay: 0ms; }
+  .constellation span:nth-child(2) { left: 24%; top: 22%; animation-delay: 160ms; }
+  .constellation span:nth-child(3) { left: 42%; top: 56%; animation-delay: 260ms; }
+  .constellation span:nth-child(4) { left: 59%; top: 18%; animation-delay: 420ms; }
+  .constellation span:nth-child(5) { left: 74%; top: 46%; animation-delay: 520ms; }
+  .constellation span:nth-child(6) { left: 89%; top: 28%; animation-delay: 660ms; }
+
+  .transition-chip {
+    position: fixed;
+    top: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    background: color-mix(in srgb, var(--bg-secondary) 88%, transparent);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 10px 14px;
+    color: var(--text-primary);
+    box-shadow: var(--shadow-sm);
+    z-index: var(--z-search);
+    backdrop-filter: blur(10px);
+  }
+
+  .transition-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: var(--text-accent);
+    box-shadow: 0 0 0 8px color-mix(in srgb, var(--text-accent) 14%, transparent);
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+
+  .empty-state {
+    position: fixed;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    z-index: var(--z-controls);
+    pointer-events: none;
+  }
+
+  .empty-card {
+    max-width: 480px;
+    text-align: center;
+    background: color-mix(in srgb, var(--bg-secondary) 92%, transparent);
+    border: 1px solid var(--border);
+    border-radius: 24px;
+    box-shadow: var(--shadow-lg);
+    padding: 32px;
+    pointer-events: auto;
+  }
+
+  .empty-card h2 {
+    margin: 8px 0 12px;
+    font-size: 30px;
+    line-height: 1.08;
+  }
+
+  .empty-card p:last-child {
+    margin: 0;
+    color: var(--text-secondary);
   }
 
   .truncation-banner {
@@ -437,12 +570,29 @@ import LandingScreen from './components/overlays/LandingScreen.svelte';
     z-index: var(--z-controls);
   }
 
-  @keyframes spin {
-    from {
-      transform: rotate(0deg);
+  @keyframes drift {
+    0%,
+    100% {
+      transform: translateY(0) scale(0.9);
+      opacity: 0.65;
     }
-    to {
-      transform: rotate(360deg);
+
+    50% {
+      transform: translateY(-6px) scale(1.08);
+      opacity: 1;
+    }
+  }
+
+  @keyframes pulse {
+    0%,
+    100% {
+      transform: scale(0.92);
+      opacity: 0.7;
+    }
+
+    50% {
+      transform: scale(1.08);
+      opacity: 1;
     }
   }
 </style>

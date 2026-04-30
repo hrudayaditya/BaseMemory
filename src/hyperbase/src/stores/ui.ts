@@ -15,6 +15,7 @@ export const pathFindingHint = writable<string | null>(null);
 export const focusMode = writable<boolean>(false);
 export const focusedNodeIds = writable<Set<string>>(new Set());
 export const handoffModal = writable<{ title: string; markdown: string } | null>(null);
+export const cinematicFocusRequest = writable<{ nodeId: string; reason: 'search'; ratio?: number } | null>(null);
 
 export function requestSearchFocus(): void {
   searchFocusNonce.update((value) => value + 1);
@@ -46,4 +47,12 @@ export function openHandoffModal(title: string, markdown: string): void {
 
 export function closeHandoffModal(): void {
   handoffModal.set(null);
+}
+
+export function requestCinematicFocus(nodeId: string, reason: 'search', ratio?: number): void {
+  cinematicFocusRequest.set({ nodeId, reason, ratio });
+}
+
+export function clearCinematicFocus(): void {
+  cinematicFocusRequest.set(null);
 }

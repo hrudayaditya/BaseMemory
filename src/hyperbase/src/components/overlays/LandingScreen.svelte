@@ -29,7 +29,7 @@
   <div class="landing-card">
     <p class="eyebrow">HyperBase</p>
     <h1>Understand any codebase, visually</h1>
-    <p class="subtitle">Drop your `codebase.db` file and HyperBase will open the graph immediately.</p>
+    <p class="subtitle">Drop your `codebase.db` file and HyperBase will open a readable codebase graph in seconds.</p>
 
     <div
       role="group"
@@ -41,6 +41,7 @@
       on:drop={handleDrop}
     >
       <p>Drop your `codebase.db` file here</p>
+      <span class="drop-copy">No CLI flags. No setup wizard. Just load a graph and explore.</span>
       <button type="button" class="primary" on:click={() => fileInput?.click()}>Choose file</button>
       <input bind:this={fileInput} type="file" accept=".db" hidden on:change={(event) => void handleFiles((event.currentTarget as HTMLInputElement).files)} />
     </div>
@@ -91,7 +92,7 @@
   .landing-card {
     width: min(920px, 100%);
     padding: 40px;
-    border-radius: 28px;
+    border-radius: 30px;
     border: 1px solid var(--border);
     background: color-mix(in srgb, var(--bg-secondary) 92%, transparent);
     box-shadow: var(--shadow-lg);
@@ -142,6 +143,12 @@
   .drop-zone p {
     margin: 0;
     font-size: 20px;
+    font-weight: 600;
+  }
+
+  .drop-copy {
+    color: var(--text-secondary);
+    font-size: 14px;
   }
 
   .primary {
@@ -149,8 +156,9 @@
     border-radius: var(--radius-lg);
     background: var(--text-accent);
     color: var(--bg-primary);
-    padding: 12px 18px;
+    padding: 13px 20px;
     font-weight: 700;
+    box-shadow: 0 14px 30px color-mix(in srgb, var(--text-accent) 20%, transparent);
   }
 
   .error-copy {
@@ -184,18 +192,19 @@
 
   .demo-card {
     text-align: left;
-    border-radius: 22px;
+    border-radius: 24px;
     border: 1px solid var(--border);
     background: var(--bg-secondary);
     padding: 18px;
     display: grid;
     gap: 10px;
-    transition: transform var(--transition-fast), border-color var(--transition-fast);
+    transition: transform var(--transition-fast), border-color var(--transition-fast), box-shadow var(--transition-fast);
   }
 
   .demo-card:hover {
     transform: translateY(-2px);
     border-color: var(--border-accent);
+    box-shadow: 0 12px 24px color-mix(in srgb, var(--text-accent) 10%, transparent);
   }
 
   .demo-card p,
@@ -226,6 +235,7 @@
     font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 0.08em;
+    font-weight: 700;
   }
 
   .stats {

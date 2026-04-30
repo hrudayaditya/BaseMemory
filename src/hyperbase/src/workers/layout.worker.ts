@@ -27,6 +27,8 @@ type ProgressMessage = {
   positions: PositionMap;
   iteration: number;
   maxDelta: number;
+  newlySettledNodeIds: string[];
+  reactivatedNodeIds: string[];
 };
 
 type DoneMessage = {
@@ -90,6 +92,19 @@ function convergenceThresholdForOrder(order: number): number {
     return 0.34;
   }
   return 0.24;
+}
+
+function settledNodeThresholdForOrder(order: number): number {
+  if (order < 30) {
+    return 0.35;
+  }
+  if (order <= 100) {
+    return 0.28;
+  }
+  if (order <= 300) {
+    return 0.22;
+  }
+  return 0.18;
 }
 
 function projectBoundaryNodes(graph: Graph): void {
@@ -158,6 +173,9 @@ self.onmessage = (event: MessageEvent<WorkerMessage>) => {
   let converged = false;
   const minimumIterationsBeforeConvergence = Math.min(payload.iterations, LAYOUT_WORKER_BATCH * 2);
   const convergenceThreshold = convergenceThresholdForOrder(graph.order);
+  const settledNodeThreshold = settledNodeThresholdForOrder(graph.order);
+  const settleStreaks = new Map<string, number>();
+  const settledNodeIds = new Set<string>();
 
   const stopHandler = (stopEvent: MessageEvent<WorkerMessage>) => {
     if (stopEvent.data.type === 'stop') {
@@ -174,6 +192,26 @@ self.onmessage = (event: MessageEvent<WorkerMessage>) => {
 
     finalPositions = positionsFor(graph);
     lastMaxDelta = maxDeltaFor(finalPositions, previousPositions);
+    const newlySettledNodeIds: string[] = [];
+    const reactivatedNodeIds: string[] = [];
+
+    for (const [nodeId, position] of Object.entries(finalPositions)) {
+      const last = previousPositions[nodeId];
+      const delta = last ? Math.hypot(position.x - last.x, position.y - last.y) : Number.POSITIVE_INFINITY;
+      if (delta <= settledNodeThreshold) {
+        const streak = (settleStreaks.get(nodeId) ?? 0) + 1;
+        settleStreaks.set(nodeId, streak);
+        if (streak >= 2 && !settledNodeIds.has(nodeId)) {
+          settledNodeIds.add(nodeId);
+          newlySettledNodeIds.push(nodeId);
+        }
+      } else {
+        settleStreaks.set(nodeId, 0);
+        if (settledNodeIds.delete(nodeId)) {
+          reactivatedNodeIds.push(nodeId);
+        }
+      }
+    }
 
     const positions = completed < payload.iterations
       ? deltaPositionsFor(graph, previousPositions, LAYOUT_POST_EPSILON)
@@ -185,6 +223,8 @@ self.onmessage = (event: MessageEvent<WorkerMessage>) => {
       positions,
       iteration: completed,
       maxDelta: lastMaxDelta,
+      newlySettledNodeIds,
+      reactivatedNodeIds,
     };
     self.postMessage(progressMessage);
 

@@ -124,6 +124,8 @@ export const graphLoadId = writable<number>(0);
 export const graphContentId = writable<string | null>(null);
 export const graphLayoutCacheHit = writable<boolean>(false);
 export const graphRefreshNonce = writable<number>(0);
+export const graphLayoutRunning = writable<boolean>(false);
+export const graphSettledNodeIds = writable<Set<string>>(new Set());
 
 export const cameraState = writable<{ x: number; y: number; ratio: number; angle: number }>({
   x: 0.5,
@@ -251,6 +253,8 @@ class GraphController {
         focusedSymbolId.set(null);
         graphNodeCount.set(0);
         graphEdgeCount.set(0);
+        graphLayoutRunning.set(false);
+        graphSettledNodeIds.set(new Set());
         graphTruncated.set(false);
         currentGraphPayload.set(null);
         currentViewInfo.set({ kind: 'overview', granularity: 1 });
@@ -854,6 +858,8 @@ class GraphController {
     graphContentId.set(options.contentId);
     graphLayoutCacheHit.set(options.layoutCacheHit);
     graphLoadId.set(this.graphLoadRevision);
+    graphLayoutRunning.set(!options.layoutCacheHit);
+    graphSettledNodeIds.set(options.layoutCacheHit ? new Set(options.graph.nodes()) : new Set());
     graphNodeCount.set(options.nodeCount);
     graphEdgeCount.set(options.edgeCount);
     graphTruncated.set(options.truncated);

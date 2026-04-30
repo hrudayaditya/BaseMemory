@@ -2,7 +2,15 @@
   import type Graph from 'graphology';
   import { onDestroy } from 'svelte';
   import { persistLayoutSnapshot } from '../../lib/layout-cache';
-  import { graphContentId, graphInstance, graphLayoutCacheHit, graphLoadId, sigmaInstance } from '../../stores/graph';
+  import {
+    graphContentId,
+    graphInstance,
+    graphLayoutCacheHit,
+    graphLayoutRunning,
+    graphLoadId,
+    graphSettledNodeIds,
+    sigmaInstance,
+  } from '../../stores/graph';
   import { LAYOUT_ITERATIONS } from '../../lib/constants';
   import type { FileGraphNodeAttributes, GraphEdgeAttributes, SymbolGraphNodeAttributes } from '../../types';
 
@@ -35,6 +43,7 @@
       worker = null;
     }
     layoutRunning = false;
+    graphLayoutRunning.set(false);
   }
 
   function startWorker(graph: HyperGraph) {
@@ -44,7 +53,14 @@
 
     worker.onmessage = (event) => {
       const payload = event.data as
-        | { type: 'progress'; positions: Record<string, { x: number; y: number }>; iteration: number; maxDelta: number }
+        | {
+            type: 'progress';
+            positions: Record<string, { x: number; y: number }>;
+            iteration: number;
+            maxDelta: number;
+            newlySettledNodeIds: string[];
+            reactivatedNodeIds: string[];
+          }
         | { type: 'done'; positions: Record<string, { x: number; y: number }>; iteration: number; converged: boolean; maxDelta: number };
 
       Object.entries(payload.positions).forEach(([node, position]) => {
@@ -53,6 +69,15 @@
         }
       });
 
+      if (payload.type === 'progress') {
+        graphSettledNodeIds.update((current) => {
+          const next = new Set(current);
+          payload.reactivatedNodeIds.forEach((nodeId) => next.delete(nodeId));
+          payload.newlySettledNodeIds.forEach((nodeId) => next.add(nodeId));
+          return next;
+        });
+      }
+
       sigmaInstance.update((sigma) => {
         sigma?.refresh();
         return sigma;
@@ -60,12 +85,16 @@
 
       if (payload.type === 'done') {
         layoutRunning = false;
+        graphLayoutRunning.set(false);
+        graphSettledNodeIds.set(new Set(graph.nodes()));
         if (currentContentId) {
           persistLayoutSnapshot(currentContentId, payload.positions);
         }
       }
     };
 
+    graphLayoutRunning.set(true);
+    graphSettledNodeIds.set(new Set());
     worker.postMessage({
       type: 'start',
       graph: graph.export(),
@@ -78,6 +107,7 @@
       currentGraph = graph;
       if (!graph) {
         stopWorker();
+        graphSettledNodeIds.set(new Set());
       }
     }),
     graphContentId.subscribe((contentId) => {
@@ -94,6 +124,7 @@
       currentLoadId = loadId;
       if (currentLayoutCacheHit) {
         stopWorker();
+        graphSettledNodeIds.set(new Set(currentGraph.nodes()));
         sigmaInstance.update((sigma) => {
           sigma?.refresh();
           return sigma;

@@ -144,9 +144,9 @@
   .content {
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
+    border-radius: 20px;
     box-shadow: var(--shadow-sm);
-    padding: 14px 16px;
+    padding: 16px 18px;
   }
 
   .breadcrumbs {
@@ -166,8 +166,9 @@
   .crumb-button {
     border: 0;
     background: transparent;
-    color: var(--accent-primary);
+    color: var(--text-accent);
     padding: 0;
+    font-weight: 600;
   }
 
   .crumb-current {
@@ -184,7 +185,8 @@
     margin: 0 0 4px;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    font-size: 12px;
+    font-size: 11px;
+    font-weight: 700;
   }
 
   .meta {
@@ -194,8 +196,9 @@
 
   h2 {
     margin: 0;
-    font-size: 20px;
-    line-height: 1.2;
+    font-size: 24px;
+    line-height: 1.1;
+    letter-spacing: -0.02em;
     color: var(--text-primary);
     word-break: break-word;
   }
