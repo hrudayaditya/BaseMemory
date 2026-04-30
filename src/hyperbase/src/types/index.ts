@@ -1,6 +1,7 @@
 export interface GraphNode {
   id: string;
   name: string;
+  entityType: 'directory' | 'file' | 'symbol';
   kind: 'function' | 'method' | 'struct' | 'class' | 'constant' | 'module' | 'interface' | 'type' | string;
   filePath: string;
   language: string;
@@ -35,10 +36,16 @@ export interface NeighborhoodResponse {
 
 export interface FileNode {
   id: string;
+  entityType: 'file' | 'directory';
+  name: string;
   filePath: string;
   language: string;
   symbolCount: number;
   directory: string;
+  fileCount?: number;
+  directoryPath?: string;
+  role?: 'internal' | 'external-caller' | 'external-callee' | 'external-bidirectional';
+  degree?: number;
 }
 
 export interface FileEdge {
@@ -48,6 +55,12 @@ export interface FileEdge {
 }
 
 export interface FullGraphResponse {
+  nodes: FileNode[];
+  edges: FileEdge[];
+}
+
+export interface OverviewGraphResponse {
+  granularity: number;
   nodes: FileNode[];
   edges: FileEdge[];
 }
@@ -93,6 +106,13 @@ export interface BlastRadiusResponse {
 export interface DirectoryGraphResponse {
   directoryPath: string;
   truncated: boolean;
+  nodes: FileNode[];
+  edges: Array<FileEdge & { id: string; boundary: 'internal' | 'incoming' | 'outgoing'; callerFilePath: string; targetFilePath: string }>;
+}
+
+export interface FileGraphResponse {
+  filePath: string;
+  truncated: boolean;
   nodes: GraphNode[];
   edges: GraphEdge[];
 }
@@ -111,10 +131,12 @@ export interface PathResponse {
 }
 
 export type CurrentGraphPayload =
+  | { kind: 'overview'; payload: OverviewGraphResponse }
   | { kind: 'galaxy'; payload: FullGraphResponse }
   | { kind: 'neighborhood'; payload: NeighborhoodResponse }
   | { kind: 'blast-radius'; payload: BlastRadiusResponse }
   | { kind: 'directory'; payload: DirectoryGraphResponse }
+  | { kind: 'file'; payload: FileGraphResponse }
   | { kind: 'path'; payload: PathResponse };
 
 export interface HealthResponse {
@@ -152,10 +174,13 @@ export interface FileGraphNodeAttributes {
   x: number;
   y: number;
   entityType: 'file' | 'directory';
+  name: string;
   filePath: string;
   language: string;
   symbolCount: number;
   directory: string;
+  fileCount?: number;
+  directoryPath?: string;
   degree: number;
   layoutRole?: 'internal' | 'external-caller' | 'external-callee' | 'external-bidirectional';
   highlighted?: boolean;
@@ -198,6 +223,7 @@ export interface GraphEdgeAttributes {
 export interface UrlState {
   branch?: string;
   symbolId?: string;
+  filePath?: string;
   fromId?: string;
   toId?: string;
   directoryPath?: string;
@@ -208,4 +234,4 @@ export interface UrlState {
 }
 
 export type Overlay = 'none' | 'community' | 'degree' | 'language' | 'coupling' | 'dead' | 'hotspot';
-export type ZoomLevel = 'galaxy' | 'solar' | 'atom';
+export type ZoomLevel = 'overview' | 'galaxy' | 'solar' | 'atom';

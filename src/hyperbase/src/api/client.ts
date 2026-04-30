@@ -3,8 +3,10 @@ import type {
   DbInfoResponse,
   DemoRepoInfo,
   DirectoryGraphResponse,
+  FileGraphResponse,
   FullGraphResponse,
   NeighborhoodResponse,
+  OverviewGraphResponse,
   PathResponse,
   PeekResult,
   SearchResult,
@@ -87,6 +89,10 @@ export async function fetchFullGraph(branch: string, signal?: AbortSignal): Prom
   return request<FullGraphResponse>(`/graph/full?branch=${encodeURIComponent(branch)}`, signal);
 }
 
+export async function fetchOverviewGraph(branch: string, signal?: AbortSignal): Promise<OverviewGraphResponse> {
+  return request<OverviewGraphResponse>(`/graph/overview?branch=${encodeURIComponent(branch)}`, signal);
+}
+
 export async function fetchNeighborhood(
   id: string,
   branch: string,
@@ -125,6 +131,17 @@ export async function fetchDirectoryGraph(
 ): Promise<DirectoryGraphResponse> {
   return request<DirectoryGraphResponse>(
     `/graph/directory?path=${encodeURIComponent(directoryPath)}&branch=${encodeURIComponent(branch)}`,
+    signal
+  );
+}
+
+export async function fetchFileGraph(
+  filePath: string,
+  branch: string,
+  signal?: AbortSignal
+): Promise<FileGraphResponse> {
+  return request<FileGraphResponse>(
+    `/graph/file?path=${encodeURIComponent(filePath)}&branch=${encodeURIComponent(branch)}`,
     signal
   );
 }

@@ -17,6 +17,7 @@ describe('specialized graph builders', () => {
       nodes: [
         {
           id: 'sym_center',
+          entityType: 'symbol',
           name: 'buildPerQueryResult',
           kind: 'function',
           filePath: '/repo/src/core/center.ts',
@@ -27,6 +28,7 @@ describe('specialized graph builders', () => {
         },
         {
           id: 'sym_depth_1',
+          entityType: 'symbol',
           name: 'computeMetrics',
           kind: 'function',
           filePath: '/repo/src/callers/caller.ts',
@@ -37,6 +39,7 @@ describe('specialized graph builders', () => {
         },
         {
           id: 'sym_depth_2',
+          entityType: 'symbol',
           name: 'finalizeEvaluationRun',
           kind: 'function',
           filePath: '/repo/src/callers/runner.ts',

@@ -2,7 +2,7 @@ import type { Settings } from 'sigma/settings';
 import { getTheme } from './theme';
 import { couplingAppearance, degreeOverlayColor } from './overlays';
 import { languageColor } from './graph-utils';
-import type { Overlay } from '../types';
+import type { GraphEdgeAttributes, Overlay } from '../types';
 
 export interface RenderSnapshot {
   activeNodeId: string | null;
@@ -34,7 +34,7 @@ export function buildSigmaSettings(getSnapshot: () => RenderSnapshot): Partial<S
       const focusDimmed = snapshot.focusMode && !snapshot.connectedEdgeIds.has(edge);
       const baseAppearance =
         snapshot.overlay === 'coupling'
-          ? couplingAppearance(data, snapshot.edgeCallCountMax, theme)
+          ? couplingAppearance(data as GraphEdgeAttributes, snapshot.edgeCallCountMax, theme)
           : {
               color: data.color,
               size: typeof data.size === 'number' ? data.size : data.isResolved ? 1 : 0.5,

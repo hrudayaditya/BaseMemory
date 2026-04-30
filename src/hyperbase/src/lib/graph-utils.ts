@@ -2,6 +2,7 @@ import Graph from 'graphology';
 import type {
   BlastRadiusResponse,
   DirectoryGraphResponse,
+  FileGraphResponse,
   PathNode,
   FileEdge,
   FileGraphNodeAttributes,
@@ -9,6 +10,7 @@ import type {
   GraphEdge,
   GraphEdgeAttributes,
   GraphNode,
+  OverviewGraphResponse,
   SymbolGraphNodeAttributes,
 } from '../types';
 import { MAX_NODE_SIZE, MIN_NODE_SIZE } from './constants';
@@ -110,6 +112,17 @@ function seededRange(seed: string, min: number, max: number): number {
   return min + seededUnit(seed) * (max - min);
 }
 
+function circleSeedPosition(nodeId: string, contentId: string, index: number, total: number, radius = 320): { x: number; y: number } {
+  const safeTotal = Math.max(total, 1);
+  const baseAngle = (index / safeTotal) * Math.PI * 2;
+  const angle = baseAngle + seededRange(`${contentId}:${nodeId}:circle:angle`, -0.14, 0.14);
+  const radial = radius + seededRange(`${contentId}:${nodeId}:circle:radius`, -48, 48);
+  return {
+    x: Math.cos(angle) * radial,
+    y: Math.sin(angle) * radial,
+  };
+}
+
 function blastDepthColor(depth: number): string {
   const theme = getTheme();
   if (depth <= 0) {
@@ -143,15 +156,19 @@ export function buildGraphologyInstance(
 
   nodes.forEach((node) => {
     graph.addNode(node.id, {
-      label: node.filePath.split('/').slice(-1)[0] ?? node.filePath,
+      label: node.name,
       color: languageColor(node.language),
       size: nodeSize(node.symbolCount, maxSymbolCount),
       x: seededPosition(node.id, contentId, 'x'),
       y: seededPosition(node.id, contentId, 'y'),
+      entityType: node.entityType,
+      name: node.name,
       filePath: node.filePath,
       language: node.language,
       symbolCount: node.symbolCount,
       directory: node.directory,
+      directoryPath: node.directoryPath,
+      fileCount: node.fileCount,
       degree: degreeMap.get(node.id) ?? 0,
       highlighted: false,
       dimmed: false,
@@ -177,6 +194,54 @@ export function buildGraphologyInstance(
   return graph;
 }
 
+export function buildOverviewGraphologyInstance(
+  payload: OverviewGraphResponse,
+  contentId: string
+): Graph<FileGraphNodeAttributes, GraphEdgeAttributes> {
+  const graph = new Graph<FileGraphNodeAttributes, GraphEdgeAttributes>({ type: 'directed', multi: false });
+  const theme = getTheme();
+  const maxSymbolCount = Math.max(...payload.nodes.map((node) => node.symbolCount), 1);
+  const sortedNodes = [...payload.nodes].sort((a, b) => a.name.localeCompare(b.name));
+
+  sortedNodes.forEach((node, index) => {
+    const position = circleSeedPosition(node.id, contentId, index, sortedNodes.length, 280);
+    graph.addNode(node.id, {
+      label: node.name,
+      color: languageColor(node.language),
+      size: nodeSize(node.symbolCount, maxSymbolCount),
+      x: position.x,
+      y: position.y,
+      entityType: 'directory',
+      name: node.name,
+      filePath: node.filePath,
+      language: node.language,
+      symbolCount: node.symbolCount,
+      directory: node.directory,
+      directoryPath: node.directoryPath,
+      fileCount: node.fileCount,
+      degree: node.degree ?? 0,
+      highlighted: false,
+      dimmed: false,
+    });
+  });
+
+  payload.edges.forEach((edge) => {
+    if (graph.hasNode(edge.from) && graph.hasNode(edge.to)) {
+      graph.addEdgeWithKey(`${edge.from}->${edge.to}`, edge.from, edge.to, {
+        size: Math.min(Math.max(Math.log(edge.callCount + 1), 1), 4),
+        color: theme.edge.file,
+        isResolved: true,
+        callCount: edge.callCount,
+        callerFilePath: graph.getNodeAttributes(edge.from).filePath,
+        targetFilePath: graph.getNodeAttributes(edge.to).filePath,
+        highlighted: false,
+      });
+    }
+  });
+
+  return graph;
+}
+
 export function buildNeighborhoodGraphologyInstance(
   nodes: GraphNode[],
   edges: GraphEdge[],
@@ -194,6 +259,7 @@ export function buildNeighborhoodGraphologyInstance(
       size: nodeSize(node.degree, maxDegree),
       x: node.x ?? seededPosition(node.id, contentId, 'x'),
       y: node.y ?? seededPosition(node.id, contentId, 'y'),
+      entityType: 'symbol',
       filePath: node.filePath,
       language: node.language,
       kind: node.kind,
@@ -294,8 +360,89 @@ export function buildBlastRadiusGraphologyInstance(
   return graph;
 }
 
+function moduleSeedPosition(
+  nodeId: string,
+  contentId: string,
+  role: FileGraphNodeAttributes['layoutRole']
+): { x: number; y: number } {
+  if (!role || role === 'internal') {
+    return {
+      x: seededRange(`${contentId}:${nodeId}:module:center:x`, -220, 220),
+      y: seededRange(`${contentId}:${nodeId}:module:center:y`, -160, 160),
+    };
+  }
+
+  const radius = seededRange(`${contentId}:${nodeId}:module:radius`, 360, 520);
+  const angle =
+    role === 'external-caller'
+      ? seededRange(`${contentId}:${nodeId}:module:angle`, Math.PI * 0.65, Math.PI * 1.35)
+      : role === 'external-callee'
+        ? seededRange(`${contentId}:${nodeId}:module:angle`, -Math.PI * 0.35, Math.PI * 0.35)
+        : seededRange(`${contentId}:${nodeId}:module:angle`, Math.PI * 1.35, Math.PI * 1.65);
+
+  return {
+    x: Math.cos(angle) * radius,
+    y: Math.sin(angle) * radius,
+  };
+}
+
 export function buildDirectoryGraphologyInstance(
   payload: DirectoryGraphResponse,
+  contentId: string
+): Graph<FileGraphNodeAttributes, GraphEdgeAttributes> {
+  const graph = new Graph<FileGraphNodeAttributes, GraphEdgeAttributes>({ type: 'directed', multi: false });
+  const theme = getTheme();
+  const maxSymbolCount = Math.max(...payload.nodes.map((node) => node.symbolCount), 1);
+
+  payload.nodes.forEach((node) => {
+    const position = moduleSeedPosition(node.id, contentId, node.role);
+    const isInternal = !node.role || node.role === 'internal';
+    graph.addNode(node.id, {
+      label: node.name,
+      color: isInternal ? languageColor(node.language) : theme.node.default,
+      size: isInternal ? nodeSize(node.symbolCount, maxSymbolCount) : Math.max(4, nodeSize(node.symbolCount, maxSymbolCount) * 0.72),
+      x: position.x,
+      y: position.y,
+      entityType: 'file',
+      name: node.name,
+      filePath: node.filePath,
+      language: node.language,
+      symbolCount: node.symbolCount,
+      directory: node.directory,
+      directoryPath: node.directory,
+      fileCount: 1,
+      degree: node.degree ?? 0,
+      layoutRole: node.role,
+      highlighted: false,
+      dimmed: false,
+    });
+  });
+
+  payload.edges.forEach((edge) => {
+    if (graph.hasNode(edge.from) && graph.hasNode(edge.to)) {
+      graph.addEdgeWithKey(edge.id, edge.from, edge.to, {
+        size: edge.boundary === 'internal' ? 1.4 : 0.9,
+        color:
+          edge.boundary === 'internal'
+            ? theme.edge.resolved
+            : edge.boundary === 'incoming'
+              ? theme.analytics.couplingCross
+              : theme.node.dimmed,
+        isResolved: true,
+        callCount: edge.callCount,
+        callerFilePath: edge.callerFilePath,
+        targetFilePath: edge.targetFilePath,
+        boundary: edge.boundary,
+        highlighted: false,
+      });
+    }
+  });
+
+  return graph;
+}
+
+export function buildFileGraphologyInstance(
+  payload: FileGraphResponse,
   contentId: string
 ): Graph<SymbolGraphNodeAttributes, GraphEdgeAttributes> {
   const graph = new Graph<SymbolGraphNodeAttributes, GraphEdgeAttributes>({ type: 'directed', multi: false });
@@ -318,6 +465,7 @@ export function buildDirectoryGraphologyInstance(
       size: isInternal ? nodeSize(node.degree, maxDegree) : Math.max(4, nodeSize(node.degree, maxDegree) * 0.7),
       x: node.x ?? position.x,
       y: node.y ?? position.y,
+      entityType: 'symbol',
       filePath: node.filePath,
       language: node.language,
       kind: node.kind,
@@ -399,6 +547,7 @@ export function buildPathGraphologyInstance(
       size: nodeSize(degreeMap.get(node.id) ?? 1, Math.max(...degreeMap.values(), 1)),
       x: index * spacing - offset,
       y: seededPosition(node.id, contentId, 'y') * 0.12,
+      entityType: 'symbol',
       filePath: node.filePath,
       language,
       kind: 'function',

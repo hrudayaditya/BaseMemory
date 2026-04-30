@@ -14,8 +14,18 @@
   import { sidebarOpen } from '../../stores/ui';
   import { shortPath } from '../../lib/graph-utils';
 
+  function selectedEntityType(): 'directory' | 'file' | 'symbol' | null {
+    const entityType = ($selectedNodeData as { entityType?: unknown } | null)?.entityType;
+    return entityType === 'directory' || entityType === 'file' || entityType === 'symbol' ? entityType : null;
+  }
+
+  function selectedLabel(): string {
+    const nodeData = $selectedNodeData as { label?: unknown; name?: unknown } | null;
+    return $selectedSymbolDetail?.name ?? (typeof nodeData?.label === 'string' ? nodeData.label : typeof nodeData?.name === 'string' ? nodeData.name : 'Node detail');
+  }
+
   async function setAsCenter() {
-    if (!$selectedNodeId || !$activeBranch || $selectedNodeId.startsWith('file::')) return;
+    if (!$selectedNodeId || !$activeBranch || selectedEntityType() !== 'symbol') return;
 
     await loadNeighborhoodGraph($selectedNodeId, {
       branch: $activeBranch,
@@ -25,7 +35,7 @@
   }
 
   async function openBlastRadius() {
-    if (!$selectedNodeId || !$activeBranch || $selectedNodeId.startsWith('file::')) return;
+    if (!$selectedNodeId || !$activeBranch || selectedEntityType() !== 'symbol') return;
     await loadBlastRadiusGraph($selectedNodeId, $activeBranch);
     await selectNode($selectedNodeId);
   }
@@ -53,20 +63,20 @@
   <div class="panel-header">
     <div>
       <p class="eyebrow">Inspector</p>
-      <h2>{$selectedSymbolDetail?.name ?? (($selectedNodeData?.label as string | undefined) ?? 'Node detail')}</h2>
+      <h2>{selectedLabel()}</h2>
     </div>
     <button class="close-button" type="button" on:click={closePanel}>×</button>
   </div>
 
   {#if $detailLoading}
     <div class="section">Loading details…</div>
-  {:else if $selectedNodeId?.startsWith('file::') && $selectedNodeData}
+  {:else if selectedEntityType() !== 'symbol' && $selectedNodeData}
     <div class="section">
-      <div class="kind-badge">file</div>
-      <p class="meta-line">{shortPath(String($selectedNodeData.filePath ?? ''))}</p>
-      <p class="meta-line">Language: {String($selectedNodeData.language ?? 'unknown')}</p>
-      <p class="meta-line">Symbols: {String($selectedNodeData.symbolCount ?? '0')}</p>
-      <p class="meta-line">Directory: {String($selectedNodeData.directory ?? '')}</p>
+      <div class="kind-badge">{selectedEntityType() ?? 'node'}</div>
+      <p class="meta-line">{shortPath(String(($selectedNodeData as { filePath?: unknown })?.filePath ?? ''))}</p>
+      <p class="meta-line">Language: {String(($selectedNodeData as { language?: unknown })?.language ?? 'unknown')}</p>
+      <p class="meta-line">Symbols: {String(($selectedNodeData as { symbolCount?: unknown })?.symbolCount ?? '0')}</p>
+      <p class="meta-line">Directory: {String(($selectedNodeData as { directory?: unknown })?.directory ?? '')}</p>
     </div>
     <div class="section actions">
       <button class="action-button primary" type="button" on:click={() => void openDirectory()}>Open directory</button>

@@ -11,7 +11,9 @@ import { fileURLToPath } from "url";
 import {
   buildBlastRadiusGraph,
   buildDirectoryGraph,
+  buildFileGraph,
   buildFullGraph,
+  buildOverviewGraph,
   buildNeighborhoodGraph,
   buildShortestPath,
   MAX_NEIGHBORHOOD_DEPTH,
@@ -439,6 +441,26 @@ export function createGraphServer(options: GraphServerOptions): GraphServerInsta
     }
 
     res.json(directoryGraph);
+  }));
+
+  app.get("/api/graph/file", (req, res) => withBranch(req, res, (state, branch) => {
+    const filePath = typeof req.query.path === "string" ? req.query.path.trim() : "";
+    if (!filePath) {
+      sendError(res, 400, "INVALID_INPUT", "Missing query parameter: path");
+      return;
+    }
+
+    const fileGraph = buildFileGraph(state.queries, branch, filePath);
+    if (!fileGraph) {
+      sendError(res, 404, "NOT_FOUND", `Unknown file: ${filePath}`);
+      return;
+    }
+
+    res.json(fileGraph);
+  }));
+
+  app.get("/api/graph/overview", (req, res) => withBranch(req, res, (state, branch) => {
+    res.json(buildOverviewGraph(state.queries, branch));
   }));
 
   app.get("/api/graph/full", (req, res) => withBranch(req, res, (state, branch) => {

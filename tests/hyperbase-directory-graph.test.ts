@@ -1,138 +1,104 @@
 import { describe, expect, it } from 'vitest';
-import { buildDirectoryGraphologyInstance } from '../src/hyperbase/src/lib/graph-utils';
-import type { DirectoryGraphResponse } from '../src/hyperbase/src/types';
+import { buildDirectoryGraphologyInstance, buildOverviewGraphologyInstance } from '../src/hyperbase/src/lib/graph-utils';
+import type { DirectoryGraphResponse, OverviewGraphResponse } from '../src/hyperbase/src/types';
 
-describe('directory graph builder', () => {
-  it('marks internal and external roles with distinct seeded layout regions', () => {
-    const payload: DirectoryGraphResponse = {
-      directoryPath: '/repo/src/core',
-      truncated: false,
+describe('overview and module graph builders', () => {
+  it('seeds overview directory nodes into a readable ring with directory semantics', () => {
+    const payload: OverviewGraphResponse = {
+      granularity: 2,
       nodes: [
         {
-          id: 'internal',
-          name: 'buildPerQueryResult',
-          kind: 'function',
-          filePath: '/repo/src/core/center.ts',
+          id: 'dir::/repo/src/indexer',
+          entityType: 'directory',
+          name: 'src/indexer',
+          filePath: '/repo/src/indexer',
+          directory: '/repo/src/indexer',
+          directoryPath: '/repo/src/indexer',
           language: 'typescript',
-          startLine: 1,
-          degree: 4,
-          role: 'internal',
+          symbolCount: 180,
+          fileCount: 12,
+          degree: 8,
         },
         {
-          id: 'incoming',
-          name: 'computeMetrics',
-          kind: 'function',
-          filePath: '/repo/src/callers/caller.ts',
+          id: 'dir::/repo/src/eval',
+          entityType: 'directory',
+          name: 'src/eval',
+          filePath: '/repo/src/eval',
+          directory: '/repo/src/eval',
+          directoryPath: '/repo/src/eval',
           language: 'typescript',
-          startLine: 1,
-          degree: 1,
-          role: 'external-caller',
-        },
-        {
-          id: 'outgoing',
-          name: 'helperAlpha',
-          kind: 'function',
-          filePath: '/repo/src/helpers/helper.ts',
-          language: 'typescript',
-          startLine: 1,
-          degree: 1,
-          role: 'external-callee',
+          symbolCount: 96,
+          fileCount: 8,
+          degree: 6,
         },
       ],
       edges: [
         {
-          id: 'incoming-edge',
-          from: 'incoming',
-          to: 'internal',
-          callType: 'Call',
-          isResolved: true,
-          callerFilePath: '/repo/src/callers/caller.ts',
-          targetFilePath: '/repo/src/core/center.ts',
-          boundary: 'incoming',
-          line: 1,
-        },
-        {
-          id: 'outgoing-edge',
-          from: 'internal',
-          to: 'outgoing',
-          callType: 'Call',
-          isResolved: true,
-          callerFilePath: '/repo/src/core/center.ts',
-          targetFilePath: '/repo/src/helpers/helper.ts',
-          boundary: 'outgoing',
-          line: 2,
+          from: 'dir::/repo/src/indexer',
+          to: 'dir::/repo/src/eval',
+          callCount: 11,
         },
       ],
     };
 
-    const graph = buildDirectoryGraphologyInstance(payload, 'g-directory-test');
-    const internal = graph.getNodeAttributes('internal');
-    const incoming = graph.getNodeAttributes('incoming');
-    const outgoing = graph.getNodeAttributes('outgoing');
+    const graph = buildOverviewGraphologyInstance(payload, 'g-overview-test');
+    const indexer = graph.getNodeAttributes('dir::/repo/src/indexer');
+    const evalNode = graph.getNodeAttributes('dir::/repo/src/eval');
 
-    expect(Math.abs(internal.x)).toBeLessThan(220);
-    expect(Math.abs(internal.y)).toBeLessThan(180);
-    expect(incoming.x).toBeLessThan(0);
-    expect(outgoing.x).toBeGreaterThan(0);
-    expect(graph.getEdgeAttributes('incoming-edge').boundary).toBe('incoming');
-    expect(graph.getEdgeAttributes('outgoing-edge').boundary).toBe('outgoing');
+    expect(indexer.entityType).toBe('directory');
+    expect(evalNode.entityType).toBe('directory');
+    expect(Math.hypot(indexer.x, indexer.y)).toBeGreaterThan(180);
+    expect(Math.hypot(evalNode.x, evalNode.y)).toBeGreaterThan(180);
   });
 
-  it('collapses duplicate directory edges into one rendered edge with aggregated call count', () => {
+  it('keeps external module files on the periphery and internal files centered', () => {
     const payload: DirectoryGraphResponse = {
-      directoryPath: '/repo/src/core',
+      directoryPath: '/repo/src/indexer',
       truncated: false,
       nodes: [
         {
-          id: 'internal',
-          name: 'buildPerQueryResult',
-          kind: 'function',
-          filePath: '/repo/src/core/center.ts',
+          id: 'file::/repo/src/indexer/main.ts',
+          entityType: 'file',
+          name: 'main.ts',
+          filePath: '/repo/src/indexer/main.ts',
           language: 'typescript',
-          startLine: 1,
-          degree: 4,
+          symbolCount: 12,
+          directory: '/repo/src/indexer',
+          degree: 5,
           role: 'internal',
         },
         {
-          id: 'outgoing',
-          name: 'helperAlpha',
-          kind: 'function',
-          filePath: '/repo/src/helpers/helper.ts',
+          id: 'file::/repo/src/shared/util.ts',
+          entityType: 'file',
+          name: 'util.ts',
+          filePath: '/repo/src/shared/util.ts',
           language: 'typescript',
-          startLine: 1,
-          degree: 1,
+          symbolCount: 4,
+          directory: '/repo/src/shared',
+          degree: 2,
           role: 'external-callee',
         },
       ],
       edges: [
         {
-          id: 'duplicate-a',
-          from: 'internal',
-          to: 'outgoing',
-          callType: 'Call',
-          isResolved: true,
-          callerFilePath: '/repo/src/core/center.ts',
-          targetFilePath: '/repo/src/helpers/helper.ts',
+          id: 'edge-a',
+          from: 'file::/repo/src/indexer/main.ts',
+          to: 'file::/repo/src/shared/util.ts',
+          callCount: 3,
           boundary: 'outgoing',
-          line: 2,
-        },
-        {
-          id: 'duplicate-b',
-          from: 'internal',
-          to: 'outgoing',
-          callType: 'Call',
-          isResolved: true,
-          callerFilePath: '/repo/src/core/center.ts',
-          targetFilePath: '/repo/src/helpers/helper.ts',
-          boundary: 'outgoing',
-          line: 9,
+          callerFilePath: '/repo/src/indexer/main.ts',
+          targetFilePath: '/repo/src/shared/util.ts',
         },
       ],
     };
 
-    const graph = buildDirectoryGraphologyInstance(payload, 'g-directory-duplicates');
+    const graph = buildDirectoryGraphologyInstance(payload, 'g-module-test');
+    const internal = graph.getNodeAttributes('file::/repo/src/indexer/main.ts');
+    const external = graph.getNodeAttributes('file::/repo/src/shared/util.ts');
 
-    expect(graph.size).toBe(1);
-    expect(graph.getEdgeAttributes('duplicate-a').callCount).toBe(2);
+    expect(Math.abs(internal.x)).toBeLessThan(260);
+    expect(Math.abs(internal.y)).toBeLessThan(220);
+    expect(external.x).toBeGreaterThan(0);
+    expect(graph.getEdgeAttributes('edge-a').boundary).toBe('outgoing');
   });
 });

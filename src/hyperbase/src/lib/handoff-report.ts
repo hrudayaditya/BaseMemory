@@ -27,7 +27,7 @@ function resolveNodeDetails(
   }
 
   const nodes =
-    payload.kind === 'galaxy'
+    payload.kind === 'overview' || payload.kind === 'galaxy'
       ? payload.payload.nodes.map((node) => ({ id: node.id, name: node.filePath.split('/').pop() ?? node.filePath, filePath: node.filePath }))
       : payload.kind === 'path'
         ? payload.payload.path
@@ -38,19 +38,38 @@ function resolveNodeDetails(
     return null;
   }
 
-  return {
-    id: match.id,
-    name: 'name' in match ? match.name : match.filePath.split('/').pop() ?? match.filePath,
-    filePath: match.filePath,
-  };
+  if ('filePath' in match) {
+    const graphMatch = match as GraphNode | PathNode;
+    return {
+      id: graphMatch.id,
+      name: graphMatch.name,
+      filePath: graphMatch.filePath,
+    };
+  }
+
+  return null;
 }
 
 function graphEdges(payload: CurrentGraphPayload): GraphEdge[] {
-  return payload.kind === 'galaxy'
-    ? []
-    : payload.kind === 'path'
-      ? payload.payload.edges
-      : payload.payload.edges;
+  if (payload.kind === 'overview' || payload.kind === 'galaxy') {
+    return [];
+  }
+
+  if (payload.kind === 'directory') {
+    return payload.payload.edges.map((edge): GraphEdge => ({
+      id: edge.id,
+      from: edge.from,
+      to: edge.to,
+      callType: 'Call',
+      isResolved: true,
+      callerFilePath: edge.callerFilePath,
+      targetFilePath: edge.targetFilePath,
+      boundary: edge.boundary,
+      line: 0,
+    }));
+  }
+
+  return payload.payload.edges;
 }
 
 export function deriveHandoffSelection(

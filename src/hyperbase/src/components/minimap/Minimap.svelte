@@ -1,16 +1,18 @@
 <script lang="ts">
+  import type Graph from 'graphology';
   import { onDestroy, onMount } from 'svelte';
   import { getTheme } from '../../lib/theme';
   import { cameraState, graphInstance, sigmaInstance } from '../../stores/graph';
   import type Sigma from 'sigma';
+  import type { FileGraphNodeAttributes, GraphEdgeAttributes, SymbolGraphNodeAttributes } from '../../types';
 
   const MINIMAP_WIDTH = 180;
   const MINIMAP_HEIGHT = 120;
   const MINIMAP_CAMERA = { x: 0.5, y: 0.5, ratio: 1, angle: 0 };
 
   let canvas: HTMLCanvasElement;
-  let graph: ReturnType<typeof $graphInstance> | null = null;
-  let sigma: Sigma | null = null;
+  let graph: Graph<FileGraphNodeAttributes | SymbolGraphNodeAttributes, GraphEdgeAttributes> | null = null;
+  let sigma: Sigma<any, any, any> | null = null;
 
   function minimapOverride(renderer: Sigma) {
     return {
@@ -64,35 +66,38 @@
       return;
     }
 
+    const currentGraph = graph;
+    const renderer = sigma;
+
     ctx.strokeStyle = theme.minimap.edge;
     ctx.lineWidth = 1;
-    graph.forEachEdge((_edge, attributes, source, target) => {
-      const sourcePos = graph?.getNodeAttributes(source);
-      const targetPos = graph?.getNodeAttributes(target);
+    currentGraph.forEachEdge((_edge: string, _attributes: GraphEdgeAttributes, source: string, target: string) => {
+      const sourcePos = currentGraph.getNodeAttributes(source);
+      const targetPos = currentGraph.getNodeAttributes(target);
       if (!sourcePos || !targetPos) return;
-      const a = graphToMinimap(sigma, sourcePos);
-      const b = graphToMinimap(sigma, targetPos);
+      const a = graphToMinimap(renderer, sourcePos);
+      const b = graphToMinimap(renderer, targetPos);
       ctx.beginPath();
       ctx.moveTo(a.x, a.y);
       ctx.lineTo(b.x, b.y);
       ctx.stroke();
     });
 
-    graph.forEachNode((_node, attributes) => {
-      const point = graphToMinimap(sigma, attributes);
+    currentGraph.forEachNode((_node: string, attributes: FileGraphNodeAttributes | SymbolGraphNodeAttributes) => {
+      const point = graphToMinimap(renderer, attributes);
       ctx.fillStyle = attributes.color;
       ctx.beginPath();
       ctx.arc(point.x, point.y, 2, 0, Math.PI * 2);
       ctx.fill();
     });
 
-    const stageDimensions = sigma.getDimensions();
+    const stageDimensions = renderer.getDimensions();
     const viewportCorners = [
-      sigma.viewportToFramedGraph({ x: 0, y: 0 }),
-      sigma.viewportToFramedGraph({ x: stageDimensions.width, y: 0 }),
-      sigma.viewportToFramedGraph({ x: stageDimensions.width, y: stageDimensions.height }),
-      sigma.viewportToFramedGraph({ x: 0, y: stageDimensions.height }),
-    ].map((point) => framedToMinimap(sigma, point));
+      renderer.viewportToFramedGraph({ x: 0, y: 0 }),
+      renderer.viewportToFramedGraph({ x: stageDimensions.width, y: 0 }),
+      renderer.viewportToFramedGraph({ x: stageDimensions.width, y: stageDimensions.height }),
+      renderer.viewportToFramedGraph({ x: 0, y: stageDimensions.height }),
+    ].map((point) => framedToMinimap(renderer, point));
 
     ctx.fillStyle = theme.minimap.viewportFill;
     ctx.strokeStyle = theme.minimap.viewportStroke;

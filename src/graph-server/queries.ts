@@ -18,6 +18,7 @@ type StatementBundle = {
   symbolById: Database.Statement<[string, string], GraphSymbolRow>;
   symbolByIds: Database.Statement<[string, string], GraphSymbolRow>;
   symbolsByDirectoryPrefix: Database.Statement<[string, string, string], GraphSymbolRow>;
+  symbolsByFilePath: Database.Statement<[string, string], GraphSymbolRow>;
   searchSymbols: Database.Statement<[string, string], GraphSymbolRow>;
   callerCount: Database.Statement<[string, string], { c: number }>;
   calleeCount: Database.Statement<[string, string], { c: number }>;
@@ -115,6 +116,24 @@ function prepareStatements(db: Database.Database): StatementBundle {
           OR s.file_path LIKE ?
         )
       ORDER BY s.file_path ASC, s.start_line ASC, s.name ASC
+    `),
+    symbolsByFilePath: db.prepare(`
+      SELECT
+        s.id,
+        s.file_path,
+        s.name,
+        s.kind,
+        s.start_line,
+        s.start_col,
+        s.end_line,
+        s.end_col,
+        s.language,
+        s.symbol_aliases
+      FROM symbols s
+      INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
+      WHERE bs.branch = ?
+        AND s.file_path = ?
+      ORDER BY s.start_line ASC, s.name ASC
     `),
     searchSymbols: db.prepare(`
       SELECT
@@ -322,6 +341,13 @@ export function createGraphQueries(db: Database.Database): GraphQueryService {
         return [];
       }
       return statements.symbolsByDirectoryPrefix.all(branch, normalized, `${normalized}/%`);
+    },
+    getSymbolsByFilePath(branch, filePath) {
+      const normalized = filePath.replace(/\\/g, "/");
+      if (!normalized) {
+        return [];
+      }
+      return statements.symbolsByFilePath.all(branch, normalized);
     },
     searchSymbols(branch, query) {
       return statements.searchSymbols.all(branch, query);

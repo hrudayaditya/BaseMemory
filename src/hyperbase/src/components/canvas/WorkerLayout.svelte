@@ -15,6 +15,19 @@
   let currentLoadId = 0;
   let currentLayoutCacheHit = false;
 
+  function layoutIterationsForGraph(graph: HyperGraph): number {
+    if (graph.order < 30) {
+      return 120;
+    }
+    if (graph.order <= 100) {
+      return 240;
+    }
+    if (graph.order <= 300) {
+      return 380;
+    }
+    return LAYOUT_ITERATIONS;
+  }
+
   function stopWorker() {
     if (worker) {
       worker.postMessage({ type: 'stop' });
@@ -56,7 +69,7 @@
     worker.postMessage({
       type: 'start',
       graph: graph.export(),
-      iterations: LAYOUT_ITERATIONS,
+      iterations: layoutIterationsForGraph(graph),
     });
   }
 

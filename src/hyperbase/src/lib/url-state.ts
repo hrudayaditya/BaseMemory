@@ -9,6 +9,7 @@ export function readUrlState(): UrlState {
   return {
     branch: params.get('branch') ?? undefined,
     symbolId: params.get('symbol') ?? undefined,
+    filePath: params.get('file') ?? undefined,
     fromId: params.get('from') ?? undefined,
     toId: params.get('to') ?? undefined,
     directoryPath: params.get('directory') ?? undefined,
@@ -24,6 +25,7 @@ export function writeUrlState(state: UrlState): void {
 
   if (state.branch) params.set('branch', state.branch);
   if (state.symbolId) params.set('symbol', state.symbolId);
+  if (state.filePath) params.set('file', state.filePath);
   if (state.fromId) params.set('from', state.fromId);
   if (state.toId) params.set('to', state.toId);
   if (state.directoryPath) params.set('directory', state.directoryPath);

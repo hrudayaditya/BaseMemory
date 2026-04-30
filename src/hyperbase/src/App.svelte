@@ -31,7 +31,7 @@ import LandingScreen from './components/overlays/LandingScreen.svelte';
     showLanding,
     sigmaInstance,
   } from './stores/graph';
-  import { clearSelectedNode, selectedNodeId, selectNode } from './stores/selection';
+  import { clearSelectedNode, selectedNodeData, selectedNodeId, selectNode } from './stores/selection';
   import {
     activeOverlay,
     cancelPathFinding,
@@ -52,7 +52,7 @@ import LandingScreen from './components/overlays/LandingScreen.svelte';
   let currentBranch = '';
   let currentFocusedSymbolId: string | null = null;
   let currentDepth = 1;
-  let currentGraphView = 'galaxy';
+  let currentGraphView = 'overview';
   let currentViewDetails = get(currentViewInfo);
   let currentFocusMode = false;
   let currentFocusedNodeIds = new Set<string>();
@@ -61,6 +61,11 @@ import LandingScreen from './components/overlays/LandingScreen.svelte';
     if (!urlSyncReady) {
       return;
     }
+
+    const urlView =
+      currentViewDetails.kind === 'atom' && currentViewDetails.mode === 'file'
+        ? 'file'
+        : currentGraphView;
 
     const pathState =
       currentViewDetails.kind === 'path'
@@ -77,15 +82,23 @@ import LandingScreen from './components/overlays/LandingScreen.svelte';
           }
         : {};
 
+    const fileState =
+      currentViewDetails.kind === 'atom' && currentViewDetails.mode === 'file' && currentViewDetails.filePath
+        ? {
+            filePath: currentViewDetails.filePath,
+          }
+        : {};
+
     writeUrlState({
       branch: currentBranch,
       symbolId: currentFocusedSymbolId ?? undefined,
       focus: currentFocusMode && currentFocusedNodeIds.size > 0,
       focusedIds: currentFocusMode && currentFocusedNodeIds.size > 0 ? Array.from(currentFocusedNodeIds) : undefined,
       depth: currentDepth,
-      view: currentGraphView,
+      view: urlView,
       ...pathState,
       ...directoryState,
+      ...fileState,
     });
   }
 
@@ -128,6 +141,8 @@ import LandingScreen from './components/overlays/LandingScreen.svelte';
       await selectNode(urlState.fromId);
     } else if (urlState.symbolId) {
       await selectNode(urlState.symbolId);
+    } else if (urlState.filePath) {
+      await selectNode(`file::${urlState.filePath}`);
     }
     if (urlState.focus && urlState.focusedIds && urlState.focusedIds.length > 0) {
       setFocusMode(true, urlState.focusedIds);
@@ -146,6 +161,12 @@ import LandingScreen from './components/overlays/LandingScreen.svelte';
     }
 
     return Boolean(element.closest('input, textarea, select, [contenteditable="true"]'));
+  }
+
+  function selectedEntityType(): 'directory' | 'file' | 'symbol' | null {
+    const value = get(selectedNodeData) as { entityType?: unknown } | null;
+    const entityType = value?.entityType;
+    return entityType === 'directory' || entityType === 'file' || entityType === 'symbol' ? entityType : null;
   }
 
   async function handleKeydown(event: KeyboardEvent) {
@@ -195,7 +216,7 @@ import LandingScreen from './components/overlays/LandingScreen.svelte';
     if (event.key.toLowerCase() === 'p') {
       event.preventDefault();
       const selectedId = get(selectedNodeId) ?? get(focusedSymbolId);
-      if (!selectedId || selectedId.startsWith('file::')) {
+      if (!selectedId || selectedEntityType() !== 'symbol') {
         pathFindingHint.set('Select a symbol, then press P to choose a path source.');
         return;
       }
@@ -208,7 +229,7 @@ import LandingScreen from './components/overlays/LandingScreen.svelte';
     if (event.key.toLowerCase() === 'r') {
       event.preventDefault();
       const selectedId = get(selectedNodeId);
-      if (!selectedId || selectedId.startsWith('file::')) {
+      if (!selectedId || selectedEntityType() !== 'symbol') {
         pathFindingHint.set('Select a symbol before opening blast radius.');
         return;
       }
@@ -292,7 +313,9 @@ import LandingScreen from './components/overlays/LandingScreen.svelte';
   {#if $graphTruncated && !truncationDismissed}
     <div class="truncation-banner">
       <span>
-        {#if $currentView === 'galaxy'}
+        {#if $currentView === 'overview'}
+          Overview condensed the codebase into readable modules. Open a module or switch to Files view to inspect every file.
+        {:else if $currentView === 'galaxy'}
           Graph truncated at 300 nodes. Zoom in and search for specific symbols to explore further.
         {:else if $currentView === 'atom'}
           Neighborhood truncated at 300 nodes. Reduce depth or open connected symbols individually.

@@ -5,7 +5,7 @@
   import Sigma from 'sigma';
   import ContextMenu from '../overlays/ContextMenu.svelte';
   import { activeOverlay, focusMode, focusedNodeIds, pathFindingHint, pathFindingMode, pathFindingSource, sidebarOpen } from '../../stores/ui';
-  import { activeBranch, cameraState, currentView, focusedSymbolId, graphContentId, graphInstance, graphRefreshNonce, loadDirectoryGraph, loadPathGraph, sigmaInstance, zoomLevel } from '../../stores/graph';
+  import { activeBranch, cameraState, currentView, focusedSymbolId, graphContentId, graphInstance, graphRefreshNonce, loadDirectoryGraph, loadFileGraph, loadPathGraph, sigmaInstance, zoomLevel } from '../../stores/graph';
   import { hoveredNodeId, selectedNodeId, selectNode } from '../../stores/selection';
   import { buildSigmaSettings, type RenderSnapshot } from '../../lib/sigma-config';
   import { DRAG_CLICK_SUPPRESSION_DISTANCE, ZOOM_ATOM_THRESHOLD, ZOOM_GALAXY_THRESHOLD } from '../../lib/constants';
@@ -19,7 +19,7 @@
 
   let container: HTMLDivElement;
   let canvasShell: HTMLDivElement;
-  let sigma: Sigma | null = null;
+  let sigma: Sigma<any, any, any> | null = null;
   let resizeObserver: ResizeObserver | null = null;
   let currentGraph: HyperGraph | null = null;
   let currentSelectedNodeId: string | null = null;
@@ -27,7 +27,7 @@
   let currentContentId: string | null = null;
   let currentOverlay: Overlay = 'none';
   let currentOverlayMetrics: OverlayMetrics = EMPTY_OVERLAY_METRICS;
-  let currentGraphView = 'galaxy';
+  let currentGraphView = 'overview';
   let currentPathFindingMode = false;
   let currentPathFindingSource: string | null = null;
   let currentFocusMode = false;
@@ -56,6 +56,16 @@
     edgeCallCountMax: 1,
   };
 
+  type EntityType = 'directory' | 'file' | 'symbol';
+
+  function nodeEntityType(nodeId: string): EntityType | null {
+    if (!currentGraph?.hasNode(nodeId)) {
+      return null;
+    }
+    const attributes = currentGraph.getNodeAttributes(nodeId) as { entityType?: EntityType };
+    return attributes.entityType ?? null;
+  }
+
   function recomputeOverlayMetrics() {
     currentOverlayMetrics = computeOverlayMetrics(currentGraph, currentOverlay);
   }
@@ -66,15 +76,18 @@
       return;
     }
 
+    const renderer = sigma;
+    const graph = currentGraph;
+
     const { width, height } = canvasShell.getBoundingClientRect();
     const nextBadges: Array<{ nodeId: string; x: number; y: number }> = [];
 
     Object.keys(currentAnnotations).forEach((nodeId) => {
-      if (!currentGraph.hasNode(nodeId)) {
+      if (!graph.hasNode(nodeId)) {
         return;
       }
 
-      const displayData = sigma.getNodeDisplayData(nodeId);
+      const displayData = renderer.getNodeDisplayData(nodeId);
       if (!displayData) {
         return;
       }
@@ -200,16 +213,18 @@
       if (!sigma) {
         sigma = new Sigma(graph, container, buildSigmaSettings(() => renderSnapshot));
         sigmaInstance.set(sigma);
+        const renderer = sigma;
 
-        sigma.on('clickNode', ({ node }) => {
+        renderer.on('clickNode', ({ node }) => {
           if (suppressNextNodeClick) {
             suppressNextNodeClick = false;
             return;
           }
 
+          const entityType = nodeEntityType(node);
           const sourceNodeId = currentPathFindingSource ?? get(selectedNodeId) ?? get(focusedSymbolId);
 
-          if (currentPathFindingMode && sourceNodeId && node !== sourceNodeId) {
+          if (currentPathFindingMode && sourceNodeId && entityType === 'symbol' && node !== sourceNodeId) {
             pathFindingHint.set(null);
             cancelPathFinding();
             void loadPathGraph(sourceNodeId, node);
@@ -218,13 +233,13 @@
 
           sidebarOpen.set(true);
           const nextNodeData = currentGraph?.hasNode(node)
-            ? (currentGraph.getNodeAttributes(node) as Record<string, unknown>)
+            ? (currentGraph.getNodeAttributes(node) as unknown as Record<string, unknown>)
             : null;
           void selectNode(node, nextNodeData);
           closeContextMenu();
         });
 
-        sigma.on('downNode', ({ node, event }) => {
+        renderer.on('downNode', ({ node, event }) => {
           if (!currentGraph || !sigma || !currentGraph.hasNode(node)) {
             return;
           }
@@ -239,7 +254,7 @@
           camera.enabledPanning = false;
         });
 
-        sigma.on('moveBody', ({ event }) => {
+        renderer.on('moveBody', ({ event }) => {
           if (!sigma || !currentGraph || !draggedNodeId || !currentGraph.hasNode(draggedNodeId)) {
             return;
           }
@@ -259,75 +274,92 @@
           sigma.refresh();
         });
 
-        sigma.on('upNode', () => {
+        renderer.on('upNode', () => {
           endDrag();
         });
 
-        sigma.on('upStage', () => {
+        renderer.on('upStage', () => {
           endDrag();
         });
 
-        sigma.on('enterNode', ({ node }) => {
+        renderer.on('enterNode', ({ node }) => {
           hoveredNodeId.set(node);
-          if (currentPathFindingMode && currentPathFindingSource && node !== currentPathFindingSource && currentGraph?.hasNode(node)) {
+          if (
+            currentPathFindingMode &&
+            currentPathFindingSource &&
+            node !== currentPathFindingSource &&
+            currentGraph?.hasNode(node) &&
+            nodeEntityType(node) === 'symbol'
+          ) {
             const attributes = currentGraph.getNodeAttributes(node) as { name?: string; label?: string };
             pathFindingHint.set(`Click to find path to ${attributes.name ?? attributes.label ?? node}`);
           }
         });
 
-        sigma.on('leaveNode', () => {
+        renderer.on('leaveNode', () => {
           hoveredNodeId.set(null);
           if (currentPathFindingMode) {
             pathFindingHint.set(null);
           }
         });
 
-        sigma.on('doubleClickNode', ({ node, event }) => {
-          if (!sigma || !currentGraph || currentGraphView !== 'galaxy' || !node.startsWith('file::')) {
+        renderer.on('doubleClickNode', ({ node, event }) => {
+          if (!sigma || !currentGraph) {
             return;
           }
 
           const attributes = currentGraph.getNodeAttributes(node) as FileGraphNodeAttributes;
           const displayData = sigma.getNodeDisplayData(node);
-          if (!displayData || !attributes.directory) {
+          const entityType = attributes.entityType;
+          if (!displayData) {
+            return;
+          }
+
+          const canOpenModule = currentGraphView === 'overview' && entityType === 'directory' && attributes.directoryPath;
+          const canOpenFile = currentGraphView === 'directory' && entityType === 'file' && attributes.filePath;
+          if (!canOpenModule && !canOpenFile) {
             return;
           }
 
           event.preventSigmaDefault();
-          const camera = sigma.getCamera();
+          const camera = renderer.getCamera();
           const nextRatio = Math.max(camera.ratio * 0.48, 0.18);
           camera.animate(
             { x: displayData.x, y: displayData.y, ratio: nextRatio },
             { duration: 240 },
             () => {
-              void loadDirectoryGraph(attributes.directory, get(activeBranch));
+              if (canOpenModule && attributes.directoryPath) {
+                void loadDirectoryGraph(attributes.directoryPath, get(activeBranch));
+              } else if (canOpenFile && attributes.filePath) {
+                void loadFileGraph(attributes.filePath, get(activeBranch));
+              }
             }
           );
         });
 
-        sigma.on('rightClickNode', ({ node, event }) => {
+        renderer.on('rightClickNode', ({ node, event }) => {
           if (!currentGraph?.hasNode(node)) {
             return;
           }
 
           event.preventSigmaDefault();
           event.original.preventDefault();
-          const nextNodeData = currentGraph.getNodeAttributes(node) as Record<string, unknown>;
+          const nextNodeData = currentGraph.getNodeAttributes(node) as unknown as Record<string, unknown>;
           void selectNode(node, nextNodeData);
           openContextMenu(node, event.x, event.y);
         });
 
-        sigma.on('clickStage', () => {
+        renderer.on('clickStage', () => {
           closeContextMenu();
         });
 
-        sigma.on('rightClickStage', ({ event }) => {
+        renderer.on('rightClickStage', ({ event }) => {
           event.preventSigmaDefault();
           event.original.preventDefault();
           closeContextMenu();
         });
 
-        sigma.on('afterRender', () => {
+        renderer.on('afterRender', () => {
           recomputeAnnotationBadges();
         });
 

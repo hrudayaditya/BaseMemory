@@ -40,6 +40,7 @@ export type GraphEdgeRow = {
 export type GraphNode = {
   id: string;
   name: string;
+  entityType: "directory" | "file" | "symbol";
   kind: string;
   filePath: string;
   language: string;
@@ -93,8 +94,51 @@ export type PathResponse = {
 export type DirectoryGraphResponse = {
   directoryPath: string;
   truncated: boolean;
+  nodes: Array<{
+    id: string;
+    entityType: "file";
+    name: string;
+    filePath: string;
+    language: string;
+    symbolCount: number;
+    directory: string;
+    degree: number;
+    role?: "internal" | "external-caller" | "external-callee" | "external-bidirectional";
+  }>;
+  edges: Array<{
+    id: string;
+    from: string;
+    to: string;
+    callCount: number;
+    boundary: "internal" | "incoming" | "outgoing";
+    callerFilePath: string;
+    targetFilePath: string;
+  }>;
+};
+
+export type FileGraphResponse = {
+  filePath: string;
+  truncated: boolean;
   nodes: GraphNode[];
   edges: GraphEdge[];
+};
+
+export type OverviewGraphResponse = {
+  granularity: number;
+  nodes: Array<{
+    id: string;
+    entityType: "directory";
+    name: string;
+    directoryPath: string;
+    language: string;
+    symbolCount: number;
+    fileCount: number;
+  }>;
+  edges: Array<{
+    from: string;
+    to: string;
+    callCount: number;
+  }>;
 };
 
 export type BranchRow = { branch: string };
@@ -197,6 +241,7 @@ export interface GraphQueryService {
   getSymbolById(branch: string, symbolId: string): GraphSymbolRow | undefined;
   getSymbolsByIds(branch: string, symbolIds: Iterable<string>): Map<string, GraphSymbolRow>;
   getSymbolsByDirectoryPrefix(branch: string, directoryPath: string): GraphSymbolRow[];
+  getSymbolsByFilePath(branch: string, filePath: string): GraphSymbolRow[];
   searchSymbols(branch: string, query: string): GraphSymbolRow[];
   getCallerCount(branch: string, symbolId: string): number;
   getCalleeCount(branch: string, symbolId: string): number;

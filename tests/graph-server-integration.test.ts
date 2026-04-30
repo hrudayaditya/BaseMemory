@@ -8,8 +8,10 @@ import { createGraphServer } from "../src/graph-server.js";
 import type {
   BlastRadiusResponse,
   DirectoryGraphResponse,
+  FileGraphResponse,
   HealthResponse,
   NeighborhoodResponse,
+  OverviewGraphResponse,
   PathResponse,
   SearchResult,
 } from "../src/hyperbase/src/types/index.ts";
@@ -191,7 +193,7 @@ describe("graph server integration", () => {
   });
 
   it("integration_error_response_returns_branch_not_found", async () => {
-    const response = await getJson<{ error: string; code: string }>("/api/health?branch=does-not-exist");
+    const response = await getJson<{ error: string; code: string }>("/api/search?q=spawn&branch=does-not-exist");
     expect(response.status).toBe(400);
     expect(response.body).toEqual({
       error: "Unknown branch: does-not-exist",
@@ -226,11 +228,33 @@ describe("graph server integration", () => {
 
     expect(response.status).toBe(200);
     expect(response.body.directoryPath.endsWith("/src/core")).toBe(true);
+    expect(response.body.nodes.every((node) => node.entityType === "file")).toBe(true);
     expect(response.body.nodes.some((node) => node.role === "internal")).toBe(true);
     expect(response.body.nodes.some((node) => node.role === "external-caller")).toBe(true);
     expect(response.body.edges.some((edge) => edge.boundary === "incoming")).toBe(true);
     expect(response.body.edges.some((edge) => edge.boundary === "outgoing")).toBe(true);
-    expect(response.body.edges.some((edge) => edge.isResolved === false && edge.to === null)).toBe(true);
+    expect(response.body.edges.some((edge) => edge.id.includes("caller"))).toBe(true);
+  });
+
+  it("integration_file_endpoint_returns_symbol_graph_for_one_file", async () => {
+    const response = await getJson<FileGraphResponse>(
+      `/api/graph/file?path=${encodeURIComponent(join(ctx.root, "repo", "src", "core", "center.ts"))}`
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body.filePath.endsWith("/src/core/center.ts")).toBe(true);
+    expect(response.body.nodes.some((node) => node.entityType === "symbol")).toBe(true);
+    expect(response.body.nodes).toHaveLength(1);
+    expect(response.body.edges).toHaveLength(0);
+  });
+
+  it("integration_overview_endpoint_returns_directory_aggregations", async () => {
+    const response = await getJson<OverviewGraphResponse>("/api/graph/overview");
+
+    expect(response.status).toBe(200);
+    expect(response.body.nodes.every((node) => node.entityType === "directory")).toBe(true);
+    expect(response.body.nodes.length).toBeGreaterThan(0);
+    expect(response.body.granularity).toBeGreaterThanOrEqual(1);
   });
 
   it("integration_blast_radius_endpoint_returns_parseable_depth_map", async () => {

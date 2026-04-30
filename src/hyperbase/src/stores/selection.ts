@@ -18,10 +18,18 @@ let detailRequestRevision = 0;
 let currentBranch = '';
 let currentSelectedNodeId: string | null = null;
 
+function resolveEntityType(nodeData: SelectableNodeData): 'directory' | 'file' | 'symbol' | null {
+  if (!nodeData || typeof nodeData !== 'object') {
+    return null;
+  }
+  const entityType = (nodeData as { entityType?: unknown }).entityType;
+  return entityType === 'directory' || entityType === 'file' || entityType === 'symbol' ? entityType : null;
+}
+
 function resolveCurrentNodeData(nodeId: string): SelectableNodeData {
   const graph = get(graphInstance);
   if (graph && graph.hasNode(nodeId)) {
-    return graph.getNodeAttributes(nodeId) as SelectableNodeData;
+    return graph.getNodeAttributes(nodeId) as unknown as SelectableNodeData;
   }
   return null;
 }
@@ -35,7 +43,8 @@ function resetDetailState(): void {
 }
 
 async function loadDetailForNode(nodeId: string): Promise<void> {
-  if (!currentBranch || !nodeId || nodeId.startsWith('file::')) {
+  const currentNodeData = resolveCurrentNodeData(nodeId);
+  if (!currentBranch || !nodeId || resolveEntityType(currentNodeData) !== 'symbol') {
     resetDetailState();
     return;
   }
@@ -84,7 +93,7 @@ async function loadDetailForNode(nodeId: string): Promise<void> {
 
 activeBranch.subscribe((value) => {
   currentBranch = value;
-  if (currentSelectedNodeId && !currentSelectedNodeId.startsWith('file::')) {
+  if (currentSelectedNodeId && resolveEntityType(get(selectedNodeData)) === 'symbol') {
     void loadDetailForNode(currentSelectedNodeId);
   }
 });
@@ -94,7 +103,7 @@ graphInstance.subscribe((graph) => {
     return;
   }
 
-  selectedNodeData.set(graph.getNodeAttributes(currentSelectedNodeId) as SelectableNodeData);
+  selectedNodeData.set(graph.getNodeAttributes(currentSelectedNodeId) as unknown as SelectableNodeData);
 });
 
 export async function selectNode(nodeId: string | null, nodeData?: SelectableNodeData): Promise<void> {
@@ -112,7 +121,7 @@ export async function selectNode(nodeId: string | null, nodeData?: SelectableNod
   selectedNodeData.set(nextNodeData);
   sidebarOpen.set(true);
 
-  if (nodeId.startsWith('file::')) {
+  if (resolveEntityType(nextNodeData) !== 'symbol') {
     resetDetailState();
     return;
   }
@@ -125,7 +134,7 @@ export function clearSelectedNode(): void {
 }
 
 export async function refreshSelectedNode(): Promise<void> {
-  if (!currentSelectedNodeId || currentSelectedNodeId.startsWith('file::')) {
+  if (!currentSelectedNodeId || resolveEntityType(get(selectedNodeData)) !== 'symbol') {
     return;
   }
 
