@@ -32,7 +32,7 @@
   function breadcrumbsForView(): Breadcrumb[] {
     const info = get(currentViewInfo);
 
-    if (info.kind === 'overview' || info.kind === 'galaxy') {
+    if (info.kind === 'overview' || info.kind === 'galaxy' || info.kind === 'functions') {
       return [];
     }
 
@@ -100,6 +100,9 @@
       {#if $currentViewInfo.kind === 'galaxy'}
         <p class="eyebrow">Files View</p>
         <h2>Full file graph</h2>
+      {:else if $currentViewInfo.kind === 'functions'}
+        <p class="eyebrow">Function View</p>
+        <h2>Full symbol graph</h2>
       {:else if $currentViewInfo.kind === 'atom' && $currentViewInfo.mode === 'file'}
         <p class="eyebrow">Symbol View</p>
         <h2>{$currentViewInfo.filePath}</h2>

@@ -38,7 +38,8 @@
   import { computeOverlayMetrics, EMPTY_OVERLAY_METRICS, type OverlayMetrics } from '../../lib/overlays';
   import { cancelPathFinding } from '../../stores/ui';
   import { annotations, getAnnotation, openAnnotationEditor, type AnnotationEntry } from '../../lib/annotations';
-  import type { FileGraphNodeAttributes, GraphEdgeAttributes, Overlay, SymbolGraphNodeAttributes } from '../../types';
+  import { shortPath } from '../../lib/graph-utils';
+  import type { FileGraphNodeAttributes, GraphEdgeAttributes, Overlay, SymbolGraphNodeAttributes, ZoomLevel } from '../../types';
 
   type HyperGraph = Graph<FileGraphNodeAttributes | SymbolGraphNodeAttributes, GraphEdgeAttributes>;
 
@@ -53,6 +54,7 @@
   let currentOverlay: Overlay = 'none';
   let currentOverlayMetrics: OverlayMetrics = EMPTY_OVERLAY_METRICS;
   let currentGraphView = 'overview';
+  let currentZoomLevel: ZoomLevel = 'overview';
   let currentPathFindingMode = false;
   let currentPathFindingSource: string | null = null;
   let currentFocusMode = false;
@@ -67,6 +69,7 @@
   let dragCameraPanningEnabled = true;
   let currentAnnotations: Record<string, AnnotationEntry> = {};
   let annotationBadges: Array<{ nodeId: string; x: number; y: number }> = [];
+  let hoverTooltip: { nodeId: string; x: number; y: number; title: string; meta: string } | null = null;
   let pulseMarker: { nodeId: string; x: number; y: number } | null = null;
   let blastGlowMarker: { nodeId: string; x: number; y: number } | null = null;
   let currentPulseNodeId: string | null = null;
@@ -95,9 +98,13 @@
     settledNodeIds: new Set<string>(),
     blastRevealDepth: Number.POSITIVE_INFINITY,
     pulseNodeId: null,
+    currentView: 'overview',
+    zoomLevel: 'overview',
+    functionLabelNodeIds: new Set<string>(),
   };
   let selectedConnectedNodeIds = new Set<string>();
   let selectedConnectedEdgeIds = new Set<string>();
+  let currentFunctionLabelNodeIds = new Set<string>();
 
   type EntityType = 'directory' | 'file' | 'symbol';
 
@@ -149,9 +156,33 @@
 
   function recomputeHeroMarkers() {
     if (!sigma || !currentGraph) {
+      hoverTooltip = null;
       pulseMarker = null;
       blastGlowMarker = null;
       return;
+    }
+
+    hoverTooltip = null;
+    if (currentHoveredNodeId && currentGraph.hasNode(currentHoveredNodeId)) {
+      const displayData = sigma.getNodeDisplayData(currentHoveredNodeId);
+      const attributes = currentGraph.getNodeAttributes(currentHoveredNodeId) as Partial<
+        SymbolGraphNodeAttributes & FileGraphNodeAttributes
+      >;
+      if (displayData) {
+        const filePath = typeof attributes.filePath === 'string' ? attributes.filePath : '';
+        const title = typeof attributes.name === 'string' ? attributes.name : typeof attributes.label === 'string' ? attributes.label : currentHoveredNodeId;
+        const metaParts = [
+          typeof attributes.kind === 'string' ? attributes.kind : typeof attributes.entityType === 'string' ? attributes.entityType : 'node',
+          filePath ? shortPath(filePath) : '',
+        ].filter(Boolean);
+        hoverTooltip = {
+          nodeId: currentHoveredNodeId,
+          x: displayData.x + displayData.size + 14,
+          y: displayData.y - displayData.size - 14,
+          title,
+          meta: metaParts.join(' · '),
+        };
+      }
     }
 
     pulseMarker = null;
@@ -236,6 +267,9 @@
       settledNodeIds: currentSettledNodeIds,
       blastRevealDepth: currentBlastRevealDepth,
       pulseNodeId: currentPulseNodeId,
+      currentView: currentGraphView,
+      zoomLevel: currentZoomLevel,
+      functionLabelNodeIds: currentFunctionLabelNodeIds,
     };
 
     sigma?.refresh();
@@ -330,7 +364,7 @@
       {
         x: displayData.x,
         y: displayData.y,
-        ratio: Math.max(Math.min(ratio ?? 0.72, 1.15), 0.46),
+        ratio: Math.max(Math.min(ratio ?? 1.65, 2.15), 0.58),
       },
       { duration: 620 },
       () => {
@@ -339,16 +373,34 @@
     );
   }
 
+  function recomputeFunctionLabels() {
+    if (!currentGraph || currentGraphView !== 'functions') {
+      currentFunctionLabelNodeIds = new Set();
+      return;
+    }
+
+    const ranked = currentGraph
+      .nodes()
+      .map((node) => [node, (currentGraph!.getNodeAttributes(node) as SymbolGraphNodeAttributes).degree ?? 0] as const)
+      .sort((a, b) => b[1] - a[1]);
+    const keepCount = Math.min(24, Math.max(8, Math.ceil(ranked.length * 0.005)));
+    currentFunctionLabelNodeIds = new Set(ranked.slice(0, keepCount).map(([node]) => node));
+  }
+
   function updateZoomLevel() {
     if (!sigma) return;
     const ratio = sigma.getCamera().ratio;
     if (ratio <= ZOOM_GALAXY_THRESHOLD) {
+      currentZoomLevel = 'galaxy';
       zoomLevel.set('galaxy');
     } else if (ratio >= ZOOM_ATOM_THRESHOLD) {
+      currentZoomLevel = 'atom';
       zoomLevel.set('atom');
     } else {
+      currentZoomLevel = 'solar';
       zoomLevel.set('solar');
     }
+    recomputeRenderSnapshot();
   }
 
   function bindCamera() {
@@ -392,6 +444,7 @@
       recomputeOverlayMetrics();
       recomputeSelectedAdjacency();
       currentBlastCenterNodeId = resolveBlastCenterNodeId();
+      recomputeFunctionLabels();
 
       if (!container || !graph) {
         currentBlastCenterNodeId = null;
@@ -621,6 +674,7 @@
 
     const currentViewUnsubscribe = currentView.subscribe((value) => {
       currentGraphView = value;
+      recomputeFunctionLabels();
       if (value === 'blast') {
         if (currentContentId) {
           blastAnimationContentId = currentContentId;
@@ -633,6 +687,11 @@
         recomputeHeroMarkers();
         recomputeRenderSnapshot();
       }
+    });
+
+    const zoomUnsubscribe = zoomLevel.subscribe((value) => {
+      currentZoomLevel = value;
+      recomputeRenderSnapshot();
     });
 
     const refreshUnsubscribe = graphRefreshNonce.subscribe(() => {
@@ -676,6 +735,7 @@
       pathFindingModeUnsubscribe();
       contentUnsubscribe();
       currentViewUnsubscribe();
+      zoomUnsubscribe();
       refreshUnsubscribe();
       cinematicFocusUnsubscribe();
       settledNodeIdsUnsubscribe();
@@ -704,6 +764,13 @@
   <div bind:this={container} class:path-finding={currentPathFindingMode} class="graph-canvas"></div>
 
   <div class="annotation-layer" aria-hidden="true">
+    {#if hoverTooltip}
+      <div class="hover-tooltip" style={`left:${hoverTooltip.x}px; top:${hoverTooltip.y}px;`}>
+        <strong>{hoverTooltip.title}</strong>
+        <span>{hoverTooltip.meta}</span>
+      </div>
+    {/if}
+
     {#if blastGlowMarker}
       <div class="blast-glow" style={`left:${blastGlowMarker.x}px; top:${blastGlowMarker.y}px;`}></div>
     {/if}
@@ -750,6 +817,33 @@
     inset: 0;
     pointer-events: none;
     z-index: calc(var(--z-canvas) + 1);
+  }
+
+  .hover-tooltip {
+    position: absolute;
+    transform: translate(-50%, -100%);
+    min-width: 160px;
+    max-width: 280px;
+    padding: 10px 12px;
+    border-radius: 14px;
+    border: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg-secondary) 96%, transparent);
+    box-shadow: var(--shadow-lg);
+    backdrop-filter: blur(10px);
+    display: grid;
+    gap: 3px;
+  }
+
+  .hover-tooltip strong {
+    font-size: 12px;
+    line-height: 1.2;
+    color: var(--text-primary);
+  }
+
+  .hover-tooltip span {
+    font-size: 11px;
+    line-height: 1.2;
+    color: var(--text-secondary);
   }
 
   .annotation-badge {

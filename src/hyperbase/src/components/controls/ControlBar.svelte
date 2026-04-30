@@ -1,9 +1,6 @@
 <script lang="ts">
   import { get } from 'svelte/store';
   import {
-    activeBranch,
-    availableBranches,
-    changeActiveBranch,
     currentGraphPayload,
     changeGraphDepth,
     graphInstance,
@@ -55,19 +52,6 @@
 </script>
 
 <div class="control-bar">
-  <div class="group">
-    <label for="branch-select">Branch</label>
-    <select
-      id="branch-select"
-      value={$activeBranch}
-      on:change={(event) => void changeActiveBranch((event.currentTarget as HTMLSelectElement).value)}
-    >
-      {#each $availableBranches as branch}
-        <option value={branch}>{branch}</option>
-      {/each}
-    </select>
-  </div>
-
   <div class="group">
     <span>Depth</span>
     <div class="pills">
@@ -149,21 +133,11 @@
     gap: var(--space-sm);
   }
 
-  label,
   span {
     color: var(--text-secondary);
     font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 0.06em;
-  }
-
-  select {
-    width: 100%;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border);
-    color: var(--text-primary);
-    border-radius: var(--radius-md);
-    padding: 10px 12px;
   }
 
   .pills {

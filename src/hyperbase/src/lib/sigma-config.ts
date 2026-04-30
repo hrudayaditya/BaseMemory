@@ -2,7 +2,7 @@ import type { Settings } from 'sigma/settings';
 import { getTheme, withAlpha } from './theme';
 import { couplingAppearance, degreeOverlayColor } from './overlays';
 import { languageColor } from './graph-utils';
-import type { GraphEdgeAttributes, Overlay } from '../types';
+import type { GraphEdgeAttributes, Overlay, ZoomLevel } from '../types';
 
 export interface RenderSnapshot {
   activeNodeId: string | null;
@@ -20,6 +20,9 @@ export interface RenderSnapshot {
   settledNodeIds: Set<string>;
   blastRevealDepth: number;
   pulseNodeId: string | null;
+  currentView: string;
+  zoomLevel: ZoomLevel;
+  functionLabelNodeIds: Set<string>;
 }
 
 export function buildSigmaSettings(getSnapshot: () => RenderSnapshot): Partial<Settings> {
@@ -37,6 +40,7 @@ export function buildSigmaSettings(getSnapshot: () => RenderSnapshot): Partial<S
       const snapshot = getSnapshot();
       const highlighted = snapshot.selectionNodeId !== null && snapshot.connectedEdgeIds.has(edge);
       const focusDimmed = snapshot.focusMode && !snapshot.connectedEdgeIds.has(edge);
+      const isFunctionView = snapshot.currentView === 'functions';
       const baseAppearance =
         snapshot.overlay === 'coupling'
           ? couplingAppearance(data as GraphEdgeAttributes, snapshot.edgeCallCountMax, theme)
@@ -45,16 +49,33 @@ export function buildSigmaSettings(getSnapshot: () => RenderSnapshot): Partial<S
               size: typeof data.size === 'number' ? data.size : data.isResolved ? 1 : 0.5,
             };
 
+      const functionEdgeColor =
+        !isFunctionView
+          ? baseAppearance.color
+          : snapshot.zoomLevel === 'galaxy'
+            ? withAlpha(baseAppearance.color, 0.028)
+          : snapshot.zoomLevel === 'solar'
+            ? withAlpha(baseAppearance.color, 0.09)
+            : baseAppearance.color;
+      const functionEdgeSize =
+        !isFunctionView
+          ? baseAppearance.size
+          : snapshot.zoomLevel === 'galaxy'
+            ? Math.max(baseAppearance.size * 0.16, 0.08)
+          : snapshot.zoomLevel === 'solar'
+            ? Math.max(baseAppearance.size * 0.42, 0.2)
+            : baseAppearance.size;
+
       return {
         ...data,
         color: highlighted
           ? theme.edge.highlighted
           : snapshot.layoutRunning
-            ? withAlpha(baseAppearance.color, 0.18)
+            ? withAlpha(functionEdgeColor, 0.18)
           : focusDimmed
             ? theme.edge.unresolved
-            : baseAppearance.color,
-        size: highlighted ? Math.max(baseAppearance.size * 1.8, 2) : baseAppearance.size,
+            : functionEdgeColor,
+        size: highlighted ? Math.max(functionEdgeSize * 1.8, 2) : functionEdgeSize,
       };
     },
     nodeReducer: (node, data) => {
@@ -69,6 +90,11 @@ export function buildSigmaSettings(getSnapshot: () => RenderSnapshot): Partial<S
         typeof data.depth === 'number' && data.depth > Math.max(snapshot.blastRevealDepth, 0);
       const pulseTarget = snapshot.pulseNodeId === node;
       const unsettled = snapshot.layoutRunning && !snapshot.settledNodeIds.has(node);
+      const isFunctionView = snapshot.currentView === 'functions' && data.entityType === 'symbol';
+      const showFunctionLabel =
+        !isFunctionView ||
+        snapshot.zoomLevel === 'atom' ||
+        (snapshot.zoomLevel === 'solar' && snapshot.functionLabelNodeIds.has(node));
 
       const color =
         snapshot.overlay === 'community' && typeof data.communityColor === 'string'
@@ -87,6 +113,10 @@ export function buildSigmaSettings(getSnapshot: () => RenderSnapshot): Partial<S
           ? (data.size as number) * 1.3
         : isHotspot || isBlastCenter
           ? (data.size as number) * 1.35
+          : isFunctionView && snapshot.zoomLevel === 'galaxy'
+            ? (data.size as number) * 0.78
+          : isFunctionView && snapshot.zoomLevel === 'solar'
+            ? (data.size as number) * 0.9
           : hiddenByBlastRipple
             ? (data.size as number) * 0.75
             : unsettled
@@ -106,6 +136,7 @@ export function buildSigmaSettings(getSnapshot: () => RenderSnapshot): Partial<S
 
       return {
         ...data,
+        label: showFunctionLabel ? data.label : '',
         color: finalColor,
         size,
         forceLabel: isHotspot || isBlastCenter,

@@ -1,9 +1,10 @@
 <script lang="ts">
+  import { get } from 'svelte/store';
   import { onDestroy } from 'svelte';
   import { isAbortError, searchSymbols } from '../../api/client';
   import { SEARCH_DEBOUNCE_MS } from '../../lib/constants';
   import { nodeColor, shortPath } from '../../lib/graph-utils';
-  import { activeBranch, graphDepth, loadDirectoryGraph, loadNeighborhoodGraph } from '../../stores/graph';
+  import { activeBranch, currentView, graphDepth, graphInstance, loadDirectoryGraph, loadNeighborhoodGraph } from '../../stores/graph';
   import { selectNode } from '../../stores/selection';
   import { requestCinematicFocus, searchFocusNonce, searchOpen, searchQuery, searchResults } from '../../stores/ui';
   import type { SearchResult } from '../../types';
@@ -11,6 +12,7 @@
   let inputElement: HTMLInputElement;
   let currentBranch = '';
   let currentDepth = 1;
+  let currentViewKind = 'overview';
   let currentQuery = '';
   let currentResults: SearchResult[] = [];
   let highlightedIndex = -1;
@@ -25,6 +27,9 @@
     }),
     graphDepth.subscribe((value) => {
       currentDepth = value;
+    }),
+    currentView.subscribe((value) => {
+      currentViewKind = value;
     }),
     searchQuery.subscribe((value) => {
       currentQuery = value;
@@ -93,12 +98,22 @@
 
   async function selectResult(result: SearchResult) {
     if (!currentBranch) return;
-    requestCinematicFocus(result.id, 'search', 0.72);
-    await loadNeighborhoodGraph(result.id, {
-      branch: currentBranch,
-      depth: currentDepth,
-    });
-    await selectNode(result.id);
+
+    const graph = get(graphInstance);
+    const canSelectInPlace = currentViewKind === 'functions' && graph?.hasNode(result.id);
+    const focusRatio = currentViewKind === 'functions' ? 1.9 : 1.65;
+    if (canSelectInPlace) {
+      requestCinematicFocus(result.id, 'search', focusRatio);
+      const nextNodeData = graph ? (graph.getNodeAttributes(result.id) as unknown as Record<string, unknown>) : null;
+      await selectNode(result.id, nextNodeData);
+    } else {
+      requestCinematicFocus(result.id, 'search', focusRatio);
+      await loadNeighborhoodGraph(result.id, {
+        branch: currentBranch,
+        depth: currentDepth,
+      });
+      await selectNode(result.id);
+    }
     searchOpen.set(false);
     searchQuery.set(result.name);
   }

@@ -117,6 +117,12 @@ export interface FileGraphResponse {
   edges: GraphEdge[];
 }
 
+export interface FullSymbolGraphResponse {
+  truncated: boolean;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
 export interface PathNode {
   id: string;
   name: string;
@@ -133,6 +139,7 @@ export interface PathResponse {
 export type CurrentGraphPayload =
   | { kind: 'overview'; payload: OverviewGraphResponse }
   | { kind: 'galaxy'; payload: FullGraphResponse }
+  | { kind: 'full-symbol'; payload: FullSymbolGraphResponse }
   | { kind: 'neighborhood'; payload: NeighborhoodResponse }
   | { kind: 'blast-radius'; payload: BlastRadiusResponse }
   | { kind: 'directory'; payload: DirectoryGraphResponse }

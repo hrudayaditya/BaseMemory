@@ -3,6 +3,7 @@ import type {
   BlastRadiusResponse,
   DirectoryGraphResponse,
   FileGraphResponse,
+  FullSymbolGraphResponse,
   PathNode,
   FileEdge,
   FileGraphNodeAttributes,
@@ -13,7 +14,7 @@ import type {
   OverviewGraphResponse,
   SymbolGraphNodeAttributes,
 } from '../types';
-import { MAX_NODE_SIZE, MIN_NODE_SIZE } from './constants';
+import { FULL_SYMBOL_FILE_RING_RADIUS, MAX_NODE_SIZE, MIN_NODE_SIZE } from './constants';
 import { getTheme } from './theme';
 
 export function nodeColor(kind: string): string {
@@ -120,6 +121,24 @@ function circleSeedPosition(nodeId: string, contentId: string, index: number, to
   return {
     x: Math.cos(angle) * radial,
     y: Math.sin(angle) * radial,
+  };
+}
+
+function clusterSeedPosition(
+  nodeId: string,
+  contentId: string,
+  anchor: { x: number; y: number },
+  index: number,
+  total: number
+): { x: number; y: number } {
+  const safeTotal = Math.max(total, 1);
+  const baseAngle = (index / safeTotal) * Math.PI * 2;
+  const angle = baseAngle + seededRange(`${contentId}:${nodeId}:cluster:angle`, -0.22, 0.22);
+  const radiusBase = Math.min(112, 18 + Math.sqrt(safeTotal) * 11);
+  const radius = radiusBase + seededRange(`${contentId}:${nodeId}:cluster:radius`, -10, 18);
+  return {
+    x: anchor.x + Math.cos(angle) * radius,
+    y: anchor.y + Math.sin(angle) * radius,
   };
 }
 
@@ -514,6 +533,111 @@ export function buildFileGraphologyInstance(
         highlighted: false,
       });
     }
+  });
+
+  return graph;
+}
+
+export function buildFullSymbolGraphologyInstance(
+  payload: FullSymbolGraphResponse,
+  contentId: string
+): Graph<SymbolGraphNodeAttributes, GraphEdgeAttributes> {
+  const graph = new Graph<SymbolGraphNodeAttributes, GraphEdgeAttributes>({ type: 'directed', multi: false });
+  const theme = getTheme();
+  const maxDegree = Math.max(...payload.nodes.map((node) => node.degree), 1);
+  const nodesByFile = new Map<string, typeof payload.nodes>();
+  const collapsedEdges = new Map<
+    string,
+    {
+      id: string;
+      from: string;
+      to: string;
+      callerFilePath: string | null;
+      targetFilePath: string | null;
+      callCount: number;
+      isResolved: boolean;
+    }
+  >();
+
+  payload.nodes.forEach((node) => {
+    const existing = nodesByFile.get(node.filePath);
+    if (existing) {
+      existing.push(node);
+    } else {
+      nodesByFile.set(node.filePath, [node]);
+    }
+  });
+
+  const sortedFiles = Array.from(nodesByFile.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+  const fileAnchors = new Map<string, { x: number; y: number }>();
+  sortedFiles.forEach(([filePath], index) => {
+    fileAnchors.set(filePath, circleSeedPosition(`file-anchor::${filePath}`, contentId, index, sortedFiles.length, FULL_SYMBOL_FILE_RING_RADIUS));
+  });
+
+  sortedFiles.forEach(([filePath, fileNodes]) => {
+    const anchor = fileAnchors.get(filePath) ?? { x: 0, y: 0 };
+    const sortedNodes = [...fileNodes].sort((a, b) => a.startLine - b.startLine || a.name.localeCompare(b.name));
+    sortedNodes.forEach((node, index) => {
+      const position = clusterSeedPosition(node.id, contentId, anchor, index, sortedNodes.length);
+      graph.addNode(node.id, {
+        label: nodeLabel(node.name, node.filePath),
+        color: nodeColor(node.kind),
+        size: nodeSize(node.degree, maxDegree),
+        x: position.x,
+        y: position.y,
+        entityType: 'symbol',
+        filePath: node.filePath,
+        language: node.language,
+        kind: node.kind,
+        degree: node.degree,
+        startLine: node.startLine,
+        name: node.name,
+        role: node.role,
+        layoutRole: node.role,
+        community: node.community,
+        communityColor: undefined,
+        highlighted: false,
+        dimmed: false,
+      });
+    });
+  });
+
+  payload.edges.forEach((edge) => {
+    if (!edge.to || !graph.hasNode(edge.from) || !graph.hasNode(edge.to)) {
+      return;
+    }
+
+    const pairKey = `${edge.from}->${edge.to}`;
+    const existing = collapsedEdges.get(pairKey);
+    if (existing) {
+      existing.callCount += 1;
+      return;
+    }
+
+    collapsedEdges.set(pairKey, {
+      id: edge.id,
+      from: edge.from,
+      to: edge.to,
+      callerFilePath: edge.callerFilePath,
+      targetFilePath: edge.targetFilePath,
+      callCount: 1,
+      isResolved: edge.isResolved,
+    });
+  });
+
+  collapsedEdges.forEach((edge) => {
+    graph.addEdgeWithKey(edge.id, edge.from, edge.to, {
+      size: Math.min(Math.max(Math.log(edge.callCount + 1), 0.7), 2.4),
+      color:
+        edge.callerFilePath && edge.targetFilePath && edge.callerFilePath === edge.targetFilePath
+          ? theme.edge.unresolved
+          : theme.edge.resolved,
+      isResolved: edge.isResolved,
+      callCount: edge.callCount,
+      callerFilePath: edge.callerFilePath,
+      targetFilePath: edge.targetFilePath,
+      highlighted: false,
+    });
   });
 
   return graph;

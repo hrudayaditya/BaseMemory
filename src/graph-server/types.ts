@@ -123,6 +123,12 @@ export type FileGraphResponse = {
   edges: GraphEdge[];
 };
 
+export type FullSymbolGraphResponse = {
+  truncated: boolean;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+};
+
 export type OverviewGraphResponse = {
   granularity: number;
   nodes: Array<{
@@ -240,6 +246,7 @@ export interface GraphQueryService {
   getResolvedEdgeCount(branch: string): number;
   getSymbolById(branch: string, symbolId: string): GraphSymbolRow | undefined;
   getSymbolsByIds(branch: string, symbolIds: Iterable<string>): Map<string, GraphSymbolRow>;
+  getAllSymbols(branch: string): GraphSymbolRow[];
   getSymbolsByDirectoryPrefix(branch: string, directoryPath: string): GraphSymbolRow[];
   getSymbolsByFilePath(branch: string, filePath: string): GraphSymbolRow[];
   searchSymbols(branch: string, query: string): GraphSymbolRow[];
@@ -250,6 +257,7 @@ export interface GraphQueryService {
   getResolvedIncident(branch: string, symbolIds: Iterable<string>): GraphEdgeRow[];
   getUnresolvedOutgoing(branch: string, symbolIds: Iterable<string>): GraphEdgeRow[];
   getDegrees(branch: string, symbolIds: Iterable<string>): Map<string, number>;
+  getAllResolvedEdges(branch: string): GraphEdgeRow[];
   getFullGraphNodes(branch: string): FileNodeRow[];
   getFullGraphEdges(branch: string): FileEdgeRow[];
   getPeekSymbolAndChunk(branch: string, symbolId: string): PeekRow | undefined;

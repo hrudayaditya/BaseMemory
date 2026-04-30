@@ -9,6 +9,7 @@ import type {
   BlastRadiusResponse,
   DirectoryGraphResponse,
   FileGraphResponse,
+  FullSymbolGraphResponse,
   HealthResponse,
   NeighborhoodResponse,
   OverviewGraphResponse,
@@ -255,6 +256,17 @@ describe("graph server integration", () => {
     expect(response.body.nodes.every((node) => node.entityType === "directory")).toBe(true);
     expect(response.body.nodes.length).toBeGreaterThan(0);
     expect(response.body.granularity).toBeGreaterThanOrEqual(1);
+  });
+
+  it("integration_full_symbol_endpoint_returns_all_symbols_and_edges", async () => {
+    const response = await getJson<FullSymbolGraphResponse>("/api/graph/symbols");
+
+    expect(response.status).toBe(200);
+    expect(response.body.truncated).toBe(false);
+    expect(response.body.nodes.every((node) => node.entityType === "symbol")).toBe(true);
+    expect(response.body.nodes).toHaveLength(4);
+    expect(response.body.edges.every((edge) => edge.isResolved)).toBe(true);
+    expect(response.body.edges.length).toBeGreaterThanOrEqual(2);
   });
 
   it("integration_blast_radius_endpoint_returns_parseable_depth_map", async () => {

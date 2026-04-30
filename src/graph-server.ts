@@ -14,6 +14,7 @@ import {
   buildDirectoryGraph,
   buildFileGraph,
   buildFullGraph,
+  buildFullSymbolGraph,
   buildOverviewGraph,
   buildNeighborhoodGraph,
   buildShortestPath,
@@ -520,6 +521,13 @@ export function createGraphServer(options: GraphServerOptions): GraphServerInsta
     const fullGraph = buildFullGraph(state.queries, branch);
     logLargeAssembly("/api/graph/full", startedAt, fullGraph);
     res.json(fullGraph);
+  }));
+
+  app.get("/api/graph/symbols", (req, res) => withBranch(req, res, (state, branch) => {
+    const startedAt = performance.now();
+    const fullSymbolGraph = buildFullSymbolGraph(state.queries, branch);
+    logLargeAssembly("/api/graph/symbols", startedAt, fullSymbolGraph);
+    res.json(fullSymbolGraph);
   }));
 
   app.get("/api/blast-radius/:id", (req, res) => withBranch(req, res, (state, branch) => {

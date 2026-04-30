@@ -4,6 +4,7 @@ import type {
   DemoRepoInfo,
   DirectoryGraphResponse,
   FileGraphResponse,
+  FullSymbolGraphResponse,
   FullGraphResponse,
   NeighborhoodResponse,
   OverviewGraphResponse,
@@ -87,6 +88,10 @@ export async function searchSymbols(q: string, branch: string, signal?: AbortSig
 
 export async function fetchFullGraph(branch: string, signal?: AbortSignal): Promise<FullGraphResponse> {
   return request<FullGraphResponse>(`/graph/full?branch=${encodeURIComponent(branch)}`, signal);
+}
+
+export async function fetchFullSymbolGraph(branch: string, signal?: AbortSignal): Promise<FullSymbolGraphResponse> {
+  return request<FullSymbolGraphResponse>(`/graph/symbols?branch=${encodeURIComponent(branch)}`, signal);
 }
 
 export async function fetchOverviewGraph(branch: string, signal?: AbortSignal): Promise<OverviewGraphResponse> {

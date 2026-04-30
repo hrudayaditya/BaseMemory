@@ -14,3 +14,5 @@ export const COUPLING_SAME_DIRECTORY_SIZE = 0.65;
 export const COUPLING_CROSS_MODULE_SIZE = 1.6;
 export const COUPLING_HIGH_CALL_SIZE = 2.3;
 export const OVERLAY_ORDER = ['none', 'community', 'degree', 'language', 'coupling', 'dead', 'hotspot'] as const;
+export const FULL_SYMBOL_FA2_SKIP_THRESHOLD = 2500;
+export const FULL_SYMBOL_FILE_RING_RADIUS = 720;

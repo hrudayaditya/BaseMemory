@@ -11,7 +11,7 @@
     graphSettledNodeIds,
     sigmaInstance,
   } from '../../stores/graph';
-  import { LAYOUT_ITERATIONS } from '../../lib/constants';
+  import { FULL_SYMBOL_FA2_SKIP_THRESHOLD, LAYOUT_ITERATIONS } from '../../lib/constants';
   import type { FileGraphNodeAttributes, GraphEdgeAttributes, SymbolGraphNodeAttributes } from '../../types';
 
   type HyperGraph = Graph<FileGraphNodeAttributes | SymbolGraphNodeAttributes, GraphEdgeAttributes>;
@@ -24,6 +24,9 @@
   let currentLayoutCacheHit = false;
 
   function layoutIterationsForGraph(graph: HyperGraph): number {
+    if (graph.order > FULL_SYMBOL_FA2_SKIP_THRESHOLD) {
+      return 0;
+    }
     if (graph.order < 30) {
       return 120;
     }
@@ -129,6 +132,28 @@
           sigma?.refresh();
           return sigma;
         });
+        return;
+      }
+      if (layoutIterationsForGraph(currentGraph) === 0) {
+        stopWorker();
+        graphLayoutRunning.set(false);
+        graphSettledNodeIds.set(new Set(currentGraph.nodes()));
+        sigmaInstance.update((sigma) => {
+          sigma?.refresh();
+          return sigma;
+        });
+        if (currentContentId) {
+          const graph = currentGraph;
+          persistLayoutSnapshot(
+            currentContentId,
+            Object.fromEntries(
+              graph.nodes().map((node) => {
+                const attrs = graph.getNodeAttributes(node);
+                return [node, { x: attrs.x, y: attrs.y }];
+              })
+            )
+          );
+        }
         return;
       }
 

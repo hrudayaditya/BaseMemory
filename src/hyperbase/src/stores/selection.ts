@@ -99,7 +99,12 @@ activeBranch.subscribe((value) => {
 });
 
 graphInstance.subscribe((graph) => {
-  if (!graph || !currentSelectedNodeId || !graph.hasNode(currentSelectedNodeId)) {
+  if (!currentSelectedNodeId) {
+    return;
+  }
+
+  if (!graph || !graph.hasNode(currentSelectedNodeId)) {
+    void selectNode(null);
     return;
   }
 

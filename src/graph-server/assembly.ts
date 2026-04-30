@@ -1,6 +1,7 @@
 import {
   type BlastRadiusResponse,
   type FileGraphResponse,
+  type FullSymbolGraphResponse,
   type FullGraphResponse,
   type GraphEdge,
   type GraphEdgeRow,
@@ -501,6 +502,36 @@ export function buildFileGraph(
     truncated: false,
     nodes,
     edges: sortEdges(Array.from(edgesById.values())),
+  };
+}
+
+export function buildFullSymbolGraph(
+  queries: GraphQueryService,
+  branch: string
+): FullSymbolGraphResponse {
+  const symbolRows = queries.getAllSymbols(branch);
+  const edgeRows = queries.getAllResolvedEdges(branch);
+  const symbolIds = symbolRows.map((row) => row.id);
+  const degrees = queries.getDegrees(branch, symbolIds);
+
+  const nodes = sortNodes(
+    symbolRows.map((row) =>
+      makeNode(row, degrees.get(row.id) ?? 0, {
+        role: "internal",
+      })
+    )
+  );
+
+  const edges = sortEdges(
+    edgeRows
+      .map((row) => makeResolvedEdge(row))
+      .filter((edge): edge is GraphEdge => Boolean(edge && edge.to))
+  );
+
+  return {
+    truncated: false,
+    nodes,
+    edges,
   };
 }
 

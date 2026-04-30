@@ -6,6 +6,7 @@
   import SearchBar from './components/search/SearchBar.svelte';
   import DetailPanel from './components/panels/DetailPanel.svelte';
   import ControlBar from './components/controls/ControlBar.svelte';
+  import ViewSidebar from './components/controls/ViewSidebar.svelte';
   import Minimap from './components/minimap/Minimap.svelte';
   import ShortcutHelpModal from './components/overlays/ShortcutHelpModal.svelte';
   import AnnotationEditorModal from './components/overlays/AnnotationEditorModal.svelte';
@@ -302,6 +303,7 @@
   {:else}
     <GraphCanvas />
     <WorkerLayout />
+    <ViewSidebar />
     <SearchBar />
     <ControlBar />
     <ViewHeader />

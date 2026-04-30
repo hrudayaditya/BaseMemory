@@ -9,6 +9,7 @@ import {
   fetchDirectoryGraph,
   fetchFileGraph,
   fetchFullGraph,
+  fetchFullSymbolGraph,
   fetchNeighborhood,
   fetchOverviewGraph,
   fetchPath,
@@ -20,6 +21,7 @@ import {
   buildBlastRadiusGraphologyInstance,
   buildDirectoryGraphologyInstance,
   buildFileGraphologyInstance,
+  buildFullSymbolGraphologyInstance,
   buildGraphologyInstance,
   buildNeighborhoodGraphologyInstance,
   buildOverviewGraphologyInstance,
@@ -37,6 +39,7 @@ import type {
   FileEdge,
   FileGraphNodeAttributes,
   FileNode,
+  FullSymbolGraphResponse,
   FullGraphResponse,
   GraphEdgeAttributes,
   NeighborhoodResponse,
@@ -47,7 +50,7 @@ import type {
   UrlState,
   ZoomLevel,
 } from '../types';
-import { activeOverlay, graphDepth } from './ui';
+import { activeOverlay, graphDepth, searchOpen, searchQuery, searchResults } from './ui';
 export { graphDepth } from './ui';
 
 type GraphLoadTarget =
@@ -57,6 +60,10 @@ type GraphLoadTarget =
     }
   | {
       kind: 'galaxy';
+      branch: string;
+    }
+  | {
+      kind: 'full-symbol';
       branch: string;
     }
   | {
@@ -90,6 +97,7 @@ type GraphLoadTarget =
 export type ViewInfo =
   | { kind: 'overview'; granularity: number }
   | { kind: 'galaxy' }
+  | { kind: 'functions' }
   | { kind: 'atom'; mode: 'symbol' | 'file'; symbolId?: string; symbolName?: string; filePath?: string; directoryPath?: string }
   | { kind: 'blast'; symbolId: string; symbolName: string; truncated: boolean }
   | { kind: 'path'; fromId: string; toId: string; fromName: string; toName: string; hopCount: number; found: boolean; exhausted: boolean }
@@ -155,6 +163,8 @@ function createGraphContentId(target: GraphLoadTarget, nodes: string[], edges: s
       ? [`view:${target.kind}`, `branch:${target.branch}`]
       : target.kind === 'galaxy'
       ? [`view:${target.kind}`, `branch:${target.branch}`]
+      : target.kind === 'full-symbol'
+        ? [`view:${target.kind}`, `branch:${target.branch}`]
       : target.kind === 'neighborhood'
         ? [`view:${target.kind}`, `branch:${target.branch}`, `symbol:${target.symbolId}`, `depth:${target.depth}`]
         : target.kind === 'blast-radius'
@@ -181,6 +191,12 @@ function fullGraphContentId(target: GraphLoadTarget, payload: FullGraphResponse)
     .map((node) => `${node.id}:${node.filePath}:${node.language}:${node.symbolCount}`)
     .sort();
   const edgeKeys = payload.edges.map((edge) => `${edge.from}:${edge.to}:${edge.callCount}`).sort();
+  return createGraphContentId(target, nodeKeys, edgeKeys);
+}
+
+function fullSymbolGraphContentId(target: GraphLoadTarget, payload: FullSymbolGraphResponse): string {
+  const nodeKeys = payload.nodes.map((node) => `${node.id}:${node.filePath}:${node.kind}:${node.degree}`).sort();
+  const edgeKeys = payload.edges.map((edge) => `${edge.id}:${edge.from}:${edge.to ?? 'null'}:${edge.isResolved}`).sort();
   return createGraphContentId(target, nodeKeys, edgeKeys);
 }
 
@@ -294,6 +310,8 @@ class GraphController {
         await this.loadDirectory(initialUrlState.directoryPath, branch);
       } else if (initialUrlState.view === 'file' && initialUrlState.filePath) {
         await this.loadFile(initialUrlState.filePath, branch);
+      } else if (initialUrlState.view === 'functions') {
+        await this.loadFullSymbol(branch);
       } else if (initialUrlState.view === 'galaxy') {
         await this.loadGalaxy(branch);
       } else if (initialUrlState.symbolId) {
@@ -383,6 +401,43 @@ class GraphController {
         fileGraph: payload,
         payload: { kind: 'galaxy', payload },
         viewInfo: { kind: 'galaxy' },
+      });
+    } catch (error) {
+      this.handleGraphLoadError(error, load.revision);
+    }
+  }
+
+  async loadFullSymbol(branch = get(activeBranch)): Promise<void> {
+    if (!branch) {
+      graphError.set('No active branch selected');
+      return;
+    }
+
+    const target: GraphLoadTarget = { kind: 'full-symbol', branch };
+    this.currentTarget = target;
+    this.lastUrlState = { branch, view: 'functions' };
+
+    const load = this.beginGraphLoad();
+
+    try {
+      const payload = await fetchFullSymbolGraph(branch, load.abortController.signal);
+      if (!this.isActiveGraphLoad(load.revision, load.abortController.signal)) {
+        return;
+      }
+
+      const contentId = fullSymbolGraphContentId(target, payload);
+      const graph = buildFullSymbolGraphologyInstance(payload, contentId);
+      const layoutCacheHit = restoreLayoutSnapshot(graph, contentId);
+      this.commitGraphLoad({
+        graph,
+        target,
+        contentId,
+        layoutCacheHit,
+        nodeCount: payload.nodes.length,
+        edgeCount: payload.edges.length,
+        truncated: payload.truncated,
+        payload: { kind: 'full-symbol', payload },
+        viewInfo: { kind: 'functions' },
       });
     } catch (error) {
       this.handleGraphLoadError(error, load.revision);
@@ -671,6 +726,9 @@ class GraphController {
       currentDatabaseInfo.set(dbInfo);
       availableBranches.set(dbInfo.branches);
       activeBranch.set(dbInfo.branch ?? '');
+      searchQuery.set('');
+      searchResults.set([]);
+      searchOpen.set(false);
       showLanding.set(false);
       this.initialized = true;
       await this.loadOverview(dbInfo.branch ?? '');
@@ -689,6 +747,9 @@ class GraphController {
       currentDatabaseInfo.set(dbInfo);
       availableBranches.set(dbInfo.branches);
       activeBranch.set(dbInfo.branch ?? '');
+      searchQuery.set('');
+      searchResults.set([]);
+      searchOpen.set(false);
       showLanding.set(false);
       this.initialized = true;
       await this.loadOverview(dbInfo.branch ?? '');
@@ -706,6 +767,11 @@ class GraphController {
 
     if (this.currentTarget?.kind === 'overview') {
       await this.loadOverview(branch);
+      return;
+    }
+
+    if (this.currentTarget?.kind === 'full-symbol') {
+      await this.loadFullSymbol(branch);
       return;
     }
 
@@ -773,6 +839,11 @@ class GraphController {
 
     if (this.currentTarget?.kind === 'overview') {
       await this.loadOverview(this.currentTarget.branch);
+      return;
+    }
+
+    if (this.currentTarget?.kind === 'full-symbol') {
+      await this.loadFullSymbol(this.currentTarget.branch);
       return;
     }
 
@@ -870,6 +941,8 @@ class GraphController {
         ? 'overview'
         : options.target.kind === 'galaxy'
         ? 'galaxy'
+        : options.target.kind === 'full-symbol'
+          ? 'functions'
         : options.target.kind === 'neighborhood'
           ? 'atom'
           : options.target.kind === 'file'
@@ -967,6 +1040,7 @@ const graphController = new GraphController();
 export const initializeGraph = (initialUrlState?: UrlState) => graphController.initialize(initialUrlState);
 export const loadOverviewGraph = (branch?: string) => graphController.loadOverview(branch);
 export const loadGalaxyGraph = (branch?: string) => graphController.loadGalaxy(branch);
+export const loadFullSymbolGraph = (branch?: string) => graphController.loadFullSymbol(branch);
 export const loadNeighborhoodGraph = (symbolId: string, options?: { branch?: string; depth?: number }) =>
   graphController.loadNeighborhood(symbolId, options);
 export const loadBlastRadiusGraph = (symbolId: string, branch?: string) => graphController.loadBlastRadius(symbolId, branch);

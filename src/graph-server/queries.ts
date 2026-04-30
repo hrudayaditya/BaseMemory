@@ -17,6 +17,7 @@ type StatementBundle = {
   resolvedEdgeCount: Database.Statement<[string], { c: number }>;
   symbolById: Database.Statement<[string, string], GraphSymbolRow>;
   symbolByIds: Database.Statement<[string, string], GraphSymbolRow>;
+  allSymbols: Database.Statement<[string], GraphSymbolRow>;
   symbolsByDirectoryPrefix: Database.Statement<[string, string, string], GraphSymbolRow>;
   symbolsByFilePath: Database.Statement<[string, string], GraphSymbolRow>;
   searchSymbols: Database.Statement<[string, string], GraphSymbolRow>;
@@ -26,6 +27,7 @@ type StatementBundle = {
   resolvedCalleesBatch: Database.Statement<[string, string], GraphEdgeRow>;
   resolvedIncidentBatch: Database.Statement<[string, string, string], GraphEdgeRow>;
   unresolvedOutgoingBatch: Database.Statement<[string, string], GraphEdgeRow>;
+  allResolvedEdges: Database.Statement<[string], GraphEdgeRow>;
   degreesBatch: Database.Statement<[string, string, string, string], { symbol_id: string; degree: number }>;
   fullGraphNodes: Database.Statement<[string], {
     file_path: string;
@@ -95,6 +97,23 @@ function prepareStatements(db: Database.Database): StatementBundle {
       INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
       WHERE bs.branch = ?
         AND s.id IN (SELECT value FROM json_each(?))
+    `),
+    allSymbols: db.prepare(`
+      SELECT
+        s.id,
+        s.file_path,
+        s.name,
+        s.kind,
+        s.start_line,
+        s.start_col,
+        s.end_line,
+        s.end_col,
+        s.language,
+        s.symbol_aliases
+      FROM symbols s
+      INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
+      WHERE bs.branch = ?
+      ORDER BY s.file_path ASC, s.start_line ASC, s.name ASC
     `),
     symbolsByDirectoryPrefix: db.prepare(`
       SELECT
@@ -243,6 +262,25 @@ function prepareStatements(db: Database.Database): StatementBundle {
         AND ce.is_resolved = 0
         AND ce.from_symbol_id IN (SELECT value FROM json_each(?))
     `),
+    allResolvedEdges: db.prepare(`
+      SELECT
+        ce.id,
+        ce.branch,
+        ce.from_symbol_id,
+        ce.caller_file_path,
+        ce.target_name,
+        ce.target_file_path,
+        ce.target_kind,
+        ce.to_symbol_id,
+        ce.call_type,
+        ce.line,
+        ce.col,
+        ce.is_resolved
+      FROM call_edges ce
+      WHERE ce.branch = ?
+        AND ce.is_resolved = 1
+      ORDER BY ce.from_symbol_id ASC, ce.to_symbol_id ASC, ce.line ASC, ce.id ASC
+    `),
     degreesBatch: db.prepare(`
       SELECT symbol_id, COUNT(*) AS degree
       FROM (
@@ -335,6 +373,9 @@ export function createGraphQueries(db: Database.Database): GraphQueryService {
       const rows = statements.symbolByIds.all(branch, jsonArray(ids));
       return new Map(rows.map((row: GraphSymbolRow) => [row.id, row]));
     },
+    getAllSymbols(branch) {
+      return statements.allSymbols.all(branch) as GraphSymbolRow[];
+    },
     getSymbolsByDirectoryPrefix(branch, directoryPath) {
       const normalized = directoryPath.replace(/\\/g, "/").replace(/\/+$/, "");
       if (!normalized) {
@@ -386,6 +427,9 @@ export function createGraphQueries(db: Database.Database): GraphQueryService {
         return [];
       }
       return statements.unresolvedOutgoingBatch.all(branch, jsonArray(ids));
+    },
+    getAllResolvedEdges(branch) {
+      return statements.allResolvedEdges.all(branch) as GraphEdgeRow[];
     },
     getDegrees(branch, symbolIds) {
       const ids = uniqueIds(symbolIds);

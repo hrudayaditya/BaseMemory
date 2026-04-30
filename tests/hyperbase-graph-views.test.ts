@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { buildBlastRadiusGraphologyInstance, buildPathGraphologyInstance } from '../src/hyperbase/src/lib/graph-utils';
+import {
+  buildBlastRadiusGraphologyInstance,
+  buildFullSymbolGraphologyInstance,
+  buildPathGraphologyInstance,
+} from '../src/hyperbase/src/lib/graph-utils';
 import { getTheme } from '../src/hyperbase/src/lib/theme';
-import type { BlastRadiusResponse, GraphEdge, PathNode } from '../src/hyperbase/src/types';
+import type { BlastRadiusResponse, FullSymbolGraphResponse, GraphEdge, PathNode } from '../src/hyperbase/src/types';
 
 describe('specialized graph builders', () => {
   it('builds blast-radius graphs with depth colors and a highlighted center node', () => {
@@ -117,5 +121,78 @@ describe('specialized graph builders', () => {
     expect(graph.getNodeAttributes('b').x).toBeLessThan(graph.getNodeAttributes('c').x);
     expect(graph.getEdgeAttributes('ab').color).toBe(theme.edge.path);
     expect(graph.getEdgeAttributes('bc').color).toBe(theme.edge.path);
+  });
+
+  it('builds full-symbol graphs with clustered file seeding and collapsed duplicate edges', () => {
+    const payload: FullSymbolGraphResponse = {
+      truncated: false,
+      nodes: [
+        {
+          id: 'sym_a1',
+          entityType: 'symbol',
+          name: 'alpha',
+          kind: 'function',
+          filePath: '/repo/src/a.ts',
+          language: 'typescript',
+          startLine: 1,
+          degree: 3,
+        },
+        {
+          id: 'sym_a2',
+          entityType: 'symbol',
+          name: 'beta',
+          kind: 'function',
+          filePath: '/repo/src/a.ts',
+          language: 'typescript',
+          startLine: 12,
+          degree: 2,
+        },
+        {
+          id: 'sym_b1',
+          entityType: 'symbol',
+          name: 'gamma',
+          kind: 'function',
+          filePath: '/repo/src/b.ts',
+          language: 'typescript',
+          startLine: 2,
+          degree: 1,
+        },
+      ],
+      edges: [
+        {
+          id: 'edge_1',
+          from: 'sym_a1',
+          to: 'sym_b1',
+          callType: 'Call',
+          isResolved: true,
+          callerFilePath: '/repo/src/a.ts',
+          targetFilePath: '/repo/src/b.ts',
+          line: 3,
+        },
+        {
+          id: 'edge_2',
+          from: 'sym_a1',
+          to: 'sym_b1',
+          callType: 'Call',
+          isResolved: true,
+          callerFilePath: '/repo/src/a.ts',
+          targetFilePath: '/repo/src/b.ts',
+          line: 8,
+        },
+      ],
+    };
+
+    const graph = buildFullSymbolGraphologyInstance(payload, 'g-full-symbol-test');
+    const a1 = graph.getNodeAttributes('sym_a1');
+    const a2 = graph.getNodeAttributes('sym_a2');
+    const b1 = graph.getNodeAttributes('sym_b1');
+
+    const intraFileDistance = Math.hypot(a1.x - a2.x, a1.y - a2.y);
+    const interFileDistance = Math.hypot(a1.x - b1.x, a1.y - b1.y);
+
+    expect(interFileDistance).toBeGreaterThan(intraFileDistance);
+    expect(graph.size).toBe(1);
+    const edgeKey = graph.edges()[0];
+    expect(graph.getEdgeAttributes(edgeKey).callCount).toBe(2);
   });
 });
