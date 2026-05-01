@@ -4,29 +4,11 @@ Base URL:
 
 - `http://127.0.0.1:7842`
 
-All routes are `GET`.
-All graph routes are branch-aware.
-The browser UI calls these routes through [src/hyperbase/src/api/client.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/api/client.ts).
+The UI calls these routes through [src/hyperbase/src/api/client.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/api/client.ts).
 
-## Branch behavior
+## Error shape
 
-Every endpoint that accepts `?branch=` follows the same rule:
-
-- if `branch` is omitted, HyperBase uses the server default branch
-- if `branch` is provided and not present in the DB, HyperBase returns HTTP `400`
-
-Error shape:
-
-```json
-{
-  "error": "Unknown branch: your-branch",
-  "code": "BRANCH_NOT_FOUND"
-}
-```
-
-## Error codes
-
-Every error response has this shape:
+Every error response uses:
 
 ```json
 {
@@ -35,7 +17,7 @@ Every error response has this shape:
 }
 ```
 
-Codes in use:
+Codes currently in use include:
 
 - `INVALID_INPUT`
 - `BRANCH_NOT_FOUND`
@@ -43,24 +25,61 @@ Codes in use:
 - `DB_ERROR`
 - `INTERNAL_ERROR`
 
-## `GET /api/health`
+## DB routes
 
-Response:
+### `GET /api/db/info`
+
+Returns the currently loaded database metadata.
+
+Loaded response:
 
 ```json
 {
-  "status": "ok",
+  "available": true,
   "dbPath": "/absolute/path/to/codebase.db",
   "branch": "after-tune/refactor",
+  "branches": ["after-tune/refactor"],
   "symbolCount": 3262,
   "resolvedEdgeCount": 7651,
   "version": "0.1.0"
 }
 ```
 
-## `GET /api/branches`
+No-DB response:
 
-Response:
+```json
+{
+  "available": false,
+  "dbPath": null,
+  "branch": null,
+  "branches": [],
+  "symbolCount": 0,
+  "resolvedEdgeCount": 0,
+  "version": "0.1.0"
+}
+```
+
+### `GET /api/db/demos`
+
+Returns the server-side demo repo registry for the landing screen.
+
+### `POST /api/db/select`
+
+Switches the active DB to a server-known demo repo or configured server-side DB path.
+
+### `POST /api/db/upload`
+
+Accepts multipart upload of a `codebase.db` file and atomically swaps the active DB.
+
+## General server routes
+
+### `GET /api/health`
+
+Returns health and currently loaded DB metadata.
+
+### `GET /api/branches`
+
+Returns:
 
 ```json
 {
@@ -68,16 +87,13 @@ Response:
 }
 ```
 
-## `GET /api/search?q=<name>&branch=<branch>`
+## Search and symbol detail
 
-Searches `symbols.name` with case-insensitive substring matching.
+### `GET /api/search?q=<name>&branch=<branch>`
 
-Sort order:
+Case-insensitive substring search on symbol names.
 
-1. `length(name)` ascending
-2. `name` ascending
-
-Response:
+Example result:
 
 ```json
 {
@@ -94,113 +110,31 @@ Response:
 }
 ```
 
-## `GET /api/symbol/:id?branch=<branch>`
+### `GET /api/symbol/:id?branch=<branch>`
 
 Returns one symbol plus resolved caller/callee counts.
 
-Response:
+### `GET /api/peek/:symbolId?branch=<branch>`
 
-```json
-{
-  "symbol": {
-    "id": "sym_49a3e9f893f1d15e",
-    "name": "buildPerQueryResult",
-    "kind": "function",
-    "filePath": "/repo/src/eval/metrics.ts",
-    "language": "typescript",
-    "startLine": 218,
-    "endLine": 266,
-    "callerCount": 12,
-    "calleeCount": 7
-  }
-}
-```
+Returns the code preview chunk used by the detail panel.
 
-Errors:
+## Graph routes
 
-- `404 NOT_FOUND` if the symbol does not exist on the selected branch
+### `GET /api/graph/overview?branch=<branch>`
 
-## `GET /api/neighborhood/:id?branch=<branch>&depth=<1|2|3>`
+Directory-first overview graph used by the `Folders` sidebar view.
 
-The main symbol graph endpoint.
+Behavior:
 
-Rules:
+- aggregates files into a readable directory/module-level graph
+- chooses a directory granularity intended to stay human-readable
+- nodes are semantic directory/module nodes
 
-- default depth: `1`
-- max depth: `3`
-- BFS expands resolved callers and resolved callees
-- node cap: `300`
-- if the cap is hit, `truncated: true`
-- unresolved edges are added after the resolved BFS pass
-- unresolved edges never create new nodes
-- unresolved edges are represented honestly with `to: null`
-- node `degree` counts resolved incident edges only
+### `GET /api/graph/full?branch=<branch>`
 
-Response:
+File-level graph used by the `Files` sidebar view.
 
-```json
-{
-  "centerSymbolId": "sym_49a3e9f893f1d15e",
-  "depth": 1,
-  "truncated": false,
-  "nodes": [
-    {
-      "id": "sym_49a3e9f893f1d15e",
-      "name": "buildPerQueryResult",
-      "kind": "function",
-      "filePath": "/repo/src/eval/metrics.ts",
-      "language": "typescript",
-      "startLine": 218,
-      "degree": 30
-    }
-  ],
-  "edges": [
-    {
-      "id": "edge_resolved",
-      "from": "sym_a",
-      "to": "sym_b",
-      "callType": "Call",
-      "isResolved": true,
-      "callerFilePath": "/repo/src/a.ts",
-      "targetFilePath": "/repo/src/b.ts",
-      "line": 42
-    },
-    {
-      "id": "edge_unresolved",
-      "from": "sym_a",
-      "to": null,
-      "callType": "Call",
-      "isResolved": false,
-      "callerFilePath": "/repo/src/a.ts",
-      "targetFilePath": null,
-      "line": 43
-    }
-  ]
-}
-```
-
-Client note:
-
-- the UI’s Graphology builder skips unresolved edges with `to: null`
-- they remain in the API payload for inspection and future rendering work
-
-Errors:
-
-- `400 INVALID_INPUT` if `depth` is outside `1..3`
-- `404 NOT_FOUND` if the center symbol does not exist
-
-## `GET /api/graph/full?branch=<branch>`
-
-File-level graph for the galaxy view.
-
-Rules:
-
-- nodes are files
-- edges are aggregated resolved cross-file call edges
-- same-file edges are excluded
-- rows with null caller or target file paths are excluded
-
-Response:
+Response shape:
 
 ```json
 {
@@ -210,7 +144,8 @@ Response:
       "filePath": "/repo/src/indexer/index.ts",
       "language": "typescript",
       "symbolCount": 48,
-      "directory": "/repo/src/indexer"
+      "directory": "/repo/src/indexer",
+      "entityType": "file"
     }
   ],
   "edges": [
@@ -223,156 +158,69 @@ Response:
 }
 ```
 
-Reserved route space:
+### `GET /api/graph/symbols?branch=<branch>`
 
-- `/api/graph/directory/:path`
+Full symbol graph used by the `Functions` sidebar view.
 
-It is still not implemented.
+Behavior:
 
-## `GET /api/blast-radius/:id?branch=<branch>`
+- returns all symbols for the branch
+- returns all resolved call edges for the branch
+- intended for hierarchical client-side seeding
 
-Downstream dependency BFS.
+### `GET /api/graph/directory?directory=<path>&branch=<branch>`
+
+Directory/module view.
+
+Behavior:
+
+- shows internal files in the chosen directory
+- shows external files at the periphery
+- distinguishes internal vs external edges
+
+### `GET /api/graph/file?file=<path>&branch=<branch>`
+
+File-symbol view.
+
+Behavior:
+
+- returns symbols contained in a file
+- returns edges among those symbols plus relevant boundary context when applicable
+
+## Symbol graph routes
+
+### `GET /api/neighborhood/:id?branch=<branch>&depth=<1|2|3>`
+
+Neighborhood graph around a selected symbol.
 
 Rules:
 
-- follows callers only
-- resolved edges only
+- default depth: `1`
+- max depth: `3`
+- node cap: `300`
+- unresolved edges are preserved as `to: null`
+
+### `GET /api/blast-radius/:id?branch=<branch>`
+
+Downstream dependency BFS used by the blast view.
+
+Rules:
+
+- follows resolved downstream relationships
 - node cap: `500`
-- returns a `depth` map keyed by node id
+- returns per-node blast depth
 
-Response:
+### `GET /api/path?from=<id>&to=<id>&branch=<branch>`
 
-```json
-{
-  "symbolId": "sym_target",
-  "truncated": false,
-  "nodes": [],
-  "edges": [],
-  "depth": {
-    "sym_target": 0,
-    "sym_direct_caller": 1,
-    "sym_indirect_caller": 2
-  }
-}
-```
+Shortest resolved path between two symbols.
 
-## `GET /api/path?from=<id>&to=<id>&branch=<branch>`
+Behavior:
 
-Shortest path over resolved edges.
+- batches frontier expansion by hop
+- returns `found` / `exhausted` state plus path nodes and edges
 
-Current implementation details that matter:
+## MCP route
 
-- traverses both directions
-- batches frontier expansion per hop
-- does not issue per-node DB queries during BFS
-- hard stop at `1000` visited nodes
+### `GET /api/mcp/neighborhood/:id?branch=<branch>&depth=<1|2|3>`
 
-Found response:
-
-```json
-{
-  "found": true,
-  "exhausted": false,
-  "path": [
-    {
-      "id": "sym_a",
-      "name": "entrypoint",
-      "filePath": "/repo/src/a.ts"
-    },
-    {
-      "id": "sym_b",
-      "name": "target",
-      "filePath": "/repo/src/b.ts"
-    }
-  ],
-  "edges": []
-}
-```
-
-Not found response:
-
-```json
-{
-  "found": false,
-  "exhausted": false,
-  "path": [],
-  "edges": []
-}
-```
-
-Exhausted response:
-
-```json
-{
-  "found": false,
-  "exhausted": true,
-  "path": [],
-  "edges": []
-}
-```
-
-Errors:
-
-- `400 INVALID_INPUT` if `from` or `to` is missing
-- `404 NOT_FOUND` if either symbol id does not exist
-
-## `GET /api/peek/:symbolId?branch=<branch>`
-
-Returns source content for the smallest chunk containing the symbol span.
-
-Rules:
-
-- looks up the symbol
-- finds overlapping chunks in the same file
-- picks the smallest containing chunk
-- reads source from disk
-- returns `content: null` if the file cannot be read
-
-Response:
-
-```json
-{
-  "symbolId": "sym_49a3e9f893f1d15e",
-  "name": "buildPerQueryResult",
-  "filePath": "/repo/src/eval/metrics.ts",
-  "startLine": 218,
-  "endLine": 266,
-  "content": "actual source code here"
-}
-```
-
-## `GET /api/mcp/neighborhood/:id?branch=<branch>&depth=<depth>`
-
-MCP-facing wrapper around the neighborhood response.
-
-The `graph` field is intentionally identical to `/api/neighborhood/:id`.
-
-Response:
-
-```json
-{
-  "schema": "hyperbase-graph-v1",
-  "generatedAt": "2026-04-28T20:00:00.000Z",
-  "query": {
-    "symbolId": "sym_49a3e9f893f1d15e",
-    "branch": "after-tune/refactor",
-    "depth": 1
-  },
-  "graph": {
-    "centerSymbolId": "sym_49a3e9f893f1d15e",
-    "depth": 1,
-    "truncated": false,
-    "nodes": [],
-    "edges": []
-  }
-}
-```
-
-## Notes for UI builders
-
-- use `/api/graph/full` for the first render
-- use `/api/search` to get symbol ids
-- use `/api/neighborhood/:id` when the user drills into a symbol
-- keep unresolved edges in your data model even if your concrete graph renderer skips them
-- do not assume symbol names are unique
-- always keep branch in client state
+MCP-friendly wrapper around neighborhood graph data.

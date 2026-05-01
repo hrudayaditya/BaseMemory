@@ -1,8 +1,10 @@
 # Architecture
 
+This document describes the current HyperBase product architecture after the Phase 4 UI work.
+
 ## Server
 
-The server is split into three layers.
+The server is still split into three layers.
 
 ### Query layer
 
@@ -31,19 +33,22 @@ File:
 
 Responsibilities:
 
+- overview aggregation
+- file graph assembly
+- full-symbol graph assembly
 - neighborhood BFS
 - blast-radius BFS
-- full-graph aggregation
 - shortest-path traversal
+- directory/file-symbol shaping
 - truncation
 - degree attachment
-- unresolved-edge policy
 - stable node/edge ordering
 
 Important current behavior:
 
-- unresolved neighborhood edges are returned with `to: null`
-- shortest path batches frontier expansion per hop instead of querying per node
+- neighborhoods preserve unresolved edges as `to: null`
+- path and neighborhood traversal batch frontier expansion by hop
+- overview is directory-first and adapts granularity instead of exposing raw file counts immediately
 
 ### Handler layer
 
@@ -55,10 +60,17 @@ Responsibilities:
 
 - Express setup
 - static file serving from `src/hyperbase/dist`
-- branch resolution
+- DB state bootstrap and runtime DB switching
 - parameter validation
-- error code mapping
+- branch resolution
+- error mapping
 - final JSON serialization
+
+Important current behavior:
+
+- route handlers capture an immutable DB snapshot at request start
+- DB upload/select swaps the runtime DB atomically
+- retired DB states are only closed after active requests complete
 
 ## Browser UI
 
@@ -69,9 +81,18 @@ Files:
 - [src/hyperbase/src/main.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/main.ts)
 - [src/hyperbase/src/App.svelte](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/App.svelte)
 
-`main.ts` initializes the theme before mounting Svelte.
+`main.ts` initializes theme state before mounting Svelte.
 
-`App.svelte` is the root layout and startup coordinator. It mounts the canvas, controls, search, detail panel, and minimap, and kicks off initialization through the graph controller.
+`App.svelte` is the root layout and startup coordinator. It mounts:
+
+- landing screen
+- sidebar
+- canvas
+- controls
+- search
+- detail panel
+- minimap
+- modals
 
 ### Graph controller
 
@@ -79,18 +100,18 @@ File:
 
 - [src/hyperbase/src/stores/graph.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/stores/graph.ts)
 
-This file is the central loading state machine in practice.
+This file is the central loading state machine.
 
 It owns:
 
-- branch bootstrap
+- DB bootstrap state
 - graph request cancellation
 - deterministic `graphContentId`
 - per-load `graphLoadId`
+- current payload/view metadata
 - graph/truncation/loading/error stores
+- layout-running and settled-node stores
 - overlay-triggered community computation
-
-The controller exposes readable state through Svelte stores and intent commands through exported functions.
 
 ### Selection and detail loading
 
@@ -105,9 +126,32 @@ This file owns:
 - selected node data
 - symbol detail fetch
 - peek fetch
-- aborting stale detail requests
+- stale-request cancellation
+- clearing selection when the current graph no longer contains the selected node
 
-That separation is intentional. Graph loading and detail loading are independent concerns.
+That separation is intentional. Graph loading and detail loading are different concerns.
+
+## View model
+
+### Primary views
+
+The sidebar exposes three top-level graph representations:
+
+- `Folders` → `overview`
+- `Files` → `galaxy`
+- `Functions` → `full-symbol`
+
+### Drill-in views
+
+The app can then move into:
+
+- `directory`
+- `file`
+- `atom` neighborhood
+- `blast`
+- `path`
+
+These are separate graph loads, not camera-only transforms.
 
 ## Graph identity and layout
 
@@ -119,9 +163,9 @@ Purpose:
 
 Used for:
 
-- deterministic seeded initial positions
-- `localStorage` key `hyperbase:layout:v1:${graphContentId}`
-- cross-tab and cross-reload layout stability
+- deterministic seeded positions
+- `localStorage` layout cache
+- cross-reload and cross-tab layout stability
 
 ### `graphLoadId`
 
@@ -134,7 +178,16 @@ Used for:
 - restarting the layout worker on every new graph load
 - rejecting stale worker/controller results
 
-### Worker protocol
+### Layout strategy by graph type
+
+- overview: small directory-first graph, fast FA2 convergence
+- files: file-level graph
+- functions: hierarchical seed with optional FA2 skip above threshold
+- atom/path/blast/directory/file: content-specific seeded layouts
+
+The graph is committed before the worker refines it. Users should see seeded positions immediately, not a blank canvas waiting for layout completion.
+
+## Worker protocol
 
 File:
 
@@ -151,24 +204,10 @@ Current messages:
 Current behavior:
 
 - layout runs off the main thread
-- `progress` posts only positions that moved beyond the configured threshold
-- `done` posts the full final position snapshot
+- convergence can stop the worker early
+- progress posts deltas rather than full maps where possible
 - community detection also runs in the worker
-
-### Layout cache
-
-File:
-
-- [src/hyperbase/src/lib/layout-cache.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/lib/layout-cache.ts)
-
-Save path:
-
-- main thread saves the final `done` snapshot
-
-Restore path:
-
-- main thread checks cache before starting the worker
-- exact cache hit applies positions directly and skips worker execution
+- large full-symbol graphs can skip FA2 entirely
 
 ## Rendering
 
@@ -181,10 +220,10 @@ Files:
 
 Current rendering model:
 
-- Sigma instance lifecycle lives in `GraphCanvas`
-- hover and selection use a component-local render snapshot
-- reducers read that snapshot during render
-- graph attributes are not rewritten on every pointer event
+- Sigma lifecycle lives in `GraphCanvas`
+- reducers read a render snapshot rather than mutating the graph on every pointer event
+- function view uses label and edge LOD
+- blast ripple and cinematic focus are renderer-side effects
 
 ### Minimap
 
@@ -194,10 +233,9 @@ File:
 
 Current behavior:
 
-- uses Sigma’s public camera and transform APIs
-- projects the full graph into minimap space
-- draws the real viewport polygon
-- converts minimap clicks back into the framed-graph camera coordinates Sigma expects
+- uses Sigma transforms instead of guessed coordinate math
+- renders the real viewport rectangle
+- supports click-to-move navigation
 
 ## Theme
 
@@ -210,7 +248,7 @@ Current behavior:
 
 - CSS variables are the source of truth
 - runtime code reads them into a typed theme object
-- Sigma and canvas code use that object instead of hardcoded color literals
+- renderer/canvas code uses the theme instead of hardcoded color literals
 
 ## Tests
 
@@ -219,8 +257,6 @@ Current behavior:
 File:
 
 - [tests/graph-server.test.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/tests/graph-server.test.ts)
-
-These are fast and broad.
 
 ### Real HTTP integration tests
 
@@ -233,6 +269,19 @@ These cover the product surface:
 - real port bind
 - real `fetch`
 - real JSON serialization
-- real client type compatibility
+- DB info / graph endpoints
 
-That split is deliberate. Keep both layers.
+### Graph-view tests
+
+File:
+
+- [tests/hyperbase-graph-views.test.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/tests/hyperbase-graph-views.test.ts)
+
+These validate:
+
+- graph builders
+- seeding behavior
+- duplicate-edge collapse
+- specialized view shaping
+
+Keep both the server and client test layers. Do not replace them with one giant browser-only suite.

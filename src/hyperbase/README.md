@@ -1,47 +1,85 @@
-# Svelte + TS + Vite
+# HyperBase UI
 
-This template should help get you started developing with Svelte and TypeScript in Vite.
+HyperBase is BaseMemory's browser-based code graph explorer.
 
-## Recommended IDE Setup
+This app is a standalone Svelte + Vite frontend that talks to the graph server in the repo root. It is not a generic Vite template anymore.
 
-[VS Code](https://code.visualstudio.com/) + [Svelte](https://marketplace.visualstudio.com/items?itemName=svelte.svelte-vscode).
+## Run it locally
 
-## Need an official Svelte framework?
+From the repo root:
 
-Check out [SvelteKit](https://github.com/sveltejs/kit#readme), which is also powered by Vite. Deploy anywhere with its serverless-first approach and adapt to various platforms, with out of the box support for TypeScript, SCSS, and Less, and easily-added support for mdsvex, GraphQL, PostCSS, Tailwind CSS, and more.
+```bash
+npm run graph
+```
 
-## Technical considerations
+That starts the graph server on:
 
-**Why use this over SvelteKit?**
+- `http://127.0.0.1:7842`
 
-- It brings its own routing solution which might not be preferable for some users.
-- It is first and foremost a framework that just happens to use Vite under the hood, not a Vite app.
+If you want hot-reload UI development, start the Vite app in a second terminal:
 
-This template contains as little as possible to get started with Vite + TypeScript + Svelte, while taking into account the developer experience with regards to HMR and intellisense. It demonstrates capabilities on par with the other `create-vite` templates and is a good starting point for beginners dipping their toes into a Vite + Svelte project.
+```bash
+cd src/hyperbase
+npm run dev
+```
 
-Should you later need the extended capabilities and extensibility provided by SvelteKit, the template has been structured similarly to SvelteKit so that it is easy to migrate.
+That starts the frontend on:
 
-**Why `global.d.ts` instead of `compilerOptions.types` inside `jsconfig.json` or `tsconfig.json`?**
+- `http://127.0.0.1:5173`
 
-Setting `compilerOptions.types` shuts out all other types not explicitly listed in the configuration. Using triple-slash references keeps the default TypeScript setting of accepting type information from the entire workspace, while also adding `svelte` and `vite/client` type information.
+In dev mode:
 
-**Why include `.vscode/extensions.json`?**
+- Vite serves the Svelte app
+- `/api/*` requests still go to the graph server on `:7842`
 
-Other templates indirectly recommend extensions via the README, but this file allows VS Code to prompt the user to install the recommended extension upon opening the project.
+## Build the production UI
 
-**Why enable `allowJs` in the TS template?**
+From the repo root:
 
-While `allowJs: false` would indeed prevent the use of `.js` files in the project, it does not prevent the use of JavaScript syntax in `.svelte` files. In addition, it would force `checkJs: false`, bringing the worst of both worlds: not being able to guarantee the entire codebase is TypeScript, and also having worse typechecking for the existing JavaScript. In addition, there are valid use cases in which a mixed codebase may be relevant.
+```bash
+npm run hyperbase:build
+```
 
-**Why is HMR not preserving my local component state?**
+The build output is written to:
 
-HMR state preservation comes with a number of gotchas! It has been disabled by default in both `svelte-hmr` and `@sveltejs/vite-plugin-svelte` due to its often surprising behavior. You can read the details [here](https://github.com/rixo/svelte-hmr#svelte-hmr).
+- [src/hyperbase/dist](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/dist)
 
-If you have state that's important to retain within a component, consider creating an external store which would not be replaced by HMR.
+The graph server serves that built UI directly when you open `http://127.0.0.1:7842`.
 
-```ts
-// store.ts
-// An extremely simple external store
-import { writable } from 'svelte/store'
-export default writable(0)
+## What HyperBase does now
+
+- shows a landing screen when no database is loaded
+- lets you upload a `codebase.db` file directly in the browser
+- ships demo repo switching for the investor flow
+- opens into a directory-first overview by default
+- supports three main graph modes from the sidebar:
+  - `Folders`
+  - `Files`
+  - `Functions`
+- supports neighborhood, blast radius, path, directory, and file-symbol views
+- keeps graph state shareable through the URL hash
+- persists deterministic layouts by graph content id
+
+## Main UI entry points
+
+- root app: [src/hyperbase/src/App.svelte](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/App.svelte)
+- graph controller: [src/hyperbase/src/stores/graph.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/stores/graph.ts)
+- graph canvas: [src/hyperbase/src/components/canvas/GraphCanvas.svelte](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/components/canvas/GraphCanvas.svelte)
+- sidebar: [src/hyperbase/src/components/controls/ViewSidebar.svelte](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/components/controls/ViewSidebar.svelte)
+- search: [src/hyperbase/src/components/search/SearchBar.svelte](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/components/search/SearchBar.svelte)
+- layout worker: [src/hyperbase/src/workers/layout.worker.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/workers/layout.worker.ts)
+
+## Useful commands
+
+```bash
+cd src/hyperbase
+npm run check
+npm run build
+```
+
+From repo root:
+
+```bash
+npm run hyperbase:build
+npm run test:run
 ```

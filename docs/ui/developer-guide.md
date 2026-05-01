@@ -1,36 +1,30 @@
 # Developer Guide
 
+This guide is for changing HyperBase without getting lost in stale assumptions.
+
 ## Commands
 
-Start the graph server:
+From the repo root:
 
 ```bash
 npm run graph
-```
-
-Build the browser UI:
-
-```bash
 npm run hyperbase:build
-```
-
-Run the full test suite:
-
-```bash
 npm run test:run
 ```
 
-Run the route-focused suite:
-
-```bash
-npx vitest run tests/graph-server.test.ts tests/graph-server-integration.test.ts
-```
-
-Run the UI in dev mode:
+For frontend-only iteration:
 
 ```bash
 cd src/hyperbase
 npm run dev
+npm run check
+```
+
+Useful focused suites:
+
+```bash
+npx vitest run tests/graph-server.test.ts tests/graph-server-integration.test.ts
+npx vitest run tests/hyperbase-graph-views.test.ts
 ```
 
 ## What runs where
@@ -42,7 +36,7 @@ Server:
 - [src/graph-server/assembly.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/graph-server/assembly.ts)
 - [src/graph-server/types.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/graph-server/types.ts)
 
-UI:
+Browser UI:
 
 - [src/hyperbase/src/App.svelte](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/App.svelte)
 - [src/hyperbase/src/stores/graph.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/stores/graph.ts)
@@ -50,170 +44,197 @@ UI:
 - [src/hyperbase/src/components](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/components)
 - [src/hyperbase/src/workers/layout.worker.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/workers/layout.worker.ts)
 
-Shared browser-side infrastructure:
+Shared browser infrastructure:
 
 - [src/hyperbase/src/api/client.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/api/client.ts)
 - [src/hyperbase/src/lib/graph-utils.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/lib/graph-utils.ts)
 - [src/hyperbase/src/lib/layout-cache.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/lib/layout-cache.ts)
-- [src/hyperbase/src/lib/theme.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/lib/theme.ts)
 - [src/hyperbase/src/lib/url-state.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/lib/url-state.ts)
+- [src/hyperbase/src/lib/sigma-config.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/lib/sigma-config.ts)
 
-Launcher:
+## Current startup model
 
-- [scripts/start-graph.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/scripts/start-graph.ts)
+HyperBase now supports three startup paths:
 
-## Current server structure
+1. convenience local DB via `npm run graph`
+2. landing-screen upload in the browser
+3. landing-screen demo repo selection
 
-The graph server is no longer a monolith.
+The server is no longer “one DB forever.”
 
-Layer split:
+`createGraphServer(...)` now owns a mutable runtime DB state and supports:
 
-- query layer: prepared SQLite statements and typed row-returning methods in [queries.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/graph-server/queries.ts)
-- graph assembly layer: BFS, node/edge shaping, truncation, unresolved-edge policy, and shortest-path logic in [assembly.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/graph-server/assembly.ts)
-- handler layer: Express routes, input validation, branch resolution, and JSON serialization in [src/graph-server.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/graph-server.ts)
+- `GET /api/db/info`
+- `GET /api/db/demos`
+- `POST /api/db/upload`
+- `POST /api/db/select`
 
-That boundary matters. If you add a new endpoint, keep SQL out of the handler and keep HTTP out of the assembly layer.
+In-flight requests keep their captured DB snapshot while a new DB is swapped in.
 
-## Current UI structure
+## Current graph controller structure
 
-Graph loading is controller-owned.
-
-The authoritative loading module is the `GraphController` class in [src/hyperbase/src/stores/graph.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/stores/graph.ts).
+The authoritative loading module is the `GraphController` in [src/hyperbase/src/stores/graph.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/stores/graph.ts).
 
 It owns:
 
-- branch initialization
+- DB/bootstrap state
 - graph loads
-- cancellation of in-flight graph requests
+- request cancellation
 - graph identity
+- layout-running and settled-node state
 - graph error/loading/truncation state
-- community computation scheduling
+- current payload/view metadata
 
-Components do not fetch graph data directly.
-They dispatch intent through exported controller functions:
+Components should not fetch graphs directly.
+
+Use exported controller commands instead:
 
 - `initializeGraph(...)`
+- `loadOverviewGraph(...)`
 - `loadGalaxyGraph(...)`
+- `loadFullSymbolGraph(...)`
 - `loadNeighborhoodGraph(...)`
+- `loadDirectoryGraph(...)`
+- `loadFileGraph(...)`
+- `loadBlastRadiusGraph(...)`
+- `loadPathGraph(...)`
 - `changeActiveBranch(...)`
 - `changeGraphDepth(...)`
 - `retryGraphLoad()`
 - `setGraphOverlay(...)`
+- `selectDemoGraph(...)`
+- `uploadDatabaseGraph(...)`
 
-Detail loading is separate. It lives in [src/hyperbase/src/stores/selection.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/stores/selection.ts), which owns symbol detail and peek fetch cancellation.
+## Current view model
+
+There are three top-level sidebar views:
+
+- `overview` → shown in the UI as `Folders`
+- `galaxy` → shown in the UI as `Files`
+- `full-symbol` → shown in the UI as `Functions`
+
+And several drill-in modes:
+
+- `directory`
+- `file`
+- `neighborhood`
+- `blast-radius`
+- `path`
+
+Keep this distinction clear when you add features. `Folders / Files / Functions` are not just overlays; they are separate graph loads with separate payloads and content ids.
 
 ## Graph identity
 
-HyperBase uses two graph identities:
+HyperBase still uses two identities:
 
 - `graphContentId`
 - `graphLoadId`
 
-`graphContentId` is deterministic. It is derived from:
+`graphContentId` is deterministic and drives:
 
-- view kind
-- branch
-- neighborhood center + depth when relevant
-- sorted node keys
-- sorted edge keys
+- seeded positions
+- layout cache restore/save
+- cross-reload spatial stability
 
-It is used for:
-
-- deterministic layout seeding
-- layout cache keys
-- cross-reload and cross-tab layout stability
-
-`graphLoadId` is a monotonic per-load revision.
-
-It is used for:
+`graphLoadId` is monotonic and drives:
 
 - worker restart semantics
-- ignoring stale worker/controller results tied to an older load
+- stale result rejection
+
+If you add a new graph kind, extend the content-id builder. Do not try to bypass it.
 
 ## Layout system
 
-Initial positions are deterministic.
+Important current behavior:
 
-The seed boundary is the graph builder in [src/hyperbase/src/lib/graph-utils.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/lib/graph-utils.ts).
-The worker does not invent its own randomness anymore.
+1. Graph builders assign seeded positions first.
+2. The graph is committed immediately so Sigma can render without a blank screen.
+3. The worker then refines the layout.
+4. On cache hit, the worker is skipped.
 
-Layout flow:
+For large function graphs:
 
-1. controller computes `graphContentId`
-2. graph builder assigns seeded node positions from that content id
-3. `layout-cache.ts` checks `localStorage`
-4. if a cached layout exists for `hyperbase:layout:v1:${graphContentId}`, positions are restored and the worker is skipped
-5. otherwise the worker runs ForceAtlas2 from the deterministic seed positions
-6. the worker posts deltas during layout and a full snapshot on `done`
-7. the main thread persists the final snapshot
+- full-symbol view uses hierarchical seeding
+- files are placed on a ring
+- symbols cluster around their file anchor
+- ForceAtlas2 is skipped above the configured threshold
 
-The layout cache is opportunistic. Corrupt or mismatched cache entries are discarded.
+Current tuning lives in:
 
-## Theme system
+- [src/hyperbase/src/lib/constants.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/lib/constants.ts)
 
-The token system is enforced at runtime now.
+## Search model
 
-Tokens live in:
+Search is now view-aware.
 
-- [src/hyperbase/src/styles/tokens.css](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/styles/tokens.css)
+In `Functions`:
 
-Runtime theme loading lives in:
+- selecting a result keeps the current full-symbol graph
+- camera flies to the symbol
+- detail panel opens in place
 
-- [src/hyperbase/src/lib/theme.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/lib/theme.ts)
+In other views:
 
-Use the theme object for:
+- selecting a symbol still loads its neighborhood graph
 
-- Sigma colors
-- canvas/minimap colors
-- derived palette choices such as community colors
+If you change search behavior, keep that distinction intact.
 
-Do not add hardcoded color literals back into renderer or canvas code.
+## Sidebar model
+
+The left sidebar is now primary navigation.
+
+File:
+
+- [src/hyperbase/src/components/controls/ViewSidebar.svelte](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/components/controls/ViewSidebar.svelte)
+
+It owns:
+
+- `Folders / Files / Functions`
+- current graph stats
+- branch selector
+- codebase switching UI
+
+Do not add the branch selector back to the control bar.
+
+## Rendering model
+
+Files:
+
+- [src/hyperbase/src/components/canvas/GraphCanvas.svelte](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/components/canvas/GraphCanvas.svelte)
+- [src/hyperbase/src/lib/sigma-config.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/src/hyperbase/src/lib/sigma-config.ts)
+
+Current rendering rules:
+
+- Sigma instance lifecycle lives in `GraphCanvas`
+- render reducers read a snapshot, not live graph mutation on every hover
+- function view uses label and edge LOD
+- cinematic search focus and blast animations are renderer concerns
 
 ## Tests
 
-There are now two server test layers.
+Use both layers:
 
-Unit-style route and behavior tests:
+- route/behavior tests: [tests/graph-server.test.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/tests/graph-server.test.ts)
+- real HTTP tests: [tests/graph-server-integration.test.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/tests/graph-server-integration.test.ts)
 
-- [tests/graph-server.test.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/tests/graph-server.test.ts)
+And use the graph-view tests when you touch builders or renderer expectations:
 
-These still use in-process request/response mocking. They are fast and good for graph logic and route behavior.
-
-Real HTTP integration tests:
-
-- [tests/graph-server-integration.test.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/tests/graph-server-integration.test.ts)
-
-These:
-
-- start a real Express server on an ephemeral port
-- make real HTTP requests with `fetch`
-- validate health, search, neighborhood, one error case, and the MCP wrapper
-- parse responses using HyperBase’s TypeScript API types
-
-In sandboxed environments that block `listen(2)`, these tests need to run outside the sandbox. Do not replace them with mocked requests just to make the environment quieter.
+- [tests/hyperbase-graph-views.test.ts](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/tests/hyperbase-graph-views.test.ts)
 
 ## Safe extension rules
 
-If you add a new graph view or trigger:
+If you add a new graph representation:
 
-1. add a controller command instead of fetching from a component
-2. decide whether it needs a new `GraphLoadTarget` variant
-3. extend `graphContentId` generation so identical content stays identical
-4. keep the worker/cache behavior aligned with that content id
-5. keep URL state in sync if the view should be shareable
+1. add a new `GraphLoadTarget` variant
+2. add a payload type
+3. add a content-id builder
+4. add a controller command
+5. add URL-state behavior if the view is shareable
+6. add tests for both the server payload and the graph builder if applicable
 
-If you add a new endpoint:
+If you add a new DB-side capability:
 
 1. add SQL to the query layer
-2. add graph shaping to the assembly layer if needed
-3. keep the handler thin
-4. add both a fast route test and a real HTTP integration test when the route is user-facing
-5. update [api-reference.md](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/docs/ui/api-reference.md)
-
-## Things that are intentionally not finished
-
-- `Degree` and `Language` overlays have UI toggles but no visual transform yet
-- `/api/graph/directory/:path` is still reserved, not implemented
-- unresolved `to: null` edges are preserved in API responses but skipped by the concrete Graphology renderer
-
-Those are current system facts, not future promises.
+2. add shaping in the assembly layer
+3. keep the route thin
+4. document it in [docs/ui/api-reference.md](/Users/aady/Desktop/OpenSourceContributions/BaseMemory/docs/ui/api-reference.md)
