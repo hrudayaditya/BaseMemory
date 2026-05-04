@@ -1,4 +1,4 @@
-import ignore, { Ignore } from "ignore";
+import ignore from "ignore";
 import { existsSync, readFileSync, promises as fsPromises } from "fs";
 import * as path from "path";
 
@@ -38,32 +38,111 @@ export interface CollectFilesResult {
   skipped: SkippedFile[];
 }
 
-export function createIgnoreFilter(projectRoot: string): Ignore {
-  const ig = ignore();
+export interface IgnoreFilter {
+  ignores(filePath: string, isDirectory?: boolean): boolean;
+}
 
-  const defaultIgnores = [
-    "node_modules",
-    ".git",
-    "dist",
-    "build",
-    ".next",
-    ".nuxt",
-    "coverage",
-    "__pycache__",
-    "target",
-    "vendor",
-    ".opencode",
-  ];
+const DEFAULT_IGNORE_PATTERNS = [
+  "node_modules/",
+  ".git/",
+  "dist/",
+  "build/",
+  ".next/",
+  ".nuxt/",
+  "coverage/",
+  "__pycache__/",
+  "target/",
+  "vendor/",
+  ".opencode/",
+];
 
-  ig.add(defaultIgnores);
+function normalizeRelativePath(filePath: string): string {
+  return filePath.replace(/\\/g, "/").replace(/^\.\//, "").replace(/^\/+/, "");
+}
 
-  const gitignorePath = path.join(projectRoot, ".gitignore");
-  if (existsSync(gitignorePath)) {
-    const gitignoreContent = readFileSync(gitignorePath, "utf-8");
-    ig.add(gitignoreContent);
+class HierarchicalIgnoreFilter implements IgnoreFilter {
+  private matcherCache = new Map<string, ReturnType<typeof ignore>>();
+
+  constructor(private readonly projectRoot: string) {}
+
+  ignores(filePath: string, isDirectory: boolean = false): boolean {
+    const relativePath = normalizeRelativePath(filePath);
+    if (!relativePath) {
+      return false;
+    }
+
+    const segments = relativePath.split("/").filter(Boolean);
+    for (let depth = 1; depth < segments.length; depth++) {
+      const ancestorPath = segments.slice(0, depth).join("/");
+      if (this.evaluatePath(ancestorPath, true)) {
+        return true;
+      }
+    }
+
+    return this.evaluatePath(relativePath, isDirectory);
   }
 
-  return ig;
+  private evaluatePath(relativePath: string, isDirectory: boolean): boolean {
+    const normalizedPath = normalizeRelativePath(relativePath);
+    if (!normalizedPath) {
+      return false;
+    }
+
+    const segments = normalizedPath.split("/").filter(Boolean);
+    let ignored = false;
+
+    for (let depth = 0; depth < segments.length; depth++) {
+      const baseRelativePath = depth === 0 ? "" : segments.slice(0, depth).join("/");
+      let candidatePath = segments.slice(depth).join("/");
+      if (isDirectory && !candidatePath.endsWith("/")) {
+        candidatePath = `${candidatePath}/`;
+      }
+
+      const result = this.getMatcher(baseRelativePath).test(candidatePath);
+      if (result.unignored) {
+        ignored = false;
+      } else if (result.ignored) {
+        ignored = true;
+      }
+    }
+
+    return ignored;
+  }
+
+  private getMatcher(baseRelativePath: string): ReturnType<typeof ignore> {
+    const cached = this.matcherCache.get(baseRelativePath);
+    if (cached) {
+      return cached;
+    }
+
+    const matcher = ignore();
+    if (baseRelativePath.length === 0) {
+      matcher.add(DEFAULT_IGNORE_PATTERNS);
+      this.addIgnoreFileIfPresent(matcher, path.join(this.projectRoot, ".git", "info", "exclude"));
+    }
+
+    const baseAbsolutePath =
+      baseRelativePath.length === 0
+        ? this.projectRoot
+        : path.join(this.projectRoot, ...baseRelativePath.split("/"));
+    this.addIgnoreFileIfPresent(matcher, path.join(baseAbsolutePath, ".gitignore"));
+    this.addIgnoreFileIfPresent(matcher, path.join(baseAbsolutePath, ".memignore"));
+
+    this.matcherCache.set(baseRelativePath, matcher);
+    return matcher;
+  }
+
+  private addIgnoreFileIfPresent(matcher: ReturnType<typeof ignore>, filePath: string): void {
+    if (!existsSync(filePath)) {
+      return;
+    }
+
+    matcher.add(readFileSync(filePath, "utf-8"));
+  }
+}
+
+export function createIgnoreFilter(projectRoot: string): IgnoreFilter {
+  return new HierarchicalIgnoreFilter(projectRoot);
 }
 
 export function shouldIncludeFile(
@@ -71,16 +150,16 @@ export function shouldIncludeFile(
   projectRoot: string,
   includePatterns: string[],
   excludePatterns: string[],
-  ignoreFilter: Ignore
+  ignoreFilter: IgnoreFilter
 ): boolean {
-  const relativePath = path.relative(projectRoot, filePath);
+  const relativePath = normalizeRelativePath(path.relative(projectRoot, filePath));
 
-  if (ignoreFilter.ignores(relativePath)) {
+  if (ignoreFilter.ignores(relativePath, false)) {
     return false;
   }
 
   for (const pattern of excludePatterns) {
-    if (matchGlob(relativePath, pattern)) {
+    if (matchesExcludePattern(relativePath, pattern)) {
       return false;
     }
   }
@@ -92,6 +171,18 @@ export function shouldIncludeFile(
   }
 
   return false;
+}
+
+export function matchesExcludePattern(filePath: string, pattern: string): boolean {
+  const normalizedPath = normalizeRelativePath(filePath);
+  const normalizedPattern = normalizeRelativePath(pattern);
+
+  if (normalizedPattern.endsWith("/")) {
+    const directoryPrefix = normalizedPattern.slice(0, -1);
+    return normalizedPath === directoryPrefix || normalizedPath.startsWith(`${directoryPrefix}/`);
+  }
+
+  return matchGlob(normalizedPath, normalizedPattern);
 }
 
 function matchGlob(filePath: string, pattern: string): boolean {
@@ -116,7 +207,7 @@ export async function* walkDirectory(
   projectRoot: string,
   includePatterns: string[],
   excludePatterns: string[],
-  ignoreFilter: Ignore,
+  ignoreFilter: IgnoreFilter,
   maxFileSize: number,
   skipped: SkippedFile[]
 ): AsyncGenerator<{ path: string; size: number }> {
@@ -124,12 +215,26 @@ export async function* walkDirectory(
 
   for (const entry of entries) {
     const fullPath = path.join(dir, entry.name);
-    const relativePath = path.relative(projectRoot, fullPath);
+    const relativePath = normalizeRelativePath(path.relative(projectRoot, fullPath));
 
-    if (ignoreFilter.ignores(relativePath)) {
+    if (ignoreFilter.ignores(relativePath, entry.isDirectory())) {
       if (entry.isFile()) {
         skipped.push({ path: relativePath, reason: "gitignore" });
       }
+      continue;
+    }
+
+    let excluded = false;
+    for (const pattern of excludePatterns) {
+      if (matchesExcludePattern(relativePath, pattern)) {
+        if (entry.isFile()) {
+          skipped.push({ path: relativePath, reason: "excluded" });
+        }
+        excluded = true;
+        break;
+      }
+    }
+    if (excluded) {
       continue;
     }
 
@@ -151,13 +256,6 @@ export async function* walkDirectory(
         continue;
       }
 
-      for (const pattern of excludePatterns) {
-        if (matchGlob(relativePath, pattern)) {
-          skipped.push({ path: relativePath, reason: "excluded" });
-          continue;
-        }
-      }
-
       let matched = false;
       for (const pattern of includePatterns) {
         if (matchGlob(relativePath, pattern)) {
@@ -168,6 +266,8 @@ export async function* walkDirectory(
 
       if (matched) {
         yield { path: fullPath, size: stat.size };
+      } else {
+        skipped.push({ path: relativePath, reason: "no_match" });
       }
     }
   }

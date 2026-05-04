@@ -1,0 +1,371 @@
+{
+  "version": "1.0.0",
+  "name": "hono-external",
+  "description": "40-query external benchmark for Hono",
+  "queries": [
+    {
+      "id": "hono-def-main-class",
+      "source": "curated",
+      "query": "where is the Hono class defined in hono.ts",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/hono.ts",
+        "symbol": "Hono"
+      }
+    },
+    {
+      "id": "hono-def-compose-middleware",
+      "query": "where is the compose function implemented that chains middleware handlers in order",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/compose.ts",
+        "symbol": "compose"
+      }
+    },
+    {
+      "id": "hono-def-request-context",
+      "source": "curated",
+      "query": "where is Hono's Context class defined — the object passed to every route handler",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/context.ts",
+        "symbol": "context"
+      }
+    },
+    {
+      "id": "hono-def-request-wrapper",
+      "source": "curated",
+      "query": "where is `HonoRequest` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/request.ts",
+        "symbol": "HonoRequest"
+      }
+    },
+    {
+      "id": "hono-def-clone-raw-request",
+      "source": "curated",
+      "query": "where is `cloneRawRequest` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/request.ts",
+        "symbol": "cloneRawRequest"
+      }
+    },
+    {
+      "id": "hono-def-http-exception",
+      "source": "curated",
+      "query": "where is `HTTPException` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/http-exception.ts",
+        "symbol": "HTTPException"
+      }
+    },
+    {
+      "id": "hono-def-validator-middleware",
+      "source": "curated",
+      "query": "where is `validator` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/validator/validator.ts",
+        "symbol": "validator"
+      }
+    },
+    {
+      "id": "hono-def-basic-auth-middleware",
+      "source": "curated",
+      "query": "where is `basicAuth` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/middleware/basic-auth/index.ts",
+        "symbol": "basicAuth"
+      }
+    },
+    {
+      "id": "hono-def-jwt-middleware",
+      "source": "curated",
+      "query": "where is `jwt` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/middleware/jwt/jwt.ts",
+        "symbol": "jwt"
+      }
+    },
+    {
+      "id": "hono-def-jwk-middleware",
+      "source": "curated",
+      "query": "where is `jwk` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/middleware/jwk/jwk.ts",
+        "symbol": "jwk"
+      }
+    },
+    {
+      "id": "hono-def-proxy-helper",
+      "source": "curated",
+      "query": "where is `proxy` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/helper/proxy/index.ts",
+        "symbol": "proxy"
+      }
+    },
+    {
+      "id": "hono-def-smart-router",
+      "source": "curated",
+      "query": "where is `SmartRouter` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/router/smart-router/router.ts",
+        "symbol": "SmartRouter"
+      }
+    },
+    {
+      "id": "hono-rel-parsebody-calls-form-parser",
+      "source": "curated",
+      "query": "what does parseBody call to handle form data after checking content type",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/utils/body.ts",
+        "symbol": "parseBody"
+      }
+    },
+    {
+      "id": "hono-rel-form-parser-converts-data",
+      "source": "curated",
+      "query": "what function calls the form-data-to-body-data converter",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/utils/body.ts",
+        "symbol": "parseFormData"
+      }
+    },
+    {
+      "id": "hono-rel-converter-nested-dot-handler",
+      "source": "curated",
+      "query": "what function invokes nested key parsing for dot notation form fields",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/utils/body.ts",
+        "symbol": "convertFormDataToBodyData"
+      }
+    },
+    {
+      "id": "hono-rel-smart-router-replays-routes",
+      "source": "curated",
+      "query": "what method replays all collected routes into candidate routers during first match",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/router/smart-router/router.ts",
+        "symbol": "match"
+      }
+    },
+    {
+      "id": "hono-rel-regexp-build-all-matchers",
+      "source": "curated",
+      "query": "what function builds matchers for each http method before route matching is finalized",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/router/reg-exp-router/router.ts",
+        "symbol": "buildAllMatchers"
+      }
+    },
+    {
+      "id": "hono-rel-regexp-build-single-matcher",
+      "source": "curated",
+      "query": "what function calls the preprocessed route matcher builder for a specific method",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/router/reg-exp-router/router.ts",
+        "symbol": "#buildMatcher"
+      }
+    },
+    {
+      "id": "hono-concept-non-strict-routing",
+      "source": "curated",
+      "query": "where is trailing slash normalization handled when strict routing is disabled",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/utils/url.ts",
+        "symbol": "getPathNoStrict"
+      }
+    },
+    {
+      "id": "hono-concept-basepath-embedding",
+      "source": "curated",
+      "query": "where is base path reconstruction with route parameters handled",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/helper/route/index.ts",
+        "symbol": "basePath"
+      }
+    },
+    {
+      "id": "hono-concept-optional-params-expand",
+      "source": "curated",
+      "query": "where are optional path parameters expanded into concrete route variants",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/utils/url.ts",
+        "symbol": "checkOptionalParameter"
+      }
+    },
+    {
+      "id": "hono-concept-wildcard-regex-build",
+      "source": "curated",
+      "query": "where does the regexp router build wildcard matching expressions",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/router/reg-exp-router/router.ts",
+        "symbol": "buildWildcardRegExp"
+      }
+    },
+    {
+      "id": "hono-concept-proto-pollution-guard",
+      "source": "curated",
+      "query": "where is prototype pollution prevented when parsing dotted form keys",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/utils/body.ts",
+        "symbol": "handleParsingNestedValues"
+      }
+    },
+    {
+      "id": "hono-concept-query-multi-values",
+      "source": "curated",
+      "query": "where is extraction of repeated query params into arrays implemented",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/utils/url.ts",
+        "symbol": "getQueryParams"
+      }
+    },
+    {
+      "id": "hono-concept-tolerant-uri-decoding",
+      "source": "curated",
+      "query": "where is tolerant uri decoding implemented for invalid percent sequences",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/utils/url.ts",
+        "symbol": "tryDecodeURI"
+      }
+    },
+    {
+      "id": "hono-concept-text-default-content-type",
+      "source": "curated",
+      "query": "where is the default text content type constant defined for text responses",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/context.ts",
+        "symbol": "TEXT_PLAIN"
+      }
+    },
+    {
+      "id": "hono-concept-routepath-from-match",
+      "source": "curated",
+      "query": "where is the helper that returns the currently matched route path",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/helper/route/index.ts",
+        "symbol": "routePath"
+      }
+    },
+    {
+      "id": "hono-concept-test-client-fetch-bridge",
+      "source": "curated",
+      "query": "where is the helper that bridges app.request into typed client fetch calls",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/helper/testing/index.ts",
+        "symbol": "testClient"
+      }
+    },
+    {
+      "id": "hono-bug-next-called-twice",
+      "source": "curated",
+      "query": "where does dispatch in compose.ts throw an error when next() is called more than once",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "src/compose.ts",
+        "symbol": "dispatch"
+      }
+    },
+    {
+      "id": "hono-bug-no-active-router",
+      "source": "curated",
+      "query": "where does router selection throw if no active router has been determined yet",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "src/router/smart-router/router.ts",
+        "symbol": "activeRouter"
+      }
+    },
+    {
+      "id": "hono-bug-invalid-connection-header-token",
+      "source": "curated",
+      "query": "where does buildRequestInitFromRequest throw for invalid connection header token syntax in strict proxy mode",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "src/helper/proxy/index.ts",
+        "symbol": "buildRequestInitFromRequest"
+      }
+    },
+    {
+      "id": "hono-bug-missing-fetch-event",
+      "source": "curated",
+      "query": "where does context access throw when no fetch event is attached",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "src/context.ts",
+        "symbol": "event"
+      }
+    },
+    {
+      "id": "hono-test-proxy-helper",
+      "source": "curated",
+      "query": "what tests cover proxy request and response header behavior",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "src/helper/proxy/index.test.ts"
+      }
+    },
+    {
+      "id": "hono-test-validator-middleware",
+      "source": "curated",
+      "query": "what test file covers validator middleware behavior across json, form, and query",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "src/validator/validator.test.ts"
+      }
+    },
+    {
+      "id": "hono-test-basic-auth-middleware",
+      "source": "curated",
+      "query": "what tests cover basic auth success, failure, and callback behavior",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "src/middleware/basic-auth/index.test.ts"
+      }
+    },
+    {
+      "id": "hono-test-jwt-middleware",
+      "source": "curated",
+      "query": "what tests cover jwt middleware behavior for headers and cookies",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "src/middleware/jwt/index.test.ts"
+      }
+    },
+    {
+      "id": "hono-test-route-helpers",
+      "source": "curated",
+      "query": "what tests verify matched route and base path helper behavior",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "src/helper/route/index.test.ts"
+      }
+    }
+  ]
+}

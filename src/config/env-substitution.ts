@@ -1,10 +1,12 @@
 const ENV_REFERENCE_PATTERN = /^\{env:([A-Z_][A-Z0-9_]*)\}$/;
 const ENV_REFERENCE_LIKE_PATTERN = /\{env:[^}]+\}/;
+const ENV_DOLLAR_REFERENCE_PATTERN = /^\$([A-Z_][A-Z0-9_]*)$/;
 
 export function substituteEnvString(value: string, keyPath: string): string {
   const match = value.match(ENV_REFERENCE_PATTERN);
+  const dollarMatch = value.match(ENV_DOLLAR_REFERENCE_PATTERN);
 
-  if (!match) {
+  if (!match && !dollarMatch) {
     if (ENV_REFERENCE_LIKE_PATTERN.test(value)) {
       throw new Error(
         `Invalid environment variable reference at '${keyPath}'. ` +
@@ -15,7 +17,10 @@ export function substituteEnvString(value: string, keyPath: string): string {
     return value;
   }
 
-  const variableName = match[1];
+  const variableName = match?.[1] ?? dollarMatch?.[1];
+  if (!variableName) {
+    return value;
+  }
   const envValue = process.env[variableName];
 
   if (envValue === undefined) {

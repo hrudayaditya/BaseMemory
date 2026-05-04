@@ -3,6 +3,8 @@ use anyhow::{anyhow, Result};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
 
+pub const GRAPH_EXTRACTOR_VERSION: &str = env!("GRAPH_EXTRACTOR_VERSION");
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallType {
     Call,
@@ -19,6 +21,55 @@ pub struct CallSite {
     pub call_type: CallType,
 }
 
+fn is_method_capture(language: Language, node: tree_sitter::Node<'_>) -> bool {
+    match language {
+        Language::Java => {
+            let mut current = node.parent();
+            while let Some(parent) = current {
+                if parent.kind() == "method_invocation" {
+                    return parent.child_by_field_name("object").is_some();
+                }
+                current = parent.parent();
+            }
+            false
+        }
+        Language::CSharp => {
+            let mut current = node.parent();
+            while let Some(parent) = current {
+                if parent.kind() == "member_access_expression" {
+                    return true;
+                }
+                if parent.kind() == "invocation_expression" {
+                    return false;
+                }
+                current = parent.parent();
+            }
+            false
+        }
+        _ => {
+            let method_parent_kinds: &[&str] = match language {
+                Language::TypeScript
+                | Language::TypeScriptTsx
+                | Language::JavaScript
+                | Language::JavaScriptJsx => &["member_expression"],
+                Language::Python => &["attribute"],
+                Language::Rust => &["field_expression"],
+                Language::Go => &["selector_expression"],
+                Language::Php => &[
+                    "member_call_expression",
+                    "scoped_call_expression",
+                    "nullsafe_member_call_expression",
+                ],
+                _ => &[],
+            };
+
+            node.parent()
+                .map(|parent| method_parent_kinds.contains(&parent.kind()))
+                .unwrap_or(false)
+        }
+    }
+}
+
 pub fn extract_calls(content: &str, language_name: &str) -> Result<Vec<CallSite>> {
     let language = Language::from_string(language_name);
     let ts_language = match language {
@@ -29,6 +80,8 @@ pub fn extract_calls(content: &str, language_name: &str) -> Result<Vec<CallSite>
         Language::Python => tree_sitter_python::LANGUAGE.into(),
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::Go => tree_sitter_go::LANGUAGE.into(),
+        Language::Java => tree_sitter_java::LANGUAGE.into(),
+        Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
         Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
         _ => return Ok(vec![]),
     };
@@ -52,6 +105,8 @@ pub fn extract_calls(content: &str, language_name: &str) -> Result<Vec<CallSite>
         Language::Python => include_str!("../queries/python-calls.scm"),
         Language::Rust => include_str!("../queries/rust-calls.scm"),
         Language::Go => include_str!("../queries/go-calls.scm"),
+        Language::Java => include_str!("../queries/java-calls.scm"),
+        Language::CSharp => include_str!("../queries/csharp-calls.scm"),
         Language::Php => include_str!("../queries/php-calls.scm"),
         _ => return Ok(vec![]),
     };
@@ -65,22 +120,6 @@ pub fn extract_calls(content: &str, language_name: &str) -> Result<Vec<CallSite>
     let import_name_idx = query.capture_index_for_name("import.name");
     let import_default_idx = query.capture_index_for_name("import.default");
     let import_namespace_idx = query.capture_index_for_name("import.namespace");
-
-    let method_parent_kinds: &[&str] = match language {
-        Language::TypeScript
-        | Language::TypeScriptTsx
-        | Language::JavaScript
-        | Language::JavaScriptJsx => &["member_expression"],
-        Language::Python => &["attribute"],
-        Language::Rust => &["field_expression"],
-        Language::Go => &["selector_expression"],
-        Language::Php => &[
-            "member_call_expression",
-            "scoped_call_expression",
-            "nullsafe_member_call_expression",
-        ],
-        _ => &[],
-    };
 
     let mut cursor = QueryCursor::new();
     let mut calls = Vec::new();
@@ -151,9 +190,7 @@ pub fn extract_calls(content: &str, language_name: &str) -> Result<Vec<CallSite>
             let is_method_call = match_.captures.iter().any(|c| {
                 if let Some(idx) = callee_name_idx {
                     if c.index == idx {
-                        if let Some(parent) = c.node.parent() {
-                            return method_parent_kinds.contains(&parent.kind());
-                        }
+                        return is_method_capture(language, c.node);
                     }
                 }
                 false
@@ -379,6 +416,108 @@ mod tests {
                 .iter()
                 .any(|c| c.callee_name == "Println" && c.call_type == CallType::MethodCall),
             "Expected Println method call, got: {:?}",
+            calls
+        );
+    }
+
+    #[test]
+    fn test_java_direct_calls() {
+        let code = r#"
+class Foo {
+    void caller() { helper(); process(1, 2); }
+}
+"#;
+        let calls = extract_calls(code, "java").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.callee_name == "helper" && c.call_type == CallType::Call),
+            "Expected helper call, got: {:?}",
+            calls
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.callee_name == "process" && c.call_type == CallType::Call),
+            "Expected process call, got: {:?}",
+            calls
+        );
+    }
+
+    #[test]
+    fn test_java_method_calls() {
+        let code = r#"
+class Foo {
+    void caller() { obj.method(); this.foo(); }
+}
+"#;
+        let calls = extract_calls(code, "java").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.callee_name == "method" && c.call_type == CallType::MethodCall),
+            "Expected method call, got: {:?}",
+            calls
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.callee_name == "foo" && c.call_type == CallType::MethodCall),
+            "Expected foo method call, got: {:?}",
+            calls
+        );
+    }
+
+    #[test]
+    fn test_java_constructors() {
+        let code = "class Foo { void run() { Bar b = new Bar(); } }";
+        let calls = extract_calls(code, "java").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.callee_name == "Bar" && c.call_type == CallType::Constructor),
+            "Expected Bar constructor, got: {:?}",
+            calls
+        );
+    }
+
+    #[test]
+    fn test_csharp_direct_calls() {
+        let code = r#"
+class Foo {
+    void Caller() { Helper(); Process(1, 2); }
+}
+"#;
+        let calls = extract_calls(code, "csharp").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.callee_name == "Helper" && c.call_type == CallType::Call),
+            "Expected Helper call, got: {:?}",
+            calls
+        );
+    }
+
+    #[test]
+    fn test_csharp_method_calls() {
+        let code = r#"
+class Foo {
+    void Caller() { obj.Method(); this.Foo(); }
+}
+"#;
+        let calls = extract_calls(code, "csharp").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.callee_name == "Method" && c.call_type == CallType::MethodCall),
+            "Expected Method call, got: {:?}",
+            calls
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.callee_name == "Foo" && c.call_type == CallType::MethodCall),
+            "Expected Foo method call, got: {:?}",
             calls
         );
     }

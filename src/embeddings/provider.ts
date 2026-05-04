@@ -11,6 +11,8 @@ export interface EmbeddingBatchResult {
   totalTokensUsed: number;
 }
 
+type EmbeddingInputType = "query" | "document";
+
 export interface EmbeddingProviderInterface {
   embedQuery(query: string): Promise<EmbeddingResult>;
   embedDocument(document: string): Promise<EmbeddingResult>;
@@ -18,15 +20,520 @@ export interface EmbeddingProviderInterface {
   getModelInfo(): BaseModelInfo;
 }
 
+export interface VoyageProviderConfig {
+  voyageApiKey?: string;
+  voyageModelId?: string;
+}
+
+const ARCTIC_QUERY_PREFIX = "Represent this sentence for searching relevant passages: ";
+
+const VOYAGE_EMBEDDING_ENDPOINT = "https://api.voyageai.com/v1/embeddings";
+const VOYAGE_DEFAULT_MODEL_ID = "voyage-code-3";
+const VOYAGE_MAX_BATCH_SIZE = 128;
+const OLLAMA_MAX_CONCURRENT_REQUESTS = 2;
+const GOOGLE_MAX_CONCURRENT_BATCHES = 4;
+const DEFAULT_EMBEDDING_MAX_ATTEMPTS = 3;
+const DEFAULT_EMBEDDING_BACKOFF_BASE_MS = 1_000;
+const DEFAULT_EMBEDDING_BACKOFF_JITTER_MS = 200;
+const DEFAULT_EMBEDDING_TIMEOUT_MS = 30_000;
+const OLLAMA_EMBEDDING_TIMEOUT_MS = 60_000;
+const VOYAGE_MAX_ATTEMPTS = 3;
+const VOYAGE_BACKOFF_BASE_MS = 1_000;
+const VOYAGE_BACKOFF_JITTER_MS = 200;
+const VOYAGE_TIMEOUT_MS = 30_000;
+
+const VOYAGE_MODEL_SPECS: Record<string, BaseModelInfo> = {
+  "voyage-code-2": {
+    model: "voyage-code-2",
+    dimensions: 1536,
+    maxTokens: 16_000,
+    costPer1MTokens: 0.12,
+  },
+  "voyage-code-3": {
+    model: "voyage-code-3",
+    dimensions: 1024,
+    maxTokens: 32_000,
+    costPer1MTokens: 0.18,
+  },
+};
+
+function normalizeEmbeddingVector(raw: number[]): number[] {
+  return Array.from(Float32Array.from(raw));
+}
+
+function estimateTokenCount(texts: string[]): number {
+  return texts.reduce((sum, text) => sum + Math.ceil(text.length / 4), 0);
+}
+
+function emptyEmbeddingBatchResult(): EmbeddingBatchResult {
+  return {
+    embeddings: [],
+    totalTokensUsed: 0,
+  };
+}
+
+function jitteredBackoffDelayMs(
+  attempt: number,
+  baseDelayMs = DEFAULT_EMBEDDING_BACKOFF_BASE_MS,
+  jitterMs = DEFAULT_EMBEDDING_BACKOFF_JITTER_MS
+): number {
+  const baseDelay = baseDelayMs * (2 ** (attempt - 1));
+  const jitter = Math.floor(Math.random() * ((jitterMs * 2) + 1)) - jitterMs;
+  return Math.max(0, baseDelay + jitter);
+}
+
+export class EmbeddingTransientError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "EmbeddingTransientError";
+  }
+}
+
+export class EmbeddingPermanentError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "EmbeddingPermanentError";
+  }
+}
+
+export class EmbeddingValidationError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "EmbeddingValidationError";
+  }
+}
+
+interface AdaptedEmbeddingPayload {
+  embeddings: number[][];
+  totalTokensUsed?: number;
+}
+
+interface EmbeddingHttpRequestOptions {
+  providerLabel: string;
+  url: string;
+  headers: Record<string, string>;
+  body: unknown;
+  expectedEmbeddingCount: number;
+  expectedDimensions: number;
+  timeoutMs?: number;
+  maxAttempts?: number;
+  backoffBaseMs?: number;
+  backoffJitterMs?: number;
+  tokenEstimateTexts: string[];
+  responseAdapter: (payload: unknown) => AdaptedEmbeddingPayload;
+  nonRetryableErrorFactory?: (message: string) => Error;
+}
+
+function ensureArrayOfNumbers(value: unknown): value is number[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "number");
+}
+
+function throwMalformedEmbeddingResponse(providerLabel: string, message: string): never {
+  throw new EmbeddingValidationError(`${providerLabel} embedding API returned malformed response: ${message}`);
+}
+
+function adaptOpenAICompatibleEmbeddingResponse(
+  payload: unknown,
+  providerLabel: string
+): AdaptedEmbeddingPayload {
+  if (!payload || typeof payload !== "object") {
+    throwMalformedEmbeddingResponse(providerLabel, "expected an object payload");
+  }
+
+  const data = (payload as { data?: unknown }).data;
+  if (!Array.isArray(data)) {
+    throwMalformedEmbeddingResponse(providerLabel, "missing data[] embeddings array");
+  }
+
+  const embeddings = data.map((entry, index) => {
+    if (!entry || typeof entry !== "object") {
+      throwMalformedEmbeddingResponse(providerLabel, `data[${index}] is not an object`);
+    }
+
+    const embedding = (entry as { embedding?: unknown }).embedding;
+    if (!ensureArrayOfNumbers(embedding)) {
+      throwMalformedEmbeddingResponse(providerLabel, `data[${index}].embedding is not a numeric vector`);
+    }
+
+    return embedding;
+  });
+
+  const usage = (payload as { usage?: { total_tokens?: unknown } }).usage;
+  return {
+    embeddings,
+    totalTokensUsed: typeof usage?.total_tokens === "number" ? usage.total_tokens : undefined,
+  };
+}
+
+function adaptVoyageEmbeddingResponse(payload: unknown, providerLabel: string): AdaptedEmbeddingPayload {
+  if (isVoyageEmbeddingsResponse(payload)) {
+    return {
+      embeddings: payload.embeddings,
+      totalTokensUsed: payload.total_tokens,
+    };
+  }
+
+  return adaptOpenAICompatibleEmbeddingResponse(payload, providerLabel);
+}
+
+function adaptGoogleEmbeddingResponse(payload: unknown, providerLabel: string): AdaptedEmbeddingPayload {
+  if (!payload || typeof payload !== "object") {
+    throwMalformedEmbeddingResponse(providerLabel, "expected an object payload");
+  }
+
+  const embeddings = (payload as { embeddings?: unknown }).embeddings;
+  if (!Array.isArray(embeddings)) {
+    throwMalformedEmbeddingResponse(providerLabel, "missing embeddings[] array");
+  }
+
+  return {
+    embeddings: embeddings.map((entry, index) => {
+      if (!entry || typeof entry !== "object") {
+        throwMalformedEmbeddingResponse(providerLabel, `embeddings[${index}] is not an object`);
+      }
+
+      const values = (entry as { values?: unknown }).values;
+      if (!ensureArrayOfNumbers(values)) {
+        throwMalformedEmbeddingResponse(providerLabel, `embeddings[${index}].values is not a numeric vector`);
+      }
+
+      return values;
+    }),
+  };
+}
+
+function adaptOllamaEmbeddingResponse(payload: unknown, providerLabel: string): AdaptedEmbeddingPayload {
+  if (!payload || typeof payload !== "object") {
+    throwMalformedEmbeddingResponse(providerLabel, "expected an object payload");
+  }
+
+  const embedding = (payload as { embedding?: unknown }).embedding;
+  if (!ensureArrayOfNumbers(embedding)) {
+    throwMalformedEmbeddingResponse(providerLabel, "missing embedding vector");
+  }
+
+  return {
+    embeddings: [embedding],
+  };
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function isRetryableEmbeddingError(error: unknown): boolean {
+  return error instanceof EmbeddingTransientError;
+}
+
+function normalizeRetryableFetchError(
+  providerLabel: string,
+  error: unknown,
+  timeoutMs: number
+): EmbeddingTransientError {
+  if (error instanceof EmbeddingTransientError) {
+    return error;
+  }
+
+  if (error instanceof Error && error.name === "AbortError") {
+    return new EmbeddingTransientError(
+      `${providerLabel} embedding request timed out after ${timeoutMs}ms`,
+      { cause: error }
+    );
+  }
+
+  if (error instanceof Error) {
+    return new EmbeddingTransientError(
+      `${providerLabel} embedding request failed: ${error.message}`,
+      { cause: error }
+    );
+  }
+
+  return new EmbeddingTransientError(
+    `${providerLabel} embedding request failed: ${String(error)}`
+  );
+}
+
+async function parseJsonPayload(providerLabel: string, response: Response): Promise<unknown> {
+  try {
+    return await response.json() as unknown;
+  } catch (error) {
+    throw new EmbeddingValidationError(
+      `${providerLabel} embedding API returned malformed JSON`,
+      { cause: error }
+    );
+  }
+}
+
+async function executeEmbeddingRequest(
+  options: EmbeddingHttpRequestOptions
+): Promise<EmbeddingBatchResult> {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_EMBEDDING_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  let response: Response;
+
+  try {
+    response = await fetch(options.url, {
+      method: "POST",
+      headers: options.headers,
+      body: JSON.stringify(options.body),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    throw normalizeRetryableFetchError(options.providerLabel, error, timeoutMs);
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    const message = `${options.providerLabel} embedding API error: ${response.status} - ${errorText || response.statusText || "unknown error"}`;
+
+    if (response.status === 429 || response.status >= 500) {
+      throw new EmbeddingTransientError(message);
+    }
+
+    if (options.nonRetryableErrorFactory) {
+      throw options.nonRetryableErrorFactory(message);
+    }
+
+    throw new EmbeddingPermanentError(message);
+  }
+
+  const payload = await parseJsonPayload(options.providerLabel, response);
+  const adapted = options.responseAdapter(payload);
+  const embeddings = adapted.embeddings.map((embedding, index) => {
+    if (!ensureArrayOfNumbers(embedding)) {
+      throw new EmbeddingValidationError(
+        `${options.providerLabel} embedding API returned a non-numeric vector at index ${index}`
+      );
+    }
+
+    if (embedding.length !== options.expectedDimensions) {
+      throw new EmbeddingValidationError(
+        `Dimension mismatch: expected ${options.expectedDimensions} dimensions for ` +
+        `${options.providerLabel}, but received ${embedding.length}`
+      );
+    }
+
+    return normalizeEmbeddingVector(embedding);
+  });
+
+  if (embeddings.length !== options.expectedEmbeddingCount) {
+    throw new EmbeddingValidationError(
+      `Embedding count mismatch: sent ${options.expectedEmbeddingCount} texts but received ${embeddings.length} embeddings`
+    );
+  }
+
+  return {
+    embeddings,
+    totalTokensUsed: adapted.totalTokensUsed ?? estimateTokenCount(options.tokenEstimateTexts),
+  };
+}
+
+async function requestEmbeddingsWithRetry(
+  options: EmbeddingHttpRequestOptions
+): Promise<EmbeddingBatchResult> {
+  const maxAttempts = options.maxAttempts ?? DEFAULT_EMBEDDING_MAX_ATTEMPTS;
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await executeEmbeddingRequest(options);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+
+      if (!isRetryableEmbeddingError(lastError) || attempt === maxAttempts) {
+        throw lastError;
+      }
+
+      await sleep(
+        jitteredBackoffDelayMs(
+          attempt,
+          options.backoffBaseMs ?? DEFAULT_EMBEDDING_BACKOFF_BASE_MS,
+          options.backoffJitterMs ?? DEFAULT_EMBEDDING_BACKOFF_JITTER_MS
+        )
+      );
+    }
+  }
+
+  throw lastError ?? new EmbeddingTransientError(`${options.providerLabel} embedding request failed`);
+}
+
+async function mapWithConcurrency<TInput, TOutput>(
+  items: TInput[],
+  concurrency: number,
+  mapper: (item: TInput, index: number) => Promise<TOutput>
+): Promise<TOutput[]> {
+  if (items.length === 0) {
+    return [];
+  }
+
+  const results = new Array<TOutput>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      if (currentIndex >= items.length) {
+        return;
+      }
+
+      results[currentIndex] = await mapper(items[currentIndex] as TInput, currentIndex);
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
+}
+
+function isVoyageEmbeddingsResponse(
+  payload: unknown
+): payload is { embeddings: number[][]; total_tokens?: number } {
+  if (!payload || typeof payload !== "object") {
+    return false;
+  }
+
+  const embeddings = (payload as { embeddings?: unknown }).embeddings;
+  return Array.isArray(embeddings) && embeddings.every((embedding) =>
+    Array.isArray(embedding) && embedding.every((value) => typeof value === "number")
+  );
+}
+
+export class VoyageEmbeddingProvider {
+  private readonly apiKey?: string;
+  private readonly modelInfo: BaseModelInfo;
+  private readonly hasUsableApiKey: boolean;
+
+  constructor(config: VoyageProviderConfig) {
+    this.apiKey = config.voyageApiKey?.trim() || undefined;
+    const modelId = config.voyageModelId?.trim() || VOYAGE_DEFAULT_MODEL_ID;
+    this.modelInfo = VOYAGE_MODEL_SPECS[modelId] ?? {
+      model: modelId,
+      dimensions: 1024,
+      maxTokens: 32_000,
+      costPer1MTokens: 0,
+    };
+    this.hasUsableApiKey = Boolean(this.apiKey);
+
+    if (!this.hasUsableApiKey) {
+      console.warn(
+        `[voyage-embeddings] voyageApiKey is missing; ${this.modelInfo.model} embeddings are disabled until a key is configured.`
+      );
+    }
+  }
+
+  async embedQuery(query: string): Promise<EmbeddingResult | null> {
+    const result = await this.embedTexts([query], "query");
+    if (!result) {
+      return null;
+    }
+
+    return {
+      embedding: result.embeddings[0] ?? [],
+      tokensUsed: result.totalTokensUsed,
+    };
+  }
+
+  async embedDocument(document: string): Promise<EmbeddingResult | null> {
+    const result = await this.embedTexts([document], "document");
+    if (!result) {
+      return null;
+    }
+
+    return {
+      embedding: result.embeddings[0] ?? [],
+      tokensUsed: result.totalTokensUsed,
+    };
+  }
+
+  async embedBatch(texts: string[]): Promise<EmbeddingBatchResult | null> {
+    return this.embedTexts(texts, "document");
+  }
+
+  getModelInfo(): BaseModelInfo {
+    return this.modelInfo;
+  }
+
+  private async embedTexts(
+    texts: string[],
+    inputType: EmbeddingInputType
+  ): Promise<EmbeddingBatchResult | null> {
+    if (texts.length === 0) {
+      return {
+        embeddings: [],
+        totalTokensUsed: 0,
+      };
+    }
+
+    if (!this.hasUsableApiKey) {
+      return null;
+    }
+
+    const embeddings: number[][] = [];
+    let totalTokensUsed = 0;
+    const totalBatches = Math.ceil(texts.length / VOYAGE_MAX_BATCH_SIZE);
+
+    for (let batchIndex = 0; batchIndex < totalBatches; batchIndex += 1) {
+      const start = batchIndex * VOYAGE_MAX_BATCH_SIZE;
+      const batch = texts.slice(start, start + VOYAGE_MAX_BATCH_SIZE);
+      const batchResult = await this.executeBatchRequest(batch, inputType);
+
+      embeddings.push(...batchResult.embeddings);
+      totalTokensUsed += batchResult.totalTokensUsed;
+    }
+
+    return {
+      embeddings,
+      totalTokensUsed,
+    };
+  }
+
+  private async executeBatchRequest(
+    batch: string[],
+    inputType: EmbeddingInputType
+  ): Promise<EmbeddingBatchResult> {
+    return requestEmbeddingsWithRetry({
+      providerLabel: "Voyage",
+      url: VOYAGE_EMBEDDING_ENDPOINT,
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: {
+        input: batch,
+        model: this.modelInfo.model,
+        input_type: inputType,
+      },
+      expectedEmbeddingCount: batch.length,
+      expectedDimensions: this.modelInfo.dimensions,
+      timeoutMs: VOYAGE_TIMEOUT_MS,
+      maxAttempts: VOYAGE_MAX_ATTEMPTS,
+      backoffBaseMs: VOYAGE_BACKOFF_BASE_MS,
+      backoffJitterMs: VOYAGE_BACKOFF_JITTER_MS,
+      tokenEstimateTexts: batch,
+      responseAdapter: (payload) => adaptVoyageEmbeddingResponse(payload, "Voyage"),
+    });
+  }
+}
+
+export function createVoyageEmbeddingProvider(config: VoyageProviderConfig): VoyageEmbeddingProvider {
+  return new VoyageEmbeddingProvider(config);
+}
+
 /**
  * Thrown by CustomEmbeddingProvider for HTTP 4xx errors (except 429 rate limit).
  * The Indexer's pRetry config uses instanceof to bail immediately on these errors
  * instead of retrying — preventing long retry loops on bad API keys or invalid models.
  */
-export class CustomProviderNonRetryableError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'CustomProviderNonRetryableError';
+export class CustomProviderNonRetryableError extends EmbeddingPermanentError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "CustomProviderNonRetryableError";
   }
 }
 
@@ -42,6 +549,38 @@ export function createEmbeddingProvider(
       return new GoogleEmbeddingProvider(configuredProviderInfo.credentials, configuredProviderInfo.modelInfo);
     case "ollama":
       return new OllamaEmbeddingProvider(configuredProviderInfo.credentials, configuredProviderInfo.modelInfo);
+    case "voyage": {
+      const provider = new VoyageEmbeddingProvider({
+        voyageApiKey: configuredProviderInfo.credentials.apiKey,
+        voyageModelId: configuredProviderInfo.modelInfo.model,
+      });
+      return {
+        async embedQuery(query: string): Promise<EmbeddingResult> {
+          const result = await provider.embedQuery(query);
+          if (!result) {
+            throw new Error("Voyage primary provider returned no query embedding.");
+          }
+          return result;
+        },
+        async embedDocument(document: string): Promise<EmbeddingResult> {
+          const result = await provider.embedDocument(document);
+          if (!result) {
+            throw new Error("Voyage primary provider returned no document embedding.");
+          }
+          return result;
+        },
+        async embedBatch(texts: string[]): Promise<EmbeddingBatchResult> {
+          const result = await provider.embedBatch(texts);
+          if (!result) {
+            throw new Error("Voyage primary provider returned no batch embeddings.");
+          }
+          return result;
+        },
+        getModelInfo(): BaseModelInfo {
+          return provider.getModelInfo();
+        },
+      };
+    }
     case "custom":
       return new CustomEmbeddingProvider(configuredProviderInfo.credentials, configuredProviderInfo.modelInfo);
     default: {
@@ -81,36 +620,29 @@ class GitHubCopilotEmbeddingProvider implements EmbeddingProviderInterface {
   }
 
   async embedBatch(texts: string[]): Promise<EmbeddingBatchResult> {
-    const token = this.getToken();
+    if (texts.length === 0) {
+      return emptyEmbeddingBatchResult();
+    }
 
-    const response = await fetch(`${this.credentials.baseUrl}/inference/embeddings`, {
-      method: "POST",
+    const token = this.getToken();
+    return requestEmbeddingsWithRetry({
+      providerLabel: "GitHub Copilot",
+      url: `${this.credentials.baseUrl}/inference/embeddings`,
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
         Accept: "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
       },
-      body: JSON.stringify({
+      body: {
         model: `openai/${this.modelInfo.model}`,
         input: texts,
-      }),
+      },
+      expectedEmbeddingCount: texts.length,
+      expectedDimensions: this.modelInfo.dimensions,
+      tokenEstimateTexts: texts,
+      responseAdapter: (payload) => adaptOpenAICompatibleEmbeddingResponse(payload, "GitHub Copilot"),
     });
-
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`GitHub Copilot embedding API error: ${response.status} - ${error}`);
-    }
-
-    const data = await response.json() as {
-      data: Array<{ embedding: number[] }>;
-      usage: { total_tokens: number };
-    };
-
-    return {
-      embeddings: data.data.map((d) => d.embedding),
-      totalTokensUsed: data.usage.total_tokens,
-    };
   }
 
   getModelInfo(): BaseModelInfo {
@@ -141,32 +673,26 @@ class OpenAIEmbeddingProvider implements EmbeddingProviderInterface {
   }
 
   async embedBatch(texts: string[]): Promise<EmbeddingBatchResult> {
-    const response = await fetch(`${this.credentials.baseUrl}/embeddings`, {
-      method: "POST",
+    if (texts.length === 0) {
+      return emptyEmbeddingBatchResult();
+    }
+
+    return requestEmbeddingsWithRetry({
+      providerLabel: "OpenAI",
+      url: `${this.credentials.baseUrl}/embeddings`,
       headers: {
         Authorization: `Bearer ${this.credentials.apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
+      body: {
         model: this.modelInfo.model,
         input: texts,
-      }),
+      },
+      expectedEmbeddingCount: texts.length,
+      expectedDimensions: this.modelInfo.dimensions,
+      tokenEstimateTexts: texts,
+      responseAdapter: (payload) => adaptOpenAICompatibleEmbeddingResponse(payload, "OpenAI"),
     });
-
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`OpenAI embedding API error: ${response.status} - ${error}`);
-    }
-
-    const data = await response.json() as {
-      data: Array<{ embedding: number[] }>;
-      usage: { total_tokens: number };
-    };
-
-    return {
-      embeddings: data.data.map((d) => d.embedding),
-      totalTokensUsed: data.usage.total_tokens,
-    };
   }
 
   getModelInfo(): BaseModelInfo {
@@ -201,6 +727,10 @@ class GoogleEmbeddingProvider implements EmbeddingProviderInterface {
   }
 
   async embedBatch(texts: string[]): Promise<EmbeddingBatchResult> {
+    if (texts.length === 0) {
+      return emptyEmbeddingBatchResult();
+    }
+
     const taskType = this.modelInfo.taskAble ? "RETRIEVAL_DOCUMENT" : undefined;
     return this.embedWithTaskType(texts, taskType);
   }
@@ -220,8 +750,10 @@ class GoogleEmbeddingProvider implements EmbeddingProviderInterface {
       batches.push(texts.slice(i, i + GoogleEmbeddingProvider.BATCH_SIZE));
     }
 
-    const batchResults = await Promise.all(
-      batches.map(async (batch) => {
+    const batchResults = await mapWithConcurrency(
+      batches,
+      GOOGLE_MAX_CONCURRENT_BATCHES,
+      async (batch) => {
         const requests = batch.map((text) => ({
           model: `models/${this.modelInfo.model}`,
           content: {
@@ -231,36 +763,24 @@ class GoogleEmbeddingProvider implements EmbeddingProviderInterface {
           outputDimensionality: this.modelInfo.dimensions,
         }));
 
-        const response = await fetch(
-          `${this.credentials.baseUrl}/models/${this.modelInfo.model}:batchEmbedContents?key=${this.credentials.apiKey}`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({ requests }),
-          }
-        );
-
-        if (!response.ok) {
-          const error = await response.text();
-          throw new Error(`Google embedding API error: ${response.status} - ${error}`);
-        }
-
-        const data = (await response.json()) as {
-          embeddings: Array<{ values: number[] }>;
-        };
-
-        return {
-          embeddings: data.embeddings.map((e) => e.values),
-          tokensUsed: batch.reduce((sum, text) => sum + Math.ceil(text.length / 4), 0),
-        };
-      })
+        return requestEmbeddingsWithRetry({
+          providerLabel: "Google",
+          url: `${this.credentials.baseUrl}/models/${this.modelInfo.model}:batchEmbedContents?key=${this.credentials.apiKey}`,
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: { requests },
+          expectedEmbeddingCount: batch.length,
+          expectedDimensions: this.modelInfo.dimensions,
+          tokenEstimateTexts: batch,
+          responseAdapter: (payload) => adaptGoogleEmbeddingResponse(payload, "Google"),
+        });
+      }
     );
 
     return {
       embeddings: batchResults.flatMap((r) => r.embeddings),
-      totalTokensUsed: batchResults.reduce((sum, r) => sum + r.tokensUsed, 0),
+      totalTokensUsed: batchResults.reduce((sum, r) => sum + r.totalTokensUsed, 0),
     };
   }
 
@@ -292,33 +812,36 @@ class OllamaEmbeddingProvider implements EmbeddingProviderInterface {
   }
 
   async embedBatch(texts: string[]): Promise<EmbeddingBatchResult> {
-    const results = await Promise.all(
-      texts.map(async (text) => {
-        const response = await fetch(`${this.credentials.baseUrl}/api/embeddings`, {
-          method: "POST",
+    if (texts.length === 0) {
+      return emptyEmbeddingBatchResult();
+    }
+
+    const results = await mapWithConcurrency(
+      texts,
+      OLLAMA_MAX_CONCURRENT_REQUESTS,
+      async (text) => {
+        const result = await requestEmbeddingsWithRetry({
+          providerLabel: "Ollama",
+          url: `${this.credentials.baseUrl}/api/embeddings`,
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({
+          body: {
             model: this.modelInfo.model,
             prompt: text,
-          }),
+          },
+          expectedEmbeddingCount: 1,
+          expectedDimensions: this.modelInfo.dimensions,
+          timeoutMs: OLLAMA_EMBEDDING_TIMEOUT_MS,
+          tokenEstimateTexts: [text],
+          responseAdapter: (payload) => adaptOllamaEmbeddingResponse(payload, "Ollama"),
         });
 
-        if (!response.ok) {
-          const error = await response.text();
-          throw new Error(`Ollama embedding API error: ${response.status} - ${error}`);
-        }
-
-        const data = (await response.json()) as {
-          embedding: number[];
-        };
-
         return {
-          embedding: data.embedding,
-          tokensUsed: Math.ceil(text.length / 4),
+          embedding: result.embeddings[0] ?? [],
+          tokensUsed: result.totalTokensUsed,
         };
-      })
+      }
     );
 
     return {
@@ -357,100 +880,55 @@ class CustomEmbeddingProvider implements EmbeddingProviderInterface {
     return batches;
   }
 
-  private async embedRequest(texts: string[]): Promise<EmbeddingBatchResult> {
-    if (texts.length === 0) {
-      return {
-        embeddings: [],
-        totalTokensUsed: 0,
-      };
+  private prepareTextsForInputType(
+    texts: string[],
+    inputType: EmbeddingInputType
+  ): string[] {
+    if (this.modelInfo.model === "snowflake-arctic-embed2" && inputType === "query") {
+      return texts.map((text) => `${ARCTIC_QUERY_PREFIX}${text}`);
     }
 
+    return texts;
+  }
+
+  private async embedRequest(
+    texts: string[],
+    inputType: EmbeddingInputType
+  ): Promise<EmbeddingBatchResult> {
+    if (texts.length === 0) {
+      return emptyEmbeddingBatchResult();
+    }
+
+    const preparedTexts = this.prepareTextsForInputType(texts, inputType);
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
     };
     if (this.credentials.apiKey) {
-      headers["Authorization"] = `Bearer ${this.credentials.apiKey}`;
+      headers.Authorization = `Bearer ${this.credentials.apiKey}`;
     }
 
-    // baseUrl is already normalized (trailing slashes stripped) by parseConfig().
-    const baseUrl = this.credentials.baseUrl ?? '';
-    const timeoutMs = this.modelInfo.timeoutMs;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-    let response: Response;
-    try {
-      response = await fetch(`${baseUrl}/embeddings`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          model: this.modelInfo.model,
-          input: texts,
-        }),
-        signal: controller.signal,
-      });
-    } catch (error: unknown) {
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw new Error(`Custom embedding API request timed out after ${timeoutMs}ms for ${baseUrl}/embeddings`);
-      }
-      throw error;
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      // Throw non-retryable error for client errors (4xx) except 429 (rate limit).
-      // The Indexer uses pRetry which retries all errors by default; marking 4xx as
-      // non-retryable prevents long retry loops on bad API keys or invalid models.
-      if (response.status >= 400 && response.status < 500 && response.status !== 429) {
-        throw new CustomProviderNonRetryableError(`Custom embedding API error (non-retryable): ${response.status} - ${errorText}`);
-      }
-      throw new Error(`Custom embedding API error: ${response.status} - ${errorText}`);
-    }
-
-    const data = await response.json() as {
-      data?: Array<{ embedding: number[] }>;
-      usage?: { total_tokens: number };
-    };
-
-    if (data.data && Array.isArray(data.data)) {
-      // Always validate dimensions — the vector store is initialized with a fixed
-      // dimension count, so mismatched vectors will corrupt the index or crash usearch.
-      if (data.data.length > 0) {
-        const actualDims = data.data[0].embedding.length;
-        if (actualDims !== this.modelInfo.dimensions) {
-          throw new Error(
-            `Dimension mismatch: customProvider.dimensions is ${this.modelInfo.dimensions}, ` +
-            `but the API returned vectors with ${actualDims} dimensions. ` +
-            `Update your config to match the model's actual output dimensions.`
-          );
-        }
-      }
-
-      // Validate the server returned exactly as many embeddings as we sent texts.
-      // A mismatch would cause undefined vectors in store.addBatch, corrupting the index.
-      if (data.data.length !== texts.length) {
-        throw new Error(
-          `Embedding count mismatch: sent ${texts.length} texts but received ${data.data.length} embeddings. ` +
-          `The custom embedding server may not support batch input.`
-        );
-      }
-
-      return {
-        embeddings: data.data.map((d) => d.embedding),
-        // Rough estimate: ~4 chars per token. Used as fallback when the server
-        // doesn't return usage.total_tokens (e.g. llama.cpp, some vLLM configs).
-        totalTokensUsed: data.usage?.total_tokens ?? texts.reduce((sum, t) => sum + Math.ceil(t.length / 4), 0),
-      };
-    }
-
-    // Fallback: some servers return a flat embedding array for single inputs
-    throw new Error("Custom embedding API returned unexpected response format. Expected OpenAI-compatible format with data[].embedding.");
+    const baseUrl = this.credentials.baseUrl ?? "";
+    return requestEmbeddingsWithRetry({
+      providerLabel: "Custom",
+      url: `${baseUrl}/embeddings`,
+      headers,
+      body: {
+        model: this.modelInfo.model,
+        input: preparedTexts,
+      },
+      expectedEmbeddingCount: preparedTexts.length,
+      expectedDimensions: this.modelInfo.dimensions,
+      timeoutMs: this.modelInfo.timeoutMs,
+      tokenEstimateTexts: texts,
+      responseAdapter: (payload) => adaptOpenAICompatibleEmbeddingResponse(payload, "Custom"),
+      nonRetryableErrorFactory: (message) => new CustomProviderNonRetryableError(
+        message.replace("Custom embedding API error:", "Custom embedding API error (non-retryable):")
+      ),
+    });
   }
 
   async embedQuery(query: string): Promise<EmbeddingResult> {
-    const result = await this.embedBatch([query]);
+    const result = await this.embedBatchInternal([query], "query");
     return {
       embedding: result.embeddings[0],
       tokensUsed: result.totalTokensUsed,
@@ -458,7 +936,7 @@ class CustomEmbeddingProvider implements EmbeddingProviderInterface {
   }
 
   async embedDocument(document: string): Promise<EmbeddingResult> {
-    const result = await this.embedBatch([document]);
+    const result = await this.embedBatchInternal([document], "document");
     return {
       embedding: result.embeddings[0],
       tokensUsed: result.totalTokensUsed,
@@ -466,12 +944,19 @@ class CustomEmbeddingProvider implements EmbeddingProviderInterface {
   }
 
   async embedBatch(texts: string[]): Promise<EmbeddingBatchResult> {
+    return this.embedBatchInternal(texts, "document");
+  }
+
+  private async embedBatchInternal(
+    texts: string[],
+    inputType: EmbeddingInputType
+  ): Promise<EmbeddingBatchResult> {
     const requestBatches = this.splitIntoRequestBatches(texts);
     const embeddings: number[][] = [];
     let totalTokensUsed = 0;
 
     for (const batch of requestBatches) {
-      const result = await this.embedRequest(batch);
+      const result = await this.embedRequest(batch, inputType);
       embeddings.push(...result.embeddings);
       totalTokensUsed += result.totalTokensUsed;
     }

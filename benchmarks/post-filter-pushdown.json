@@ -1,0 +1,43 @@
+{
+  "generatedAt": "2026-04-07T05:45:15.015Z",
+  "projectRoot": "/Users/aady/Desktop/OpenSourceContributions/BaseMemory",
+  "datasetPath": "/Users/aady/Desktop/OpenSourceContributions/BaseMemory/benchmarks/golden/small.json",
+  "datasetName": "small",
+  "datasetVersion": "1.0.0",
+  "queryCount": 4,
+  "topK": 10,
+  "searchConfig": {
+    "fusionStrategy": "rrf",
+    "hybridWeight": 0.4,
+    "rrfK": 60,
+    "rerankTopN": 20
+  },
+  "metrics": {
+    "hitAt1": 1,
+    "hitAt3": 1,
+    "hitAt5": 1,
+    "hitAt10": 1,
+    "mrrAt10": 1,
+    "ndcgAt10": 0.9032867981913646,
+    "latencyMs": {
+      "p50": 2.2603335000003426,
+      "p95": 5.305143700000007,
+      "p99": 5.719328739999872
+    },
+    "tokenEstimate": {
+      "queryTokens": 43,
+      "embeddingTokensUsed": 17288
+    },
+    "embedding": {
+      "callCount": 150,
+      "estimatedCostUsd": 0,
+      "costPer1MTokensUsd": 0
+    },
+    "failureBuckets": {
+      "wrong-file": 0,
+      "wrong-symbol": 2,
+      "docs-tests-outranking-source": 0,
+      "no-relevant-hit-top-k": 0
+    }
+  }
+}

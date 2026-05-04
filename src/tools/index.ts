@@ -7,15 +7,18 @@ import type { LogLevel } from "../config/schema.js";
 import type { LogEntry } from "../utils/logger.js";
 import {
   formatProgressTitle,
-  formatIndexStats,
+  formatForegroundReadyMessage,
   formatStatus,
   calculatePercentage,
   formatCodebasePeek,
   formatDefinitionLookup,
+  formatExpandedContext,
   formatHealthCheck,
   formatLogs,
   formatSearchResults,
+  formatCoverageReport,
 } from "./utils.js";
+import { SEARCH_TASK_TYPES } from "../indexer/search-recipes.js";
 
 const z = tool.schema;
 
@@ -40,18 +43,35 @@ export const codebase_peek: ToolDefinition = tool({
     limit: z.number().optional().default(10).describe("Maximum number of results to return"),
     fileType: z.string().optional().describe("Filter by file extension (e.g., 'ts', 'py', 'rs')"),
     directory: z.string().optional().describe("Filter by directory path (e.g., 'src/utils', 'lib')"),
-    chunkType: z.enum(["function", "class", "method", "interface", "type", "enum", "struct", "impl", "trait", "module", "other"]).optional().describe("Filter by code chunk type"),
+    chunkType: z.enum(["function", "class", "method", "interface", "type", "enum", "struct", "impl", "trait", "module", "constant", "other"]).optional().describe("Filter by code chunk type"),
+    taskType: z.enum(SEARCH_TASK_TYPES).optional().describe("Retrieval recipe to apply (default: general)"),
+    graphDepth: z.number().optional().describe("Optional call-graph expansion depth (0-2, default: 0)"),
   },
   async execute(args) {
     const indexer = getIndexer();
-    const results = await indexer.search(args.query, args.limit ?? 10, {
-      fileType: args.fileType,
-      directory: args.directory,
-      chunkType: args.chunkType,
-      metadataOnly: true,
-    });
+    const response = args.graphDepth && args.graphDepth > 0
+      ? await indexer.searchDetailed(args.query, args.limit ?? 10, {
+          fileType: args.fileType,
+          directory: args.directory,
+          chunkType: args.chunkType,
+          metadataOnly: true,
+          taskType: args.taskType,
+          graphDepth: args.graphDepth,
+        })
+      : {
+          primaryResults: await indexer.search(args.query, args.limit ?? 10, {
+            fileType: args.fileType,
+            directory: args.directory,
+            chunkType: args.chunkType,
+            metadataOnly: true,
+            taskType: args.taskType,
+          }),
+          expandedContext: [],
+        };
 
-    return formatCodebasePeek(results, args.query);
+    const base = formatCodebasePeek(response.primaryResults, args.query);
+    const expanded = formatExpandedContext(response.expandedContext, true);
+    return expanded.length > 0 ? `${base}\n\n${expanded}` : base;
   },
 });
 
@@ -75,7 +95,7 @@ export const index_codebase: ToolDefinition = tool({
       await indexer.clearIndex();
     }
 
-    const stats = await indexer.index((progress) => {
+    const stats = await indexer.indexForeground((progress) => {
       context.metadata({
         title: formatProgressTitle(progress),
         metadata: {
@@ -88,7 +108,7 @@ export const index_codebase: ToolDefinition = tool({
         },
       });
     });
-    return formatIndexStats(stats, args.verbose ?? false);
+    return formatForegroundReadyMessage(stats, args.verbose ?? false);
   },
 });
 
@@ -112,6 +132,17 @@ export const index_health_check: ToolDefinition = tool({
     const result = await indexer.healthCheck();
 
     return formatHealthCheck(result);
+  },
+});
+
+export const index_coverage: ToolDefinition = tool({
+  description:
+    "Show durable code coverage limits in the index, including files truncated by the per-file chunk cap and the named symbols currently invisible to retrieval.",
+  args: {},
+  async execute() {
+    const indexer = getIndexer();
+    const report = await indexer.getCoverageReport();
+    return formatCoverageReport(report);
   },
 });
 
@@ -172,7 +203,7 @@ export const find_similar: ToolDefinition = tool({
     limit: z.number().optional().default(10).describe("Maximum number of results to return"),
     fileType: z.string().optional().describe("Filter by file extension (e.g., 'ts', 'py', 'rs')"),
     directory: z.string().optional().describe("Filter by directory path (e.g., 'src/utils', 'lib')"),
-    chunkType: z.enum(["function", "class", "method", "interface", "type", "enum", "struct", "impl", "trait", "module", "other"]).optional().describe("Filter by code chunk type"),
+    chunkType: z.enum(["function", "class", "method", "interface", "type", "enum", "struct", "impl", "trait", "module", "constant", "other"]).optional().describe("Filter by code chunk type"),
     excludeFile: z.string().optional().describe("Exclude results from this file path (useful when searching for duplicates of code from a specific file)"),
   },
   async execute(args) {
@@ -200,23 +231,40 @@ export const codebase_search: ToolDefinition = tool({
     limit: z.number().optional().default(5).describe("Maximum number of results to return"),
     fileType: z.string().optional().describe("Filter by file extension (e.g., 'ts', 'py', 'rs')"),
     directory: z.string().optional().describe("Filter by directory path (e.g., 'src/utils', 'lib')"),
-    chunkType: z.enum(["function", "class", "method", "interface", "type", "enum", "struct", "impl", "trait", "module", "other"]).optional().describe("Filter by code chunk type"),
+    chunkType: z.enum(["function", "class", "method", "interface", "type", "enum", "struct", "impl", "trait", "module", "constant", "other"]).optional().describe("Filter by code chunk type"),
     contextLines: z.number().optional().describe("Number of extra lines to include before/after each match (default: 0)"),
+    taskType: z.enum(SEARCH_TASK_TYPES).optional().describe("Retrieval recipe to apply (default: general)"),
+    graphDepth: z.number().optional().describe("Optional call-graph expansion depth (0-2, default: 0)"),
   },
   async execute(args) {
     const indexer = getIndexer();
-    const results = await indexer.search(args.query, args.limit ?? 5, {
-      fileType: args.fileType,
-      directory: args.directory,
-      chunkType: args.chunkType,
-      contextLines: args.contextLines,
-    });
+    const response = args.graphDepth && args.graphDepth > 0
+      ? await indexer.searchDetailed(args.query, args.limit ?? 5, {
+          fileType: args.fileType,
+          directory: args.directory,
+          chunkType: args.chunkType,
+          contextLines: args.contextLines,
+          taskType: args.taskType,
+          graphDepth: args.graphDepth,
+        })
+      : {
+          primaryResults: await indexer.search(args.query, args.limit ?? 5, {
+            fileType: args.fileType,
+            directory: args.directory,
+            chunkType: args.chunkType,
+            contextLines: args.contextLines,
+            taskType: args.taskType,
+          }),
+          expandedContext: [],
+        };
 
-    if (results.length === 0) {
+    if (response.primaryResults.length === 0) {
       return "No matching code found. Try a different query or run index_codebase first.";
     }
 
-    return `Found ${results.length} results for "${args.query}":\n\n${formatSearchResults(results, "score")}`;
+    const primary = `Found ${response.primaryResults.length} results for "${args.query}":\n\n${formatSearchResults(response.primaryResults, "score")}`;
+    const expanded = formatExpandedContext(response.expandedContext);
+    return expanded.length > 0 ? `${primary}\n\n${expanded}` : primary;
   },
 });
 
@@ -231,15 +279,31 @@ export const implementation_lookup: ToolDefinition = tool({
     limit: z.number().optional().default(5).describe("Maximum number of results"),
     fileType: z.string().optional().describe("Filter by file extension (e.g., 'ts', 'py')"),
     directory: z.string().optional().describe("Filter by directory path (e.g., 'src/utils')"),
+    taskType: z.enum(SEARCH_TASK_TYPES).optional().describe("Retrieval recipe to apply (default: definition)"),
+    graphDepth: z.number().optional().describe("Optional call-graph expansion depth (0-2, default: 0)"),
   },
   async execute(args) {
     const indexer = getIndexer();
-    const results = await indexer.search(args.query, args.limit ?? 5, {
-      fileType: args.fileType,
-      directory: args.directory,
-      definitionIntent: true,
-    });
-    return formatDefinitionLookup(results, args.query);
+    const response = args.graphDepth && args.graphDepth > 0
+      ? await indexer.searchDetailed(args.query, args.limit ?? 5, {
+          fileType: args.fileType,
+          directory: args.directory,
+          definitionIntent: true,
+          taskType: args.taskType ?? "definition",
+          graphDepth: args.graphDepth,
+        })
+      : {
+          primaryResults: await indexer.search(args.query, args.limit ?? 5, {
+            fileType: args.fileType,
+            directory: args.directory,
+            definitionIntent: true,
+            taskType: args.taskType ?? "definition",
+          }),
+          expandedContext: [],
+        };
+    const primary = formatDefinitionLookup(response.primaryResults, args.query);
+    const expanded = formatExpandedContext(response.expandedContext);
+    return expanded.length > 0 ? `${primary}\n\n${expanded}` : primary;
   },
 });
 

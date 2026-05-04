@@ -1,5 +1,6 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -13,11 +14,75 @@ pub enum DbError {
 pub type DbResult<T> = Result<T, DbError>;
 
 /// Schema version for migrations
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 16;
+
+pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
+const INIT_DB_BUSY_RETRY_ATTEMPTS: usize = 2;
+const INIT_DB_BUSY_RETRY_BASE_DELAY_MS: u64 = 50;
 
 /// Maximum number of SQL bind parameters per query.
 /// SQLite defaults to 999 (SQLITE_MAX_VARIABLE_NUMBER). We use 900 to stay safely under.
 const SQL_BIND_PARAM_BATCH_SIZE: usize = 900;
+
+fn serialize_symbol_aliases(aliases: &[String]) -> String {
+    aliases.join(",")
+}
+
+fn deserialize_symbol_aliases(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn alias_match_sql(column: &str, case_insensitive: bool) -> String {
+    if case_insensitive {
+        format!(
+            "(',' || LOWER(COALESCE({column}, '')) || ',') LIKE ('%,' || LOWER(?) || ',%')"
+        )
+    } else {
+        format!("(',' || COALESCE({column}, '') || ',') LIKE ('%,' || ? || ',%')")
+    }
+}
+
+pub fn is_sqlite_busy_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(
+                code.code,
+                rusqlite::ffi::ErrorCode::DatabaseBusy | rusqlite::ffi::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+pub fn is_busy_error(error: &DbError) -> bool {
+    match error {
+        DbError::Sqlite(error) => is_sqlite_busy_error(error),
+        DbError::Io(_) => false,
+    }
+}
+
+fn retry_busy_sqlite<T, F>(mut operation: F) -> DbResult<T>
+where
+    F: FnMut() -> rusqlite::Result<T>,
+{
+    let mut delay_ms = INIT_DB_BUSY_RETRY_BASE_DELAY_MS;
+
+    for attempt in 0..=INIT_DB_BUSY_RETRY_ATTEMPTS {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_sqlite_busy_error(&error) && attempt < INIT_DB_BUSY_RETRY_ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                delay_ms = (delay_ms * 2).min(500);
+            }
+            Err(error) => return Err(DbError::Sqlite(error)),
+        }
+    }
+
+    unreachable!("retry loop must return or error");
+}
 
 /// Initialize the database with the required schema
 pub fn init_db(db_path: &Path) -> DbResult<Connection> {
@@ -27,11 +92,15 @@ pub fn init_db(db_path: &Path) -> DbResult<Connection> {
     }
 
     let conn = Connection::open(db_path)?;
+    conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))?;
+    conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS as i64)?;
 
     // Enable WAL mode for better concurrent read performance
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys = ON;",
-    )?;
+    retry_busy_sqlite(|| {
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys = ON;",
+        )
+    })?;
 
     let current_version: i32 = conn
         .query_row(
@@ -94,6 +163,7 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> DbResult<()> {
             -- Indexes for fast lookups
             CREATE INDEX IF NOT EXISTS idx_chunks_content_hash ON chunks(content_hash);
             CREATE INDEX IF NOT EXISTS idx_chunks_file_path ON chunks(file_path);
+            CREATE INDEX IF NOT EXISTS idx_chunks_node_type ON chunks(node_type);
             CREATE INDEX IF NOT EXISTS idx_chunks_name ON chunks(name);
             CREATE INDEX IF NOT EXISTS idx_chunks_name_lower ON chunks(lower(name));
             CREATE INDEX IF NOT EXISTS idx_branch_chunks_branch ON branch_chunks(branch);
@@ -218,6 +288,419 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> DbResult<()> {
         )?;
     }
 
+    if from_version < 5 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS merkle_snapshots (
+                branch TEXT PRIMARY KEY,
+                root_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS merkle_nodes (
+                branch TEXT NOT NULL,
+                path TEXT NOT NULL,
+                parent_path TEXT,
+                node_kind TEXT NOT NULL,
+                node_hash TEXT NOT NULL,
+                size_bytes INTEGER,
+                PRIMARY KEY (branch, path),
+                FOREIGN KEY (branch) REFERENCES merkle_snapshots(branch) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_merkle_nodes_branch_parent
+                ON merkle_nodes(branch, parent_path);
+            CREATE INDEX IF NOT EXISTS idx_merkle_nodes_branch_kind
+                ON merkle_nodes(branch, node_kind);
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
+    if from_version < 6 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS pipeline_state (
+                branch TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                status TEXT NOT NULL,
+                input_hash TEXT,
+                error TEXT,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (branch, file_path, stage)
+            );
+
+            CREATE TABLE IF NOT EXISTS pipeline_runs (
+                run_id TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                run_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                config_hash TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                PRIMARY KEY (run_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS config_versions (
+                config_hash TEXT NOT NULL,
+                embedding_model_id TEXT NOT NULL,
+                embedding_dimension INTEGER NOT NULL,
+                chunker_version TEXT NOT NULL,
+                graph_extractor_version TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (config_hash)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pipeline_state_branch_status
+                ON pipeline_state (branch, status);
+            CREATE INDEX IF NOT EXISTS idx_pipeline_runs_branch_status
+                ON pipeline_runs (branch, status);
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
+    if from_version < 7 {
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = OFF;
+
+            BEGIN;
+
+            DROP TABLE call_edges;
+
+            CREATE TABLE call_edges (
+                id TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                from_symbol_id TEXT NOT NULL,
+                caller_file_path TEXT,
+                target_name TEXT NOT NULL,
+                target_file_path TEXT,
+                target_kind TEXT,
+                to_symbol_id TEXT,
+                call_type TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                col INTEGER NOT NULL,
+                is_resolved INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (id, branch),
+                FOREIGN KEY (from_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_call_edges_branch_from
+                ON call_edges(branch, from_symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_call_edges_branch_target_name
+                ON call_edges(branch, target_name);
+            CREATE INDEX IF NOT EXISTS idx_call_edges_branch_to
+                ON call_edges(branch, to_symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_call_edges_from ON call_edges(from_symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_call_edges_to ON call_edges(to_symbol_id);
+            CREATE INDEX IF NOT EXISTS idx_call_edges_target_name ON call_edges(target_name);
+
+            ALTER TABLE chunks ADD COLUMN chunk_kind TEXT;
+            ALTER TABLE chunks ADD COLUMN symbol_kind TEXT;
+
+            COMMIT;
+
+            PRAGMA foreign_keys = ON;
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
+    if from_version < 8 {
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = OFF;
+
+            BEGIN;
+
+            ALTER TABLE embeddings RENAME TO embeddings_old;
+
+            CREATE TABLE embeddings (
+                content_hash TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                chunk_text TEXT NOT NULL,
+                model TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (content_hash, model)
+            );
+
+            INSERT INTO embeddings (content_hash, embedding, chunk_text, model, created_at)
+            SELECT content_hash, embedding, chunk_text, model, created_at
+            FROM embeddings_old;
+
+            DROP TABLE embeddings_old;
+
+            CREATE INDEX IF NOT EXISTS idx_embeddings_model_content_hash
+                ON embeddings(model, content_hash);
+
+            ALTER TABLE config_versions RENAME TO config_versions_old;
+
+            CREATE TABLE config_versions (
+                config_hash TEXT NOT NULL,
+                embedding_model_id TEXT NOT NULL,
+                embedding_dimension INTEGER NOT NULL,
+                voyage_model_id TEXT,
+                chunker_version TEXT NOT NULL,
+                graph_extractor_version TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (config_hash)
+            );
+
+            INSERT INTO config_versions (
+                config_hash,
+                embedding_model_id,
+                embedding_dimension,
+                voyage_model_id,
+                chunker_version,
+                graph_extractor_version,
+                active,
+                created_at
+            )
+            SELECT
+                config_hash,
+                embedding_model_id,
+                embedding_dimension,
+                NULL,
+                chunker_version,
+                graph_extractor_version,
+                active,
+                created_at
+            FROM config_versions_old;
+
+            DROP TABLE config_versions_old;
+
+            COMMIT;
+
+            PRAGMA foreign_keys = ON;
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
+    if from_version < 9 {
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = OFF;
+
+            BEGIN;
+
+            ALTER TABLE config_versions ADD COLUMN embedding_prefix_version INTEGER NOT NULL DEFAULT 0;
+
+            COMMIT;
+
+            PRAGMA foreign_keys = ON;
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
+    if from_version < 10 {
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys = OFF;
+
+            BEGIN;
+
+            ALTER TABLE embeddings RENAME TO embeddings_old;
+
+            CREATE TABLE embeddings (
+                embedding_input_hash TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                chunk_text TEXT NOT NULL,
+                model TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (embedding_input_hash, model)
+            );
+
+            INSERT INTO embeddings (
+                embedding_input_hash,
+                content_hash,
+                embedding,
+                chunk_text,
+                model,
+                created_at
+            )
+            SELECT
+                content_hash,
+                content_hash,
+                embedding,
+                chunk_text,
+                model,
+                created_at
+            FROM embeddings_old;
+
+            DROP TABLE embeddings_old;
+
+            CREATE INDEX IF NOT EXISTS idx_embeddings_model_input_hash
+                ON embeddings(model, embedding_input_hash);
+            CREATE INDEX IF NOT EXISTS idx_embeddings_content_hash
+                ON embeddings(content_hash);
+
+            ALTER TABLE chunks ADD COLUMN embedding_input_hash TEXT NOT NULL DEFAULT '';
+
+            UPDATE chunks
+            SET embedding_input_hash = content_hash
+            WHERE embedding_input_hash = '';
+
+            CREATE INDEX IF NOT EXISTS idx_chunks_embedding_input_hash
+                ON chunks(embedding_input_hash);
+
+            COMMIT;
+
+            PRAGMA foreign_keys = ON;
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
+    if from_version < 11 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS branch_config_versions (
+                branch TEXT NOT NULL,
+                config_hash TEXT NOT NULL,
+                applied_at INTEGER NOT NULL,
+                PRIMARY KEY (branch),
+                FOREIGN KEY (config_hash) REFERENCES config_versions(config_hash) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_branch_config_versions_config_hash
+                ON branch_config_versions(config_hash);
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
+    if from_version < 12 {
+        // v12 is a control-plane semantics upgrade: pipeline_runs.status now
+        // recognizes "finalizing" as an interrupted-publication marker. The
+        // table already stores status as TEXT, so this migration only advances
+        // schema_version for startup recovery logic to opt in cleanly.
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
+    if from_version < 13 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS embedding_debt (
+                branch TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                model TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (branch, file_path, model)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_embedding_debt_branch_model
+                ON embedding_debt (branch, model);
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
+    if from_version < 14 {
+        conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_chunks_node_type
+                ON chunks(node_type);
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
+    if from_version < 15 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS reranker_health (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                backend TEXT NOT NULL,
+                status TEXT NOT NULL,
+                model TEXT,
+                error TEXT,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS chunk_cap_drops (
+                branch TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                cap_limit INTEGER NOT NULL,
+                kept_count INTEGER NOT NULL,
+                dropped_count INTEGER NOT NULL,
+                dropped_named TEXT NOT NULL,
+                indexed_at INTEGER NOT NULL,
+                PRIMARY KEY (branch, file_path)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunk_cap_drops_branch
+                ON chunk_cap_drops (branch);
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
+    if from_version < 16 {
+        conn.execute_batch(
+            r#"
+            ALTER TABLE chunks ADD COLUMN symbol_aliases TEXT NOT NULL DEFAULT '';
+            ALTER TABLE symbols ADD COLUMN symbol_aliases TEXT NOT NULL DEFAULT '';
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -225,22 +708,38 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> DbResult<()> {
 // Embedding Operations
 // ============================================================================
 
-/// Check if an embedding exists for a content hash
-pub fn embedding_exists(conn: &Connection, content_hash: &str) -> DbResult<bool> {
+/// Check if an embedding exists for an embedding input hash
+pub fn embedding_exists(conn: &Connection, embedding_input_hash: &str) -> DbResult<bool> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM embeddings WHERE content_hash = ?",
-        params![content_hash],
+        "SELECT COUNT(*) FROM embeddings WHERE embedding_input_hash = ?",
+        params![embedding_input_hash],
         |row| row.get(0),
     )?;
     Ok(count > 0)
 }
 
-/// Get embedding for a content hash
-pub fn get_embedding(conn: &Connection, content_hash: &str) -> DbResult<Option<Vec<u8>>> {
+/// Get embedding for an embedding input hash
+pub fn get_embedding(conn: &Connection, embedding_input_hash: &str) -> DbResult<Option<Vec<u8>>> {
     let result = conn
         .query_row(
-            "SELECT embedding FROM embeddings WHERE content_hash = ?",
-            params![content_hash],
+            "SELECT embedding FROM embeddings WHERE embedding_input_hash = ?",
+            params![embedding_input_hash],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(result)
+}
+
+/// Get embedding for an embedding input hash and model
+pub fn get_embedding_for_model(
+    conn: &Connection,
+    embedding_input_hash: &str,
+    model: &str,
+) -> DbResult<Option<Vec<u8>>> {
+    let result = conn
+        .query_row(
+            "SELECT embedding FROM embeddings WHERE embedding_input_hash = ? AND model = ?",
+            params![embedding_input_hash, model],
             |row| row.get(0),
         )
         .optional()?;
@@ -250,6 +749,7 @@ pub fn get_embedding(conn: &Connection, content_hash: &str) -> DbResult<Option<V
 /// Insert or update an embedding
 pub fn upsert_embedding(
     conn: &Connection,
+    embedding_input_hash: &str,
     content_hash: &str,
     embedding: &[u8],
     chunk_text: &str,
@@ -257,13 +757,27 @@ pub fn upsert_embedding(
 ) -> DbResult<()> {
     conn.execute(
         r#"
-        INSERT INTO embeddings (content_hash, embedding, chunk_text, model, created_at)
-        VALUES (?, ?, ?, ?, strftime('%s', 'now'))
-        ON CONFLICT(content_hash) DO UPDATE SET
+        INSERT INTO embeddings (
+            embedding_input_hash,
+            content_hash,
+            embedding,
+            chunk_text,
+            model,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))
+        ON CONFLICT(embedding_input_hash, model) DO UPDATE SET
+            content_hash = excluded.content_hash,
             embedding = excluded.embedding,
-            model = excluded.model
+            chunk_text = excluded.chunk_text
         "#,
-        params![content_hash, embedding, chunk_text, model],
+        params![
+            embedding_input_hash,
+            content_hash,
+            embedding,
+            chunk_text,
+            model
+        ],
     )?;
     Ok(())
 }
@@ -271,7 +785,7 @@ pub fn upsert_embedding(
 /// Batch insert or update embeddings within a single transaction
 pub fn upsert_embeddings_batch(
     conn: &mut Connection,
-    embeddings: &[(String, Vec<u8>, String, String)],
+    embeddings: &[(String, String, Vec<u8>, String, String)],
 ) -> DbResult<()> {
     if embeddings.is_empty() {
         return Ok(());
@@ -281,36 +795,122 @@ pub fn upsert_embeddings_batch(
     {
         let mut stmt = tx.prepare(
             r#"
-            INSERT INTO embeddings (content_hash, embedding, chunk_text, model, created_at)
-            VALUES (?, ?, ?, ?, strftime('%s', 'now'))
-            ON CONFLICT(content_hash) DO UPDATE SET
+            INSERT INTO embeddings (
+                embedding_input_hash,
+                content_hash,
+                embedding,
+                chunk_text,
+                model,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))
+            ON CONFLICT(embedding_input_hash, model) DO UPDATE SET
+                content_hash = excluded.content_hash,
                 embedding = excluded.embedding,
-                model = excluded.model
+                chunk_text = excluded.chunk_text
             "#,
         )?;
 
-        for (content_hash, embedding, chunk_text, model) in embeddings {
-            stmt.execute(params![content_hash, embedding, chunk_text, model])?;
+        for (embedding_input_hash, content_hash, embedding, chunk_text, model) in embeddings {
+            stmt.execute(params![
+                embedding_input_hash,
+                content_hash,
+                embedding,
+                chunk_text,
+                model
+            ])?;
         }
     }
     tx.commit()?;
     Ok(())
 }
 
-/// Get multiple embeddings by content hashes
+/// Get multiple embeddings by embedding input hashes for a specific model
+pub fn get_embeddings_for_model_batch(
+    conn: &Connection,
+    embedding_input_hashes: &[String],
+    model: &str,
+) -> DbResult<Vec<(String, Vec<u8>)>> {
+    if embedding_input_hashes.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    for chunk in embedding_input_hashes.chunks(SQL_BIND_PARAM_BATCH_SIZE) {
+        let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT embedding_input_hash, embedding FROM embeddings WHERE model = ? AND embedding_input_hash IN ({})",
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 1);
+        params.push(&model);
+        params.extend(chunk.iter().map(|s| s as &dyn rusqlite::ToSql));
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    Ok(results)
+}
+
+/// Get stored chunk text by embedding input hash across any embedding model.
+/// chunk_text is stored redundantly per model, so collapse to one row per hash.
+pub fn get_chunk_texts_batch(
+    conn: &Connection,
+    embedding_input_hashes: &[String],
+) -> DbResult<Vec<(String, String)>> {
+    if embedding_input_hashes.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    for chunk in embedding_input_hashes.chunks(SQL_BIND_PARAM_BATCH_SIZE) {
+        let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT embedding_input_hash, MIN(chunk_text)
+             FROM embeddings
+             WHERE embedding_input_hash IN ({})
+             GROUP BY embedding_input_hash",
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    Ok(results)
+}
+
+/// Get multiple embeddings by embedding input hashes
 #[allow(dead_code)]
 pub fn get_embeddings_batch(
     conn: &Connection,
-    content_hashes: &[String],
+    embedding_input_hashes: &[String],
 ) -> DbResult<Vec<(String, Vec<u8>)>> {
-    if content_hashes.is_empty() {
+    if embedding_input_hashes.is_empty() {
         return Ok(vec![]);
     }
     let mut results = Vec::new();
-    for chunk in content_hashes.chunks(SQL_BIND_PARAM_BATCH_SIZE) {
+    for chunk in embedding_input_hashes.chunks(SQL_BIND_PARAM_BATCH_SIZE) {
         let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let query = format!(
-            "SELECT content_hash, embedding FROM embeddings WHERE content_hash IN ({})",
+            "SELECT embedding_input_hash, embedding FROM embeddings WHERE embedding_input_hash IN ({})",
             placeholders
         );
 
@@ -329,19 +929,19 @@ pub fn get_embeddings_batch(
     Ok(results)
 }
 
-/// Get content hashes that don't have embeddings yet
+/// Get embedding input hashes that don't have embeddings yet
 pub fn get_missing_embeddings(
     conn: &Connection,
-    content_hashes: &[String],
+    embedding_input_hashes: &[String],
 ) -> DbResult<Vec<String>> {
-    if content_hashes.is_empty() {
+    if embedding_input_hashes.is_empty() {
         return Ok(vec![]);
     }
     let mut existing = std::collections::HashSet::new();
-    for chunk in content_hashes.chunks(SQL_BIND_PARAM_BATCH_SIZE) {
+    for chunk in embedding_input_hashes.chunks(SQL_BIND_PARAM_BATCH_SIZE) {
         let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let query = format!(
-            "SELECT content_hash FROM embeddings WHERE content_hash IN ({})",
+            "SELECT embedding_input_hash FROM embeddings WHERE embedding_input_hash IN ({})",
             placeholders
         );
 
@@ -357,11 +957,316 @@ pub fn get_missing_embeddings(
         existing.extend(batch_existing);
     }
 
-    Ok(content_hashes
+    Ok(embedding_input_hashes
         .iter()
         .filter(|h| !existing.contains(*h))
         .cloned()
         .collect())
+}
+
+/// Get embedding input hashes that don't have embeddings for the requested model yet
+pub fn get_missing_embeddings_for_model(
+    conn: &Connection,
+    embedding_input_hashes: &[String],
+    model: &str,
+) -> DbResult<Vec<String>> {
+    if embedding_input_hashes.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut existing = std::collections::HashSet::new();
+    for chunk in embedding_input_hashes.chunks(SQL_BIND_PARAM_BATCH_SIZE) {
+        let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT embedding_input_hash FROM embeddings WHERE model = ? AND embedding_input_hash IN ({})",
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 1);
+        params.push(&model);
+        params.extend(chunk.iter().map(|s| s as &dyn rusqlite::ToSql));
+
+        let batch_existing: std::collections::HashSet<String> = stmt
+            .query_map(params.as_slice(), |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        existing.extend(batch_existing);
+    }
+
+    Ok(embedding_input_hashes
+        .iter()
+        .filter(|h| !existing.contains(*h))
+        .cloned()
+        .collect())
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddingDebtRow {
+    pub branch: String,
+    pub file_path: String,
+    pub model: String,
+    pub reason: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RerankerHealthRow {
+    pub backend: String,
+    pub status: String,
+    pub model: Option<String>,
+    pub error: Option<String>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChunkCapDropRow {
+    pub branch: String,
+    pub file_path: String,
+    pub cap_limit: u32,
+    pub kept_count: u32,
+    pub dropped_count: u32,
+    pub dropped_named: Vec<String>,
+    pub indexed_at: i64,
+}
+
+pub fn upsert_reranker_health(
+    conn: &Connection,
+    backend: &str,
+    status: &str,
+    model: Option<&str>,
+    error: Option<&str>,
+) -> DbResult<()> {
+    conn.execute(
+        r#"
+        INSERT INTO reranker_health (id, backend, status, model, error, updated_at)
+        VALUES (1, ?, ?, ?, ?, CAST(strftime('%s', 'now') AS INTEGER))
+        ON CONFLICT(id) DO UPDATE SET
+            backend = excluded.backend,
+            status = excluded.status,
+            model = excluded.model,
+            error = excluded.error,
+            updated_at = excluded.updated_at
+        "#,
+        params![backend, status, model, error],
+    )?;
+    Ok(())
+}
+
+pub fn get_reranker_health(conn: &Connection) -> DbResult<Option<RerankerHealthRow>> {
+    conn.query_row(
+        r#"
+        SELECT backend, status, model, error, updated_at
+        FROM reranker_health
+        WHERE id = 1
+        "#,
+        [],
+        |row| {
+            Ok(RerankerHealthRow {
+                backend: row.get(0)?,
+                status: row.get(1)?,
+                model: row.get(2)?,
+                error: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(DbError::from)
+}
+
+pub fn upsert_chunk_cap_drop(
+    conn: &Connection,
+    branch: &str,
+    file_path: &str,
+    cap_limit: u32,
+    kept_count: u32,
+    dropped_count: u32,
+    dropped_named: &[String],
+) -> DbResult<()> {
+    let dropped_named_json =
+        serde_json::to_string(dropped_named).map_err(|error| std::io::Error::other(error.to_string()))?;
+    conn.execute(
+        r#"
+        INSERT INTO chunk_cap_drops (
+            branch,
+            file_path,
+            cap_limit,
+            kept_count,
+            dropped_count,
+            dropped_named,
+            indexed_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, CAST(strftime('%s', 'now') AS INTEGER))
+        ON CONFLICT(branch, file_path) DO UPDATE SET
+            cap_limit = excluded.cap_limit,
+            kept_count = excluded.kept_count,
+            dropped_count = excluded.dropped_count,
+            dropped_named = excluded.dropped_named,
+            indexed_at = excluded.indexed_at
+        "#,
+        params![
+            branch,
+            file_path,
+            cap_limit,
+            kept_count,
+            dropped_count,
+            dropped_named_json,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn clear_chunk_cap_drop(
+    conn: &Connection,
+    branch: &str,
+    file_path: &str,
+) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM chunk_cap_drops WHERE branch = ? AND file_path = ?",
+        params![branch, file_path],
+    )?;
+    Ok(count)
+}
+
+pub fn get_chunk_cap_drops_for_branch(
+    conn: &Connection,
+    branch: &str,
+) -> DbResult<Vec<ChunkCapDropRow>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT branch, file_path, cap_limit, kept_count, dropped_count, dropped_named, indexed_at
+        FROM chunk_cap_drops
+        WHERE branch = ?
+        ORDER BY file_path ASC
+        "#,
+    )?;
+    let rows = stmt.query_map(params![branch], |row| {
+        let dropped_named_json: String = row.get(5)?;
+        let dropped_named = serde_json::from_str::<Vec<String>>(&dropped_named_json)
+            .unwrap_or_default();
+        Ok(ChunkCapDropRow {
+            branch: row.get(0)?,
+            file_path: row.get(1)?,
+            cap_limit: row.get(2)?,
+            kept_count: row.get(3)?,
+            dropped_count: row.get(4)?,
+            dropped_named,
+            indexed_at: row.get(6)?,
+        })
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn clear_chunk_cap_drops_for_branch(conn: &Connection, branch: &str) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM chunk_cap_drops WHERE branch = ?",
+        params![branch],
+    )?;
+    Ok(count)
+}
+
+pub fn clear_all_chunk_cap_drops(conn: &Connection) -> DbResult<usize> {
+    let count = conn.execute("DELETE FROM chunk_cap_drops", [])?;
+    Ok(count)
+}
+
+pub fn record_embedding_debt(
+    conn: &Connection,
+    branch: &str,
+    file_path: &str,
+    model: &str,
+    reason: &str,
+) -> DbResult<()> {
+    conn.execute(
+        r#"
+        INSERT INTO embedding_debt (
+            branch,
+            file_path,
+            model,
+            reason,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, strftime('%s', 'now'))
+        ON CONFLICT(branch, file_path, model) DO UPDATE SET
+            reason = excluded.reason,
+            created_at = excluded.created_at
+        "#,
+        params![branch, file_path, model, reason],
+    )?;
+    Ok(())
+}
+
+pub fn clear_embedding_debt(
+    conn: &Connection,
+    branch: &str,
+    file_path: &str,
+    model: &str,
+) -> DbResult<()> {
+    conn.execute(
+        "DELETE FROM embedding_debt WHERE branch = ? AND file_path = ? AND model = ?",
+        params![branch, file_path, model],
+    )?;
+    Ok(())
+}
+
+pub fn clear_embedding_debt_for_file(
+    conn: &Connection,
+    branch: &str,
+    file_path: &str,
+) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM embedding_debt WHERE branch = ? AND file_path = ?",
+        params![branch, file_path],
+    )?;
+    Ok(count)
+}
+
+pub fn get_embedding_debt_for_branch(
+    conn: &Connection,
+    branch: &str,
+) -> DbResult<Vec<EmbeddingDebtRow>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT branch, file_path, model, reason, created_at
+        FROM embedding_debt
+        WHERE branch = ?
+        ORDER BY file_path ASC, model ASC
+        "#,
+    )?;
+    let rows = stmt.query_map(params![branch], |row| {
+        Ok(EmbeddingDebtRow {
+            branch: row.get(0)?,
+            file_path: row.get(1)?,
+            model: row.get(2)?,
+            reason: row.get(3)?,
+            created_at: row.get(4)?,
+        })
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn clear_embedding_debt_for_branch(conn: &Connection, branch: &str) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM embedding_debt WHERE branch = ?",
+        params![branch],
+    )?;
+    Ok(count)
+}
+
+pub fn clear_all_embedding_debt(conn: &Connection) -> DbResult<usize> {
+    let count = conn.execute("DELETE FROM embedding_debt", [])?;
+    Ok(count)
 }
 
 // ============================================================================
@@ -374,27 +1279,62 @@ pub fn upsert_chunk(
     conn: &Connection,
     chunk_id: &str,
     content_hash: &str,
+    embedding_input_hash: &str,
     file_path: &str,
     start_line: u32,
     end_line: u32,
     node_type: Option<&str>,
     name: Option<&str>,
+    symbol_aliases: &[String],
+    chunk_kind: Option<&str>,
+    symbol_kind: Option<&str>,
     language: &str,
 ) -> DbResult<()> {
+    let symbol_aliases = serialize_symbol_aliases(symbol_aliases);
     conn.execute(
         r#"
-        INSERT INTO chunks (chunk_id, content_hash, file_path, start_line, end_line, node_type, name, language)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO chunks (
+            chunk_id,
+            content_hash,
+            embedding_input_hash,
+            file_path,
+            start_line,
+            end_line,
+            node_type,
+            name,
+            symbol_aliases,
+            chunk_kind,
+            symbol_kind,
+            language
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(chunk_id) DO UPDATE SET
             content_hash = excluded.content_hash,
+            embedding_input_hash = excluded.embedding_input_hash,
             file_path = excluded.file_path,
             start_line = excluded.start_line,
             end_line = excluded.end_line,
             node_type = excluded.node_type,
             name = excluded.name,
+            symbol_aliases = excluded.symbol_aliases,
+            chunk_kind = excluded.chunk_kind,
+            symbol_kind = excluded.symbol_kind,
             language = excluded.language
         "#,
-        params![chunk_id, content_hash, file_path, start_line, end_line, node_type, name, language],
+        params![
+            chunk_id,
+            content_hash,
+            embedding_input_hash,
+            file_path,
+            start_line,
+            end_line,
+            node_type,
+            name,
+            symbol_aliases,
+            chunk_kind,
+            symbol_kind,
+            language
+        ],
     )?;
     Ok(())
 }
@@ -409,15 +1349,32 @@ pub fn upsert_chunks_batch(conn: &mut Connection, chunks: &[ChunkRow]) -> DbResu
     {
         let mut stmt = tx.prepare(
             r#"
-            INSERT INTO chunks (chunk_id, content_hash, file_path, start_line, end_line, node_type, name, language)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO chunks (
+                chunk_id,
+                content_hash,
+                embedding_input_hash,
+                file_path,
+                start_line,
+            end_line,
+            node_type,
+            name,
+            symbol_aliases,
+            chunk_kind,
+            symbol_kind,
+            language
+        )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(chunk_id) DO UPDATE SET
                 content_hash = excluded.content_hash,
+                embedding_input_hash = excluded.embedding_input_hash,
                 file_path = excluded.file_path,
                 start_line = excluded.start_line,
                 end_line = excluded.end_line,
                 node_type = excluded.node_type,
                 name = excluded.name,
+                symbol_aliases = excluded.symbol_aliases,
+                chunk_kind = excluded.chunk_kind,
+                symbol_kind = excluded.symbol_kind,
                 language = excluded.language
             "#,
         )?;
@@ -426,11 +1383,15 @@ pub fn upsert_chunks_batch(conn: &mut Connection, chunks: &[ChunkRow]) -> DbResu
             stmt.execute(params![
                 chunk.chunk_id,
                 chunk.content_hash,
+                chunk.embedding_input_hash,
                 chunk.file_path,
                 chunk.start_line,
                 chunk.end_line,
                 chunk.node_type,
                 chunk.name,
+                serialize_symbol_aliases(&chunk.symbol_aliases),
+                chunk.chunk_kind,
+                chunk.symbol_kind,
                 chunk.language
             ])?;
         }
@@ -444,22 +1405,11 @@ pub fn get_chunk(conn: &Connection, chunk_id: &str) -> DbResult<Option<ChunkRow>
     let result = conn
         .query_row(
             r#"
-            SELECT chunk_id, content_hash, file_path, start_line, end_line, node_type, name, language
+            SELECT chunk_id, content_hash, embedding_input_hash, file_path, start_line, end_line, node_type, name, symbol_aliases, chunk_kind, symbol_kind, language
             FROM chunks WHERE chunk_id = ?
             "#,
             params![chunk_id],
-            |row| {
-                Ok(ChunkRow {
-                    chunk_id: row.get(0)?,
-                    content_hash: row.get(1)?,
-                    file_path: row.get(2)?,
-                    start_line: row.get(3)?,
-                    end_line: row.get(4)?,
-                    node_type: row.get(5)?,
-                    name: row.get(6)?,
-                    language: row.get(7)?,
-                })
-            },
+            map_chunk_row,
         )
         .optional()?;
     Ok(result)
@@ -469,24 +1419,133 @@ pub fn get_chunk(conn: &Connection, chunk_id: &str) -> DbResult<Option<ChunkRow>
 pub fn get_chunks_by_file(conn: &Connection, file_path: &str) -> DbResult<Vec<ChunkRow>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT chunk_id, content_hash, file_path, start_line, end_line, node_type, name, language
+        SELECT chunk_id, content_hash, embedding_input_hash, file_path, start_line, end_line, node_type, name, symbol_aliases, chunk_kind, symbol_kind, language
         FROM chunks WHERE file_path = ?
         ORDER BY start_line
         "#,
     )?;
 
-    let rows = stmt.query_map(params![file_path], |row| {
-        Ok(ChunkRow {
-            chunk_id: row.get(0)?,
-            content_hash: row.get(1)?,
-            file_path: row.get(2)?,
-            start_line: row.get(3)?,
-            end_line: row.get(4)?,
-            node_type: row.get(5)?,
-            name: row.get(6)?,
-            language: row.get(7)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![file_path], map_chunk_row)?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Get all chunks for a file that belong to the provided branch
+pub fn get_chunks_by_file_on_branch(
+    conn: &Connection,
+    file_path: &str,
+    branch: &str,
+) -> DbResult<Vec<ChunkRow>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT c.chunk_id, c.content_hash, c.embedding_input_hash, c.file_path, c.start_line, c.end_line, c.node_type, c.name, c.symbol_aliases, c.chunk_kind, c.symbol_kind, c.language
+        FROM chunks c
+        INNER JOIN branch_chunks bc ON bc.chunk_id = c.chunk_id
+        WHERE c.file_path = ? AND bc.branch = ?
+        ORDER BY c.start_line
+        "#,
+    )?;
+
+    let rows = stmt.query_map(params![file_path, branch], map_chunk_row)?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn get_chunk_ids_by_filters_for_branch(
+    conn: &Connection,
+    branch: &str,
+    file_type: Option<&str>,
+    directory: Option<&str>,
+    chunk_type: Option<&str>,
+    exclude_file: Option<&str>,
+    chunk_kind: Option<&str>,
+    language: Option<&str>,
+    path_glob: Option<&str>,
+) -> DbResult<Vec<String>> {
+    let normalized_file_type = file_type
+        .map(|value| value.trim().trim_start_matches('.').to_lowercase())
+        .filter(|value| !value.is_empty());
+    let normalized_directory = directory
+        .map(|value| value.trim().trim_matches('/').replace('\\', "/"))
+        .filter(|value| !value.is_empty());
+    let normalized_chunk_kind = chunk_kind
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
+    let normalized_language = language
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
+    let normalized_path_glob = path_glob
+        .map(|value| value.trim().replace('\\', "/"))
+        .filter(|value| !value.is_empty());
+    let file_type_pattern = normalized_file_type
+        .as_ref()
+        .map(|value| format!("%.{}", value));
+    // Mirror matchesHardRetrievalFilters():
+    // - includes(`/${dir}/`) -> %/{dir}/%
+    // - includes(`${dir}/`) at repo-relative path start -> {dir}/%
+    let directory_nested_pattern = normalized_directory
+        .as_ref()
+        .map(|value| format!("%/{}/%", value));
+    let directory_prefix_pattern = normalized_directory
+        .as_ref()
+        .map(|value| format!("{}/%", value));
+    let path_glob_absolute_pattern = normalized_path_glob
+        .as_ref()
+        .map(|value| {
+            if value.starts_with('/') {
+                value.clone()
+            } else {
+                format!("*/{}", value.trim_start_matches("./"))
+            }
+        });
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT bc.chunk_id
+        FROM branch_chunks bc
+        INNER JOIN chunks c ON c.chunk_id = bc.chunk_id
+        WHERE bc.branch = ?
+          AND (? IS NULL OR LOWER(c.file_path) LIKE ?)
+          AND (? IS NULL OR c.file_path LIKE ? OR c.file_path LIKE ?)
+          AND (? IS NULL OR c.node_type = ?)
+          AND (? IS NULL OR c.file_path != ?)
+          AND (? IS NULL OR LOWER(COALESCE(c.chunk_kind, '')) = ?)
+          AND (? IS NULL OR LOWER(c.language) = ?)
+          AND (? IS NULL OR c.file_path GLOB ? OR c.file_path GLOB ?)
+        ORDER BY bc.chunk_id
+        "#,
+    )?;
+
+    let rows = stmt.query_map(
+        params![
+            branch,
+            normalized_file_type.as_deref(),
+            file_type_pattern.as_deref(),
+            normalized_directory.as_deref(),
+            directory_nested_pattern.as_deref(),
+            directory_prefix_pattern.as_deref(),
+            chunk_type,
+            chunk_type,
+            exclude_file,
+            exclude_file,
+            normalized_chunk_kind.as_deref(),
+            normalized_chunk_kind.as_deref(),
+            normalized_language.as_deref(),
+            normalized_language.as_deref(),
+            normalized_path_glob.as_deref(),
+            normalized_path_glob.as_deref(),
+            path_glob_absolute_pattern.as_deref(),
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -496,25 +1555,18 @@ pub fn get_chunks_by_file(conn: &Connection, file_path: &str) -> DbResult<Vec<Ch
 }
 
 pub fn get_chunks_by_name(conn: &Connection, name: &str) -> DbResult<Vec<ChunkRow>> {
+    let alias_match = alias_match_sql("symbol_aliases", false);
     let mut stmt = conn.prepare(
-        r#"
-        SELECT chunk_id, content_hash, file_path, start_line, end_line, node_type, name, language
-        FROM chunks WHERE name = ?
+        &format!(
+            r#"
+        SELECT chunk_id, content_hash, embedding_input_hash, file_path, start_line, end_line, node_type, name, symbol_aliases, chunk_kind, symbol_kind, language
+        FROM chunks WHERE name = ? OR {}
         "#,
+            alias_match
+        ),
     )?;
 
-    let rows = stmt.query_map(params![name], |row| {
-        Ok(ChunkRow {
-            chunk_id: row.get(0)?,
-            content_hash: row.get(1)?,
-            file_path: row.get(2)?,
-            start_line: row.get(3)?,
-            end_line: row.get(4)?,
-            node_type: row.get(5)?,
-            name: row.get(6)?,
-            language: row.get(7)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![name, name], map_chunk_row)?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -524,25 +1576,18 @@ pub fn get_chunks_by_name(conn: &Connection, name: &str) -> DbResult<Vec<ChunkRo
 }
 
 pub fn get_chunks_by_name_ci(conn: &Connection, name: &str) -> DbResult<Vec<ChunkRow>> {
+    let alias_match = alias_match_sql("symbol_aliases", true);
     let mut stmt = conn.prepare(
-        r#"
-        SELECT chunk_id, content_hash, file_path, start_line, end_line, node_type, name, language
-        FROM chunks WHERE lower(name) = lower(?)
+        &format!(
+            r#"
+        SELECT chunk_id, content_hash, embedding_input_hash, file_path, start_line, end_line, node_type, name, symbol_aliases, chunk_kind, symbol_kind, language
+        FROM chunks WHERE lower(name) = lower(?) OR {}
         "#,
+            alias_match
+        ),
     )?;
 
-    let rows = stmt.query_map(params![name], |row| {
-        Ok(ChunkRow {
-            chunk_id: row.get(0)?,
-            content_hash: row.get(1)?,
-            file_path: row.get(2)?,
-            start_line: row.get(3)?,
-            end_line: row.get(4)?,
-            node_type: row.get(5)?,
-            name: row.get(6)?,
-            language: row.get(7)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![name, name], map_chunk_row)?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -561,12 +1606,260 @@ pub fn delete_chunks_by_file(conn: &Connection, file_path: &str) -> DbResult<usi
 pub struct ChunkRow {
     pub chunk_id: String,
     pub content_hash: String,
+    pub embedding_input_hash: String,
     pub file_path: String,
     pub start_line: u32,
     pub end_line: u32,
     pub node_type: Option<String>,
     pub name: Option<String>,
+    pub symbol_aliases: Vec<String>,
+    pub chunk_kind: Option<String>,
+    pub symbol_kind: Option<String>,
     pub language: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChunkKindEnrichmentRow {
+    pub chunk_id: String,
+    pub chunk_kind: Option<String>,
+    pub symbol_kind: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChunkMetadataRow {
+    pub chunk_id: String,
+    pub embedding_input_hash: String,
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub node_type: Option<String>,
+    pub name: Option<String>,
+    pub symbol_aliases: Vec<String>,
+    pub chunk_kind: Option<String>,
+    pub symbol_kind: Option<String>,
+    pub language: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SymbolChunkRow {
+    pub symbol_id: String,
+    pub chunk_id: String,
+    pub content_hash: String,
+    pub embedding_input_hash: String,
+    pub file_path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub node_type: Option<String>,
+    pub name: Option<String>,
+    pub symbol_aliases: Vec<String>,
+    pub chunk_kind: Option<String>,
+    pub symbol_kind: Option<String>,
+    pub language: String,
+}
+
+/// Get chunk_kind and symbol_kind for multiple chunk ids
+pub fn get_chunk_kinds_batch(
+    conn: &Connection,
+    chunk_ids: &[String],
+) -> DbResult<Vec<ChunkKindEnrichmentRow>> {
+    if chunk_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    for chunk in chunk_ids.chunks(SQL_BIND_PARAM_BATCH_SIZE) {
+        let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT chunk_id, chunk_kind, symbol_kind FROM chunks WHERE chunk_id IN ({})",
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(ChunkKindEnrichmentRow {
+                chunk_id: row.get(0)?,
+                chunk_kind: row.get(1)?,
+                symbol_kind: row.get(2)?,
+            })
+        })?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    Ok(results)
+}
+
+/// Get retrieval metadata for multiple chunk ids without relying on vector-store metadata.
+pub fn get_chunk_metadata_batch(
+    conn: &Connection,
+    chunk_ids: &[String],
+) -> DbResult<Vec<ChunkMetadataRow>> {
+    if chunk_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    for chunk in chunk_ids.chunks(SQL_BIND_PARAM_BATCH_SIZE) {
+        let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT chunk_id, embedding_input_hash, file_path, start_line, end_line, node_type, name, symbol_aliases, chunk_kind, symbol_kind, language FROM chunks WHERE chunk_id IN ({})",
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let symbol_aliases: String = row.get(7)?;
+            Ok(ChunkMetadataRow {
+                chunk_id: row.get(0)?,
+                embedding_input_hash: row.get(1)?,
+                file_path: row.get(2)?,
+                start_line: row.get(3)?,
+                end_line: row.get(4)?,
+                node_type: row.get(5)?,
+                name: row.get(6)?,
+                symbol_aliases: deserialize_symbol_aliases(&symbol_aliases),
+                chunk_kind: row.get(8)?,
+                symbol_kind: row.get(9)?,
+                language: row.get(10)?,
+            })
+        })?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    Ok(results)
+}
+
+pub fn get_chunks_for_symbols_batch(
+    conn: &Connection,
+    symbol_ids: &[String],
+    branch: &str,
+    allowed_chunk_ids: Option<&[String]>,
+) -> DbResult<Vec<SymbolChunkRow>> {
+    if symbol_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    let reserved_params = 2 + allowed_chunk_ids.map_or(0, |ids| ids.len());
+    let symbol_batch_size = SQL_BIND_PARAM_BATCH_SIZE.saturating_sub(reserved_params).max(1);
+
+    for symbol_batch in symbol_ids.chunks(symbol_batch_size) {
+        let symbol_placeholders = symbol_batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let allowed_clause = allowed_chunk_ids
+            .filter(|ids| !ids.is_empty())
+            .map(|ids| {
+                format!(
+                    " AND c.chunk_id IN ({})",
+                    ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+                )
+            })
+            .unwrap_or_default();
+
+        let query = format!(
+            r#"
+            WITH ranked_chunks AS (
+                SELECT
+                    s.id AS symbol_id,
+                    c.chunk_id,
+                    c.content_hash,
+                    c.embedding_input_hash,
+                    c.file_path,
+                    c.start_line,
+                    c.end_line,
+                    c.node_type,
+                    c.name,
+                    c.symbol_aliases,
+                    c.chunk_kind,
+                    c.symbol_kind,
+                    c.language,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.id
+                        ORDER BY
+                            CASE WHEN c.name = s.name THEN 0 ELSE 1 END,
+                            (c.end_line - c.start_line) ASC,
+                            c.chunk_id ASC
+                    ) AS rank_in_symbol
+                FROM symbols s
+                INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
+                INNER JOIN chunks c ON c.file_path = s.file_path
+                INNER JOIN branch_chunks bc ON bc.chunk_id = c.chunk_id
+                WHERE bs.branch = ?
+                  AND bc.branch = ?
+                  AND s.id IN ({symbol_placeholders})
+                  AND c.start_line <= s.start_line
+                  AND c.end_line >= s.end_line
+                  {allowed_clause}
+            )
+            SELECT
+                symbol_id,
+                chunk_id,
+                content_hash,
+                embedding_input_hash,
+                file_path,
+                start_line,
+                end_line,
+                node_type,
+                name,
+                symbol_aliases,
+                chunk_kind,
+                symbol_kind,
+                language
+            FROM ranked_chunks
+            WHERE rank_in_symbol = 1
+            ORDER BY symbol_id
+            "#
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> =
+            Vec::with_capacity(2 + symbol_batch.len() + allowed_chunk_ids.map_or(0, |ids| ids.len()));
+        params.push(&branch);
+        params.push(&branch);
+        for symbol_id in symbol_batch {
+            params.push(symbol_id as &dyn rusqlite::ToSql);
+        }
+        if let Some(ids) = allowed_chunk_ids {
+            for chunk_id in ids {
+                params.push(chunk_id as &dyn rusqlite::ToSql);
+            }
+        }
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let symbol_aliases: String = row.get(9)?;
+            Ok(SymbolChunkRow {
+                symbol_id: row.get(0)?,
+                chunk_id: row.get(1)?,
+                content_hash: row.get(2)?,
+                embedding_input_hash: row.get(3)?,
+                file_path: row.get(4)?,
+                start_line: row.get(5)?,
+                end_line: row.get(6)?,
+                node_type: row.get(7)?,
+                name: row.get(8)?,
+                symbol_aliases: deserialize_symbol_aliases(&symbol_aliases),
+                chunk_kind: row.get(10)?,
+                symbol_kind: row.get(11)?,
+                language: row.get(12)?,
+            })
+        })?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    Ok(results)
 }
 
 // ============================================================================
@@ -617,6 +1910,12 @@ pub fn clear_branch(conn: &Connection, branch: &str) -> DbResult<usize> {
         "DELETE FROM branch_chunks WHERE branch = ?",
         params![branch],
     )?;
+    Ok(count)
+}
+
+/// Remove all branch-chunk associations across every branch
+pub fn clear_all_branches(conn: &Connection) -> DbResult<usize> {
+    let count = conn.execute("DELETE FROM branch_chunks", [])?;
     Ok(count)
 }
 
@@ -687,6 +1986,20 @@ pub fn chunk_exists_on_branch(conn: &Connection, branch: &str, chunk_id: &str) -
     Ok(count > 0)
 }
 
+/// Check if a chunk exists on any branch other than the current one
+pub fn chunk_exists_on_other_branches(
+    conn: &Connection,
+    branch: &str,
+    chunk_id: &str,
+) -> DbResult<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM branch_chunks WHERE branch != ? AND chunk_id = ?",
+        params![branch, chunk_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 /// Get all branches
 pub fn get_all_branches(conn: &Connection) -> DbResult<Vec<String>> {
     let mut stmt = conn.prepare("SELECT DISTINCT branch FROM branch_chunks")?;
@@ -708,6 +2021,7 @@ pub struct SymbolRow {
     pub id: String,
     pub file_path: String,
     pub name: String,
+    pub symbol_aliases: Vec<String>,
     pub kind: String,
     pub start_line: u32,
     pub start_col: u32,
@@ -716,11 +2030,49 @@ pub struct SymbolRow {
     pub language: String,
 }
 
+fn map_chunk_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRow> {
+    let symbol_aliases: String = row.get(8)?;
+    Ok(ChunkRow {
+        chunk_id: row.get(0)?,
+        content_hash: row.get(1)?,
+        embedding_input_hash: row.get(2)?,
+        file_path: row.get(3)?,
+        start_line: row.get(4)?,
+        end_line: row.get(5)?,
+        node_type: row.get(6)?,
+        name: row.get(7)?,
+        symbol_aliases: deserialize_symbol_aliases(&symbol_aliases),
+        chunk_kind: row.get(9)?,
+        symbol_kind: row.get(10)?,
+        language: row.get(11)?,
+    })
+}
+
+fn map_symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolRow> {
+    let symbol_aliases: String = row.get(3)?;
+    Ok(SymbolRow {
+        id: row.get(0)?,
+        file_path: row.get(1)?,
+        name: row.get(2)?,
+        symbol_aliases: deserialize_symbol_aliases(&symbol_aliases),
+        kind: row.get(4)?,
+        start_line: row.get(5)?,
+        start_col: row.get(6)?,
+        end_line: row.get(7)?,
+        end_col: row.get(8)?,
+        language: row.get(9)?,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct CallEdgeRow {
     pub id: String,
+    pub branch: String,
     pub from_symbol_id: String,
+    pub caller_file_path: Option<String>,
     pub target_name: String,
+    pub target_file_path: Option<String>,
+    pub target_kind: Option<String>,
     pub to_symbol_id: Option<String>,
     pub call_type: String,
     pub line: u32,
@@ -735,6 +2087,8 @@ pub struct CallerRow {
     pub from_symbol_name: String,
     pub from_symbol_file_path: String,
     pub target_name: String,
+    pub target_file_path: Option<String>,
+    pub target_kind: Option<String>,
     pub to_symbol_id: Option<String>,
     pub call_type: String,
     pub line: u32,
@@ -742,17 +2096,36 @@ pub struct CallerRow {
     pub is_resolved: bool,
 }
 
-/// Insert or replace a symbol
+#[derive(Debug, Clone)]
+pub struct CallEdgeFrontierBatch {
+    pub callers: Vec<CallerRow>,
+    pub callees: Vec<CallEdgeRow>,
+}
+
+/// Insert or update a symbol without deleting the existing row.
+/// Using REPLACE here would cascade-delete call edges for unchanged symbol ids.
 pub fn upsert_symbol(conn: &Connection, symbol: &SymbolRow) -> DbResult<()> {
+    let symbol_aliases = serialize_symbol_aliases(&symbol.symbol_aliases);
     conn.execute(
         r#"
-        INSERT OR REPLACE INTO symbols (id, file_path, name, kind, start_line, start_col, end_line, end_col, language)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO symbols (id, file_path, name, symbol_aliases, kind, start_line, start_col, end_line, end_col, language)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            file_path = excluded.file_path,
+            name = excluded.name,
+            symbol_aliases = excluded.symbol_aliases,
+            kind = excluded.kind,
+            start_line = excluded.start_line,
+            start_col = excluded.start_col,
+            end_line = excluded.end_line,
+            end_col = excluded.end_col,
+            language = excluded.language
         "#,
         params![
             symbol.id,
             symbol.file_path,
             symbol.name,
+            symbol_aliases,
             symbol.kind,
             symbol.start_line,
             symbol.start_col,
@@ -764,7 +2137,7 @@ pub fn upsert_symbol(conn: &Connection, symbol: &SymbolRow) -> DbResult<()> {
     Ok(())
 }
 
-/// Batch insert or replace symbols within a single transaction
+/// Batch insert or update symbols within a single transaction
 pub fn upsert_symbols_batch(conn: &mut Connection, symbols: &[SymbolRow]) -> DbResult<()> {
     if symbols.is_empty() {
         return Ok(());
@@ -774,8 +2147,18 @@ pub fn upsert_symbols_batch(conn: &mut Connection, symbols: &[SymbolRow]) -> DbR
     {
         let mut stmt = tx.prepare(
             r#"
-            INSERT OR REPLACE INTO symbols (id, file_path, name, kind, start_line, start_col, end_line, end_col, language)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO symbols (id, file_path, name, symbol_aliases, kind, start_line, start_col, end_line, end_col, language)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                file_path = excluded.file_path,
+                name = excluded.name,
+                symbol_aliases = excluded.symbol_aliases,
+                kind = excluded.kind,
+                start_line = excluded.start_line,
+                start_col = excluded.start_col,
+                end_line = excluded.end_line,
+                end_col = excluded.end_col,
+                language = excluded.language
             "#,
         )?;
 
@@ -784,6 +2167,7 @@ pub fn upsert_symbols_batch(conn: &mut Connection, symbols: &[SymbolRow]) -> DbR
                 symbol.id,
                 symbol.file_path,
                 symbol.name,
+                serialize_symbol_aliases(&symbol.symbol_aliases),
                 symbol.kind,
                 symbol.start_line,
                 symbol.start_col,
@@ -801,30 +2185,118 @@ pub fn upsert_symbols_batch(conn: &mut Connection, symbols: &[SymbolRow]) -> DbR
 pub fn get_symbols_by_file(conn: &Connection, file_path: &str) -> DbResult<Vec<SymbolRow>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT id, file_path, name, kind, start_line, start_col, end_line, end_col, language
+        SELECT id, file_path, name, symbol_aliases, kind, start_line, start_col, end_line, end_col, language
         FROM symbols WHERE file_path = ?
         ORDER BY start_line
         "#,
     )?;
 
-    let rows = stmt.query_map(params![file_path], |row| {
-        Ok(SymbolRow {
-            id: row.get(0)?,
-            file_path: row.get(1)?,
-            name: row.get(2)?,
-            kind: row.get(3)?,
-            start_line: row.get(4)?,
-            start_col: row.get(5)?,
-            end_line: row.get(6)?,
-            end_col: row.get(7)?,
-            language: row.get(8)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![file_path], map_symbol_row)?;
 
     let mut results = Vec::new();
     for row in rows {
         results.push(row?);
     }
+    Ok(results)
+}
+
+/// Get all symbols in a file that belong to the provided branch
+pub fn get_symbols_by_file_on_branch(
+    conn: &Connection,
+    file_path: &str,
+    branch: &str,
+) -> DbResult<Vec<SymbolRow>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT s.id, s.file_path, s.name, s.symbol_aliases, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
+        FROM symbols s
+        INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
+        WHERE s.file_path = ? AND bs.branch = ?
+        ORDER BY s.start_line
+        "#,
+    )?;
+
+    let rows = stmt.query_map(params![file_path, branch], map_symbol_row)?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn get_symbol_by_id(conn: &Connection, symbol_id: &str) -> DbResult<Option<SymbolRow>> {
+    let result = conn
+        .query_row(
+            r#"
+            SELECT id, file_path, name, symbol_aliases, kind, start_line, start_col, end_line, end_col, language
+            FROM symbols WHERE id = ?
+            "#,
+            params![symbol_id],
+            map_symbol_row,
+        )
+        .optional()?;
+    Ok(result)
+}
+
+pub fn get_symbol_by_id_on_branch(
+    conn: &Connection,
+    symbol_id: &str,
+    branch: &str,
+) -> DbResult<Option<SymbolRow>> {
+    let result = conn
+        .query_row(
+            r#"
+            SELECT s.id, s.file_path, s.name, s.symbol_aliases, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
+            FROM symbols s
+            INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
+            WHERE s.id = ? AND bs.branch = ?
+            "#,
+            params![symbol_id, branch],
+            map_symbol_row,
+        )
+        .optional()?;
+    Ok(result)
+}
+
+pub fn get_symbols_by_ids_on_branch(
+    conn: &Connection,
+    symbol_ids: &[String],
+    branch: &str,
+) -> DbResult<Vec<SymbolRow>> {
+    if symbol_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    let symbol_batch_size = SQL_BIND_PARAM_BATCH_SIZE.saturating_sub(1).max(1);
+
+    for symbol_batch in symbol_ids.chunks(symbol_batch_size) {
+        let placeholders = symbol_batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            r#"
+            SELECT s.id, s.file_path, s.name, s.symbol_aliases, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
+            FROM symbols s
+            INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
+            WHERE bs.branch = ? AND s.id IN ({})
+            "#,
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + symbol_batch.len());
+        params.push(&branch);
+        for symbol_id in symbol_batch {
+            params.push(symbol_id as &dyn rusqlite::ToSql);
+        }
+
+        let rows = stmt.query_map(params.as_slice(), map_symbol_row)?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
     Ok(results)
 }
 
@@ -834,52 +2306,63 @@ pub fn get_symbol_by_name(
     name: &str,
     file_path: &str,
 ) -> DbResult<Option<SymbolRow>> {
+    let alias_match = alias_match_sql("symbol_aliases", false);
     let result = conn
         .query_row(
-            r#"
-            SELECT id, file_path, name, kind, start_line, start_col, end_line, end_col, language
-            FROM symbols WHERE name = ? AND file_path = ?
+            &format!(
+                r#"
+            SELECT id, file_path, name, symbol_aliases, kind, start_line, start_col, end_line, end_col, language
+            FROM symbols WHERE (name = ? OR {}) AND file_path = ?
             "#,
-            params![name, file_path],
-            |row| {
-                Ok(SymbolRow {
-                    id: row.get(0)?,
-                    file_path: row.get(1)?,
-                    name: row.get(2)?,
-                    kind: row.get(3)?,
-                    start_line: row.get(4)?,
-                    start_col: row.get(5)?,
-                    end_line: row.get(6)?,
-                    end_col: row.get(7)?,
-                    language: row.get(8)?,
-                })
-            },
+                alias_match
+            ),
+            params![name, name, file_path],
+            map_symbol_row,
+        )
+        .optional()?;
+    Ok(result)
+}
+
+pub fn get_symbol_by_name_on_branch(
+    conn: &Connection,
+    name: &str,
+    file_path: &str,
+    branch: &str,
+) -> DbResult<Option<SymbolRow>> {
+    let alias_match = alias_match_sql("s.symbol_aliases", false);
+    let result = conn
+        .query_row(
+            &format!(
+                r#"
+            SELECT s.id, s.file_path, s.name, s.symbol_aliases, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
+            FROM symbols s
+            INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
+            WHERE (s.name = ? OR {}) AND s.file_path = ? AND bs.branch = ?
+            ORDER BY s.start_line ASC, s.start_col ASC, s.id ASC
+            LIMIT 1
+            "#,
+                alias_match
+            ),
+            params![name, name, file_path, branch],
+            map_symbol_row,
         )
         .optional()?;
     Ok(result)
 }
 
 pub fn get_symbols_by_name(conn: &Connection, name: &str) -> DbResult<Vec<SymbolRow>> {
+    let alias_match = alias_match_sql("symbol_aliases", false);
     let mut stmt = conn.prepare(
-        r#"
-        SELECT id, file_path, name, kind, start_line, start_col, end_line, end_col, language
-        FROM symbols WHERE name = ?
+        &format!(
+            r#"
+        SELECT id, file_path, name, symbol_aliases, kind, start_line, start_col, end_line, end_col, language
+        FROM symbols WHERE name = ? OR {}
         "#,
+            alias_match
+        ),
     )?;
 
-    let rows = stmt.query_map(params![name], |row| {
-        Ok(SymbolRow {
-            id: row.get(0)?,
-            file_path: row.get(1)?,
-            name: row.get(2)?,
-            kind: row.get(3)?,
-            start_line: row.get(4)?,
-            start_col: row.get(5)?,
-            end_line: row.get(6)?,
-            end_col: row.get(7)?,
-            language: row.get(8)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![name, name], map_symbol_row)?;
 
     let mut results = Vec::new();
     for row in rows {
@@ -888,33 +2371,147 @@ pub fn get_symbols_by_name(conn: &Connection, name: &str) -> DbResult<Vec<Symbol
     Ok(results)
 }
 
-pub fn get_symbols_by_name_ci(conn: &Connection, name: &str) -> DbResult<Vec<SymbolRow>> {
+pub fn get_symbols_by_name_on_branch(
+    conn: &Connection,
+    name: &str,
+    branch: &str,
+) -> DbResult<Vec<SymbolRow>> {
+    let alias_match = alias_match_sql("s.symbol_aliases", false);
     let mut stmt = conn.prepare(
-        r#"
-        SELECT id, file_path, name, kind, start_line, start_col, end_line, end_col, language
-        FROM symbols WHERE lower(name) = lower(?)
+        &format!(
+            r#"
+        SELECT s.id, s.file_path, s.name, s.symbol_aliases, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
+        FROM symbols s
+        INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
+        WHERE (s.name = ? OR {}) AND bs.branch = ?
+        ORDER BY s.file_path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
         "#,
+            alias_match
+        ),
     )?;
 
-    let rows = stmt.query_map(params![name], |row| {
-        Ok(SymbolRow {
-            id: row.get(0)?,
-            file_path: row.get(1)?,
-            name: row.get(2)?,
-            kind: row.get(3)?,
-            start_line: row.get(4)?,
-            start_col: row.get(5)?,
-            end_line: row.get(6)?,
-            end_col: row.get(7)?,
-            language: row.get(8)?,
-        })
-    })?;
+    let rows = stmt.query_map(params![name, name, branch], map_symbol_row)?;
 
     let mut results = Vec::new();
     for row in rows {
         results.push(row?);
     }
     Ok(results)
+}
+
+pub fn get_symbols_by_names_on_branch(
+    conn: &Connection,
+    names: &[String],
+    branch: &str,
+) -> DbResult<Vec<SymbolRow>> {
+    if names.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    let name_batch_size = SQL_BIND_PARAM_BATCH_SIZE.saturating_sub(1).max(1);
+
+    for name_batch in names.chunks(name_batch_size) {
+        let direct_placeholders = name_batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            r#"
+            SELECT s.id, s.file_path, s.name, s.symbol_aliases, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
+            FROM symbols s
+            INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
+            WHERE bs.branch = ? AND (
+                s.name IN ({})
+                OR {}
+            )
+            ORDER BY s.name ASC, s.file_path ASC, s.start_line ASC, s.start_col ASC, s.id ASC
+            "#,
+            direct_placeholders,
+            name_batch
+                .iter()
+                .map(|_| alias_match_sql("s.symbol_aliases", false))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + name_batch.len() * 2);
+        params.push(&branch);
+        for name in name_batch {
+            params.push(name as &dyn rusqlite::ToSql);
+        }
+        for name in name_batch {
+            params.push(name as &dyn rusqlite::ToSql);
+        }
+
+        let rows = stmt.query_map(params.as_slice(), map_symbol_row)?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    Ok(results)
+}
+
+pub fn get_symbols_by_name_ci(conn: &Connection, name: &str) -> DbResult<Vec<SymbolRow>> {
+    let alias_match = alias_match_sql("symbol_aliases", true);
+    let mut stmt = conn.prepare(
+        &format!(
+            r#"
+        SELECT id, file_path, name, symbol_aliases, kind, start_line, start_col, end_line, end_col, language
+        FROM symbols WHERE lower(name) = lower(?) OR {}
+        "#,
+            alias_match
+        ),
+    )?;
+
+    let rows = stmt.query_map(params![name, name], map_symbol_row)?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn get_symbols_by_name_ci_on_branch(
+    conn: &Connection,
+    name: &str,
+    branch: &str,
+) -> DbResult<Vec<SymbolRow>> {
+    let alias_match = alias_match_sql("s.symbol_aliases", true);
+    let mut stmt = conn.prepare(
+        &format!(
+            r#"
+        SELECT s.id, s.file_path, s.name, s.symbol_aliases, s.kind, s.start_line, s.start_col, s.end_line, s.end_col, s.language
+        FROM symbols s
+        INNER JOIN branch_symbols bs ON bs.symbol_id = s.id
+        WHERE (lower(s.name) = lower(?) OR {}) AND bs.branch = ?
+        "#,
+            alias_match
+        ),
+    )?;
+
+    let rows = stmt.query_map(params![name, name, branch], map_symbol_row)?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+/// Check if a symbol exists on any branch other than the current one
+pub fn symbol_exists_on_other_branches(
+    conn: &Connection,
+    branch: &str,
+    symbol_id: &str,
+) -> DbResult<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM branch_symbols WHERE branch != ? AND symbol_id = ?",
+        params![branch, symbol_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 /// Delete all symbols for a file
@@ -926,6 +2523,12 @@ pub fn delete_symbols_by_file(conn: &Connection, file_path: &str) -> DbResult<us
     Ok(count)
 }
 
+/// Delete a single symbol by id
+pub fn delete_symbol(conn: &Connection, symbol_id: &str) -> DbResult<bool> {
+    let count = conn.execute("DELETE FROM symbols WHERE id = ?", params![symbol_id])?;
+    Ok(count > 0)
+}
+
 // ============================================================================
 // Call Edge Operations (Call Graph)
 // ============================================================================
@@ -934,13 +2537,30 @@ pub fn delete_symbols_by_file(conn: &Connection, file_path: &str) -> DbResult<us
 pub fn upsert_call_edge(conn: &Connection, edge: &CallEdgeRow) -> DbResult<()> {
     conn.execute(
         r#"
-        INSERT OR REPLACE INTO call_edges (id, from_symbol_id, target_name, to_symbol_id, call_type, line, col, is_resolved)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO call_edges (
+            id,
+            branch,
+            from_symbol_id,
+            caller_file_path,
+            target_name,
+            target_file_path,
+            target_kind,
+            to_symbol_id,
+            call_type,
+            line,
+            col,
+            is_resolved
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
         params![
             edge.id,
+            edge.branch,
             edge.from_symbol_id,
+            edge.caller_file_path,
             edge.target_name,
+            edge.target_file_path,
+            edge.target_kind,
             edge.to_symbol_id,
             edge.call_type,
             edge.line,
@@ -961,16 +2581,33 @@ pub fn upsert_call_edges_batch(conn: &mut Connection, edges: &[CallEdgeRow]) -> 
     {
         let mut stmt = tx.prepare(
             r#"
-            INSERT OR REPLACE INTO call_edges (id, from_symbol_id, target_name, to_symbol_id, call_type, line, col, is_resolved)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO call_edges (
+                id,
+                branch,
+                from_symbol_id,
+                caller_file_path,
+                target_name,
+                target_file_path,
+                target_kind,
+                to_symbol_id,
+                call_type,
+                line,
+                col,
+                is_resolved
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )?;
 
         for edge in edges {
             stmt.execute(params![
                 edge.id,
+                edge.branch,
                 edge.from_symbol_id,
+                edge.caller_file_path,
                 edge.target_name,
+                edge.target_file_path,
+                edge.target_kind,
                 edge.to_symbol_id,
                 edge.call_type,
                 edge.line,
@@ -992,24 +2629,38 @@ pub fn get_callers(
 ) -> DbResult<Vec<CallEdgeRow>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT ce.id, ce.from_symbol_id, ce.target_name, ce.to_symbol_id, ce.call_type, ce.line, ce.col, ce.is_resolved
+        SELECT
+            ce.id,
+            ce.branch,
+            ce.from_symbol_id,
+            ce.caller_file_path,
+            ce.target_name,
+            ce.target_file_path,
+            ce.target_kind,
+            ce.to_symbol_id,
+            ce.call_type,
+            ce.line,
+            ce.col,
+            ce.is_resolved
         FROM call_edges ce
-        INNER JOIN symbols s ON ce.from_symbol_id = s.id
-        INNER JOIN branch_symbols bs ON s.id = bs.symbol_id AND bs.branch = ?
-        WHERE ce.target_name = ? COLLATE NOCASE
+        WHERE ce.branch = ? AND ce.target_name = ? COLLATE NOCASE
         "#,
     )?;
 
     let rows = stmt.query_map(params![branch, symbol_name], |row| {
         Ok(CallEdgeRow {
             id: row.get(0)?,
-            from_symbol_id: row.get(1)?,
-            target_name: row.get(2)?,
-            to_symbol_id: row.get(3)?,
-            call_type: row.get(4)?,
-            line: row.get(5)?,
-            col: row.get(6)?,
-            is_resolved: row.get::<_, i32>(7)? != 0,
+            branch: row.get(1)?,
+            from_symbol_id: row.get(2)?,
+            caller_file_path: row.get(3)?,
+            target_name: row.get(4)?,
+            target_file_path: row.get(5)?,
+            target_kind: row.get(6)?,
+            to_symbol_id: row.get(7)?,
+            call_type: row.get(8)?,
+            line: row.get(9)?,
+            col: row.get(10)?,
+            is_resolved: row.get::<_, i32>(11)? != 0,
         })
     })?;
 
@@ -1031,8 +2682,10 @@ pub fn get_callers_with_context(
             ce.id,
             ce.from_symbol_id,
             s.name,
-            s.file_path,
+            COALESCE(ce.caller_file_path, s.file_path),
             ce.target_name,
+            ce.target_file_path,
+            ce.target_kind,
             ce.to_symbol_id,
             ce.call_type,
             ce.line,
@@ -1040,8 +2693,7 @@ pub fn get_callers_with_context(
             ce.is_resolved
         FROM call_edges ce
         INNER JOIN symbols s ON ce.from_symbol_id = s.id
-        INNER JOIN branch_symbols bs ON s.id = bs.symbol_id AND bs.branch = ?
-        WHERE ce.target_name = ? COLLATE NOCASE
+        WHERE ce.branch = ? AND ce.target_name = ? COLLATE NOCASE
         "#,
     )?;
 
@@ -1052,11 +2704,13 @@ pub fn get_callers_with_context(
             from_symbol_name: row.get(2)?,
             from_symbol_file_path: row.get(3)?,
             target_name: row.get(4)?,
-            to_symbol_id: row.get(5)?,
-            call_type: row.get(6)?,
-            line: row.get(7)?,
-            col: row.get(8)?,
-            is_resolved: row.get::<_, i32>(9)? != 0,
+            target_file_path: row.get(5)?,
+            target_kind: row.get(6)?,
+            to_symbol_id: row.get(7)?,
+            call_type: row.get(8)?,
+            line: row.get(9)?,
+            col: row.get(10)?,
+            is_resolved: row.get::<_, i32>(11)? != 0,
         })
     })?;
 
@@ -1064,6 +2718,124 @@ pub fn get_callers_with_context(
     for row in rows {
         results.push(row?);
     }
+    Ok(results)
+}
+
+pub fn get_callers_with_context_by_target_symbol_id(
+    conn: &Connection,
+    target_symbol_id: &str,
+    branch: &str,
+) -> DbResult<Vec<CallerRow>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            ce.id,
+            ce.from_symbol_id,
+            s.name,
+            COALESCE(ce.caller_file_path, s.file_path),
+            ce.target_name,
+            ce.target_file_path,
+            ce.target_kind,
+            ce.to_symbol_id,
+            ce.call_type,
+            ce.line,
+            ce.col,
+            ce.is_resolved
+        FROM call_edges ce
+        INNER JOIN symbols s ON ce.from_symbol_id = s.id
+        WHERE ce.branch = ? AND ce.to_symbol_id = ?
+        "#,
+    )?;
+
+    let rows = stmt.query_map(params![branch, target_symbol_id], |row| {
+        Ok(CallerRow {
+            id: row.get(0)?,
+            from_symbol_id: row.get(1)?,
+            from_symbol_name: row.get(2)?,
+            from_symbol_file_path: row.get(3)?,
+            target_name: row.get(4)?,
+            target_file_path: row.get(5)?,
+            target_kind: row.get(6)?,
+            to_symbol_id: row.get(7)?,
+            call_type: row.get(8)?,
+            line: row.get(9)?,
+            col: row.get(10)?,
+            is_resolved: row.get::<_, i32>(11)? != 0,
+        })
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn get_callers_with_context_by_target_symbol_ids_batch(
+    conn: &Connection,
+    target_symbol_ids: &[String],
+    branch: &str,
+) -> DbResult<Vec<CallerRow>> {
+    if target_symbol_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    let symbol_batch_size = SQL_BIND_PARAM_BATCH_SIZE.saturating_sub(1).max(1);
+
+    for symbol_batch in target_symbol_ids.chunks(symbol_batch_size) {
+        let placeholders = symbol_batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            r#"
+            SELECT
+                ce.id,
+                ce.from_symbol_id,
+                s.name,
+                COALESCE(ce.caller_file_path, s.file_path),
+                ce.target_name,
+                ce.target_file_path,
+                ce.target_kind,
+                ce.to_symbol_id,
+                ce.call_type,
+                ce.line,
+                ce.col,
+                ce.is_resolved
+            FROM call_edges ce
+            INNER JOIN symbols s ON ce.from_symbol_id = s.id
+            WHERE ce.branch = ? AND ce.to_symbol_id IN ({})
+            "#,
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + symbol_batch.len());
+        params.push(&branch);
+        for symbol_id in symbol_batch {
+            params.push(symbol_id as &dyn rusqlite::ToSql);
+        }
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(CallerRow {
+                id: row.get(0)?,
+                from_symbol_id: row.get(1)?,
+                from_symbol_name: row.get(2)?,
+                from_symbol_file_path: row.get(3)?,
+                target_name: row.get(4)?,
+                target_file_path: row.get(5)?,
+                target_kind: row.get(6)?,
+                to_symbol_id: row.get(7)?,
+                call_type: row.get(8)?,
+                line: row.get(9)?,
+                col: row.get(10)?,
+                is_resolved: row.get::<_, i32>(11)? != 0,
+            })
+        })?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
     Ok(results)
 }
 
@@ -1071,24 +2843,38 @@ pub fn get_callers_with_context(
 pub fn get_callees(conn: &Connection, symbol_id: &str, branch: &str) -> DbResult<Vec<CallEdgeRow>> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT ce.id, ce.from_symbol_id, ce.target_name, ce.to_symbol_id, ce.call_type, ce.line, ce.col, ce.is_resolved
+        SELECT
+            ce.id,
+            ce.branch,
+            ce.from_symbol_id,
+            ce.caller_file_path,
+            ce.target_name,
+            ce.target_file_path,
+            ce.target_kind,
+            ce.to_symbol_id,
+            ce.call_type,
+            ce.line,
+            ce.col,
+            ce.is_resolved
         FROM call_edges ce
-        INNER JOIN symbols s ON ce.from_symbol_id = s.id
-        INNER JOIN branch_symbols bs ON s.id = bs.symbol_id AND bs.branch = ?
-        WHERE ce.from_symbol_id = ?
+        WHERE ce.branch = ? AND ce.from_symbol_id = ?
         "#,
     )?;
 
     let rows = stmt.query_map(params![branch, symbol_id], |row| {
         Ok(CallEdgeRow {
             id: row.get(0)?,
-            from_symbol_id: row.get(1)?,
-            target_name: row.get(2)?,
-            to_symbol_id: row.get(3)?,
-            call_type: row.get(4)?,
-            line: row.get(5)?,
-            col: row.get(6)?,
-            is_resolved: row.get::<_, i32>(7)? != 0,
+            branch: row.get(1)?,
+            from_symbol_id: row.get(2)?,
+            caller_file_path: row.get(3)?,
+            target_name: row.get(4)?,
+            target_file_path: row.get(5)?,
+            target_kind: row.get(6)?,
+            to_symbol_id: row.get(7)?,
+            call_type: row.get(8)?,
+            line: row.get(9)?,
+            col: row.get(10)?,
+            is_resolved: row.get::<_, i32>(11)? != 0,
         })
     })?;
 
@@ -1099,26 +2885,447 @@ pub fn get_callees(conn: &Connection, symbol_id: &str, branch: &str) -> DbResult
     Ok(results)
 }
 
-/// Delete all call edges where the source symbol is in a file
-pub fn delete_call_edges_by_file(conn: &Connection, file_path: &str) -> DbResult<usize> {
+pub fn get_callees_batch(
+    conn: &Connection,
+    symbol_ids: &[String],
+    branch: &str,
+) -> DbResult<Vec<CallEdgeRow>> {
+    if symbol_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    let symbol_batch_size = SQL_BIND_PARAM_BATCH_SIZE.saturating_sub(1).max(1);
+
+    for symbol_batch in symbol_ids.chunks(symbol_batch_size) {
+        let placeholders = symbol_batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            r#"
+            SELECT
+                ce.id,
+                ce.branch,
+                ce.from_symbol_id,
+                ce.caller_file_path,
+                ce.target_name,
+                ce.target_file_path,
+                ce.target_kind,
+                ce.to_symbol_id,
+                ce.call_type,
+                ce.line,
+                ce.col,
+                ce.is_resolved
+            FROM call_edges ce
+            WHERE ce.branch = ? AND ce.from_symbol_id IN ({})
+            "#,
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + symbol_batch.len());
+        params.push(&branch);
+        for symbol_id in symbol_batch {
+            params.push(symbol_id as &dyn rusqlite::ToSql);
+        }
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(CallEdgeRow {
+                id: row.get(0)?,
+                branch: row.get(1)?,
+                from_symbol_id: row.get(2)?,
+                caller_file_path: row.get(3)?,
+                target_name: row.get(4)?,
+                target_file_path: row.get(5)?,
+                target_kind: row.get(6)?,
+                to_symbol_id: row.get(7)?,
+                call_type: row.get(8)?,
+                line: row.get(9)?,
+                col: row.get(10)?,
+                is_resolved: row.get::<_, i32>(11)? != 0,
+            })
+        })?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    Ok(results)
+}
+
+pub fn get_call_edge_frontier_batch(
+    conn: &Connection,
+    symbol_ids: &[String],
+    branch: &str,
+) -> DbResult<CallEdgeFrontierBatch> {
+    Ok(CallEdgeFrontierBatch {
+        callers: get_callers_with_context_by_target_symbol_ids_batch(conn, symbol_ids, branch)?,
+        callees: get_callees_batch(conn, symbol_ids, branch)?,
+    })
+}
+
+pub fn get_unresolved_callers_by_target_names_on_branch(
+    conn: &Connection,
+    target_names: &[String],
+    branch: &str,
+) -> DbResult<Vec<CallerRow>> {
+    if target_names.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    let name_batch_size = SQL_BIND_PARAM_BATCH_SIZE.saturating_sub(1).max(1);
+
+    for name_batch in target_names.chunks(name_batch_size) {
+        let placeholders = name_batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            r#"
+            SELECT
+                ce.id,
+                ce.from_symbol_id,
+                s.name,
+                COALESCE(ce.caller_file_path, s.file_path),
+                ce.target_name,
+                ce.target_file_path,
+                ce.target_kind,
+                ce.to_symbol_id,
+                ce.call_type,
+                ce.line,
+                ce.col,
+                ce.is_resolved
+            FROM call_edges ce
+            INNER JOIN symbols s ON ce.from_symbol_id = s.id
+            WHERE ce.branch = ?
+              AND ce.to_symbol_id IS NULL
+              AND ce.target_name IN ({})
+            "#,
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&query)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + name_batch.len());
+        params.push(&branch);
+        for target_name in name_batch {
+            params.push(target_name as &dyn rusqlite::ToSql);
+        }
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(CallerRow {
+                id: row.get(0)?,
+                from_symbol_id: row.get(1)?,
+                from_symbol_name: row.get(2)?,
+                from_symbol_file_path: row.get(3)?,
+                target_name: row.get(4)?,
+                target_file_path: row.get(5)?,
+                target_kind: row.get(6)?,
+                to_symbol_id: row.get(7)?,
+                call_type: row.get(8)?,
+                line: row.get(9)?,
+                col: row.get(10)?,
+                is_resolved: row.get::<_, i32>(11)? != 0,
+            })
+        })?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    Ok(results)
+}
+
+/// Delete all call edges where the source symbol is in a file for a branch
+pub fn delete_call_edges_by_file(
+    conn: &Connection,
+    file_path: &str,
+    branch: &str,
+) -> DbResult<usize> {
     let count = conn.execute(
         r#"
-        DELETE FROM call_edges WHERE from_symbol_id IN (
+        DELETE FROM call_edges
+        WHERE branch = ?
+          AND from_symbol_id IN (
             SELECT id FROM symbols WHERE file_path = ?
         )
         "#,
-        params![file_path],
+        params![branch, file_path],
+    )?;
+    Ok(count)
+}
+
+/// Delete all call edges where the source symbol matches a symbol id
+pub fn delete_call_edges_by_symbol(conn: &Connection, symbol_id: &str) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM call_edges WHERE from_symbol_id = ?",
+        params![symbol_id],
+    )?;
+    Ok(count)
+}
+
+/// Delete call edges for a symbol on a single branch
+pub fn delete_call_edges_by_symbol_for_branch(
+    conn: &Connection,
+    symbol_id: &str,
+    branch: &str,
+) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM call_edges WHERE from_symbol_id = ? AND branch = ?",
+        params![symbol_id, branch],
+    )?;
+    Ok(count)
+}
+
+/// Unresolve call edges targeting a symbol on a single branch while preserving the edge row
+pub fn unresolve_call_edges_by_target_symbol_for_branch(
+    conn: &Connection,
+    symbol_id: &str,
+    branch: &str,
+) -> DbResult<usize> {
+    let count = conn.execute(
+        r#"
+        UPDATE call_edges
+        SET to_symbol_id = NULL,
+            target_file_path = NULL,
+            target_kind = NULL,
+            is_resolved = 0
+        WHERE to_symbol_id = ? AND branch = ?
+        "#,
+        params![symbol_id, branch],
+    )?;
+    Ok(count)
+}
+
+/// Delete all call edges whose resolved target points at a specific symbol id
+pub fn delete_call_edges_by_target_symbol(conn: &Connection, symbol_id: &str) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM call_edges WHERE to_symbol_id = ?",
+        params![symbol_id],
     )?;
     Ok(count)
 }
 
 /// Resolve a call edge by setting the target symbol
-pub fn resolve_call_edge(conn: &Connection, edge_id: &str, to_symbol_id: &str) -> DbResult<()> {
+pub fn resolve_call_edge(
+    conn: &Connection,
+    edge_id: &str,
+    branch: &str,
+    to_symbol_id: &str,
+    target_file_path: Option<&str>,
+    target_kind: Option<&str>,
+) -> DbResult<()> {
     conn.execute(
-        "UPDATE call_edges SET to_symbol_id = ?, is_resolved = 1 WHERE id = ?",
-        params![to_symbol_id, edge_id],
+        r#"
+        UPDATE call_edges
+        SET to_symbol_id = ?,
+            target_file_path = ?,
+            target_kind = ?,
+            is_resolved = 1
+        WHERE id = ? AND branch = ?
+        "#,
+        params![to_symbol_id, target_file_path, target_kind, edge_id, branch],
     )?;
     Ok(())
+}
+
+/// Resolve unresolved call edges for a branch using the authoritative branch symbol table.
+///
+/// Resolution order:
+/// 1. Unique same-file exact match
+/// 2. Unique branch-wide exact match
+///
+/// Ambiguous matches and missing targets remain unresolved.
+pub fn resolve_unresolved_call_edges_for_branch(
+    conn: &Connection,
+    branch: &str,
+) -> DbResult<usize> {
+    let same_file_resolved = conn.execute(
+        r#"
+        WITH candidate_matches AS (
+            SELECT
+                ce.id AS edge_id,
+                MIN(target.id) AS to_symbol_id,
+                MIN(target.file_path) AS target_file_path,
+                MIN(target.kind) AS target_kind
+            FROM call_edges ce
+            INNER JOIN symbols caller ON caller.id = ce.from_symbol_id
+            INNER JOIN branch_symbols bs
+                ON bs.branch = ?
+            INNER JOIN symbols target
+                ON target.id = bs.symbol_id
+            WHERE ce.branch = ?
+              AND ce.is_resolved = 0
+              AND target.name = ce.target_name
+              AND target.file_path = COALESCE(ce.caller_file_path, caller.file_path)
+              AND (ce.target_kind IS NULL OR lower(target.kind) = lower(ce.target_kind))
+            GROUP BY ce.id
+            HAVING COUNT(*) = 1
+        )
+        UPDATE call_edges
+        SET to_symbol_id = (
+                SELECT candidate_matches.to_symbol_id
+                FROM candidate_matches
+                WHERE candidate_matches.edge_id = call_edges.id
+            ),
+            target_file_path = (
+                SELECT candidate_matches.target_file_path
+                FROM candidate_matches
+                WHERE candidate_matches.edge_id = call_edges.id
+            ),
+            target_kind = (
+                SELECT candidate_matches.target_kind
+                FROM candidate_matches
+                WHERE candidate_matches.edge_id = call_edges.id
+            ),
+            is_resolved = 1
+        WHERE branch = ?
+          AND is_resolved = 0
+          AND id IN (SELECT edge_id FROM candidate_matches)
+        "#,
+        params![branch, branch, branch],
+    )?;
+
+    let branch_unique_resolved = conn.execute(
+        r#"
+        WITH candidate_matches AS (
+            SELECT
+                ce.id AS edge_id,
+                MIN(target.id) AS to_symbol_id,
+                MIN(target.file_path) AS target_file_path,
+                MIN(target.kind) AS target_kind
+            FROM call_edges ce
+            INNER JOIN branch_symbols bs
+                ON bs.branch = ?
+            INNER JOIN symbols target
+                ON target.id = bs.symbol_id
+            WHERE ce.branch = ?
+              AND ce.is_resolved = 0
+              AND target.name = ce.target_name
+              AND (ce.target_kind IS NULL OR lower(target.kind) = lower(ce.target_kind))
+            GROUP BY ce.id
+            HAVING COUNT(*) = 1
+        )
+        UPDATE call_edges
+        SET to_symbol_id = (
+                SELECT candidate_matches.to_symbol_id
+                FROM candidate_matches
+                WHERE candidate_matches.edge_id = call_edges.id
+            ),
+            target_file_path = (
+                SELECT candidate_matches.target_file_path
+                FROM candidate_matches
+                WHERE candidate_matches.edge_id = call_edges.id
+            ),
+            target_kind = (
+                SELECT candidate_matches.target_kind
+                FROM candidate_matches
+                WHERE candidate_matches.edge_id = call_edges.id
+            ),
+            is_resolved = 1
+        WHERE branch = ?
+          AND is_resolved = 0
+          AND id IN (SELECT edge_id FROM candidate_matches)
+        "#,
+        params![branch, branch, branch],
+    )?;
+
+    let same_file_fragment_resolved = conn.execute(
+        r#"
+        WITH raw_candidates AS (
+            SELECT
+                ce.id AS edge_id,
+                ce.target_file_path AS requested_target_file_path,
+                target.id AS to_symbol_id,
+                target.file_path AS target_file_path,
+                target.kind AS target_kind,
+                target.start_line AS start_line,
+                target.start_col AS start_col
+            FROM call_edges ce
+            INNER JOIN branch_symbols bs
+                ON bs.branch = ?
+            INNER JOIN symbols target
+                ON target.id = bs.symbol_id
+            WHERE ce.branch = ?
+              AND ce.is_resolved = 0
+              AND target.name = ce.target_name
+              AND (ce.target_kind IS NULL OR lower(target.kind) = lower(ce.target_kind))
+        ),
+        target_file_candidates AS (
+            SELECT *
+            FROM raw_candidates
+            WHERE requested_target_file_path IS NOT NULL
+              AND target_file_path = requested_target_file_path
+        ),
+        target_file_choice AS (
+            SELECT c.edge_id, c.to_symbol_id, c.target_file_path, c.target_kind
+            FROM target_file_candidates c
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM target_file_candidates other
+                WHERE other.edge_id = c.edge_id
+                  AND (
+                    other.start_line < c.start_line OR
+                    (other.start_line = c.start_line AND other.start_col < c.start_col) OR
+                    (other.start_line = c.start_line AND other.start_col = c.start_col AND other.to_symbol_id < c.to_symbol_id)
+                  )
+            )
+        ),
+        same_file_edges AS (
+            SELECT rc.edge_id, MIN(rc.target_file_path) AS target_file_path
+            FROM raw_candidates rc
+            LEFT JOIN target_file_choice tfc ON tfc.edge_id = rc.edge_id
+            WHERE tfc.edge_id IS NULL
+            GROUP BY rc.edge_id
+            HAVING COUNT(DISTINCT rc.target_file_path) = 1
+        ),
+        same_file_choice AS (
+            SELECT rc.edge_id, rc.to_symbol_id, rc.target_file_path, rc.target_kind
+            FROM raw_candidates rc
+            INNER JOIN same_file_edges sfe
+                ON sfe.edge_id = rc.edge_id
+               AND sfe.target_file_path = rc.target_file_path
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM raw_candidates other
+                WHERE other.edge_id = rc.edge_id
+                  AND other.target_file_path = rc.target_file_path
+                  AND (
+                    other.start_line < rc.start_line OR
+                    (other.start_line = rc.start_line AND other.start_col < rc.start_col) OR
+                    (other.start_line = rc.start_line AND other.start_col = rc.start_col AND other.to_symbol_id < rc.to_symbol_id)
+                  )
+            )
+        ),
+        candidate_matches AS (
+            SELECT edge_id, to_symbol_id, target_file_path, target_kind
+            FROM target_file_choice
+            UNION ALL
+            SELECT edge_id, to_symbol_id, target_file_path, target_kind
+            FROM same_file_choice
+        )
+        UPDATE call_edges
+        SET to_symbol_id = (
+                SELECT candidate_matches.to_symbol_id
+                FROM candidate_matches
+                WHERE candidate_matches.edge_id = call_edges.id
+            ),
+            target_file_path = (
+                SELECT candidate_matches.target_file_path
+                FROM candidate_matches
+                WHERE candidate_matches.edge_id = call_edges.id
+            ),
+            target_kind = (
+                SELECT candidate_matches.target_kind
+                FROM candidate_matches
+                WHERE candidate_matches.edge_id = call_edges.id
+            ),
+            is_resolved = 1
+        WHERE branch = ?
+          AND is_resolved = 0
+          AND id IN (SELECT edge_id FROM candidate_matches)
+        "#,
+        params![branch, branch, branch],
+    )?;
+
+    Ok(same_file_resolved + branch_unique_resolved + same_file_fragment_resolved)
 }
 
 // ============================================================================
@@ -1188,6 +3395,12 @@ pub fn clear_branch_symbols(conn: &Connection, branch: &str) -> DbResult<usize> 
     Ok(count)
 }
 
+/// Remove all branch-symbol associations across every branch
+pub fn clear_all_branch_symbols(conn: &Connection) -> DbResult<usize> {
+    let count = conn.execute("DELETE FROM branch_symbols", [])?;
+    Ok(count)
+}
+
 // ============================================================================
 // Metadata Operations
 // ============================================================================
@@ -1228,8 +3441,8 @@ pub fn gc_orphan_embeddings(conn: &Connection) -> DbResult<usize> {
     let count = conn.execute(
         r#"
         DELETE FROM embeddings
-        WHERE content_hash NOT IN (
-            SELECT DISTINCT content_hash FROM chunks
+        WHERE embedding_input_hash NOT IN (
+            SELECT DISTINCT embedding_input_hash FROM chunks
         )
         "#,
         [],
@@ -1253,6 +3466,22 @@ pub fn gc_orphan_chunks(conn: &Connection) -> DbResult<usize> {
 
 /// Delete orphaned symbols (not referenced by any branch)
 pub fn gc_orphan_symbols(conn: &Connection) -> DbResult<usize> {
+    conn.execute(
+        r#"
+        UPDATE call_edges
+        SET to_symbol_id = NULL,
+            target_file_path = NULL,
+            target_kind = NULL,
+            is_resolved = 0
+        WHERE to_symbol_id IN (
+            SELECT id FROM symbols
+            WHERE id NOT IN (
+                SELECT DISTINCT symbol_id FROM branch_symbols
+            )
+        )
+        "#,
+        [],
+    )?;
     // First, delete call edges referencing orphan symbols to avoid FK violation
     conn.execute(
         r#"
@@ -1275,9 +3504,9 @@ pub fn gc_orphan_symbols(conn: &Connection) -> DbResult<usize> {
     Ok(count)
 }
 
-/// Delete orphaned call edges (from_symbol not in symbols table)
+/// Delete orphaned call edges (missing callers) and unresolve stale missing targets
 pub fn gc_orphan_call_edges(conn: &Connection) -> DbResult<usize> {
-    let count = conn.execute(
+    let deleted = conn.execute(
         r#"
         DELETE FROM call_edges
         WHERE from_symbol_id NOT IN (
@@ -1286,7 +3515,21 @@ pub fn gc_orphan_call_edges(conn: &Connection) -> DbResult<usize> {
         "#,
         [],
     )?;
-    Ok(count)
+    let unresolved = conn.execute(
+        r#"
+        UPDATE call_edges
+        SET to_symbol_id = NULL,
+            target_file_path = NULL,
+            target_kind = NULL,
+            is_resolved = 0
+        WHERE to_symbol_id IS NOT NULL
+          AND to_symbol_id NOT IN (
+            SELECT DISTINCT id FROM symbols
+          )
+        "#,
+        [],
+    )?;
+    Ok(deleted + unresolved)
 }
 
 /// Get database statistics
@@ -1323,9 +3566,581 @@ pub struct DbStats {
     pub call_edge_count: u64,
 }
 
+// ============================================================================
+// Pipeline State Operations
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct PipelineStateRow {
+    pub branch: String,
+    pub file_path: String,
+    pub stage: String,
+    pub status: String,
+    pub input_hash: Option<String>,
+    pub error: Option<String>,
+    pub updated_at: i64,
+}
+
+pub fn upsert_pipeline_state(conn: &Connection, state: &PipelineStateRow) -> DbResult<()> {
+    conn.execute(
+        r#"
+        INSERT INTO pipeline_state (branch, file_path, stage, status, input_hash, error, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(branch, file_path, stage) DO UPDATE SET
+            status = excluded.status,
+            input_hash = excluded.input_hash,
+            error = excluded.error,
+            updated_at = excluded.updated_at
+        "#,
+        params![
+            state.branch,
+            state.file_path,
+            state.stage,
+            state.status,
+            state.input_hash,
+            state.error,
+            state.updated_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_pipeline_state(
+    conn: &Connection,
+    branch: &str,
+    file_path: &str,
+    stage: &str,
+) -> DbResult<Option<PipelineStateRow>> {
+    let result = conn
+        .query_row(
+            r#"
+            SELECT branch, file_path, stage, status, input_hash, error, updated_at
+            FROM pipeline_state
+            WHERE branch = ? AND file_path = ? AND stage = ?
+            "#,
+            params![branch, file_path, stage],
+            |row| {
+                Ok(PipelineStateRow {
+                    branch: row.get(0)?,
+                    file_path: row.get(1)?,
+                    stage: row.get(2)?,
+                    status: row.get(3)?,
+                    input_hash: row.get(4)?,
+                    error: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(result)
+}
+
+pub fn get_unfinished_pipeline_files(conn: &Connection, branch: &str) -> DbResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        r#"
+        WITH known_files AS (
+            SELECT DISTINCT file_path
+            FROM pipeline_state
+            WHERE branch = ?
+
+            UNION
+
+            SELECT DISTINCT c.file_path
+            FROM branch_chunks bc
+            INNER JOIN chunks c ON c.chunk_id = bc.chunk_id
+            WHERE bc.branch = ?
+        ),
+        required_stages(stage) AS (
+            VALUES ('chunk'), ('embed'), ('index'), ('graph')
+        )
+        SELECT DISTINCT known_files.file_path
+        FROM known_files
+        CROSS JOIN required_stages
+        LEFT JOIN pipeline_state ps
+            ON ps.branch = ?
+           AND ps.file_path = known_files.file_path
+           AND ps.stage = required_stages.stage
+        WHERE ps.status IS NULL
+           OR ps.status != 'complete'
+           OR ps.input_hash IS NULL
+        ORDER BY known_files.file_path
+        "#,
+    )?;
+    let rows = stmt.query_map(params![branch, branch, branch], |row| {
+        row.get::<_, String>(0)
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn get_known_pipeline_files(conn: &Connection, branch: &str) -> DbResult<Vec<String>> {
+    let mut stmt = conn.prepare(
+        r#"
+        WITH known_files AS (
+            SELECT DISTINCT file_path
+            FROM pipeline_state
+            WHERE branch = ?
+
+            UNION
+
+            SELECT DISTINCT c.file_path
+            FROM branch_chunks bc
+            INNER JOIN chunks c ON c.chunk_id = bc.chunk_id
+            WHERE bc.branch = ?
+        )
+        SELECT file_path
+        FROM known_files
+        ORDER BY file_path
+        "#,
+    )?;
+    let rows = stmt.query_map(params![branch, branch], |row| row.get::<_, String>(0))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn reset_pipeline_stage(
+    conn: &Connection,
+    branch: &str,
+    stage: &str,
+    updated_at: i64,
+) -> DbResult<usize> {
+    let count = conn.execute(
+        r#"
+        UPDATE pipeline_state
+        SET status = 'pending',
+            input_hash = NULL,
+            error = NULL,
+            updated_at = ?
+        WHERE branch = ? AND stage = ?
+        "#,
+        params![updated_at, branch, stage],
+    )?;
+    Ok(count)
+}
+
+pub fn clear_pipeline_state_for_branch(conn: &Connection, branch: &str) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM pipeline_state WHERE branch = ?",
+        params![branch],
+    )?;
+    Ok(count)
+}
+
+pub fn clear_pipeline_state_for_file(
+    conn: &Connection,
+    branch: &str,
+    file_path: &str,
+) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM pipeline_state WHERE branch = ? AND file_path = ?",
+        params![branch, file_path],
+    )?;
+    Ok(count)
+}
+
+pub fn clear_all_pipeline_state(conn: &Connection) -> DbResult<usize> {
+    let count = conn.execute("DELETE FROM pipeline_state", [])?;
+    Ok(count)
+}
+
+// ============================================================================
+// Pipeline Run Operations
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct PipelineRunRow {
+    pub run_id: String,
+    pub branch: String,
+    pub run_type: String,
+    pub status: String,
+    pub config_hash: String,
+    pub started_at: i64,
+    pub completed_at: Option<i64>,
+}
+
+pub fn start_pipeline_run(
+    conn: &mut Connection,
+    run: &PipelineRunRow,
+    cancelled_at: i64,
+) -> DbResult<()> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        r#"
+        UPDATE pipeline_runs
+        SET status = 'cancelled',
+            completed_at = ?
+        WHERE branch = ? AND status IN ('in_progress', 'finalizing')
+        "#,
+        params![cancelled_at, run.branch],
+    )?;
+
+    tx.execute(
+        r#"
+        INSERT INTO pipeline_runs (run_id, branch, run_type, status, config_hash, started_at, completed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        "#,
+        params![
+            run.run_id,
+            run.branch,
+            run.run_type,
+            run.status,
+            run.config_hash,
+            run.started_at,
+            run.completed_at
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn update_pipeline_run_status(
+    conn: &Connection,
+    run_id: &str,
+    status: &str,
+    completed_at: Option<i64>,
+) -> DbResult<bool> {
+    let count = conn.execute(
+        r#"
+        UPDATE pipeline_runs
+        SET status = ?,
+            completed_at = ?
+        WHERE run_id = ?
+        "#,
+        params![status, completed_at, run_id],
+    )?;
+    Ok(count > 0)
+}
+
+pub fn get_pipeline_run(conn: &Connection, run_id: &str) -> DbResult<Option<PipelineRunRow>> {
+    let result = conn
+        .query_row(
+            r#"
+            SELECT run_id, branch, run_type, status, config_hash, started_at, completed_at
+            FROM pipeline_runs
+            WHERE run_id = ?
+            "#,
+            params![run_id],
+            |row| {
+                Ok(PipelineRunRow {
+                    run_id: row.get(0)?,
+                    branch: row.get(1)?,
+                    run_type: row.get(2)?,
+                    status: row.get(3)?,
+                    config_hash: row.get(4)?,
+                    started_at: row.get(5)?,
+                    completed_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(result)
+}
+
+pub fn cancel_active_pipeline_runs(
+    conn: &Connection,
+    branch: &str,
+    cancelled_at: i64,
+) -> DbResult<usize> {
+    let count = conn.execute(
+        r#"
+        UPDATE pipeline_runs
+        SET status = 'cancelled',
+            completed_at = ?
+        WHERE branch = ? AND status IN ('in_progress', 'finalizing')
+        "#,
+        params![cancelled_at, branch],
+    )?;
+    Ok(count)
+}
+
+pub fn get_active_pipeline_runs(conn: &Connection) -> DbResult<Vec<PipelineRunRow>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT run_id, branch, run_type, status, config_hash, started_at, completed_at
+        FROM pipeline_runs
+        WHERE status = 'in_progress'
+        ORDER BY started_at, run_id
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(PipelineRunRow {
+            run_id: row.get(0)?,
+            branch: row.get(1)?,
+            run_type: row.get(2)?,
+            status: row.get(3)?,
+            config_hash: row.get(4)?,
+            started_at: row.get(5)?,
+            completed_at: row.get(6)?,
+        })
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn get_pipeline_runs_by_status(
+    conn: &Connection,
+    status: &str,
+) -> DbResult<Vec<PipelineRunRow>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT run_id, branch, run_type, status, config_hash, started_at, completed_at
+        FROM pipeline_runs
+        WHERE status = ?
+        ORDER BY started_at, run_id
+        "#,
+    )?;
+    let rows = stmt.query_map(params![status], |row| {
+        Ok(PipelineRunRow {
+            run_id: row.get(0)?,
+            branch: row.get(1)?,
+            run_type: row.get(2)?,
+            status: row.get(3)?,
+            config_hash: row.get(4)?,
+            started_at: row.get(5)?,
+            completed_at: row.get(6)?,
+        })
+    })?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row?);
+    }
+    Ok(results)
+}
+
+pub fn prune_finished_pipeline_runs(conn: &Connection, older_than: i64) -> DbResult<usize> {
+    let count = conn.execute(
+        r#"
+        DELETE FROM pipeline_runs
+        WHERE status != 'in_progress'
+          AND completed_at IS NOT NULL
+          AND completed_at < ?
+        "#,
+        params![older_than],
+    )?;
+    Ok(count)
+}
+
+pub fn clear_all_pipeline_runs(conn: &Connection) -> DbResult<usize> {
+    let count = conn.execute("DELETE FROM pipeline_runs", [])?;
+    Ok(count)
+}
+
+// ============================================================================
+// Config Version Operations
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct ConfigVersionRow {
+    pub config_hash: String,
+    pub embedding_model_id: String,
+    pub embedding_dimension: i64,
+    pub voyage_model_id: Option<String>,
+    pub embedding_prefix_version: i64,
+    pub chunker_version: String,
+    pub graph_extractor_version: String,
+    pub active: bool,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BranchConfigVersionRow {
+    pub branch: String,
+    pub config_hash: String,
+    pub applied_at: i64,
+}
+
+pub fn get_config_version(
+    conn: &Connection,
+    config_hash: &str,
+) -> DbResult<Option<ConfigVersionRow>> {
+    let result = conn
+        .query_row(
+            r#"
+            SELECT config_hash,
+                   embedding_model_id,
+                   embedding_dimension,
+                   voyage_model_id,
+                   embedding_prefix_version,
+                   chunker_version,
+                   graph_extractor_version,
+                   active,
+                   created_at
+            FROM config_versions
+            WHERE config_hash = ?
+            LIMIT 1
+            "#,
+            params![config_hash],
+            |row| {
+                Ok(ConfigVersionRow {
+                    config_hash: row.get(0)?,
+                    embedding_model_id: row.get(1)?,
+                    embedding_dimension: row.get(2)?,
+                    voyage_model_id: row.get(3)?,
+                    embedding_prefix_version: row.get(4)?,
+                    chunker_version: row.get(5)?,
+                    graph_extractor_version: row.get(6)?,
+                    active: row.get::<_, i64>(7)? != 0,
+                    created_at: row.get(8)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(result)
+}
+
+pub fn get_active_config_version(conn: &Connection) -> DbResult<Option<ConfigVersionRow>> {
+    let result = conn
+        .query_row(
+            r#"
+            SELECT config_hash,
+                   embedding_model_id,
+                   embedding_dimension,
+                   voyage_model_id,
+                   embedding_prefix_version,
+                   chunker_version,
+                   graph_extractor_version,
+                   active,
+                   created_at
+            FROM config_versions
+            WHERE active = 1
+            ORDER BY created_at DESC, config_hash DESC
+            LIMIT 1
+            "#,
+            [],
+            |row| {
+                Ok(ConfigVersionRow {
+                    config_hash: row.get(0)?,
+                    embedding_model_id: row.get(1)?,
+                    embedding_dimension: row.get(2)?,
+                    voyage_model_id: row.get(3)?,
+                    embedding_prefix_version: row.get(4)?,
+                    chunker_version: row.get(5)?,
+                    graph_extractor_version: row.get(6)?,
+                    active: row.get::<_, i64>(7)? != 0,
+                    created_at: row.get(8)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(result)
+}
+
+pub fn activate_config_version(
+    conn: &mut Connection,
+    config_version: &ConfigVersionRow,
+) -> DbResult<()> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE config_versions SET active = 0 WHERE active != 0",
+        [],
+    )?;
+    tx.execute(
+        r#"
+        INSERT INTO config_versions (
+            config_hash,
+            embedding_model_id,
+            embedding_dimension,
+            voyage_model_id,
+            embedding_prefix_version,
+            chunker_version,
+            graph_extractor_version,
+            active,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+        ON CONFLICT(config_hash) DO UPDATE SET
+            embedding_model_id = excluded.embedding_model_id,
+            embedding_dimension = excluded.embedding_dimension,
+            voyage_model_id = excluded.voyage_model_id,
+            embedding_prefix_version = excluded.embedding_prefix_version,
+            chunker_version = excluded.chunker_version,
+            graph_extractor_version = excluded.graph_extractor_version,
+            active = 1
+        "#,
+        params![
+            config_version.config_hash,
+            config_version.embedding_model_id,
+            config_version.embedding_dimension,
+            config_version.voyage_model_id,
+            config_version.embedding_prefix_version,
+            config_version.chunker_version,
+            config_version.graph_extractor_version,
+            config_version.created_at
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn get_branch_config_version(
+    conn: &Connection,
+    branch: &str,
+) -> DbResult<Option<BranchConfigVersionRow>> {
+    let result = conn
+        .query_row(
+            r#"
+            SELECT branch, config_hash, applied_at
+            FROM branch_config_versions
+            WHERE branch = ?
+            LIMIT 1
+            "#,
+            params![branch],
+            |row| {
+                Ok(BranchConfigVersionRow {
+                    branch: row.get(0)?,
+                    config_hash: row.get(1)?,
+                    applied_at: row.get(2)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(result)
+}
+
+pub fn upsert_branch_config_version(
+    conn: &Connection,
+    branch_config: &BranchConfigVersionRow,
+) -> DbResult<()> {
+    conn.execute(
+        r#"
+        INSERT INTO branch_config_versions (branch, config_hash, applied_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(branch) DO UPDATE SET
+            config_hash = excluded.config_hash,
+            applied_at = excluded.applied_at
+        "#,
+        params![
+            branch_config.branch,
+            branch_config.config_hash,
+            branch_config.applied_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn clear_all_config_versions(conn: &Connection) -> DbResult<usize> {
+    let count = conn.execute("DELETE FROM config_versions", [])?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     fn setup_test_db() -> (TempDir, Connection) {
@@ -1333,6 +4148,24 @@ mod tests {
         let db_path = temp_dir.path().join("test.db");
         let conn = init_db(&db_path).unwrap();
         (temp_dir, conn)
+    }
+
+    fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
+        let pragma = format!("PRAGMA table_info('{table}')");
+        let mut stmt = conn.prepare(&pragma).unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    fn index_names(conn: &Connection, table: &str) -> Vec<String> {
+        let pragma = format!("PRAGMA index_list('{table}')");
+        let mut stmt = conn.prepare(&pragma).unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
     }
 
     #[test]
@@ -1345,25 +4178,103 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4");
+        assert_eq!(version, "16");
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout, SQLITE_BUSY_TIMEOUT_MS as i64);
+    }
+
+    #[test]
+    fn test_busy_timeout_waits_for_transient_write_lock() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("busy-timeout.db");
+        let conn = init_db(&db_path).unwrap();
+        let waiting_conn = init_db(&db_path).unwrap();
+
+        conn.execute("BEGIN IMMEDIATE", []).unwrap();
+        set_metadata(&conn, "held-lock", "true").unwrap();
+
+        let writer = thread::spawn(move || {
+            let started = Instant::now();
+            set_metadata(&waiting_conn, "after-lock", "ok").unwrap();
+            started.elapsed()
+        });
+
+        thread::sleep(Duration::from_millis(250));
+        conn.execute("COMMIT", []).unwrap();
+
+        let elapsed = writer.join().unwrap();
+        assert!(elapsed >= Duration::from_millis(200));
+        assert!(elapsed < Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS));
+
+        let verify_conn = init_db(&db_path).unwrap();
+        assert_eq!(
+            get_metadata(&verify_conn, "after-lock").unwrap(),
+            Some("ok".to_string())
+        );
+    }
+
+    #[test]
+    fn test_busy_timeout_fires_after_configured_duration() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("busy-timeout-timeout.db");
+        let conn = init_db(&db_path).unwrap();
+        let waiting_conn = init_db(&db_path).unwrap();
+
+        conn.execute("BEGIN IMMEDIATE", []).unwrap();
+        set_metadata(&conn, "held-lock", "true").unwrap();
+
+        let started = Instant::now();
+        let result = set_metadata(&waiting_conn, "timeout-write", "blocked");
+        let elapsed = started.elapsed();
+        conn.execute("ROLLBACK", []).unwrap();
+
+        assert!(result.is_err());
+        assert!(elapsed >= Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS.saturating_sub(250)));
     }
 
     #[test]
     fn test_embedding_operations() {
         let (_temp_dir, conn) = setup_test_db();
 
-        // Insert embedding
         let hash = "abc123";
         let embedding = vec![1u8, 2, 3, 4];
-        upsert_embedding(&conn, hash, &embedding, "test content", "test-model").unwrap();
+        let voyage_embedding = vec![5u8, 6, 7, 8];
+        upsert_embedding(&conn, hash, hash, &embedding, "test content", "test-model").unwrap();
+        upsert_embedding(
+            &conn,
+            hash,
+            hash,
+            &voyage_embedding,
+            "test content",
+            "voyage-model",
+        )
+        .unwrap();
 
-        // Check exists
         assert!(embedding_exists(&conn, hash).unwrap());
         assert!(!embedding_exists(&conn, "nonexistent").unwrap());
 
-        // Get embedding
-        let retrieved = get_embedding(&conn, hash).unwrap().unwrap();
+        let retrieved = get_embedding_for_model(&conn, hash, "test-model")
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved, embedding);
+        let retrieved_voyage = get_embedding_for_model(&conn, hash, "voyage-model")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retrieved_voyage, voyage_embedding);
+
+        let batch_rows =
+            get_embeddings_for_model_batch(&conn, &[hash.to_string()], "voyage-model").unwrap();
+        assert_eq!(batch_rows.len(), 1);
+        assert_eq!(batch_rows[0].0, hash);
+        assert_eq!(batch_rows[0].1, voyage_embedding);
+
+        let chunk_texts =
+            get_chunk_texts_batch(&conn, &[hash.to_string(), "missing".to_string()]).unwrap();
+        assert_eq!(chunk_texts.len(), 1);
+        assert_eq!(chunk_texts[0].0, hash);
+        assert_eq!(chunk_texts[0].1, "test content");
     }
 
     #[test]
@@ -1371,18 +4282,22 @@ mod tests {
         let (_temp_dir, conn) = setup_test_db();
 
         // First insert the embedding
-        upsert_embedding(&conn, "hash1", &[1, 2, 3], "content", "model").unwrap();
+        upsert_embedding(&conn, "hash1", "hash1", &[1, 2, 3], "content", "model").unwrap();
 
         // Insert chunk
         upsert_chunk(
             &conn,
             "chunk1",
             "hash1",
+            "hash1",
             "src/main.rs",
             10,
             20,
             Some("function"),
             Some("main"),
+            &[],
+            Some("function"),
+            Some("function"),
             "rust",
         )
         .unwrap();
@@ -1392,6 +4307,8 @@ mod tests {
         assert_eq!(chunk.file_path, "src/main.rs");
         assert_eq!(chunk.start_line, 10);
         assert_eq!(chunk.node_type, Some("function".to_string()));
+        assert_eq!(chunk.chunk_kind, Some("function".to_string()));
+        assert_eq!(chunk.symbol_kind, Some("function".to_string()));
     }
 
     #[test]
@@ -1399,13 +4316,22 @@ mod tests {
         let (_temp_dir, conn) = setup_test_db();
 
         // Setup
-        upsert_embedding(&conn, "hash1", &[1], "c1", "m").unwrap();
-        upsert_embedding(&conn, "hash2", &[2], "c2", "m").unwrap();
-        upsert_embedding(&conn, "hash3", &[3], "c3", "m").unwrap();
+        upsert_embedding(&conn, "hash1", "hash1", &[1], "c1", "m").unwrap();
+        upsert_embedding(&conn, "hash2", "hash2", &[2], "c2", "m").unwrap();
+        upsert_embedding(&conn, "hash3", "hash3", &[3], "c3", "m").unwrap();
 
-        upsert_chunk(&conn, "c1", "hash1", "f1.rs", 1, 10, None, None, "rust").unwrap();
-        upsert_chunk(&conn, "c2", "hash2", "f2.rs", 1, 10, None, None, "rust").unwrap();
-        upsert_chunk(&conn, "c3", "hash3", "f3.rs", 1, 10, None, None, "rust").unwrap();
+        upsert_chunk(
+            &conn, "c1", "hash1", "hash1", "f1.rs", 1, 10, None, None, &[], None, None, "rust",
+        )
+        .unwrap();
+        upsert_chunk(
+            &conn, "c2", "hash2", "hash2", "f2.rs", 1, 10, None, None, &[], None, None, "rust",
+        )
+        .unwrap();
+        upsert_chunk(
+            &conn, "c3", "hash3", "hash3", "f3.rs", 1, 10, None, None, &[], None, None, "rust",
+        )
+        .unwrap();
 
         // Add to branches
         add_chunks_to_branch(&conn, "main", &["c1".to_string(), "c2".to_string()]).unwrap();
@@ -1426,11 +4352,14 @@ mod tests {
         let (_temp_dir, conn) = setup_test_db();
 
         // Create orphaned embedding
-        upsert_embedding(&conn, "orphan", &[1], "orphan content", "m").unwrap();
-        upsert_embedding(&conn, "used", &[2], "used content", "m").unwrap();
+        upsert_embedding(&conn, "orphan", "orphan", &[1], "orphan content", "m").unwrap();
+        upsert_embedding(&conn, "used", "used", &[2], "used content", "m").unwrap();
 
         // Create chunk using one embedding
-        upsert_chunk(&conn, "c1", "used", "f1.rs", 1, 10, None, None, "rust").unwrap();
+        upsert_chunk(
+            &conn, "c1", "used", "used", "f1.rs", 1, 10, None, None, &[], None, None, "rust",
+        )
+        .unwrap();
         add_chunks_to_branch(&conn, "main", &["c1".to_string()]).unwrap();
 
         // GC should remove orphan
@@ -1449,6 +4378,7 @@ mod tests {
             id: "sym1".to_string(),
             file_path: "src/main.ts".to_string(),
             name: "handleRequest".to_string(),
+            symbol_aliases: Vec::new(),
             kind: "function".to_string(),
             start_line: 10,
             start_col: 0,
@@ -1492,6 +4422,42 @@ mod tests {
     }
 
     #[test]
+    fn test_symbol_alias_lookup_on_branch_returns_primary_symbol() {
+        let (_temp_dir, mut conn) = setup_test_db();
+
+        let symbol = SymbolRow {
+            id: "sym_parse".to_string(),
+            file_path: "src/parse.ts".to_string(),
+            name: "parse".to_string(),
+            symbol_aliases: vec!["_parse".to_string()],
+            kind: "function".to_string(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 20,
+            end_col: 1,
+            language: "typescript".to_string(),
+        };
+
+        upsert_symbol(&conn, &symbol).unwrap();
+        add_symbols_to_branch(&conn, "main", &["sym_parse".to_string()]).unwrap();
+
+        let alias_match = get_symbols_by_name_on_branch(&conn, "_parse", "main").unwrap();
+        assert_eq!(alias_match.len(), 1);
+        assert_eq!(alias_match[0].name, "parse");
+        assert_eq!(alias_match[0].symbol_aliases, vec!["_parse".to_string()]);
+
+        let primary_match = get_symbols_by_name_on_branch(&conn, "parse", "main").unwrap();
+        assert_eq!(primary_match.len(), 1);
+        assert_eq!(primary_match[0].name, "parse");
+        assert_eq!(primary_match[0].symbol_aliases, vec!["_parse".to_string()]);
+
+        let scoped_alias =
+            get_symbol_by_name_on_branch(&conn, "_parse", "src/parse.ts", "main").unwrap();
+        assert!(scoped_alias.is_some());
+        assert_eq!(scoped_alias.unwrap().name, "parse");
+    }
+
+    #[test]
     fn test_symbol_batch_operations() {
         let (_temp_dir, mut conn) = setup_test_db();
 
@@ -1500,6 +4466,7 @@ mod tests {
                 id: "s1".to_string(),
                 file_path: "src/a.ts".to_string(),
                 name: "foo".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -1511,6 +4478,7 @@ mod tests {
                 id: "s2".to_string(),
                 file_path: "src/a.ts".to_string(),
                 name: "bar".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 7,
                 start_col: 0,
@@ -1522,6 +4490,7 @@ mod tests {
                 id: "s3".to_string(),
                 file_path: "src/b.ts".to_string(),
                 name: "baz".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "class".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -1545,6 +4514,95 @@ mod tests {
     }
 
     #[test]
+    fn test_branch_scoped_chunk_and_symbol_lookups() {
+        let (_temp_dir, mut conn) = setup_test_db();
+
+        let chunks = vec![
+            ChunkRow {
+                chunk_id: "chunk_main".to_string(),
+                content_hash: "hash_main".to_string(),
+                embedding_input_hash: "hash_main".to_string(),
+                file_path: "src/shared.ts".to_string(),
+                start_line: 1,
+                end_line: 10,
+                node_type: Some("function".to_string()),
+                name: Some("processPayment".to_string()),
+                symbol_aliases: Vec::new(),
+                chunk_kind: Some("Code".to_string()),
+                symbol_kind: Some("Function".to_string()),
+                language: "typescript".to_string(),
+            },
+            ChunkRow {
+                chunk_id: "chunk_feature".to_string(),
+                content_hash: "hash_feature".to_string(),
+                embedding_input_hash: "hash_feature".to_string(),
+                file_path: "src/shared.ts".to_string(),
+                start_line: 20,
+                end_line: 30,
+                node_type: Some("function".to_string()),
+                name: Some("processPayment".to_string()),
+                symbol_aliases: Vec::new(),
+                chunk_kind: Some("Code".to_string()),
+                symbol_kind: Some("Function".to_string()),
+                language: "typescript".to_string(),
+            },
+        ];
+        upsert_chunks_batch(&mut conn, &chunks).unwrap();
+        add_chunks_to_branch(&conn, "main", &["chunk_main".to_string()]).unwrap();
+        add_chunks_to_branch(&conn, "feature", &["chunk_feature".to_string()]).unwrap();
+
+        let symbols = vec![
+            SymbolRow {
+                id: "sym_main".to_string(),
+                file_path: "src/shared.ts".to_string(),
+                name: "processPayment".to_string(),
+                symbol_aliases: Vec::new(),
+                kind: "function".to_string(),
+                start_line: 1,
+                start_col: 0,
+                end_line: 10,
+                end_col: 1,
+                language: "typescript".to_string(),
+            },
+            SymbolRow {
+                id: "sym_feature".to_string(),
+                file_path: "src/shared.ts".to_string(),
+                name: "processPayment".to_string(),
+                symbol_aliases: Vec::new(),
+                kind: "function".to_string(),
+                start_line: 20,
+                start_col: 0,
+                end_line: 30,
+                end_col: 1,
+                language: "typescript".to_string(),
+            },
+        ];
+        upsert_symbols_batch(&mut conn, &symbols).unwrap();
+        add_symbols_to_branch(&conn, "main", &["sym_main".to_string()]).unwrap();
+        add_symbols_to_branch(&conn, "feature", &["sym_feature".to_string()]).unwrap();
+
+        let main_chunks = get_chunks_by_file_on_branch(&conn, "src/shared.ts", "main").unwrap();
+        assert_eq!(main_chunks.len(), 1);
+        assert_eq!(main_chunks[0].chunk_id, "chunk_main");
+
+        let feature_symbols =
+            get_symbols_by_name_on_branch(&conn, "processPayment", "feature").unwrap();
+        assert_eq!(feature_symbols.len(), 1);
+        assert_eq!(feature_symbols[0].id, "sym_feature");
+
+        let scoped_symbol =
+            get_symbol_by_name_on_branch(&conn, "processPayment", "src/shared.ts", "main").unwrap();
+        assert_eq!(scoped_symbol.unwrap().id, "sym_main");
+
+        let missing_symbol = get_symbol_by_id_on_branch(&conn, "sym_main", "feature").unwrap();
+        assert!(missing_symbol.is_none());
+
+        let ci_symbols = get_symbols_by_name_ci_on_branch(&conn, "PROCESSPAYMENT", "main").unwrap();
+        assert_eq!(ci_symbols.len(), 1);
+        assert_eq!(ci_symbols[0].id, "sym_main");
+    }
+
+    #[test]
     fn test_call_edge_operations() {
         let (_temp_dir, mut conn) = setup_test_db();
 
@@ -1554,6 +4612,7 @@ mod tests {
                 id: "sym_main".to_string(),
                 file_path: "src/main.ts".to_string(),
                 name: "main".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -1565,6 +4624,7 @@ mod tests {
                 id: "sym_helper".to_string(),
                 file_path: "src/helper.ts".to_string(),
                 name: "helper".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -1586,8 +4646,12 @@ mod tests {
         // Create call edge: main -> helper
         let edge = CallEdgeRow {
             id: "edge1".to_string(),
+            branch: "main".to_string(),
             from_symbol_id: "sym_main".to_string(),
+            caller_file_path: Some("src/main.ts".to_string()),
             target_name: "helper".to_string(),
+            target_file_path: None,
+            target_kind: None,
             to_symbol_id: None,
             call_type: "Call".to_string(),
             line: 5,
@@ -1606,18 +4670,387 @@ mod tests {
         let callers = get_callers(&conn, "helper", "main").unwrap();
         assert_eq!(callers.len(), 1);
         assert_eq!(callers[0].from_symbol_id, "sym_main");
+        assert_eq!(callers[0].branch, "main");
 
         // Resolve the edge
-        resolve_call_edge(&conn, "edge1", "sym_helper").unwrap();
+        resolve_call_edge(
+            &conn,
+            "edge1",
+            "main",
+            "sym_helper",
+            Some("src/helper.ts"),
+            Some("function"),
+        )
+        .unwrap();
         let callees = get_callees(&conn, "sym_main", "main").unwrap();
         assert!(callees[0].is_resolved);
         assert_eq!(callees[0].to_symbol_id, Some("sym_helper".to_string()));
+        assert_eq!(
+            callees[0].target_file_path,
+            Some("src/helper.ts".to_string())
+        );
+        assert_eq!(callees[0].target_kind, Some("function".to_string()));
 
         // Delete by file
-        let deleted = delete_call_edges_by_file(&conn, "src/main.ts").unwrap();
+        let deleted = delete_call_edges_by_file(&conn, "src/main.ts", "main").unwrap();
         assert_eq!(deleted, 1);
         let callees = get_callees(&conn, "sym_main", "main").unwrap();
         assert!(callees.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_unresolved_call_edges_for_branch_resolves_unique_cross_file_targets() {
+        let (_temp_dir, mut conn) = setup_test_db();
+
+        upsert_symbols_batch(
+            &mut conn,
+            &vec![
+                SymbolRow {
+                    id: "sym_caller".to_string(),
+                    file_path: "src/caller.ts".to_string(),
+                    name: "runTask".to_string(),
+                    symbol_aliases: Vec::new(),
+                    kind: "function".to_string(),
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 5,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+                SymbolRow {
+                    id: "sym_helper".to_string(),
+                    file_path: "src/helper.ts".to_string(),
+                    name: "helperFn".to_string(),
+                    symbol_aliases: Vec::new(),
+                    kind: "function".to_string(),
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 5,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        add_symbols_to_branch_batch(
+            &mut conn,
+            "main",
+            &["sym_caller".to_string(), "sym_helper".to_string()],
+        )
+        .unwrap();
+
+        upsert_call_edge(
+            &conn,
+            &CallEdgeRow {
+                id: "edge_cross_file".to_string(),
+                branch: "main".to_string(),
+                from_symbol_id: "sym_caller".to_string(),
+                caller_file_path: Some("src/caller.ts".to_string()),
+                target_name: "helperFn".to_string(),
+                target_file_path: None,
+                target_kind: None,
+                to_symbol_id: None,
+                call_type: "Call".to_string(),
+                line: 3,
+                col: 2,
+                is_resolved: false,
+            },
+        )
+        .unwrap();
+
+        let changed = resolve_unresolved_call_edges_for_branch(&conn, "main").unwrap();
+        assert_eq!(changed, 1);
+
+        let callees = get_callees(&conn, "sym_caller", "main").unwrap();
+        assert_eq!(callees.len(), 1);
+        assert!(callees[0].is_resolved);
+        assert_eq!(callees[0].to_symbol_id, Some("sym_helper".to_string()));
+        assert_eq!(
+            callees[0].target_file_path,
+            Some("src/helper.ts".to_string())
+        );
+        assert_eq!(callees[0].target_kind, Some("function".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_unresolved_call_edges_for_branch_leaves_ambiguous_targets_unresolved() {
+        let (_temp_dir, mut conn) = setup_test_db();
+
+        upsert_symbols_batch(
+            &mut conn,
+            &vec![
+                SymbolRow {
+                    id: "sym_caller".to_string(),
+                    file_path: "src/caller.ts".to_string(),
+                    name: "runTask".to_string(),
+                    symbol_aliases: Vec::new(),
+                    kind: "function".to_string(),
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 5,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+                SymbolRow {
+                    id: "sym_process_a".to_string(),
+                    file_path: "src/process-a.ts".to_string(),
+                    name: "process".to_string(),
+                    symbol_aliases: Vec::new(),
+                    kind: "function".to_string(),
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 5,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+                SymbolRow {
+                    id: "sym_process_b".to_string(),
+                    file_path: "src/process-b.ts".to_string(),
+                    name: "process".to_string(),
+                    symbol_aliases: Vec::new(),
+                    kind: "function".to_string(),
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 5,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        add_symbols_to_branch_batch(
+            &mut conn,
+            "main",
+            &[
+                "sym_caller".to_string(),
+                "sym_process_a".to_string(),
+                "sym_process_b".to_string(),
+            ],
+        )
+        .unwrap();
+
+        upsert_call_edge(
+            &conn,
+            &CallEdgeRow {
+                id: "edge_ambiguous_cross_file".to_string(),
+                branch: "main".to_string(),
+                from_symbol_id: "sym_caller".to_string(),
+                caller_file_path: Some("src/caller.ts".to_string()),
+                target_name: "process".to_string(),
+                target_file_path: None,
+                target_kind: None,
+                to_symbol_id: None,
+                call_type: "Call".to_string(),
+                line: 3,
+                col: 2,
+                is_resolved: false,
+            },
+        )
+        .unwrap();
+
+        let changed = resolve_unresolved_call_edges_for_branch(&conn, "main").unwrap();
+        assert_eq!(changed, 0);
+
+        let callees = get_callees(&conn, "sym_caller", "main").unwrap();
+        assert_eq!(callees.len(), 1);
+        assert!(!callees[0].is_resolved);
+        assert_eq!(callees[0].to_symbol_id, None);
+        assert_eq!(callees[0].target_file_path, None);
+        assert_eq!(callees[0].target_kind, None);
+    }
+
+    #[test]
+    fn test_resolve_unresolved_call_edges_for_branch_resolves_same_file_split_fragments() {
+        let (_temp_dir, mut conn) = setup_test_db();
+
+        upsert_symbols_batch(
+            &mut conn,
+            &vec![
+                SymbolRow {
+                    id: "sym_caller".to_string(),
+                    file_path: "src/runner.ts".to_string(),
+                    name: "runEval".to_string(),
+                    symbol_aliases: Vec::new(),
+                    kind: "function".to_string(),
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 10,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+                SymbolRow {
+                    id: "sym_target_head".to_string(),
+                    file_path: "src/metrics.ts".to_string(),
+                    name: "computeMetrics".to_string(),
+                    symbol_aliases: Vec::new(),
+                    kind: "function".to_string(),
+                    start_line: 20,
+                    start_col: 0,
+                    end_line: 80,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+                SymbolRow {
+                    id: "sym_target_tail".to_string(),
+                    file_path: "src/metrics.ts".to_string(),
+                    name: "computeMetrics".to_string(),
+                    symbol_aliases: Vec::new(),
+                    kind: "function".to_string(),
+                    start_line: 81,
+                    start_col: 0,
+                    end_line: 120,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        add_symbols_to_branch_batch(
+            &mut conn,
+            "main",
+            &[
+                "sym_caller".to_string(),
+                "sym_target_head".to_string(),
+                "sym_target_tail".to_string(),
+            ],
+        )
+        .unwrap();
+
+        upsert_call_edge(
+            &conn,
+            &CallEdgeRow {
+                id: "edge_split_target".to_string(),
+                branch: "main".to_string(),
+                from_symbol_id: "sym_caller".to_string(),
+                caller_file_path: Some("src/runner.ts".to_string()),
+                target_name: "computeMetrics".to_string(),
+                target_file_path: None,
+                target_kind: Some("function".to_string()),
+                to_symbol_id: None,
+                call_type: "Call".to_string(),
+                line: 3,
+                col: 2,
+                is_resolved: false,
+            },
+        )
+        .unwrap();
+
+        let changed = resolve_unresolved_call_edges_for_branch(&conn, "main").unwrap();
+        assert_eq!(changed, 1);
+
+        let callees = get_callees(&conn, "sym_caller", "main").unwrap();
+        assert_eq!(callees.len(), 1);
+        assert!(callees[0].is_resolved);
+        assert_eq!(callees[0].to_symbol_id, Some("sym_target_head".to_string()));
+        assert_eq!(
+            callees[0].target_file_path,
+            Some("src/metrics.ts".to_string())
+        );
+        assert_eq!(callees[0].target_kind, Some("function".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_unresolved_call_edges_for_branch_prefers_target_file_path_for_split_fragments() {
+        let (_temp_dir, mut conn) = setup_test_db();
+
+        upsert_symbols_batch(
+            &mut conn,
+            &vec![
+                SymbolRow {
+                    id: "sym_caller".to_string(),
+                    file_path: "src/runner.ts".to_string(),
+                    name: "runEval".to_string(),
+                    symbol_aliases: Vec::new(),
+                    kind: "function".to_string(),
+                    start_line: 1,
+                    start_col: 0,
+                    end_line: 10,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+                SymbolRow {
+                    id: "sym_target_a_head".to_string(),
+                    file_path: "src/metrics-a.ts".to_string(),
+                    name: "computeMetrics".to_string(),
+                    symbol_aliases: Vec::new(),
+                    kind: "function".to_string(),
+                    start_line: 20,
+                    start_col: 0,
+                    end_line: 80,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+                SymbolRow {
+                    id: "sym_target_a_tail".to_string(),
+                    file_path: "src/metrics-a.ts".to_string(),
+                    name: "computeMetrics".to_string(),
+                    symbol_aliases: Vec::new(),
+                    kind: "function".to_string(),
+                    start_line: 81,
+                    start_col: 0,
+                    end_line: 120,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+                SymbolRow {
+                    id: "sym_target_b".to_string(),
+                    file_path: "src/metrics-b.ts".to_string(),
+                    name: "computeMetrics".to_string(),
+                    symbol_aliases: Vec::new(),
+                    kind: "function".to_string(),
+                    start_line: 15,
+                    start_col: 0,
+                    end_line: 30,
+                    end_col: 1,
+                    language: "typescript".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        add_symbols_to_branch_batch(
+            &mut conn,
+            "main",
+            &[
+                "sym_caller".to_string(),
+                "sym_target_a_head".to_string(),
+                "sym_target_a_tail".to_string(),
+                "sym_target_b".to_string(),
+            ],
+        )
+        .unwrap();
+
+        upsert_call_edge(
+            &conn,
+            &CallEdgeRow {
+                id: "edge_target_file_path".to_string(),
+                branch: "main".to_string(),
+                from_symbol_id: "sym_caller".to_string(),
+                caller_file_path: Some("src/runner.ts".to_string()),
+                target_name: "computeMetrics".to_string(),
+                target_file_path: Some("src/metrics-a.ts".to_string()),
+                target_kind: Some("function".to_string()),
+                to_symbol_id: None,
+                call_type: "Call".to_string(),
+                line: 3,
+                col: 2,
+                is_resolved: false,
+            },
+        )
+        .unwrap();
+
+        let changed = resolve_unresolved_call_edges_for_branch(&conn, "main").unwrap();
+        assert_eq!(changed, 1);
+
+        let callees = get_callees(&conn, "sym_caller", "main").unwrap();
+        assert_eq!(callees[0].to_symbol_id, Some("sym_target_a_head".to_string()));
+        assert_eq!(
+            callees[0].target_file_path,
+            Some("src/metrics-a.ts".to_string())
+        );
     }
 
     #[test]
@@ -1629,6 +5062,7 @@ mod tests {
                 id: "s1".to_string(),
                 file_path: "src/a.ts".to_string(),
                 name: "foo".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -1640,6 +5074,7 @@ mod tests {
                 id: "s2".to_string(),
                 file_path: "src/b.ts".to_string(),
                 name: "bar".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -1674,6 +5109,7 @@ mod tests {
                 id: "used".to_string(),
                 file_path: "src/a.ts".to_string(),
                 name: "used_fn".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -1685,6 +5121,7 @@ mod tests {
                 id: "orphan".to_string(),
                 file_path: "src/b.ts".to_string(),
                 name: "orphan_fn".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -1702,8 +5139,12 @@ mod tests {
         let edges = vec![
             CallEdgeRow {
                 id: "e1".to_string(),
+                branch: "main".to_string(),
                 from_symbol_id: "used".to_string(),
+                caller_file_path: Some("src/a.ts".to_string()),
                 target_name: "something".to_string(),
+                target_file_path: None,
+                target_kind: None,
                 to_symbol_id: None,
                 call_type: "Call".to_string(),
                 line: 3,
@@ -1712,8 +5153,12 @@ mod tests {
             },
             CallEdgeRow {
                 id: "e2".to_string(),
+                branch: "main".to_string(),
                 from_symbol_id: "orphan".to_string(),
+                caller_file_path: Some("src/b.ts".to_string()),
                 target_name: "other".to_string(),
+                target_file_path: None,
+                target_kind: None,
                 to_symbol_id: None,
                 call_type: "Call".to_string(),
                 line: 2,
@@ -1739,6 +5184,71 @@ mod tests {
     }
 
     #[test]
+    fn test_gc_orphan_call_edges_unresolves_missing_targets() {
+        let (_temp_dir, mut conn) = setup_test_db();
+
+        let symbols = vec![
+            SymbolRow {
+                id: "caller".to_string(),
+                file_path: "src/a.ts".to_string(),
+                name: "caller".to_string(),
+                symbol_aliases: Vec::new(),
+                kind: "function".to_string(),
+                start_line: 1,
+                start_col: 0,
+                end_line: 5,
+                end_col: 1,
+                language: "typescript".to_string(),
+            },
+            SymbolRow {
+                id: "target".to_string(),
+                file_path: "src/a.ts".to_string(),
+                name: "target".to_string(),
+                symbol_aliases: Vec::new(),
+                kind: "function".to_string(),
+                start_line: 7,
+                start_col: 0,
+                end_line: 10,
+                end_col: 1,
+                language: "typescript".to_string(),
+            },
+        ];
+        upsert_symbols_batch(&mut conn, &symbols).unwrap();
+        add_symbols_to_branch(&conn, "main", &["caller".to_string(), "target".to_string()])
+            .unwrap();
+        upsert_call_edge(
+            &conn,
+            &CallEdgeRow {
+                id: "edge_target_gc".to_string(),
+                branch: "main".to_string(),
+                from_symbol_id: "caller".to_string(),
+                caller_file_path: Some("src/a.ts".to_string()),
+                target_name: "target".to_string(),
+                target_file_path: Some("src/a.ts".to_string()),
+                target_kind: Some("function".to_string()),
+                to_symbol_id: Some("target".to_string()),
+                call_type: "Call".to_string(),
+                line: 3,
+                col: 0,
+                is_resolved: true,
+            },
+        )
+        .unwrap();
+
+        delete_symbol(&conn, "target").unwrap();
+
+        let changed = gc_orphan_call_edges(&conn).unwrap();
+        assert_eq!(changed, 1);
+
+        let edges = get_callees(&conn, "caller", "main").unwrap();
+        assert_eq!(edges.len(), 1);
+        assert!(!edges[0].is_resolved);
+        assert_eq!(edges[0].to_symbol_id, None);
+        assert_eq!(edges[0].target_file_path, None);
+        assert_eq!(edges[0].target_kind, None);
+    }
+
+    #[test]
     fn test_stats_include_symbols() {
         let (_temp_dir, conn) = setup_test_db();
 
@@ -1752,6 +5262,7 @@ mod tests {
             id: "s1".to_string(),
             file_path: "src/a.ts".to_string(),
             name: "test".to_string(),
+            symbol_aliases: Vec::new(),
             kind: "function".to_string(),
             start_line: 1,
             start_col: 0,
@@ -1763,8 +5274,12 @@ mod tests {
 
         let edge = CallEdgeRow {
             id: "e1".to_string(),
+            branch: "main".to_string(),
             from_symbol_id: "s1".to_string(),
+            caller_file_path: Some("src/a.ts".to_string()),
             target_name: "foo".to_string(),
+            target_file_path: None,
+            target_kind: None,
             to_symbol_id: None,
             call_type: "Call".to_string(),
             line: 3,
@@ -1779,7 +5294,7 @@ mod tests {
     }
 
     #[test]
-    fn test_migration_v4_adds_cascade_on_call_edges_and_chunk_name_indexes() {
+    fn test_migration_v5_adds_cascade_on_call_edges_chunk_indexes_and_merkle_tables() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("migration-v2.db");
 
@@ -1792,12 +5307,15 @@ mod tests {
                     value TEXT NOT NULL
                 );
                 CREATE TABLE embeddings (
-                    content_hash TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL,
                     embedding BLOB NOT NULL,
                     chunk_text TEXT NOT NULL,
                     model TEXT NOT NULL,
-                    created_at INTEGER NOT NULL
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (content_hash, model)
                 );
+                CREATE INDEX idx_embeddings_model_content_hash
+                    ON embeddings(model, content_hash);
                 CREATE TABLE chunks (
                     chunk_id TEXT PRIMARY KEY,
                     content_hash TEXT NOT NULL,
@@ -1853,7 +5371,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, "4");
+        assert_eq!(schema_version, "16");
 
         let on_delete: String = conn
             .query_row("PRAGMA foreign_key_list(call_edges)", [], |row| row.get(6))
@@ -1871,6 +5389,24 @@ mod tests {
         assert!(index_names
             .iter()
             .any(|name| name == "idx_chunks_name_lower"));
+
+        let merkle_snapshot_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'merkle_snapshots'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(merkle_snapshot_exists, "merkle_snapshots");
+
+        let merkle_nodes_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'merkle_nodes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(merkle_nodes_exists, "merkle_nodes");
     }
 
     #[test]
@@ -1883,6 +5419,286 @@ mod tests {
     }
 
     #[test]
+    fn test_v14_schema_exists_on_fresh_db() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        let schema_version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, "16");
+
+        let pipeline_state_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pipeline_state_exists, "pipeline_state");
+
+        let pipeline_runs_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pipeline_runs_exists, "pipeline_runs");
+
+        let config_versions_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'config_versions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(config_versions_exists, "config_versions");
+
+        let branch_config_versions_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'branch_config_versions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(branch_config_versions_exists, "branch_config_versions");
+
+        let embedding_debt_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'embedding_debt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(embedding_debt_exists, "embedding_debt");
+
+        let branch_config_indexes = index_names(&conn, "branch_config_versions");
+        assert!(branch_config_indexes
+            .iter()
+            .any(|name| name == "idx_branch_config_versions_config_hash"));
+
+        let embedding_debt_indexes = index_names(&conn, "embedding_debt");
+        assert!(embedding_debt_indexes
+            .iter()
+            .any(|name| name == "idx_embedding_debt_branch_model"));
+
+        let config_version_columns = table_columns(&conn, "config_versions");
+        assert!(config_version_columns
+            .iter()
+            .any(|name| name == "voyage_model_id"));
+        assert!(config_version_columns
+            .iter()
+            .any(|name| name == "embedding_prefix_version"));
+
+        let embedding_indexes = index_names(&conn, "embeddings");
+        assert!(embedding_indexes
+            .iter()
+            .any(|name| name == "idx_embeddings_model_input_hash"));
+        assert!(embedding_indexes
+            .iter()
+            .any(|name| name == "idx_embeddings_content_hash"));
+
+        let chunk_columns = table_columns(&conn, "chunks");
+        assert!(chunk_columns.iter().any(|name| name == "chunk_kind"));
+        assert!(chunk_columns.iter().any(|name| name == "symbol_kind"));
+        assert!(chunk_columns
+            .iter()
+            .any(|name| name == "embedding_input_hash"));
+
+        let chunk_indexes = index_names(&conn, "chunks");
+        assert!(chunk_indexes
+            .iter()
+            .any(|name| name == "idx_chunks_node_type"));
+
+        let call_edge_columns = table_columns(&conn, "call_edges");
+        assert!(call_edge_columns.iter().any(|name| name == "branch"));
+        assert!(call_edge_columns
+            .iter()
+            .any(|name| name == "caller_file_path"));
+        assert!(call_edge_columns
+            .iter()
+            .any(|name| name == "target_file_path"));
+        assert!(call_edge_columns.iter().any(|name| name == "target_kind"));
+
+        let mut stmt = conn.prepare("PRAGMA index_list('pipeline_state')").unwrap();
+        let pipeline_state_indexes: Vec<String> = stmt
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(pipeline_state_indexes
+            .iter()
+            .any(|name| name == "idx_pipeline_state_branch_status"));
+
+        let mut stmt = conn.prepare("PRAGMA index_list('pipeline_runs')").unwrap();
+        let pipeline_runs_indexes: Vec<String> = stmt
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(pipeline_runs_indexes
+            .iter()
+            .any(|name| name == "idx_pipeline_runs_branch_status"));
+    }
+
+    #[test]
+    fn test_migration_v6_adds_pipeline_tables_and_indexes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("migration-v5.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE embeddings (
+                    content_hash TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    chunk_text TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (content_hash, model)
+                );
+                CREATE TABLE chunks (
+                    chunk_id TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    node_type TEXT,
+                    name TEXT,
+                    language TEXT NOT NULL
+                );
+                CREATE TABLE branch_chunks (
+                    branch TEXT NOT NULL,
+                    chunk_id TEXT NOT NULL,
+                    PRIMARY KEY (branch, chunk_id)
+                );
+                CREATE TABLE symbols (
+                    id TEXT PRIMARY KEY,
+                    file_path TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    start_col INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    end_col INTEGER NOT NULL,
+                    language TEXT NOT NULL
+                );
+                CREATE TABLE call_edges (
+                    id TEXT PRIMARY KEY,
+                    from_symbol_id TEXT NOT NULL,
+                    target_name TEXT NOT NULL,
+                    to_symbol_id TEXT,
+                    call_type TEXT NOT NULL,
+                    line INTEGER NOT NULL,
+                    col INTEGER NOT NULL,
+                    is_resolved INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY (from_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+                );
+                CREATE TABLE branch_symbols (
+                    branch TEXT NOT NULL,
+                    symbol_id TEXT NOT NULL,
+                    PRIMARY KEY (branch, symbol_id)
+                );
+                CREATE TABLE merkle_snapshots (
+                    branch TEXT PRIMARY KEY,
+                    root_hash TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE merkle_nodes (
+                    branch TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    parent_path TEXT,
+                    node_kind TEXT NOT NULL,
+                    node_hash TEXT NOT NULL,
+                    size_bytes INTEGER,
+                    PRIMARY KEY (branch, path),
+                    FOREIGN KEY (branch) REFERENCES merkle_snapshots(branch) ON DELETE CASCADE
+                );
+                INSERT INTO metadata (key, value) VALUES ('schema_version', '5');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let conn = init_db(&db_path).unwrap();
+
+        let schema_version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, "16");
+
+        let pipeline_state_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pipeline_state_exists, "pipeline_state");
+
+        let pipeline_runs_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pipeline_runs_exists, "pipeline_runs");
+
+        let config_versions_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'config_versions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(config_versions_exists, "config_versions");
+
+        let branch_config_versions_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'branch_config_versions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(branch_config_versions_exists, "branch_config_versions");
+
+        let mut stmt = conn.prepare("PRAGMA index_list('pipeline_state')").unwrap();
+        let pipeline_state_indexes: Vec<String> = stmt
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(pipeline_state_indexes
+            .iter()
+            .any(|name| name == "idx_pipeline_state_branch_status"));
+
+        let mut stmt = conn.prepare("PRAGMA index_list('pipeline_runs')").unwrap();
+        let pipeline_runs_indexes: Vec<String> = stmt
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(pipeline_runs_indexes
+            .iter()
+            .any(|name| name == "idx_pipeline_runs_branch_status"));
+    }
+
+    #[test]
     fn test_cascade_deletes_call_edges_when_symbol_deleted() {
         let (_temp_dir, mut conn) = setup_test_db();
 
@@ -1891,6 +5707,7 @@ mod tests {
                 id: "sym_caller".to_string(),
                 file_path: "src/main.ts".to_string(),
                 name: "main".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 1,
                 start_col: 0,
@@ -1902,6 +5719,7 @@ mod tests {
                 id: "sym_target".to_string(),
                 file_path: "src/main.ts".to_string(),
                 name: "target".to_string(),
+                symbol_aliases: Vec::new(),
                 kind: "function".to_string(),
                 start_line: 12,
                 start_col: 0,
@@ -1920,8 +5738,12 @@ mod tests {
 
         let edge = CallEdgeRow {
             id: "edge_cascade".to_string(),
+            branch: "main".to_string(),
             from_symbol_id: "sym_caller".to_string(),
+            caller_file_path: Some("src/main.ts".to_string()),
             target_name: "target".to_string(),
+            target_file_path: None,
+            target_kind: None,
             to_symbol_id: None,
             call_type: "Call".to_string(),
             line: 5,
@@ -1937,11 +5759,1120 @@ mod tests {
 
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM call_edges WHERE id = 'edge_cascade'",
+                "SELECT COUNT(*) FROM call_edges WHERE id = 'edge_cascade' AND branch = 'main'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_call_edge_branch_isolation() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        let symbol = SymbolRow {
+            id: "sym_shared".to_string(),
+            file_path: "src/main.ts".to_string(),
+            name: "main".to_string(),
+            symbol_aliases: Vec::new(),
+            kind: "function".to_string(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 5,
+            end_col: 1,
+            language: "typescript".to_string(),
+        };
+        upsert_symbol(&conn, &symbol).unwrap();
+
+        let edge_main = CallEdgeRow {
+            id: "edge_shared".to_string(),
+            branch: "main".to_string(),
+            from_symbol_id: "sym_shared".to_string(),
+            caller_file_path: Some("src/main.ts".to_string()),
+            target_name: "helper".to_string(),
+            target_file_path: None,
+            target_kind: None,
+            to_symbol_id: None,
+            call_type: "Call".to_string(),
+            line: 2,
+            col: 0,
+            is_resolved: false,
+        };
+        let edge_feature = CallEdgeRow {
+            branch: "feature".to_string(),
+            ..edge_main.clone()
+        };
+
+        upsert_call_edge(&conn, &edge_main).unwrap();
+        upsert_call_edge(&conn, &edge_feature).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM call_edges WHERE id = 'edge_shared'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let deleted = delete_call_edges_by_symbol_for_branch(&conn, "sym_shared", "main").unwrap();
+        assert_eq!(deleted, 1);
+
+        let main_edges = get_callees(&conn, "sym_shared", "main").unwrap();
+        assert!(main_edges.is_empty());
+        let feature_edges = get_callees(&conn, "sym_shared", "feature").unwrap();
+        assert_eq!(feature_edges.len(), 1);
+        assert_eq!(feature_edges[0].branch, "feature");
+    }
+
+    #[test]
+    fn test_unresolve_call_edges_by_target_symbol_for_branch() {
+        let (_temp_dir, mut conn) = setup_test_db();
+
+        let symbols = vec![
+            SymbolRow {
+                id: "sym_caller".to_string(),
+                file_path: "src/main.ts".to_string(),
+                name: "caller".to_string(),
+                symbol_aliases: Vec::new(),
+                kind: "function".to_string(),
+                start_line: 1,
+                start_col: 0,
+                end_line: 5,
+                end_col: 1,
+                language: "typescript".to_string(),
+            },
+            SymbolRow {
+                id: "sym_target".to_string(),
+                file_path: "src/main.ts".to_string(),
+                name: "target".to_string(),
+                symbol_aliases: Vec::new(),
+                kind: "function".to_string(),
+                start_line: 7,
+                start_col: 0,
+                end_line: 10,
+                end_col: 1,
+                language: "typescript".to_string(),
+            },
+        ];
+        upsert_symbols_batch(&mut conn, &symbols).unwrap();
+        add_symbols_to_branch(
+            &conn,
+            "main",
+            &["sym_caller".to_string(), "sym_target".to_string()],
+        )
+        .unwrap();
+        add_symbols_to_branch(
+            &conn,
+            "feature",
+            &["sym_caller".to_string(), "sym_target".to_string()],
+        )
+        .unwrap();
+
+        upsert_call_edges_batch(
+            &mut conn,
+            &[
+                CallEdgeRow {
+                    id: "edge_target".to_string(),
+                    branch: "main".to_string(),
+                    from_symbol_id: "sym_caller".to_string(),
+                    caller_file_path: Some("src/main.ts".to_string()),
+                    target_name: "target".to_string(),
+                    target_file_path: Some("src/main.ts".to_string()),
+                    target_kind: Some("function".to_string()),
+                    to_symbol_id: Some("sym_target".to_string()),
+                    call_type: "Call".to_string(),
+                    line: 3,
+                    col: 0,
+                    is_resolved: true,
+                },
+                CallEdgeRow {
+                    id: "edge_target".to_string(),
+                    branch: "feature".to_string(),
+                    from_symbol_id: "sym_caller".to_string(),
+                    caller_file_path: Some("src/main.ts".to_string()),
+                    target_name: "target".to_string(),
+                    target_file_path: Some("src/main.ts".to_string()),
+                    target_kind: Some("function".to_string()),
+                    to_symbol_id: Some("sym_target".to_string()),
+                    call_type: "Call".to_string(),
+                    line: 3,
+                    col: 0,
+                    is_resolved: true,
+                },
+            ],
+        )
+        .unwrap();
+
+        let changed =
+            unresolve_call_edges_by_target_symbol_for_branch(&conn, "sym_target", "main").unwrap();
+        assert_eq!(changed, 1);
+
+        let main_edges = get_callees(&conn, "sym_caller", "main").unwrap();
+        assert_eq!(main_edges.len(), 1);
+        assert!(!main_edges[0].is_resolved);
+        assert_eq!(main_edges[0].to_symbol_id, None);
+        assert_eq!(main_edges[0].target_file_path, None);
+        assert_eq!(main_edges[0].target_kind, None);
+
+        let feature_edges = get_callees(&conn, "sym_caller", "feature").unwrap();
+        assert_eq!(feature_edges.len(), 1);
+        assert!(feature_edges[0].is_resolved);
+        assert_eq!(
+            feature_edges[0].to_symbol_id,
+            Some("sym_target".to_string())
+        );
+
+        let main_callers =
+            get_callers_with_context_by_target_symbol_id(&conn, "sym_target", "main").unwrap();
+        assert!(main_callers.is_empty());
+        let feature_callers =
+            get_callers_with_context_by_target_symbol_id(&conn, "sym_target", "feature").unwrap();
+        assert_eq!(feature_callers.len(), 1);
+    }
+
+    #[test]
+    fn test_delete_call_edges_by_target_symbol_globally() {
+        let (_temp_dir, mut conn) = setup_test_db();
+
+        let symbols = vec![
+            SymbolRow {
+                id: "sym_caller".to_string(),
+                file_path: "src/main.ts".to_string(),
+                name: "caller".to_string(),
+                symbol_aliases: Vec::new(),
+                kind: "function".to_string(),
+                start_line: 1,
+                start_col: 0,
+                end_line: 5,
+                end_col: 1,
+                language: "typescript".to_string(),
+            },
+            SymbolRow {
+                id: "sym_target".to_string(),
+                file_path: "src/main.ts".to_string(),
+                name: "target".to_string(),
+                symbol_aliases: Vec::new(),
+                kind: "function".to_string(),
+                start_line: 7,
+                start_col: 0,
+                end_line: 10,
+                end_col: 1,
+                language: "typescript".to_string(),
+            },
+        ];
+        upsert_symbols_batch(&mut conn, &symbols).unwrap();
+
+        upsert_call_edges_batch(
+            &mut conn,
+            &[
+                CallEdgeRow {
+                    id: "edge_target".to_string(),
+                    branch: "main".to_string(),
+                    from_symbol_id: "sym_caller".to_string(),
+                    caller_file_path: Some("src/main.ts".to_string()),
+                    target_name: "target".to_string(),
+                    target_file_path: Some("src/main.ts".to_string()),
+                    target_kind: Some("function".to_string()),
+                    to_symbol_id: Some("sym_target".to_string()),
+                    call_type: "Call".to_string(),
+                    line: 3,
+                    col: 0,
+                    is_resolved: true,
+                },
+                CallEdgeRow {
+                    id: "edge_target".to_string(),
+                    branch: "feature".to_string(),
+                    from_symbol_id: "sym_caller".to_string(),
+                    caller_file_path: Some("src/main.ts".to_string()),
+                    target_name: "target".to_string(),
+                    target_file_path: Some("src/main.ts".to_string()),
+                    target_kind: Some("function".to_string()),
+                    to_symbol_id: Some("sym_target".to_string()),
+                    call_type: "Call".to_string(),
+                    line: 3,
+                    col: 0,
+                    is_resolved: true,
+                },
+            ],
+        )
+        .unwrap();
+
+        let deleted = delete_call_edges_by_target_symbol(&conn, "sym_target").unwrap();
+        assert_eq!(deleted, 2);
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM call_edges WHERE to_symbol_id = 'sym_target'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_call_edge_enriched_fields() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        let symbol = SymbolRow {
+            id: "sym_main".to_string(),
+            file_path: "src/main.ts".to_string(),
+            name: "main".to_string(),
+            symbol_aliases: Vec::new(),
+            kind: "function".to_string(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 5,
+            end_col: 1,
+            language: "typescript".to_string(),
+        };
+        upsert_symbol(&conn, &symbol).unwrap();
+
+        let edge = CallEdgeRow {
+            id: "edge_enriched".to_string(),
+            branch: "main".to_string(),
+            from_symbol_id: "sym_main".to_string(),
+            caller_file_path: Some("src/main.ts".to_string()),
+            target_name: "helper".to_string(),
+            target_file_path: Some("src/helper.ts".to_string()),
+            target_kind: Some("function".to_string()),
+            to_symbol_id: Some("sym_helper".to_string()),
+            call_type: "Call".to_string(),
+            line: 4,
+            col: 2,
+            is_resolved: true,
+        };
+        upsert_call_edge(&conn, &edge).unwrap();
+
+        let edges = get_callees(&conn, "sym_main", "main").unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].branch, "main");
+        assert_eq!(edges[0].caller_file_path, Some("src/main.ts".to_string()));
+        assert_eq!(edges[0].target_file_path, Some("src/helper.ts".to_string()));
+        assert_eq!(edges[0].target_kind, Some("function".to_string()));
+        assert_eq!(edges[0].to_symbol_id, Some("sym_helper".to_string()));
+        assert!(edges[0].is_resolved);
+    }
+
+    #[test]
+    fn test_get_callers_direct_branch_filter() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        let symbol = SymbolRow {
+            id: "sym_main".to_string(),
+            file_path: "src/main.ts".to_string(),
+            name: "main".to_string(),
+            symbol_aliases: Vec::new(),
+            kind: "function".to_string(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 5,
+            end_col: 1,
+            language: "typescript".to_string(),
+        };
+        upsert_symbol(&conn, &symbol).unwrap();
+
+        let edge = CallEdgeRow {
+            id: "edge_direct_filter".to_string(),
+            branch: "main".to_string(),
+            from_symbol_id: "sym_main".to_string(),
+            caller_file_path: Some("src/main.ts".to_string()),
+            target_name: "helper".to_string(),
+            target_file_path: None,
+            target_kind: None,
+            to_symbol_id: None,
+            call_type: "Call".to_string(),
+            line: 3,
+            col: 0,
+            is_resolved: false,
+        };
+        upsert_call_edge(&conn, &edge).unwrap();
+
+        let main_callers = get_callers(&conn, "helper", "main").unwrap();
+        assert_eq!(main_callers.len(), 1);
+
+        let feature_callers = get_callers(&conn, "helper", "feature").unwrap();
+        assert!(feature_callers.is_empty());
+    }
+
+    #[test]
+    fn test_delete_call_edges_branch_scoped() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        let symbol = SymbolRow {
+            id: "sym_branch_delete".to_string(),
+            file_path: "src/main.ts".to_string(),
+            name: "main".to_string(),
+            symbol_aliases: Vec::new(),
+            kind: "function".to_string(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 5,
+            end_col: 1,
+            language: "typescript".to_string(),
+        };
+        upsert_symbol(&conn, &symbol).unwrap();
+
+        let edge_main = CallEdgeRow {
+            id: "edge_branch_delete".to_string(),
+            branch: "main".to_string(),
+            from_symbol_id: "sym_branch_delete".to_string(),
+            caller_file_path: Some("src/main.ts".to_string()),
+            target_name: "helper".to_string(),
+            target_file_path: None,
+            target_kind: None,
+            to_symbol_id: None,
+            call_type: "Call".to_string(),
+            line: 2,
+            col: 0,
+            is_resolved: false,
+        };
+        let edge_feature = CallEdgeRow {
+            branch: "feature".to_string(),
+            ..edge_main.clone()
+        };
+
+        upsert_call_edge(&conn, &edge_main).unwrap();
+        upsert_call_edge(&conn, &edge_feature).unwrap();
+
+        let deleted = delete_call_edges_by_file(&conn, "src/main.ts", "main").unwrap();
+        assert_eq!(deleted, 1);
+
+        let main_edges = get_callees(&conn, "sym_branch_delete", "main").unwrap();
+        assert!(main_edges.is_empty());
+        let feature_edges = get_callees(&conn, "sym_branch_delete", "feature").unwrap();
+        assert_eq!(feature_edges.len(), 1);
+    }
+
+    #[test]
+    fn test_chunk_kind_symbol_kind_roundtrip() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        upsert_embedding(
+            &conn,
+            "hash_kind",
+            "hash_kind",
+            &[1, 2, 3],
+            "content",
+            "model",
+        )
+        .unwrap();
+        upsert_chunk(
+            &conn,
+            "chunk_kind_roundtrip",
+            "hash_kind",
+            "hash_kind",
+            "src/main.rs",
+            1,
+            5,
+            Some("function_item"),
+            Some("main"),
+            &[],
+            Some("Function"),
+            Some("Function"),
+            "rust",
+        )
+        .unwrap();
+
+        let chunk = get_chunk(&conn, "chunk_kind_roundtrip").unwrap().unwrap();
+        assert_eq!(chunk.chunk_kind, Some("Function".to_string()));
+        assert_eq!(chunk.symbol_kind, Some("Function".to_string()));
+    }
+
+    #[test]
+    fn test_chunk_kind_null_for_pre_v7_rows() {
+        let (_temp_dir, conn) = setup_test_db();
+
+        upsert_embedding(
+            &conn,
+            "hash_null_kind",
+            "hash_null_kind",
+            &[1, 2, 3],
+            "content",
+            "model",
+        )
+        .unwrap();
+        upsert_chunk(
+            &conn,
+            "chunk_null_kind",
+            "hash_null_kind",
+            "hash_null_kind",
+            "src/main.rs",
+            1,
+            5,
+            Some("function_item"),
+            Some("main"),
+            &[],
+            None,
+            None,
+            "rust",
+        )
+        .unwrap();
+
+        let chunk = get_chunk(&conn, "chunk_null_kind").unwrap().unwrap();
+        assert_eq!(chunk.chunk_kind, None);
+        assert_eq!(chunk.symbol_kind, None);
+    }
+
+    #[test]
+    fn test_v7_migration_from_v6() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("migration-v6.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE embeddings (
+                    content_hash TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    chunk_text TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (content_hash, model)
+                );
+                CREATE TABLE chunks (
+                    chunk_id TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    node_type TEXT,
+                    name TEXT,
+                    language TEXT NOT NULL
+                );
+                CREATE TABLE branch_chunks (
+                    branch TEXT NOT NULL,
+                    chunk_id TEXT NOT NULL,
+                    PRIMARY KEY (branch, chunk_id)
+                );
+                CREATE TABLE symbols (
+                    id TEXT PRIMARY KEY,
+                    file_path TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    start_col INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    end_col INTEGER NOT NULL,
+                    language TEXT NOT NULL
+                );
+                CREATE TABLE call_edges (
+                    id TEXT PRIMARY KEY,
+                    from_symbol_id TEXT NOT NULL,
+                    target_name TEXT NOT NULL,
+                    to_symbol_id TEXT,
+                    call_type TEXT NOT NULL,
+                    line INTEGER NOT NULL,
+                    col INTEGER NOT NULL,
+                    is_resolved INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY (from_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+                );
+                CREATE TABLE branch_symbols (
+                    branch TEXT NOT NULL,
+                    symbol_id TEXT NOT NULL,
+                    PRIMARY KEY (branch, symbol_id)
+                );
+                CREATE TABLE merkle_snapshots (
+                    branch TEXT PRIMARY KEY,
+                    root_hash TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE merkle_nodes (
+                    branch TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    parent_path TEXT,
+                    node_kind TEXT NOT NULL,
+                    node_hash TEXT NOT NULL,
+                    size_bytes INTEGER,
+                    PRIMARY KEY (branch, path),
+                    FOREIGN KEY (branch) REFERENCES merkle_snapshots(branch) ON DELETE CASCADE
+                );
+                CREATE TABLE pipeline_state (
+                    branch TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    input_hash TEXT,
+                    error TEXT,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (branch, file_path, stage)
+                );
+                CREATE TABLE pipeline_runs (
+                    run_id TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    run_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    config_hash TEXT NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    completed_at INTEGER,
+                    PRIMARY KEY (run_id)
+                );
+                CREATE TABLE config_versions (
+                    config_hash TEXT NOT NULL,
+                    embedding_model_id TEXT NOT NULL,
+                    embedding_dimension INTEGER NOT NULL,
+                    chunker_version TEXT NOT NULL,
+                    graph_extractor_version TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (config_hash)
+                );
+
+                CREATE INDEX idx_call_edges_from ON call_edges(from_symbol_id);
+                CREATE INDEX idx_call_edges_to ON call_edges(to_symbol_id);
+                CREATE INDEX idx_call_edges_target_name ON call_edges(target_name);
+
+                INSERT INTO symbols (
+                    id,
+                    file_path,
+                    name,
+                    kind,
+                    start_line,
+                    start_col,
+                    end_line,
+                    end_col,
+                    language
+                ) VALUES ('sym_v6', 'src/main.ts', 'main', 'function', 1, 0, 5, 1, 'typescript');
+
+                INSERT INTO call_edges (
+                    id,
+                    from_symbol_id,
+                    target_name,
+                    to_symbol_id,
+                    call_type,
+                    line,
+                    col,
+                    is_resolved
+                ) VALUES ('edge_v6', 'sym_v6', 'helper', NULL, 'Call', 3, 1, 0);
+
+                INSERT INTO metadata (key, value) VALUES ('schema_version', '6');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let conn = init_db(&db_path).unwrap();
+
+        let schema_version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, "16");
+
+        let call_edge_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM call_edges", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(call_edge_count, 0);
+
+        let chunk_columns = table_columns(&conn, "chunks");
+        assert!(chunk_columns.iter().any(|name| name == "chunk_kind"));
+        assert!(chunk_columns.iter().any(|name| name == "symbol_kind"));
+
+        let call_edge_columns = table_columns(&conn, "call_edges");
+        assert!(call_edge_columns.iter().any(|name| name == "branch"));
+        assert!(call_edge_columns
+            .iter()
+            .any(|name| name == "caller_file_path"));
+        assert!(call_edge_columns
+            .iter()
+            .any(|name| name == "target_file_path"));
+        assert!(call_edge_columns.iter().any(|name| name == "target_kind"));
+
+        let call_edge_indexes = index_names(&conn, "call_edges");
+        assert!(call_edge_indexes
+            .iter()
+            .any(|name| name == "idx_call_edges_branch_from"));
+        assert!(call_edge_indexes
+            .iter()
+            .any(|name| name == "idx_call_edges_branch_target_name"));
+        assert!(call_edge_indexes
+            .iter()
+            .any(|name| name == "idx_call_edges_branch_to"));
+
+        let (fk_table, fk_from, fk_on_delete): (String, String, String) = conn
+            .query_row("PRAGMA foreign_key_list(call_edges)", [], |row| {
+                Ok((row.get(2)?, row.get(3)?, row.get(6)?))
+            })
+            .unwrap();
+        assert_eq!(fk_table, "symbols");
+        assert_eq!(fk_from, "from_symbol_id");
+        assert_eq!(fk_on_delete.to_uppercase(), "CASCADE");
+    }
+
+    #[test]
+    fn test_v8_to_v15_migration_adds_embedding_input_hash_branch_config_versions_and_observability_tables() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("migration-v8.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA foreign_keys = ON;
+
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE embeddings (
+                    content_hash TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    chunk_text TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (content_hash, model)
+                );
+                CREATE INDEX idx_embeddings_model_content_hash
+                    ON embeddings(model, content_hash);
+                CREATE TABLE chunks (
+                    chunk_id TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    node_type TEXT,
+                    name TEXT,
+                    language TEXT NOT NULL,
+                    chunk_kind TEXT,
+                    symbol_kind TEXT
+                );
+                CREATE TABLE branch_chunks (
+                    branch TEXT NOT NULL,
+                    chunk_id TEXT NOT NULL,
+                    PRIMARY KEY (branch, chunk_id)
+                );
+                CREATE TABLE symbols (
+                    id TEXT PRIMARY KEY,
+                    file_path TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    start_col INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    end_col INTEGER NOT NULL,
+                    language TEXT NOT NULL
+                );
+                CREATE TABLE call_edges (
+                    id TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    from_symbol_id TEXT NOT NULL,
+                    caller_file_path TEXT,
+                    target_name TEXT NOT NULL,
+                    target_file_path TEXT,
+                    target_kind TEXT,
+                    to_symbol_id TEXT,
+                    call_type TEXT NOT NULL,
+                    line INTEGER NOT NULL,
+                    col INTEGER NOT NULL,
+                    is_resolved INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (id, branch),
+                    FOREIGN KEY (from_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+                );
+                CREATE INDEX idx_call_edges_from ON call_edges(from_symbol_id);
+                CREATE INDEX idx_call_edges_to ON call_edges(to_symbol_id);
+                CREATE INDEX idx_call_edges_target_name ON call_edges(target_name);
+                CREATE INDEX idx_call_edges_branch_from ON call_edges(branch, from_symbol_id);
+                CREATE INDEX idx_call_edges_branch_target_name ON call_edges(branch, target_name);
+                CREATE INDEX idx_call_edges_branch_to ON call_edges(branch, to_symbol_id);
+                CREATE TABLE branch_symbols (
+                    branch TEXT NOT NULL,
+                    symbol_id TEXT NOT NULL,
+                    PRIMARY KEY (branch, symbol_id)
+                );
+                CREATE TABLE merkle_snapshots (
+                    branch TEXT PRIMARY KEY,
+                    root_hash TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE merkle_nodes (
+                    branch TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    parent_path TEXT,
+                    node_kind TEXT NOT NULL,
+                    node_hash TEXT NOT NULL,
+                    size_bytes INTEGER,
+                    PRIMARY KEY (branch, path),
+                    FOREIGN KEY (branch) REFERENCES merkle_snapshots(branch) ON DELETE CASCADE
+                );
+                CREATE TABLE pipeline_state (
+                    branch TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    input_hash TEXT,
+                    error TEXT,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (branch, file_path, stage)
+                );
+                CREATE TABLE pipeline_runs (
+                    run_id TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    run_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    config_hash TEXT NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    completed_at INTEGER,
+                    PRIMARY KEY (run_id)
+                );
+                CREATE TABLE config_versions (
+                    config_hash TEXT NOT NULL,
+                    embedding_model_id TEXT NOT NULL,
+                    embedding_dimension INTEGER NOT NULL,
+                    voyage_model_id TEXT,
+                    chunker_version TEXT NOT NULL,
+                    graph_extractor_version TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (config_hash)
+                );
+                INSERT INTO embeddings (content_hash, embedding, chunk_text, model, created_at)
+                VALUES ('shared_hash', X'01020304', 'chunk', 'mock-embedding-model', 1);
+                INSERT INTO config_versions (
+                    config_hash,
+                    embedding_model_id,
+                    embedding_dimension,
+                    voyage_model_id,
+                    chunker_version,
+                    graph_extractor_version,
+                    active,
+                    created_at
+                ) VALUES ('cfg-v8', 'mock-embedding-model', 8, NULL, 'chunker-v1', '1.0.0', 1, 1);
+                INSERT INTO metadata (key, value) VALUES ('schema_version', '8');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let conn = init_db(&db_path).unwrap();
+
+        let schema_version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, "16");
+
+        let chunk_indexes = index_names(&conn, "chunks");
+        assert!(chunk_indexes
+            .iter()
+            .any(|name| name == "idx_chunks_node_type"));
+
+        let config_columns = table_columns(&conn, "config_versions");
+        assert!(config_columns.iter().any(|name| name == "voyage_model_id"));
+        assert!(config_columns
+            .iter()
+            .any(|name| name == "embedding_prefix_version"));
+        let embedding_columns = table_columns(&conn, "embeddings");
+        assert!(embedding_columns
+            .iter()
+            .any(|name| name == "embedding_input_hash"));
+        let chunk_columns = table_columns(&conn, "chunks");
+        assert!(chunk_columns
+            .iter()
+            .any(|name| name == "embedding_input_hash"));
+        let branch_config_versions_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'branch_config_versions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(branch_config_versions_exists, "branch_config_versions");
+
+        let active_config = get_active_config_version(&conn).unwrap().unwrap();
+        assert_eq!(active_config.voyage_model_id, None);
+        assert_eq!(active_config.embedding_prefix_version, 0);
+
+        let embedding = get_embedding_for_model(&conn, "shared_hash", "mock-embedding-model")
+            .unwrap()
+            .unwrap();
+        assert_eq!(embedding, vec![1u8, 2, 3, 4]);
+
+        upsert_embedding(
+            &conn,
+            "shared_hash",
+            "shared_hash",
+            &[5u8, 6, 7, 8],
+            "chunk",
+            "voyage-code-2",
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings WHERE content_hash = 'shared_hash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let embedding_indexes = index_names(&conn, "embeddings");
+        assert!(embedding_indexes
+            .iter()
+            .any(|name| name == "idx_embeddings_model_input_hash"));
+        assert!(embedding_indexes
+            .iter()
+            .any(|name| name == "idx_embeddings_content_hash"));
+
+        let branch_config_indexes = index_names(&conn, "branch_config_versions");
+        assert!(branch_config_indexes
+            .iter()
+            .any(|name| name == "idx_branch_config_versions_config_hash"));
+    }
+
+    #[test]
+    fn test_v14_to_v15_migration_adds_reranker_health_and_chunk_cap_drops() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("migration-v14.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE embeddings (
+                    embedding_input_hash TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    chunk_text TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (embedding_input_hash, model)
+                );
+                CREATE TABLE chunks (
+                    chunk_id TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL,
+                    embedding_input_hash TEXT NOT NULL DEFAULT '',
+                    file_path TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    node_type TEXT,
+                    name TEXT,
+                    language TEXT NOT NULL,
+                    chunk_kind TEXT,
+                    symbol_kind TEXT
+                );
+                CREATE TABLE branch_chunks (
+                    branch TEXT NOT NULL,
+                    chunk_id TEXT NOT NULL,
+                    PRIMARY KEY (branch, chunk_id)
+                );
+                CREATE TABLE symbols (
+                    id TEXT PRIMARY KEY,
+                    file_path TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    start_col INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    end_col INTEGER NOT NULL,
+                    language TEXT NOT NULL
+                );
+                CREATE TABLE pipeline_state (
+                    branch TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    input_hash TEXT,
+                    error TEXT,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (branch, file_path, stage)
+                );
+                CREATE TABLE pipeline_runs (
+                    run_id TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    run_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    config_hash TEXT NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    completed_at INTEGER,
+                    PRIMARY KEY (run_id)
+                );
+                CREATE TABLE config_versions (
+                    config_hash TEXT NOT NULL,
+                    embedding_model_id TEXT NOT NULL,
+                    embedding_dimension INTEGER NOT NULL,
+                    voyage_model_id TEXT,
+                    embedding_prefix_version INTEGER NOT NULL DEFAULT 0,
+                    chunker_version TEXT NOT NULL,
+                    graph_extractor_version TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (config_hash)
+                );
+                CREATE TABLE branch_config_versions (
+                    branch TEXT NOT NULL PRIMARY KEY,
+                    config_hash TEXT NOT NULL,
+                    applied_at INTEGER NOT NULL
+                );
+                CREATE TABLE embedding_debt (
+                    branch TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (branch, file_path, model)
+                );
+                INSERT INTO metadata (key, value) VALUES ('schema_version', '14');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let conn = init_db(&db_path).unwrap();
+
+        let schema_version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, "16");
+
+        let reranker_health_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'reranker_health'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reranker_health_exists, "reranker_health");
+
+        let chunk_cap_drops_exists: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'chunk_cap_drops'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunk_cap_drops_exists, "chunk_cap_drops");
+
+        let chunk_cap_indexes = index_names(&conn, "chunk_cap_drops");
+        assert!(chunk_cap_indexes
+            .iter()
+            .any(|name| name == "idx_chunk_cap_drops_branch"));
+    }
+
+    #[test]
+    fn test_v15_to_v16_migration_adds_symbol_aliases_columns() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("migration-v15.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE chunks (
+                    chunk_id TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL,
+                    embedding_input_hash TEXT NOT NULL DEFAULT '',
+                    file_path TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    node_type TEXT,
+                    name TEXT,
+                    language TEXT NOT NULL,
+                    chunk_kind TEXT,
+                    symbol_kind TEXT
+                );
+                CREATE TABLE symbols (
+                    id TEXT PRIMARY KEY,
+                    file_path TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    start_line INTEGER NOT NULL,
+                    start_col INTEGER NOT NULL,
+                    end_line INTEGER NOT NULL,
+                    end_col INTEGER NOT NULL,
+                    language TEXT NOT NULL
+                );
+                INSERT INTO metadata (key, value) VALUES ('schema_version', '15');
+                INSERT INTO chunks (
+                    chunk_id, content_hash, embedding_input_hash, file_path, start_line, end_line, node_type, name, language, chunk_kind, symbol_kind
+                ) VALUES (
+                    'chunk_legacy', 'hash_legacy', 'hash_legacy', 'src/parse.ts', 1, 10, 'function', 'parse', 'typescript', 'Code', 'Function'
+                );
+                INSERT INTO symbols (
+                    id, file_path, name, kind, start_line, start_col, end_line, end_col, language
+                ) VALUES (
+                    'sym_legacy', 'src/parse.ts', 'parse', 'function', 1, 0, 10, 1, 'typescript'
+                );
+                "#,
+            )
+            .unwrap();
+        }
+
+        let conn = init_db(&db_path).unwrap();
+
+        assert!(table_columns(&conn, "chunks")
+            .iter()
+            .any(|column| column == "symbol_aliases"));
+        assert!(table_columns(&conn, "symbols")
+            .iter()
+            .any(|column| column == "symbol_aliases"));
+
+        let legacy_chunk_aliases: String = conn
+            .query_row(
+                "SELECT symbol_aliases FROM chunks WHERE chunk_id = 'chunk_legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_chunk_aliases, "");
+
+        let legacy_symbol_aliases: String = conn
+            .query_row(
+                "SELECT symbol_aliases FROM symbols WHERE id = 'sym_legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_symbol_aliases, "");
+
+        upsert_symbol(
+            &conn,
+            &SymbolRow {
+                id: "sym_new".to_string(),
+                file_path: "src/parse.ts".to_string(),
+                name: "parse".to_string(),
+                symbol_aliases: vec!["_parse".to_string()],
+                kind: "function".to_string(),
+                start_line: 1,
+                start_col: 0,
+                end_line: 20,
+                end_col: 1,
+                language: "typescript".to_string(),
+            },
+        )
+        .unwrap();
+
+        let alias_lookup = get_symbols_by_name(&conn, "_parse").unwrap();
+        assert_eq!(alias_lookup.len(), 1);
+        assert_eq!(alias_lookup[0].name, "parse");
+        assert_eq!(alias_lookup[0].symbol_aliases, vec!["_parse".to_string()]);
     }
 }

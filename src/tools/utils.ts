@@ -1,4 +1,13 @@
-import { IndexStats, IndexProgress, SearchResult, HealthCheckResult, StatusResult } from "../indexer/index.js";
+import {
+  ForegroundIndexResult,
+  IndexStats,
+  IndexProgress,
+  SearchResult,
+  GraphContextResult,
+  HealthCheckResult,
+  StatusResult,
+  IndexCoverageResult,
+} from "../indexer/index.js";
 import type { LogEntry } from "../utils/logger.js";
 
 const MAX_CONTENT_LINES = 30;
@@ -65,6 +74,47 @@ export function formatIndexStats(stats: IndexStats, verbose: boolean = false): s
   return lines.join("\n");
 }
 
+export function formatForegroundReadyMessage(
+  result: ForegroundIndexResult,
+  verbose: boolean = false
+): string {
+  if (result.alreadyInProgress) {
+    const progress =
+      result.embeddingProgress.total > 0
+        ? ` (${result.embeddingProgress.embedded}/${result.embeddingProgress.total} chunks embedded)`
+        : "";
+    return `Index ready. Semantic search embedding is already in progress for this branch${progress}. Use index_status to check progress.`;
+  }
+
+  const lines = [
+    "Index ready. BM25 search, call graph, and symbol navigation are available now.",
+    "",
+    `Files processed: ${result.filesProcessed}`,
+    `Chunks indexed: ${result.totalChunks}`,
+  ];
+
+  if (result.removedChunks > 0) {
+    lines.push(`Removed stale chunks: ${result.removedChunks}`);
+  }
+
+  if (result.embeddingStatus === "complete" || result.embeddingProgress.total === 0) {
+    lines.push("");
+    lines.push("Semantic search: complete");
+  } else {
+    lines.push("");
+    lines.push(
+      `Semantic search: indexing in background (${result.embeddingProgress.embedded}/${result.embeddingProgress.total} chunks embedded)`
+    );
+    lines.push("Use index_status to check embedding progress.");
+  }
+
+  if (verbose) {
+    lines.push(`Foreground duration: ${(result.durationMs / 1000).toFixed(2)}s`);
+  }
+
+  return lines.join("\n");
+}
+
 export function formatStatus(status: StatusResult): string {
   if (!status.indexed) {
     return "Codebase is not indexed. Run index_codebase to create an index.";
@@ -78,9 +128,58 @@ export function formatStatus(status: StatusResult): string {
     `  Location: ${status.indexPath}`,
   ];
 
+  if (status.foreground) {
+    lines.push(
+      `  BM25 + call graph: ${status.foreground.bm25Ready && status.foreground.callGraphReady ? "complete" : "pending"}`
+    );
+  }
+
+  if (status.embedding) {
+    const suffix =
+      status.embedding.total > 0
+        ? ` (${status.embedding.embedded}/${status.embedding.total})`
+        : "";
+    if (status.embedding.status === "complete") {
+      lines.push("  Semantic search: complete");
+    } else if (status.embedding.status === "in_progress" || status.embedding.status === "pending") {
+      lines.push(`  Semantic search: indexing in background${suffix}`);
+    } else {
+      lines.push(`  Semantic search: ${status.embedding.status}${suffix}`);
+      if (status.embedding.failed) {
+        lines.push(`  Embedding failure: ${status.embedding.failed}`);
+      }
+    }
+  }
+
   if (status.currentBranch !== "default") {
     lines.push(`  Current branch: ${status.currentBranch}`);
     lines.push(`  Base branch: ${status.baseBranch}`);
+  }
+
+  if (status.rerankerHealth) {
+    const reranker = status.rerankerHealth;
+    if (reranker.status === "healthy") {
+      lines.push(`  Reranker: ${reranker.backend} (healthy)`);
+    } else if (reranker.status === "failed") {
+      lines.push(`  Reranker: ${reranker.backend} (DEGRADED - backend failed)`);
+    } else {
+      lines.push(`  Reranker: ${reranker.backend} (${reranker.status})`);
+    }
+
+    if (reranker.model) {
+      lines.push(`  Reranker model: ${reranker.model}`);
+    }
+    if (reranker.error) {
+      lines.push(`  Last reranker error: ${reranker.error}`);
+    }
+  }
+
+  if (status.chunkCapSummary && status.chunkCapSummary.truncatedFiles > 0) {
+    lines.push(
+      `  Chunk cap: ${status.chunkCapSummary.truncatedFiles} files truncated ` +
+      `(${status.chunkCapSummary.totalDroppedChunks} chunks dropped, ` +
+      `${status.chunkCapSummary.totalDroppedNamedSymbols} named symbols invisible)`
+    );
   }
 
   if (status.compatibility && !status.compatibility.compatible) {
@@ -98,6 +197,10 @@ export function formatStatus(status: StatusResult): string {
   }
 
   return lines.join("\n");
+}
+
+export function formatCoverageReport(report: IndexCoverageResult): string {
+  return JSON.stringify(report, null, 2);
 }
 
 export function formatProgressTitle(progress: IndexProgress): string {
@@ -142,9 +245,11 @@ export function formatCodebasePeek(results: SearchResult[], query: string): stri
   }
 
   const formatted = results.map((r, idx) => {
+    const relationPrefix = r.relation ? `${r.relation} depth=${r.depth ?? 1} ` : "";
+    const provenance = r.viaSymbol ? ` via ${r.viaSymbol}` : "";
     const location = `${r.filePath}:${r.startLine}-${r.endLine}`;
     const name = r.name ? `"${r.name}"` : "(anonymous)";
-    return `[${idx + 1}] ${r.chunkType} ${name} at ${location} (score: ${r.score.toFixed(2)})`;
+    return `[${idx + 1}] ${relationPrefix}${r.chunkType} ${name} at ${location}${provenance} (score: ${r.score.toFixed(2)})`;
   });
 
   return `Found ${results.length} locations for "${query}":\n\n${formatted.join("\n")}\n\nUse Read tool to examine specific files.`;
@@ -218,9 +323,11 @@ export type ScoreFormat = "score" | "similarity";
 
 export function formatSearchResults(results: SearchResult[], scoreFormat: ScoreFormat = "similarity"): string {
   const formatted = results.map((r, idx) => {
+    const relationPrefix = r.relation ? `${r.relation} depth=${r.depth ?? 1} ` : "";
+    const provenance = r.viaSymbol ? ` via ${r.viaSymbol}` : "";
     const header = r.name
-      ? `[${idx + 1}] ${r.chunkType} "${r.name}" in ${r.filePath}:${r.startLine}-${r.endLine}`
-      : `[${idx + 1}] ${r.chunkType} in ${r.filePath}:${r.startLine}-${r.endLine}`;
+      ? `[${idx + 1}] ${relationPrefix}${r.chunkType} "${r.name}" in ${r.filePath}:${r.startLine}-${r.endLine}${provenance}`
+      : `[${idx + 1}] ${relationPrefix}${r.chunkType} in ${r.filePath}:${r.startLine}-${r.endLine}${provenance}`;
 
     const scoreLabel = scoreFormat === "similarity"
       ? `(similarity: ${(r.score * 100).toFixed(1)}%)`
@@ -230,4 +337,26 @@ export function formatSearchResults(results: SearchResult[], scoreFormat: ScoreF
   });
 
   return formatted.join("\n\n");
+}
+
+export function formatExpandedContext(results: GraphContextResult[], metadataOnly: boolean = false): string {
+  if (results.length === 0) {
+    return "";
+  }
+
+  const formatted = results.map((result, index) => {
+    const relation = result.relation === "caller" ? "caller" : "callee";
+    const provenance = result.viaSymbol ? ` via ${result.viaSymbol}` : "";
+    const header = result.name
+      ? `[${index + 1}] ${relation} depth=${result.depth} "${result.name}" in ${result.filePath}:${result.startLine}-${result.endLine}${provenance}`
+      : `[${index + 1}] ${relation} depth=${result.depth} in ${result.filePath}:${result.startLine}-${result.endLine}${provenance}`;
+
+    if (metadataOnly) {
+      return header;
+    }
+
+    return `${header}\n\`\`\`\n${truncateContent(result.content)}\n\`\`\``;
+  });
+
+  return `Expanded graph context:\n\n${formatted.join("\n\n")}`;
 }

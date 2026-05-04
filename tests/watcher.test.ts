@@ -2,8 +2,32 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { FileWatcher, GitHeadWatcher, FileChange } from "../src/watcher/index.js";
+import {
+  createWatcherWithIndexer,
+  FileWatcher,
+  GitHeadWatcher,
+  type BranchChangeHandler,
+  type ChangeHandler,
+  type FileChange,
+} from "../src/watcher/index.js";
 import { ParsedCodebaseIndexConfig } from "../src/config/schema.js";
+
+async function waitForCondition(
+  predicate: () => boolean,
+  timeoutMs: number = 3000,
+  intervalMs: number = 25
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+
+  throw new Error("Timed out waiting for watcher condition");
+}
 
 const createTestConfig = (overrides: Partial<ParsedCodebaseIndexConfig> = {}): ParsedCodebaseIndexConfig => ({
   embeddingProvider: "auto",
@@ -29,6 +53,9 @@ const createTestConfig = (overrides: Partial<ParsedCodebaseIndexConfig> = {}): P
     minScore: 0.1,
     includeContext: true,
     hybridWeight: 0.5,
+    fusionStrategy: "rrf",
+    rrfK: 60,
+    rerankTopN: 20,
     contextLines: 0,
   },
   debug: {
@@ -40,6 +67,9 @@ const createTestConfig = (overrides: Partial<ParsedCodebaseIndexConfig> = {}): P
     logGc: true,
     logBranch: true,
     metrics: true,
+  },
+  eval: {
+    useQueryTypes: false,
   },
   ...overrides,
 });
@@ -111,12 +141,15 @@ describe("FileWatcher", () => {
       fs.writeFileSync(path.join(tempDir, "src", "test.ts"), "const x = 1;");
       fs.writeFileSync(path.join(tempDir, "src", "test.md"), "# README");
 
-      await new Promise((r) => setTimeout(r, 1500));
+      await waitForCondition(
+        () => changes.some((change) => change.path.endsWith(".ts")),
+        4000
+      );
 
       const tsChanges = changes.filter((c) => c.path.endsWith(".ts"));
       const mdChanges = changes.filter((c) => c.path.endsWith(".md"));
 
-      expect(tsChanges.length).toBeGreaterThanOrEqual(0);
+      expect(tsChanges.length).toBeGreaterThan(0);
       expect(mdChanges.length).toBe(0);
     });
   });
@@ -223,13 +256,77 @@ describe("GitHeadWatcher", () => {
 
       fs.writeFileSync(path.join(tempDir, ".git", "HEAD"), "ref: refs/heads/feature\n");
 
-      await new Promise((r) => setTimeout(r, 500));
+      await waitForCondition(() => branchChanges.length > 0, 3000);
 
-      expect(branchChanges.length).toBeGreaterThanOrEqual(0);
-      if (branchChanges.length > 0) {
-        expect(branchChanges[0].old).toBe("main");
-        expect(branchChanges[0].new).toBe("feature");
-      }
+      expect(branchChanges.length).toBeGreaterThan(0);
+      expect(branchChanges[0].old).toBe("main");
+      expect(branchChanges[0].new).toBe("feature");
     });
+  });
+});
+
+describe("createWatcherWithIndexer", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "combined-watcher-test-"));
+    fs.mkdirSync(path.join(tempDir, ".git", "refs", "heads"), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, ".git", "HEAD"), "ref: refs/heads/main\n");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("routes file and branch events to incremental indexer handlers", async () => {
+    let fileHandler: ChangeHandler | null = null;
+    let branchHandler: BranchChangeHandler | null = null;
+
+    const fileStartSpy = vi
+      .spyOn(FileWatcher.prototype, "start")
+      .mockImplementation(function(this: FileWatcher, handler: ChangeHandler) {
+        fileHandler = handler;
+      });
+    const fileStopSpy = vi
+      .spyOn(FileWatcher.prototype, "stop")
+      .mockImplementation(function(this: FileWatcher) {});
+    const gitStartSpy = vi
+      .spyOn(GitHeadWatcher.prototype, "start")
+      .mockImplementation(function(this: GitHeadWatcher, handler: BranchChangeHandler) {
+        branchHandler = handler;
+      });
+    const gitStopSpy = vi
+      .spyOn(GitHeadWatcher.prototype, "stop")
+      .mockImplementation(function(this: GitHeadWatcher) {});
+
+    const indexer = {
+      handleFileChanges: vi.fn().mockResolvedValue(undefined),
+      handleBranchChange: vi.fn().mockResolvedValue(undefined),
+    };
+
+    const combined = createWatcherWithIndexer(
+      indexer as unknown as never,
+      tempDir,
+      createTestConfig()
+    );
+
+    expect(fileStartSpy).toHaveBeenCalledTimes(1);
+    expect(gitStartSpy).toHaveBeenCalledTimes(1);
+    expect(fileHandler).not.toBeNull();
+    expect(branchHandler).not.toBeNull();
+
+    const changes: FileChange[] = [
+      { type: "change", path: path.join(tempDir, "src", "index.ts") },
+    ];
+    await fileHandler?.(changes);
+    expect(indexer.handleFileChanges).toHaveBeenCalledWith(changes);
+
+    await branchHandler?.("main", "feature/test");
+    expect(indexer.handleBranchChange).toHaveBeenCalledWith("main", "feature/test");
+
+    combined.stop();
+    expect(fileStopSpy).toHaveBeenCalledTimes(1);
+    expect(gitStopSpy).toHaveBeenCalledTimes(1);
   });
 });

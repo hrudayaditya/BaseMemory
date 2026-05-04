@@ -1,7 +1,7 @@
 {
-  "version": "1.0.0",
+  "version": "1.2.0",
   "name": "small",
-  "description": "Smoke-sized golden eval set for retrieval quality checks.",
+  "description": "Expanded smoke-sized golden eval set covering definition, config, tests, bug reports, relationships, file intent, and concept lookups.",
   "queries": [
     {
       "id": "def-rank-hybrid-results",
@@ -35,10 +35,361 @@
       "query": "fusionStrategy hybridWeight rrfK rerankTopN",
       "queryType": "keyword-heavy",
       "expected": {
-        "acceptableFiles": [
-          "src/config/schema.ts",
-          "src/indexer/index.ts"
-        ]
+        "filePath": "src/config/schema.ts"
+      }
+    },
+    {
+      "id": "sem-finalize-eval-artifacts",
+      "query": "orchestrates eval output artifact writing",
+      "queryType": "similarity",
+      "expected": {
+        "filePath": "src/eval/runner.ts",
+        "symbol": "finalizeEvaluationRun"
+      }
+    },
+    {
+      "id": "impl-implementation-lookup-tool",
+      "query": "where is implementation_lookup tool implementation",
+      "queryType": "implementation-intent",
+      "expected": {
+        "filePath": "src/tools/index.ts",
+        "symbol": "implementation_lookup"
+      }
+    },
+    {
+      "id": "def-typescript-chunker-policy",
+      "query": "where is classify_ts_js_node implementation",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "native/src/chunker/languages/typescript.rs",
+        "symbol": "classify_ts_js_node_impl"
+      }
+    },
+    {
+      "id": "def-build-merkle-snapshot",
+      "query": "where is buildMerkleSnapshot implementation",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/native/index.ts",
+        "symbol": "buildMerkleSnapshot"
+      }
+    },
+    {
+      "id": "sem-index-codebase-caller",
+      "query": "which tool returns the foreground-ready indexing message and sends indexing progress updates",
+      "queryType": "similarity",
+      "expected": {
+        "filePath": "src/tools/index.ts",
+        "symbol": "index_codebase"
+      }
+    },
+    {
+      "id": "impl-call-graph-tool",
+      "query": "where is call_graph tool implementation",
+      "queryType": "implementation-intent",
+      "expected": {
+        "filePath": "src/tools/index.ts",
+        "symbol": "call_graph"
+      }
+    },
+    {
+      "id": "cfg-sqlite-busy-timeout",
+      "query": "what is the sqlite busy timeout value",
+      "queryType": "config-lookup",
+      "expected": {
+        "filePath": "native/src/db.rs",
+        "symbol": "SQLITE_BUSY_TIMEOUT_MS",
+        "startLine": 19,
+        "endLine": 19
+      }
+    },
+    {
+      "id": "cfg-arctic-query-prefix",
+      "query": "what query prefix does arctic use for search embeddings",
+      "queryType": "config-lookup",
+      "expected": {
+        "filePath": "src/embeddings/provider.ts",
+        "symbol": "ARCTIC_QUERY_PREFIX",
+        "startLine": 28,
+        "endLine": 28
+      }
+    },
+    {
+      "id": "cfg-voyage-default-model",
+      "query": "what is the default voyage model id",
+      "queryType": "config-lookup",
+      "expected": {
+        "filePath": "src/embeddings/provider.ts",
+        "symbol": "VOYAGE_DEFAULT_MODEL_ID",
+        "startLine": 31,
+        "endLine": 31
+      }
+    },
+    {
+      "id": "cfg-default-final-rerank",
+      "query": "what is the default final rerank top n",
+      "queryType": "config-lookup",
+      "expected": {
+        "filePath": "src/indexer/search-recipes.ts",
+        "symbol": "DEFAULT_FINAL_RERANK_TOP_N",
+        "startLine": 32,
+        "endLine": 33
+      }
+    },
+    {
+      "id": "cfg-general-final-rerank",
+      "query": "what is the general search rerank top n default",
+      "queryType": "config-lookup",
+      "expected": {
+        "filePath": "src/indexer/search-recipes.ts",
+        "symbol": "GENERAL_FINAL_RERANK_TOP_N",
+        "startLine": 33,
+        "endLine": 34
+      }
+    },
+    {
+      "id": "test-call-graph-branch-awareness",
+      "query": "what tests cover branch-aware call graph filtering",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/call-graph.test.ts"
+      }
+    },
+    {
+      "id": "test-eval-runner",
+      "query": "where are the eval runner tests",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/eval-runner.test.ts"
+      }
+    },
+    {
+      "id": "test-voyage-indexing-failure",
+      "query": "which tests cover voyage-only embedding failure handling",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/incremental-orchestrator.test.ts"
+      }
+    },
+    {
+      "id": "test-task-inference-ranking",
+      "query": "what tests cover retrieval task inference and ranking",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/retrieval-ranking.test.ts"
+      }
+    },
+    {
+      "id": "test-search-integration-graph-expansion",
+      "query": "where are the graph expansion search integration tests",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/search-integration.test.ts"
+      }
+    },
+    {
+      "id": "bug-graph-expansion-branch-leak",
+      "query": "Expected behavior: graph expansion should stay on the current branch. Actual behavior: expanded context leaks symbols from another branch.",
+      "queryType": "bug-report",
+      "expected": {
+        "filePath": "src/indexer/graph-expansion.ts",
+        "symbol": "expandGraphContext",
+        "startLine": 223,
+        "endLine": 448
+      }
+    },
+    {
+      "id": "bug-preserve-voyage-on-arctic-failure",
+      "query": "Expected behavior: successful Voyage embeddings should be preserved even if Arctic fails. Actual behavior: they get discarded.",
+      "queryType": "bug-report",
+      "expected": {
+        "filePath": "src/indexer/incremental-index-orchestrator.ts",
+        "symbol": "processEmbedStage",
+        "startLine": 2349,
+        "endLine": 2734
+      }
+    },
+    {
+      "id": "bug-default-branch-filtering",
+      "query": "Expected behavior: branch filtering should stay active on a branch literally named default. Actual behavior: it falls back to unfiltered results.",
+      "queryType": "bug-report",
+      "expected": {
+        "filePath": "src/indexer/index.ts",
+        "symbol": "getActiveBranchKey",
+        "startLine": 4130,
+        "endLine": 4132
+      }
+    },
+    {
+      "id": "bug-indexed-snippet-content",
+      "query": "Expected behavior: search snippets should show indexed chunk content. Actual behavior: they reflect live disk edits.",
+      "queryType": "bug-report",
+      "expected": {
+        "filePath": "src/indexer/index.ts",
+        "symbol": "materializeRankedResults",
+        "startLine": 5806,
+        "endLine": 5860
+      }
+    },
+    {
+      "id": "bug-sqlite-busy-locks",
+      "query": "Expected behavior: SQLite writes should wait through transient lock contention. Actual behavior: SQLITE_BUSY fails immediately.",
+      "queryType": "bug-report",
+      "expected": {
+        "filePath": "native/src/db.rs",
+        "symbol": "retry_busy_sqlite",
+        "startLine": 67,
+        "endLine": 85
+      }
+    },
+    {
+      "id": "rel-build-per-query-result-caller",
+      "query": "what calls buildPerQueryResult",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/eval/runner.ts",
+        "symbol": "finalizeEvaluationRun",
+        "startLine": 390,
+        "endLine": 548
+      }
+    },
+    {
+      "id": "rel-compute-eval-metrics-caller",
+      "query": "what calls computeEvalMetrics",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/eval/runner.ts",
+        "symbol": "finalizeEvaluationRun",
+        "startLine": 390,
+        "endLine": 548
+      }
+    },
+    {
+      "id": "rel-evaluate-budget-gate-caller",
+      "query": "what calls evaluateBudgetGate",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/eval/runner.ts",
+        "symbol": "finalizeEvaluationRun",
+        "startLine": 390,
+        "endLine": 548
+      }
+    },
+    {
+      "id": "rel-map-query-type-caller",
+      "query": "what calls mapEvalQueryTypeToTaskType during eval",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/eval/runner.ts",
+        "symbol": "resolveEvalTaskType",
+        "startLine": 316,
+        "endLine": 334
+      }
+    },
+    {
+      "id": "rel-create-embedding-text-caller",
+      "query": "what calls createEmbeddingText during indexing",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/indexer/incremental-index-orchestrator.ts",
+        "symbol": "buildChunkRecords",
+        "startLine": 2985,
+        "endLine": 3053
+      }
+    },
+    {
+      "id": "file-eval-runner-intent",
+      "query": "what does the eval runner module do",
+      "queryType": "file-intent",
+      "expected": {
+        "filePath": "src/eval/runner.ts"
+      }
+    },
+    {
+      "id": "file-eval-cli-intent",
+      "query": "what does the eval cli module do",
+      "queryType": "file-intent",
+      "expected": {
+        "filePath": "src/eval/cli.ts"
+      }
+    },
+    {
+      "id": "file-graph-expansion-intent",
+      "query": "what does the graph expansion module do",
+      "queryType": "file-intent",
+      "expected": {
+        "filePath": "src/indexer/graph-expansion.ts"
+      }
+    },
+    {
+      "id": "file-watcher-intent",
+      "query": "what does the watcher module do",
+      "queryType": "file-intent",
+      "expected": {
+        "filePath": "src/watcher/index.ts"
+      }
+    },
+    {
+      "id": "file-tools-intent",
+      "query": "what does the tools module do",
+      "queryType": "file-intent",
+      "expected": {
+        "filePath": "src/tools/index.ts"
+      }
+    },
+    {
+      "id": "concept-budget-gate",
+      "query": "where is evaluation budget gating handled",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/eval/budget.ts",
+        "symbol": "checkGate",
+        "startLine": 16,
+        "endLine": 80
+      }
+    },
+    {
+      "id": "concept-embedding-text-prefix",
+      "query": "where is embedding text prefix assembly handled for indexed chunks",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/native/index.ts",
+        "symbol": "createEmbeddingText",
+        "startLine": 654,
+        "endLine": 697
+      }
+    },
+    {
+      "id": "concept-eval-task-type-resolution",
+      "query": "where is eval task type resolution handled",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/eval/runner.ts",
+        "symbol": "resolveEvalTaskType",
+        "startLine": 316,
+        "endLine": 334
+      }
+    },
+    {
+      "id": "concept-query-type-recipe-mapping",
+      "query": "where is query type to task recipe mapping handled",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/indexer/search-recipes.ts",
+        "symbol": "mapEvalQueryTypeToTaskType",
+        "startLine": 133,
+        "endLine": 170
+      }
+    },
+    {
+      "id": "concept-watcher-event-timestamps",
+      "query": "where is watcher event timestamp tracking handled",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/indexer/watcher-tti.ts",
+        "symbol": "recordWatcherEventTimestamp",
+        "startLine": 14,
+        "endLine": 19
       }
     }
   ]

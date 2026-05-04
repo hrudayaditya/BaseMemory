@@ -1,0 +1,5 @@
+# BaseMemory - exclude non-source paths from code indexing
+benchmarks/results/
+**/*.md
+**/*.yaml
+**/*.yml

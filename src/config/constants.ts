@@ -25,6 +25,11 @@ export const DEFAULT_EXCLUDE = [
   "**/.next/**",
   "**/.nuxt/**",
   "**/.opencode/**",
+  "**/_artifacts/**",
+  "**/skills/**",
+  "**/CHANGELOG*",
+  "**/LICENSE*",
+  "**/AGENTS.md",
 ];
 
 
@@ -84,6 +89,22 @@ export const EMBEDDING_MODELS = {
       costPer1MTokens: 0.00,
     },
   },
+  "voyage": {
+    "voyage-code-2": {
+      provider: "voyage",
+      model: "voyage-code-2",
+      dimensions: 1536,
+      maxTokens: 16_000,
+      costPer1MTokens: 0.12,
+    },
+    "voyage-code-3": {
+      provider: "voyage",
+      model: "voyage-code-3",
+      dimensions: 1024,
+      maxTokens: 32_000,
+      costPer1MTokens: 0.18,
+    },
+  },
   "github-copilot": {
     "text-embedding-3-small": {
       provider: "github-copilot",
@@ -100,4 +121,5 @@ export const DEFAULT_PROVIDER_MODELS = {
   "openai": "text-embedding-3-small",
   "google": "text-embedding-005",
   "ollama": "nomic-embed-text",
+  "voyage": "voyage-code-3",
 } as const

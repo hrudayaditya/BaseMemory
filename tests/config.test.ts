@@ -83,7 +83,7 @@ describe("config schema", () => {
       expect(config.embeddingModel).toBeUndefined();
       expect(config.scope).toBe("project");
       expect(config.include).toHaveLength(10);
-      expect(config.exclude).toHaveLength(13);
+      expect(config.exclude).toHaveLength(18);
     });
 
     it("should return defaults for null input", () => {
@@ -271,6 +271,7 @@ describe("config schema", () => {
             rrfK: 80,
             rerankTopN: 12,
             contextLines: 10,
+            experimentalIdentifierRiskPolicy: true,
           },
         });
 
@@ -282,6 +283,7 @@ describe("config schema", () => {
         expect(config.search.rrfK).toBe(80);
         expect(config.search.rerankTopN).toBe(12);
         expect(config.search.contextLines).toBe(10);
+        expect(config.search.experimentalIdentifierRiskPolicy).toBe(true);
       });
 
       it("should use default search ranking config values", () => {
@@ -289,6 +291,7 @@ describe("config schema", () => {
         expect(config.search.fusionStrategy).toBe("rrf");
         expect(config.search.rrfK).toBe(60);
         expect(config.search.rerankTopN).toBe(20);
+        expect(config.search.experimentalIdentifierRiskPolicy).toBe(false);
       });
 
       it("should fallback fusionStrategy to default for invalid values", () => {
@@ -481,7 +484,7 @@ describe("config schema", () => {
         warnSpy.mockRestore();
       });
 
-      it("should ignore customProvider when embeddingProvider is not 'custom'", () => {
+      it("should ignore customProvider when embeddingProvider is not 'custom' or 'voyage'", () => {
         const config = parseConfig({
           embeddingProvider: "openai",
           customProvider: {
@@ -492,6 +495,21 @@ describe("config schema", () => {
         });
         expect(config.embeddingProvider).toBe("openai");
         expect(config.customProvider).toBeUndefined();
+      });
+
+      it("should preserve customProvider when embeddingProvider is 'voyage'", () => {
+        const config = parseConfig({
+          embeddingProvider: "voyage",
+          customProvider: {
+            baseUrl: "http://localhost:11434/v1",
+            model: "snowflake-arctic-embed2",
+            dimensions: 1024,
+          },
+        });
+        expect(config.embeddingProvider).toBe("voyage");
+        expect(config.customProvider).toBeDefined();
+        expect(config.customProvider!.model).toBe("snowflake-arctic-embed2");
+        expect(config.customProvider!.dimensions).toBe(1024);
       });
 
       it("should parse custom provider with timeoutMs", () => {
@@ -736,6 +754,37 @@ describe("config schema", () => {
           },
         });
         expect(config.customProvider!.timeoutMs).toBe(1000);
+      });
+    });
+
+    describe("voyage provider config", () => {
+      it("defaults voyageModelId to voyage-code-3", () => {
+        const config = parseConfig({});
+        expect(config.voyageModelId).toBe("voyage-code-3");
+        expect(config.voyageApiKey).toBeUndefined();
+      });
+
+      it("parses explicit voyage config values", () => {
+        const config = parseConfig({
+          voyageApiKey: "voyage-test-key",
+          voyageModelId: "voyage-code-3",
+        });
+
+        expect(config.voyageApiKey).toBe("voyage-test-key");
+        expect(config.voyageModelId).toBe("voyage-code-3");
+      });
+
+      it("accepts env-substituted voyage credentials", () => {
+        vi.stubEnv("VOYAGE_API_KEY", "voyage-env-key");
+
+        const config = parseConfig(substituteEnvReferences({
+          voyageApiKey: "{env:VOYAGE_API_KEY}",
+        }));
+
+        expect(config.voyageApiKey).toBe("voyage-env-key");
+        expect(config.voyageModelId).toBe("voyage-code-3");
+
+        vi.unstubAllEnvs();
       });
     });
   });

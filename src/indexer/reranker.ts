@@ -1,0 +1,738 @@
+import type { ChunkKind, ChunkMetadata, ChunkSymbolKind } from "../native/index.js";
+
+import type { SearchTaskType } from "./search-recipes.js";
+
+// Keep tokenizer/config/model assets on the same Xenova repo. Mixing the
+// Hugging Face tokenizer with the Xenova ONNX mirror causes Transformers.js
+// to fail tokenizer initialization and silently drops us to the heuristic
+// fallback during eval/search.
+export const DEFAULT_LOCAL_CROSS_ENCODER_TOKENIZER = "Xenova/ms-marco-MiniLM-L-6-v2";
+// Transformers.js v2 loads ONNX weights from a compatible mirror. The Xenova
+// repo provides the quantized ONNX graph and matching tokenizer assets for
+// the same cross-encoder.
+export const DEFAULT_LOCAL_CROSS_ENCODER_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2";
+export const DEFAULT_JINA_RERANKER_MODEL = "jina-reranker-v3";
+const JINA_RERANKER_ENDPOINT = "https://api.jina.ai/v1/rerank";
+const JINA_RERANKER_TIMEOUT_MS = 15_000;
+
+export interface RerankerCandidate {
+  id: string;
+  baseScore: number;
+  metadata: ChunkMetadata;
+  chunkKind?: ChunkKind;
+  symbolKind?: ChunkSymbolKind;
+  relation?: "caller" | "callee";
+  content: string;
+}
+
+export interface RerankerResult {
+  candidates: RerankerCandidate[];
+  applied: boolean;
+  backend: string | null;
+  failedBackend?: string | null;
+}
+
+export type RerankerHealthBackend = "jina-api" | "transformers-cross-encoder" | "heuristic-local" | "none";
+export type RerankerHealthStatus = "healthy" | "failed" | "never-loaded";
+
+export interface RerankerHealthEvent {
+  backend: RerankerHealthBackend;
+  status: RerankerHealthStatus;
+  model?: string | null;
+  error?: string | null;
+}
+
+interface ScoredCandidate {
+  candidate: RerankerCandidate;
+  score: number;
+  originalIndex: number;
+}
+
+const BUG_TEST_DOC_POST_RERANK_FACTOR = 0.05;
+const TEST_DEBUG_COARSE_MODULE_POST_RERANK_FACTOR = 0.75;
+
+interface CrossEncoderPair {
+  text: string;
+  textPair: string;
+}
+
+type CrossEncoderScorer = (pairs: CrossEncoderPair[]) => Promise<number[]>;
+type FetchLike = typeof fetch;
+
+interface CrossEncoderLoadResult {
+  scorer: CrossEncoderScorer | null;
+  model: string;
+  error?: string | null;
+}
+
+type CrossEncoderLoader = () => Promise<CrossEncoderLoadResult>;
+
+interface SequenceClassificationLogits {
+  data: ArrayLike<number>;
+  dims: number[];
+}
+
+interface SequenceClassificationOutput {
+  logits: SequenceClassificationLogits;
+}
+
+interface SequenceClassificationConfig {
+  model_type?: string;
+  id2label?: Record<string, string> | string[];
+}
+
+interface SequenceClassificationModel {
+  (inputs: unknown): Promise<SequenceClassificationOutput>;
+  config?: SequenceClassificationConfig;
+}
+
+interface SequenceTokenizer {
+  (
+    text: string | string[],
+    options?: {
+      text_pair?: string | string[];
+      padding?: boolean;
+      truncation?: boolean;
+    }
+  ): Promise<unknown> | unknown;
+}
+
+interface TransformersModule {
+  AutoConfig: {
+    from_pretrained(model: string): Promise<SequenceClassificationConfig>;
+  };
+  AutoTokenizer: {
+    from_pretrained(model: string): Promise<SequenceTokenizer>;
+  };
+  AutoModelForSequenceClassification: {
+    from_pretrained(
+      model: string,
+      options?: {
+        quantized?: boolean;
+        config?: SequenceClassificationConfig;
+        model_file_name?: string;
+      }
+    ): Promise<SequenceClassificationModel>;
+  };
+}
+
+export interface SearchRerankerBackend {
+  readonly name: string;
+  rerank(query: string, candidates: RerankerCandidate[], taskType: SearchTaskType): Promise<RerankerCandidate[]>;
+}
+
+interface SearchRerankerOptions {
+  jinaApiKey?: string;
+  jinaModel?: string;
+  fetchImpl?: FetchLike;
+  onSelection?: (backend: string, model?: string | null) => void;
+}
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function stableSigmoid(logit: number): number {
+  if (!Number.isFinite(logit)) {
+    return logit > 0 ? 1 : 0;
+  }
+
+  if (logit >= 0) {
+    const scaled = Math.exp(-logit);
+    return 1 / (1 + scaled);
+  }
+
+  const scaled = Math.exp(logit);
+  return scaled / (1 + scaled);
+}
+
+function buildCrossEncoderDocument(candidate: RerankerCandidate): string {
+  const prefixParts: string[] = [];
+
+  if (candidate.metadata.name) {
+    prefixParts.push(`[name: ${candidate.metadata.name}]`);
+  }
+
+  if (candidate.chunkKind) {
+    prefixParts.push(`[kind: ${candidate.chunkKind}]`);
+  }
+
+  // Symbol kind is more semantically precise than chunk role, so surface it
+  // separately instead of overloading the chunk-kind slot.
+  if (candidate.symbolKind) {
+    prefixParts.push(`[symbol: ${candidate.symbolKind}]`);
+  }
+
+  if (candidate.relation) {
+    prefixParts.push(`[relation: ${candidate.relation}]`);
+  }
+
+  if (prefixParts.length === 0) {
+    return candidate.content;
+  }
+
+  if (candidate.content.length === 0) {
+    return prefixParts.join(" ");
+  }
+
+  return `${prefixParts.join(" ")} ${candidate.content}`;
+}
+
+function tokenize(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .replace(/[^\w\s]/g, " ")
+      .split(/\s+/)
+      .filter((token) => token.length > 1)
+  );
+}
+
+function splitPath(filePath: string): Set<string> {
+  return new Set(
+    filePath
+      .toLowerCase()
+      .split(/[/._-]+/)
+      .filter((token) => token.length > 1)
+  );
+}
+
+function looksLikeTestPath(filePath: string): boolean {
+  const lowered = filePath.toLowerCase();
+  return lowered.includes("test") || lowered.includes("__tests__") || lowered.includes("spec");
+}
+
+function isTestCandidate(candidate: RerankerCandidate): boolean {
+  if (candidate.chunkKind !== undefined) {
+    return candidate.chunkKind === "Test";
+  }
+  return looksLikeTestPath(candidate.metadata.filePath);
+}
+
+function overlapCount(left: Set<string>, right: Set<string>): number {
+  let matches = 0;
+  for (const token of left) {
+    if (right.has(token)) {
+      matches += 1;
+    }
+  }
+  return matches;
+}
+
+function getPostRerankScoreFactor(candidate: RerankerCandidate, taskType: SearchTaskType): number {
+  if (taskType === "bug") {
+    return candidate.chunkKind === "Test" || candidate.chunkKind === "Doc"
+      ? BUG_TEST_DOC_POST_RERANK_FACTOR
+      : 1;
+  }
+
+  if (taskType === "test_debug") {
+    return candidate.metadata.chunkType === "module" ||
+      candidate.chunkKind === "File" ||
+      candidate.symbolKind === "Module"
+      ? TEST_DEBUG_COARSE_MODULE_POST_RERANK_FACTOR
+      : 1;
+  }
+
+  return 1;
+}
+
+function applyPostRerankTaskBias(
+  candidates: RerankerCandidate[],
+  taskType: SearchTaskType
+): RerankerCandidate[] {
+  if (taskType !== "bug" && taskType !== "test_debug") {
+    return candidates;
+  }
+
+  const rescored = candidates.map((candidate, originalIndex) => ({
+    candidate,
+    score: candidate.baseScore * getPostRerankScoreFactor(candidate, taskType),
+    originalIndex,
+  }));
+
+  rescored.sort((left, right) => {
+    if (right.score !== left.score) {
+      return right.score - left.score;
+    }
+    if (right.candidate.baseScore !== left.candidate.baseScore) {
+      return right.candidate.baseScore - left.candidate.baseScore;
+    }
+    return left.originalIndex - right.originalIndex;
+  });
+
+  return rescored.map((entry) => ({
+    ...entry.candidate,
+    baseScore: entry.score,
+  }));
+}
+
+function selectPositiveLabelIndex(
+  id2label: SequenceClassificationConfig["id2label"],
+  width: number
+): number {
+  if (width <= 1) {
+    return 0;
+  }
+
+  const labels = Array.from({ length: width }, (_, index) => {
+    if (Array.isArray(id2label)) {
+      return id2label[index] ?? "";
+    }
+
+    if (id2label && typeof id2label === "object") {
+      return id2label[String(index)] ?? "";
+    }
+
+    return "";
+  }).map((label) => label.toLowerCase());
+
+  const relevantIndex = labels.findIndex((label) =>
+    label.includes("relevant") ||
+    label.includes("positive") ||
+    label.includes("entailment") ||
+    label === "label_1"
+  );
+
+  if (relevantIndex >= 0) {
+    return relevantIndex;
+  }
+
+  return Math.min(1, width - 1);
+}
+
+function extractCrossEncoderScores(
+  output: SequenceClassificationOutput,
+  config?: SequenceClassificationConfig
+): number[] {
+  const dims = output.logits.dims;
+  const data = Array.from(output.logits.data);
+  const batchSize = dims[0] ?? data.length;
+  const width = dims[1] ?? 1;
+
+  if (width <= 1) {
+    return data.slice(0, batchSize);
+  }
+
+  const positiveIndex = selectPositiveLabelIndex(config?.id2label, width);
+  const scores: number[] = [];
+
+  for (let row = 0; row < batchSize; row += 1) {
+    const offset = row * width;
+    scores.push(data[offset + positiveIndex] ?? Number.NEGATIVE_INFINITY);
+  }
+
+  return scores;
+}
+
+async function loadTransformersCrossEncoderScorer(): Promise<CrossEncoderLoadResult> {
+  try {
+    const transformersModule = await import("@xenova/transformers") as TransformersModule;
+    const [config, tokenizer] = await Promise.all([
+      transformersModule.AutoConfig.from_pretrained(DEFAULT_LOCAL_CROSS_ENCODER_TOKENIZER),
+      transformersModule.AutoTokenizer.from_pretrained(DEFAULT_LOCAL_CROSS_ENCODER_TOKENIZER),
+    ]);
+    const model = await transformersModule.AutoModelForSequenceClassification.from_pretrained(
+      DEFAULT_LOCAL_CROSS_ENCODER_MODEL,
+      {
+        quantized: false,
+        config,
+        model_file_name: "model_uint8",
+      }
+    );
+
+    return {
+      model: DEFAULT_LOCAL_CROSS_ENCODER_MODEL,
+      scorer: async (pairs: CrossEncoderPair[]): Promise<number[]> => {
+        const texts = pairs.map((pair) => pair.text);
+        const textPairs = pairs.map((pair) => pair.textPair);
+        const modelInputs = await tokenizer(texts, {
+          text_pair: textPairs,
+          padding: true,
+          truncation: true,
+        });
+        const output = await model(modelInputs);
+        return extractCrossEncoderScores(output, model.config);
+      },
+    };
+  } catch (error) {
+    return {
+      model: DEFAULT_LOCAL_CROSS_ENCODER_MODEL,
+      scorer: null,
+      error: getErrorMessage(error),
+    };
+  }
+}
+
+function computeHeuristicJointScore(
+  query: string,
+  candidate: RerankerCandidate,
+  taskType: SearchTaskType
+): number {
+  if (taskType === "general") {
+    // Preserve the existing stack order when the real cross-encoder is not
+    // available. General-mode heuristics should not silently rewrite ranking.
+    return candidate.baseScore;
+  }
+
+  const queryTokens = tokenize(query);
+  const pathTokens = splitPath(candidate.metadata.filePath);
+  const nameTokens = tokenize(candidate.metadata.name ?? "");
+  const contentTokens = tokenize(candidate.content);
+  const normalizedQuery = query.toLowerCase();
+  const normalizedContent = candidate.content.toLowerCase();
+  const normalizedName = (candidate.metadata.name ?? "").toLowerCase();
+
+  const nameOverlap = overlapCount(queryTokens, nameTokens);
+  const pathOverlap = overlapCount(queryTokens, pathTokens);
+  const contentOverlap = overlapCount(queryTokens, contentTokens);
+  const exactNameBoost = normalizedName.length > 0 && normalizedQuery.includes(normalizedName) ? 0.4 : 0;
+  const contentPhraseBoost = normalizedContent.includes(normalizedQuery) ? 0.25 : 0;
+  const isTest = isTestCandidate(candidate);
+
+  let taskBias = 0;
+  if (taskType === "definition") {
+    taskBias += exactNameBoost + nameOverlap * 0.16 + pathOverlap * 0.05;
+  } else if (taskType === "bug") {
+    const errorTraceBoost =
+      /\b(?:error|exception|stack|trace|abort)\b/.test(normalizedQuery) &&
+      /\b(?:error|exception|throw|abort|fail)\b/.test(normalizedContent)
+        ? 0.14
+        : 0;
+    taskBias += contentOverlap * 0.12 + pathOverlap * 0.06 + nameOverlap * 0.05;
+    taskBias += contentPhraseBoost + exactNameBoost * 0.5 + errorTraceBoost;
+    taskBias += isTest ? 0.04 : 0;
+  } else if (taskType === "semantic") {
+    taskBias += contentOverlap * 0.1 + contentPhraseBoost;
+  } else if (taskType === "test_debug") {
+    taskBias += isTest ? 0.18 : -0.04;
+    taskBias += contentOverlap * 0.08 + pathOverlap * 0.05;
+  }
+
+  return (
+    candidate.baseScore * 0.6 +
+    contentOverlap * 0.06 +
+    pathOverlap * 0.04 +
+    nameOverlap * 0.08 +
+    exactNameBoost +
+    contentPhraseBoost +
+    taskBias
+  );
+}
+
+export class HeuristicLocalRerankerBackend implements SearchRerankerBackend {
+  readonly name = "heuristic-local";
+
+  async rerank(
+    query: string,
+    candidates: RerankerCandidate[],
+    taskType: SearchTaskType
+  ): Promise<RerankerCandidate[]> {
+    const scored: ScoredCandidate[] = candidates.map((candidate, originalIndex) => ({
+      candidate,
+      score: computeHeuristicJointScore(query, candidate, taskType),
+      originalIndex,
+    }));
+
+    scored.sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+      if (right.candidate.baseScore !== left.candidate.baseScore) {
+        return right.candidate.baseScore - left.candidate.baseScore;
+      }
+      if (left.originalIndex !== right.originalIndex) {
+        return left.originalIndex - right.originalIndex;
+      }
+      return left.candidate.id.localeCompare(right.candidate.id);
+    });
+
+    return scored.map((entry) => ({
+      ...entry.candidate,
+      baseScore: entry.score,
+    }));
+  }
+}
+
+export class TransformersCrossEncoderBackend implements SearchRerankerBackend {
+  readonly name = "transformers-cross-encoder";
+  private scorerPromise: Promise<CrossEncoderScorer | null> | null = null;
+  private lastLoadError: string | null = null;
+  private loadModel: string = DEFAULT_LOCAL_CROSS_ENCODER_MODEL;
+
+  constructor(
+    private readonly loader: CrossEncoderLoader = loadTransformersCrossEncoderScorer,
+    private readonly reportHealth?: (event: RerankerHealthEvent) => void
+  ) {}
+
+  async rerank(
+    query: string,
+    candidates: RerankerCandidate[],
+    _taskType: SearchTaskType
+  ): Promise<RerankerCandidate[]> {
+    const scorer = await this.getScorer();
+    if (!scorer) {
+      throw new Error("transformers backend unavailable");
+    }
+
+    const scores = await scorer(
+      candidates.map((candidate) => ({
+        text: query,
+        textPair: buildCrossEncoderDocument(candidate),
+      }))
+    );
+
+    const scored: ScoredCandidate[] = candidates.map((candidate, index) => ({
+      candidate,
+      score: stableSigmoid(Number(scores[index] ?? Number.NEGATIVE_INFINITY)),
+      originalIndex: index,
+    }));
+
+    scored.sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+      if (right.candidate.baseScore !== left.candidate.baseScore) {
+        return right.candidate.baseScore - left.candidate.baseScore;
+      }
+      return left.originalIndex - right.originalIndex;
+    });
+
+    return scored.map((entry) => ({
+      ...entry.candidate,
+      baseScore: entry.score,
+    }));
+  }
+
+  private async getScorer(): Promise<CrossEncoderScorer | null> {
+    if (!this.scorerPromise) {
+      this.scorerPromise = this.loader().then((result) => {
+        this.loadModel = result.model;
+        this.lastLoadError = result.error ?? null;
+        if (result.scorer) {
+          this.reportHealth?.({
+            backend: "transformers-cross-encoder",
+            status: "healthy",
+            model: result.model,
+            error: null,
+          });
+        } else {
+          this.reportHealth?.({
+            backend: "heuristic-local",
+            status: "failed",
+            model: result.model,
+            error: result.error ?? "transformers backend unavailable",
+          });
+        }
+        return result.scorer;
+      });
+    }
+    return this.scorerPromise;
+  }
+
+  getModelId(): string {
+    return this.loadModel;
+  }
+
+  getLastLoadError(): string | null {
+    return this.lastLoadError;
+  }
+}
+
+interface JinaRerankResponse {
+  model: string;
+  results: Array<{
+    index: number;
+    relevance_score: number;
+  }>;
+}
+
+export class JinaApiRerankerBackend implements SearchRerankerBackend {
+  readonly name = "jina-api";
+
+  constructor(
+    private readonly apiKey: string,
+    private readonly model: string = DEFAULT_JINA_RERANKER_MODEL,
+    private readonly reportHealth?: (event: RerankerHealthEvent) => void,
+    private readonly fetchImpl: FetchLike = fetch
+  ) {}
+
+  async rerank(
+    query: string,
+    candidates: RerankerCandidate[],
+    _taskType: SearchTaskType
+  ): Promise<RerankerCandidate[]> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), JINA_RERANKER_TIMEOUT_MS);
+
+    try {
+      const response = await this.fetchImpl(JINA_RERANKER_ENDPOINT, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: this.model,
+          query,
+          documents: candidates.map((candidate) => buildCrossEncoderDocument(candidate)),
+          return_documents: false,
+          truncation: true,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const responseBody = await response.text().catch(() => "");
+        throw new Error(`Jina reranker request failed with ${response.status}: ${responseBody || response.statusText}`);
+      }
+
+      const payload = (await response.json()) as Partial<JinaRerankResponse>;
+      if (!Array.isArray(payload.results)) {
+        throw new Error("Jina reranker response missing results array");
+      }
+
+      const seen = new Set<number>();
+      const reranked: RerankerCandidate[] = [];
+      for (const result of payload.results) {
+        const originalIndex = result?.index;
+        const relevanceScore = result?.relevance_score;
+        if (!Number.isInteger(originalIndex) || originalIndex < 0 || originalIndex >= candidates.length) {
+          continue;
+        }
+        if (typeof relevanceScore !== "number" || !Number.isFinite(relevanceScore)) {
+          continue;
+        }
+        seen.add(originalIndex);
+        reranked.push({
+          ...candidates[originalIndex],
+          baseScore: relevanceScore,
+        });
+      }
+
+      for (let index = 0; index < candidates.length; index += 1) {
+        if (!seen.has(index)) {
+          reranked.push(candidates[index]);
+        }
+      }
+
+      this.reportHealth?.({
+        backend: "jina-api",
+        status: "healthy",
+        model: this.model,
+        error: null,
+      });
+
+      return reranked;
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new Error(`Jina reranker request timed out after ${JINA_RERANKER_TIMEOUT_MS}ms`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  getModelId(): string {
+    return this.model;
+  }
+}
+
+export class SearchReranker {
+  private readonly backends: SearchRerankerBackend[];
+
+  constructor(
+    backends?: SearchRerankerBackend[],
+    private readonly reportHealth?: (event: RerankerHealthEvent) => void,
+    options: SearchRerankerOptions = {}
+  ) {
+    this.backends = backends ?? (
+      options.jinaApiKey
+        ? [
+            new JinaApiRerankerBackend(
+              options.jinaApiKey,
+              options.jinaModel ?? DEFAULT_JINA_RERANKER_MODEL,
+              reportHealth,
+              options.fetchImpl ?? fetch
+            ),
+            new HeuristicLocalRerankerBackend(),
+          ]
+        : [
+            new TransformersCrossEncoderBackend(loadTransformersCrossEncoderScorer, reportHealth),
+            new HeuristicLocalRerankerBackend(),
+          ]
+    );
+
+    const primary = this.backends[0];
+    if (primary) {
+      const model =
+        primary instanceof JinaApiRerankerBackend
+          ? options.jinaModel ?? DEFAULT_JINA_RERANKER_MODEL
+          : primary instanceof TransformersCrossEncoderBackend
+            ? DEFAULT_LOCAL_CROSS_ENCODER_MODEL
+            : null;
+      options.onSelection?.(primary.name, model);
+    }
+  }
+
+  async rerank(
+    query: string,
+    candidates: RerankerCandidate[],
+    taskType: SearchTaskType
+  ): Promise<RerankerResult> {
+    if (candidates.length < 2) {
+      return {
+        candidates,
+        applied: false,
+        backend: null,
+      };
+    }
+
+    let failedBackend: string | null = null;
+
+    for (const backend of this.backends) {
+      try {
+        const reranked = applyPostRerankTaskBias(
+          await backend.rerank(query, candidates, taskType),
+          taskType
+        );
+        return {
+          candidates: reranked,
+          applied: true,
+          backend: backend.name,
+          failedBackend,
+        };
+      } catch (error) {
+        console.error('[reranker] Jina API failure:', getErrorMessage(error)); // ADD THIS LINE
+        failedBackend = backend.name;
+        if (backend instanceof JinaApiRerankerBackend) {
+          this.reportHealth?.({
+            backend: "jina-api",
+            status: "failed",
+            model: backend.getModelId(),
+            error: getErrorMessage(error),
+          });
+        }
+        if (backend instanceof TransformersCrossEncoderBackend) {
+          this.reportHealth?.({
+            backend: "heuristic-local",
+            status: "failed",
+            model: backend.getModelId(),
+            error: getErrorMessage(error) || backend.getLastLoadError() || "transformers backend unavailable",
+          });
+        }
+      }
+    }
+
+    return {
+      candidates,
+      applied: false,
+      backend: null,
+      failedBackend,
+    };
+  }
+}

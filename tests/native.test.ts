@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import {
+  chunkFile,
   parseFile,
   parseFiles,
   hashContent,
@@ -12,6 +13,7 @@ import {
   createDynamicBatches,
   generateChunkId,
   estimateTokens,
+  prepareEmbeddingInput,
   type CodeChunk,
 } from "../src/native/index.js";
 
@@ -72,7 +74,7 @@ const add = (a, b) => a + b;
       expect(chunks).toBeInstanceOf(Array);
     });
 
-    it("should parse PHP files", () => {
+    it("should parse PHP files semantically", () => {
       const content = `
 <?php
 
@@ -104,7 +106,7 @@ interface Logger {
       expect(chunks.some((c) => c.content.includes("interface Logger"))).toBe(true);
     });
 
-    it("should parse PHP .inc files", () => {
+    it("should parse PHP .inc files semantically", () => {
       const content = `
 <?php
 
@@ -125,6 +127,93 @@ trait Timestampable {
       expect(chunks.length).toBeGreaterThanOrEqual(2);
       expect(chunks.some((c) => c.content.includes("function helper"))).toBe(true);
       expect(chunks.some((c) => c.content.includes("trait Timestampable"))).toBe(true);
+    });
+  });
+
+  describe("chunkFile", () => {
+    it("should return semantic metadata for supported languages", () => {
+      const content = `
+// utility
+export function validateEmail(email: string): boolean {
+  return email.includes("@");
+}
+`;
+
+      const chunks = chunkFile("test.ts", "typescript", content);
+      const fine = chunks.find((chunk) => chunk.symbolName === "validateEmail" && chunk.granularity === "Fine");
+
+      expect(fine).toBeDefined();
+      expect(fine?.symbolKind).toBe("Function");
+      expect(fine?.chunkHash).toHaveLength(16);
+      expect(fine?.text.startsWith("// utility")).toBe(true);
+    });
+
+    it("should emit coarse chunks for container symbols", () => {
+      const content = `
+export class UserService {
+  getUser(id: string) {
+    return id;
+  }
+}
+`;
+
+      const chunks = chunkFile("service.ts", "typescript", content);
+
+      expect(chunks.some((chunk) => chunk.symbolName === "UserService" && chunk.granularity === "Coarse")).toBe(true);
+    });
+
+    it("should return semantic metadata for Java and config files", () => {
+      const javaContent = `
+public class UserService {
+  public String getUser(String id) {
+    return id;
+  }
+}
+`;
+      const jsonContent = `{
+  "service": {
+    "name": "users"
+  }
+}`;
+
+      const javaChunks = chunkFile("UserService.java", "java", javaContent);
+      const jsonChunks = chunkFile("config.json", "json", jsonContent);
+
+      expect(javaChunks.some((chunk) => chunk.symbolName === "UserService" && chunk.granularity === "Coarse")).toBe(true);
+      expect(jsonChunks.some((chunk) => chunk.chunkKind === "Config")).toBe(true);
+    });
+
+    it("captures exported tool definitions by exported const name", () => {
+      const content = `
+import { tool, type ToolDefinition } from "@opencode-ai/plugin";
+
+export const find_similar: ToolDefinition = tool({
+  description: "Find code similar to a given snippet.",
+  args: {
+    code: z.string().describe("The code snippet to find similar code for"),
+  },
+  async execute(args) {
+    return args.code;
+  },
+});
+
+export const codebase_search: ToolDefinition = tool({
+  description: "Search codebase by meaning.",
+  args: {
+    query: z.string().describe("Natural language description of what code you're looking for."),
+  },
+  async execute(args) {
+    return args.query;
+  },
+});
+`;
+
+      const chunks = chunkFile("tools.ts", "typescript", content);
+
+      expect(chunks.some((chunk) => chunk.symbolName === "find_similar" && chunk.granularity === "Fine")).toBe(true);
+      expect(chunks.some((chunk) => chunk.symbolName === "codebase_search" && chunk.granularity === "Fine")).toBe(true);
+      expect(chunks.some((chunk) => chunk.symbolName === "The code snippet to find similar code for")).toBe(false);
+      expect(chunks.some((chunk) => chunk.symbolName === "Natural language description of what code you're looking for.")).toBe(false);
     });
   });
 
@@ -243,6 +332,30 @@ trait Timestampable {
 
       expect(results.length).toBe(2);
       expect(results[0].id).toBe("chunk1");
+    });
+
+    it("should search only within allowed vector ids", () => {
+      store.add("chunk1", [1, 0, 0], {
+        filePath: "test.ts",
+        startLine: 1,
+        endLine: 5,
+        chunkType: "function",
+        language: "typescript",
+        hash: "abc123",
+      });
+      store.add("chunk2", [0.95, 0.05, 0], {
+        filePath: "test2.ts",
+        startLine: 10,
+        endLine: 15,
+        chunkType: "function",
+        language: "typescript",
+        hash: "def456",
+      });
+
+      const results = store.searchFiltered([1, 0.1, 0], ["chunk2"], 5);
+
+      expect(results).toHaveLength(1);
+      expect(results[0]?.id).toBe("chunk2");
     });
 
     it("should remove vectors", () => {
@@ -375,36 +488,277 @@ trait Timestampable {
   });
 
   describe("createEmbeddingText", () => {
-    it("should create embedding text with metadata", () => {
+    const LARGE_MODEL_MAX_TOKENS = 8_191;
+    const SMALL_MODEL_MAX_TOKENS = 512;
+
+    function expectEmbeddingFormatterContract(
+      fixtureName: string,
+      actual: string,
+      expected: string
+    ): void {
+      if (actual !== expected) {
+        throw new Error(
+          `Embedding formatter contract changed for ${fixtureName}. ` +
+          "If this change is intentional, bump EMBEDDING_INPUT_FORMAT_VERSION in src/native/index.ts " +
+          "and update this expected output."
+        );
+      }
+
+      expect(actual).toBe(expected);
+    }
+
+    it("keeps the formatter contract stable for representative fixtures", () => {
+      const shortPathWithSymbol = createEmbeddingText(
+        {
+          content: "export function sum(a: number, b: number): number {\n  return a + b;\n}\n",
+          startLine: 1,
+          endLine: 3,
+          chunkType: "function",
+          name: "sum",
+          symbolKind: "Function",
+          language: "typescript",
+        },
+        "/repo/src/math.ts",
+        "/repo",
+        LARGE_MODEL_MAX_TOKENS
+      );
+      expectEmbeddingFormatterContract(
+        "short-path-with-symbol",
+        shortPathWithSymbol,
+        [
+          "file: src/math.ts",
+          "symbol: sum (function)",
+          "",
+          "export function sum(a: number, b: number): number {",
+          "  return a + b;",
+          "}",
+          "",
+        ].join("\n")
+      );
+
+      const longPathWithSymbol = createEmbeddingText(
+        {
+          content: "export class HybridLane {}\n",
+          startLine: 12,
+          endLine: 12,
+          chunkType: "class",
+          name: "HybridLane",
+          symbolKind: "Class",
+          language: "typescript",
+        },
+        "/repo/packages/app/src/features/search/ranking/semantic/retrieval/hybrid/index.ts",
+        "/repo",
+        LARGE_MODEL_MAX_TOKENS
+      );
+      expectEmbeddingFormatterContract(
+        "long-path-with-symbol",
+        longPathWithSymbol,
+        [
+          "file: packages/app/src/features/search/ranking/semantic/retrieval/hybrid/index.ts",
+          "symbol: HybridLane (class) terms: hybrid lane",
+          "",
+          "export class HybridLane {}",
+          "",
+        ].join("\n")
+      );
+
+      const noSymbol = createEmbeddingText(
+        {
+          content: "import \"./setup\";\n",
+          startLine: 1,
+          endLine: 1,
+          chunkType: "other",
+          language: "typescript",
+        },
+        "/repo/src/bootstrap.ts",
+        "/repo",
+        LARGE_MODEL_MAX_TOKENS
+      );
+      expectEmbeddingFormatterContract(
+        "no-symbol",
+        noSymbol,
+        [
+          "file: src/bootstrap.ts",
+          "",
+          "import \"./setup\";",
+          "",
+        ].join("\n")
+      );
+
+      const truncationHeader = "file: src/truncate.ts\n\n";
+      const truncatedContentLength = 1_497;
+      const truncated = createEmbeddingText(
+        {
+          content: "x".repeat(3_000),
+          startLine: 1,
+          endLine: 1,
+          chunkType: "other",
+          language: "typescript",
+        },
+        "/repo/src/truncate.ts",
+        "/repo",
+        SMALL_MODEL_MAX_TOKENS
+      );
+      expectEmbeddingFormatterContract(
+        "truncation",
+        truncated,
+        `${truncationHeader}${"x".repeat(truncatedContentLength)}\n... [truncated]`
+      );
+
+      const nonAsciiPath = createEmbeddingText(
+        {
+          content: "export const cafe = true;\n",
+          startLine: 1,
+          endLine: 1,
+          chunkType: "other",
+          name: "cafe",
+          symbolKind: "Constant",
+          language: "typescript",
+        },
+        "/repo/src/café/naïve.ts",
+        "/repo",
+        LARGE_MODEL_MAX_TOKENS
+      );
+      expectEmbeddingFormatterContract(
+        "non-ascii-path",
+        nonAsciiPath,
+        [
+          "file: src/café/naïve.ts",
+          "symbol: cafe (constant)",
+          "",
+          "export const cafe = true;",
+          "",
+        ].join("\n")
+      );
+    });
+
+    it("creates embedding text with a structured file and symbol prefix", () => {
       const chunk: CodeChunk = {
         content: "function test() { return 1; }",
         startLine: 1,
         endLine: 3,
         chunkType: "function",
         name: "test",
+        symbolKind: "Function",
         language: "typescript",
       };
 
-      const text = createEmbeddingText(chunk, "/src/utils/helper.ts");
+      const text = createEmbeddingText(
+        chunk,
+        "/repo/src/utils/helper.ts",
+        "/repo",
+        LARGE_MODEL_MAX_TOKENS
+      );
 
-      expect(text).toContain("TypeScript");
-      expect(text).toContain("test");
+      expect(text).toContain("file: src/utils/helper.ts");
+      expect(text).toContain("symbol: test (function)");
       expect(text).toContain("function test()");
     });
 
-    it("should extract semantic hints", () => {
+    it("suppresses synthetic symbol names from the prefix", () => {
       const chunk: CodeChunk = {
-        content: "async function validateToken(token: string) { return jwt.verify(token); }",
+        content: "export default { value: 1 };",
         startLine: 1,
-        endLine: 5,
-        chunkType: "function",
-        name: "validateToken",
+        endLine: 1,
+        chunkType: "other",
+        name: "<default>",
+        symbolKind: "Constant",
         language: "typescript",
       };
 
-      const text = createEmbeddingText(chunk, "/src/auth.ts");
+      const text = createEmbeddingText(
+        chunk,
+        "/repo/src/config.ts",
+        "/repo",
+        LARGE_MODEL_MAX_TOKENS
+      );
 
-      expect(text.toLowerCase()).toContain("token");
+      expect(text).toContain("file: src/config.ts");
+      expect(text).not.toContain("<default>");
+      expect(text).not.toContain("symbol:");
+    });
+
+    it("uses only a file prefix when the chunk has no symbol name", () => {
+      const chunk: CodeChunk = {
+        content: "import \"./setup\";",
+        startLine: 1,
+        endLine: 1,
+        chunkType: "other",
+        language: "typescript",
+      };
+
+      const text = createEmbeddingText(
+        chunk,
+        "/repo/src/main.ts",
+        "/repo",
+        LARGE_MODEL_MAX_TOKENS
+      );
+
+      expect(text).toContain("file: src/main.ts");
+      expect(text).not.toContain("symbol:");
+    });
+
+    it("adds normalized identifier terms for vocabulary-mismatched symbols", () => {
+      const text = createEmbeddingText(
+        {
+          content: "export const API_BASE_URL = 'http://localhost:3001';",
+          startLine: 1,
+          endLine: 1,
+          chunkType: "function",
+          name: "API_BASE_URL",
+          symbolKind: "Constant",
+          language: "typescript",
+        },
+        "/repo/src/config/api.ts",
+        "/repo",
+        LARGE_MODEL_MAX_TOKENS
+      );
+
+      expect(text).toContain("file: src/config/api.ts");
+      expect(text).toContain("symbol: API_BASE_URL (constant) terms: api base url");
+      expect(text).toContain("export const API_BASE_URL = 'http://localhost:3001';");
+    });
+
+    it("keeps embedding input within a small model token cap", () => {
+      const { text } = prepareEmbeddingInput(
+        {
+          content: "x".repeat(8_000),
+          startLine: 1,
+          endLine: 1,
+          chunkType: "other",
+          language: "typescript",
+        },
+        "/repo/src/small-cap.ts",
+        "/repo",
+        SMALL_MODEL_MAX_TOKENS
+      );
+
+      expect(estimateTokens(text)).toBeLessThanOrEqual(SMALL_MODEL_MAX_TOKENS);
+    });
+
+    it("accounts for header overhead by shrinking content instead of dropping the header", () => {
+      const { text } = prepareEmbeddingInput(
+        {
+          content: "y".repeat(8_000),
+          startLine: 1,
+          endLine: 1,
+          chunkType: "function",
+          name: "SuperLongSymbolNameForHeaderBudgetTestingAndIdentifierExpansion",
+          symbolKind: "Function",
+          language: "typescript",
+        },
+        "/repo/packages/app/src/features/search/ranking/semantic/retrieval/header/overhead/super-long-file-name-for-budget-check.ts",
+        "/repo",
+        SMALL_MODEL_MAX_TOKENS
+      );
+
+      expect(text).toContain(
+        "file: packages/app/src/features/search/ranking/semantic/retrieval/header/overhead/super-long-file-name-for-budget-check.ts"
+      );
+      expect(text).toContain(
+        "symbol: SuperLongSymbolNameForHeaderBudgetTestingAndIdentifierExpansion (function)"
+      );
+      expect(estimateTokens(text)).toBeLessThanOrEqual(SMALL_MODEL_MAX_TOKENS);
     });
   });
 
@@ -416,14 +770,14 @@ trait Timestampable {
         { text: "c".repeat(1000), id: "3" },
       ];
 
-      const batches = createDynamicBatches(chunks);
+      const batches = createDynamicBatches(chunks, 8_191);
 
       expect(batches.length).toBeGreaterThanOrEqual(1);
       expect(batches.flat().length).toBe(3);
     });
 
     it("should handle empty input", () => {
-      const batches = createDynamicBatches([]);
+      const batches = createDynamicBatches([], 8_191);
 
       expect(batches.length).toBe(0);
     });
@@ -434,9 +788,31 @@ trait Timestampable {
         { text: "b".repeat(30000), id: "2" },
       ];
 
-      const batches = createDynamicBatches(chunks);
+      const batches = createDynamicBatches(chunks, 8_191);
 
       expect(batches.length).toBe(2);
+    });
+
+    it("sizes batches according to the active model token limit", () => {
+      const chunks = Array.from({ length: 6 }, (_value, index) => ({
+        id: String(index + 1),
+        text: "z".repeat(400),
+      }));
+
+      const smallModelBatches = createDynamicBatches(chunks, 512);
+      const largeModelBatches = createDynamicBatches(chunks, 8_192);
+
+      expect(smallModelBatches.length).toBeGreaterThan(largeModelBatches.length);
+      expect(
+        smallModelBatches.every((batch) =>
+          batch.reduce((sum, chunk) => sum + estimateTokens(chunk.text), 0) <= 512
+        )
+      ).toBe(true);
+      expect(
+        largeModelBatches.every((batch) =>
+          batch.reduce((sum, chunk) => sum + estimateTokens(chunk.text), 0) <= 8_192
+        )
+      ).toBe(true);
     });
   });
 

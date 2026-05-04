@@ -1,11 +1,14 @@
 import { readFileSync } from "fs";
 
+import { isSearchTaskType } from "../indexer/search-recipes.js";
+
 import type {
   EvalBudget,
   GoldenDataset,
   GoldenExpected,
   GoldenQuery,
   GoldenQueryType,
+  GoldenQuerySource,
 } from "./types.js";
 
 function parseJsonFile(filePath: string): unknown {
@@ -31,15 +34,38 @@ function asPositiveNumber(value: unknown, path: string): number {
 function parseQueryType(value: unknown, path: string): GoldenQueryType {
   if (
     value === "definition" ||
+    value === "identifier-heavy" ||
     value === "implementation-intent" ||
     value === "similarity" ||
-    value === "keyword-heavy"
+    value === "keyword-heavy" ||
+    value === "config-lookup" ||
+    value === "config-constant-lookup" ||
+    value === "test-discovery" ||
+    value === "bug-report" ||
+    value === "bug-error-lookup" ||
+    value === "cross-file-relationship" ||
+    value === "file-intent" ||
+    value === "concept"
   ) {
     return value;
   }
   throw new Error(
-    `${path} must be one of: definition, implementation-intent, similarity, keyword-heavy`
+    `${path} must be one of: definition, identifier-heavy, implementation-intent, similarity, keyword-heavy, config-lookup, config-constant-lookup, test-discovery, bug-report, bug-error-lookup, cross-file-relationship, file-intent, concept`
   );
+}
+
+function parseSource(value: unknown, path: string): GoldenQuerySource {
+  if (value === "curated" || value === "generated") {
+    return value;
+  }
+  throw new Error(`${path} must be one of: curated, generated`);
+}
+
+function parseTaskType(value: unknown, path: string) {
+  if (typeof value === "string" && isSearchTaskType(value)) {
+    return value;
+  }
+  throw new Error(`${path} must be a valid search task type`);
 }
 
 function parseExpected(input: unknown, path: string): GoldenExpected {
@@ -50,6 +76,8 @@ function parseExpected(input: unknown, path: string): GoldenExpected {
   const filePathRaw = input.filePath;
   const acceptableFilesRaw = input.acceptableFiles;
   const symbolRaw = input.symbol;
+  const startLineRaw = input.startLine;
+  const endLineRaw = input.endLine;
   const branchRaw = input.branch;
 
   const filePath = typeof filePathRaw === "string" ? filePathRaw : undefined;
@@ -67,6 +95,18 @@ function parseExpected(input: unknown, path: string): GoldenExpected {
     throw new Error(`${path}.symbol must be a string when provided`);
   }
 
+  if (startLineRaw !== undefined || endLineRaw !== undefined) {
+    if (typeof startLineRaw !== "number" || !Number.isInteger(startLineRaw) || startLineRaw <= 0) {
+      throw new Error(`${path}.startLine must be a positive integer when provided`);
+    }
+    if (typeof endLineRaw !== "number" || !Number.isInteger(endLineRaw) || endLineRaw <= 0) {
+      throw new Error(`${path}.endLine must be a positive integer when provided`);
+    }
+    if (startLineRaw > endLineRaw) {
+      throw new Error(`${path}.startLine must be less than or equal to ${path}.endLine`);
+    }
+  }
+
   if (branchRaw !== undefined && typeof branchRaw !== "string") {
     throw new Error(`${path}.branch must be a string when provided`);
   }
@@ -75,6 +115,8 @@ function parseExpected(input: unknown, path: string): GoldenExpected {
     filePath,
     acceptableFiles,
     symbol: typeof symbolRaw === "string" ? symbolRaw : undefined,
+    startLine: typeof startLineRaw === "number" ? startLineRaw : undefined,
+    endLine: typeof endLineRaw === "number" ? endLineRaw : undefined,
     branch: typeof branchRaw === "string" ? branchRaw : undefined,
   };
 }
@@ -87,7 +129,10 @@ function parseQuery(input: unknown, index: number): GoldenQuery {
 
   const id = input.id;
   const query = input.query;
-  const queryType = input.queryType;
+  const queryType = input.queryType ?? input.query_type;
+  const source = input.source;
+  const heuristic = input.heuristic ?? input.generationHeuristic ?? input.generation_heuristic;
+  const taskType = input.taskType ?? input.type;
   const expected = input.expected;
 
   if (typeof id !== "string" || id.trim().length === 0) {
@@ -98,10 +143,26 @@ function parseQuery(input: unknown, index: number): GoldenQuery {
     throw new Error(`${path}.query must be a non-empty string`);
   }
 
+  if (heuristic !== undefined && typeof heuristic !== "string") {
+    throw new Error(`${path}.heuristic must be a string when provided`);
+  }
+
+  const parsedSource =
+    source === undefined ? undefined : parseSource(source, `${path}.source`);
+
+  if (parsedSource === "generated" && (typeof heuristic !== "string" || heuristic.trim().length === 0)) {
+    throw new Error(`${path}.heuristic must be provided for generated queries`);
+  }
+
   return {
     id,
     query,
-    queryType: parseQueryType(queryType, `${path}.queryType`),
+    queryType:
+      queryType === undefined ? undefined : parseQueryType(queryType, `${path}.queryType`),
+    source: parsedSource,
+    heuristic: typeof heuristic === "string" ? heuristic : undefined,
+    taskType:
+      taskType === undefined ? undefined : parseTaskType(taskType, `${path}.taskType`),
     expected: parseExpected(expected, `${path}.expected`),
   };
 }
@@ -187,6 +248,10 @@ export function parseBudget(raw: unknown, sourceLabel: string): EvalBudget {
     failOnMissingBaseline:
       typeof failOnMissingBaseline === "boolean" ? failOnMissingBaseline : true,
     thresholds: {
+      hitAt1MaxDrop:
+        thresholds.hitAt1MaxDrop === undefined
+          ? undefined
+          : asPositiveNumber(thresholds.hitAt1MaxDrop, `${sourceLabel}.thresholds.hitAt1MaxDrop`),
       hitAt5MaxDrop:
         thresholds.hitAt5MaxDrop === undefined
           ? undefined
@@ -195,6 +260,20 @@ export function parseBudget(raw: unknown, sourceLabel: string): EvalBudget {
         thresholds.mrrAt10MaxDrop === undefined
           ? undefined
           : asPositiveNumber(thresholds.mrrAt10MaxDrop, `${sourceLabel}.thresholds.mrrAt10MaxDrop`),
+      combinedRecallAt10MaxDrop:
+        thresholds.combinedRecallAt10MaxDrop === undefined && thresholds.combinedRecallAt10 === undefined
+          ? undefined
+          : asPositiveNumber(
+              thresholds.combinedRecallAt10MaxDrop ?? thresholds.combinedRecallAt10,
+              `${sourceLabel}.thresholds.combinedRecallAt10`
+            ),
+      expansionHitRateMaxDrop:
+        thresholds.expansionHitRateMaxDrop === undefined && thresholds.expansionHitRate === undefined
+          ? undefined
+          : asPositiveNumber(
+              thresholds.expansionHitRateMaxDrop ?? thresholds.expansionHitRate,
+              `${sourceLabel}.thresholds.expansionHitRate`
+            ),
       p95LatencyMaxMultiplier:
         thresholds.p95LatencyMaxMultiplier === undefined
           ? undefined
@@ -209,6 +288,10 @@ export function parseBudget(raw: unknown, sourceLabel: string): EvalBudget {
               thresholds.p95LatencyMaxAbsoluteMs,
               `${sourceLabel}.thresholds.p95LatencyMaxAbsoluteMs`
             ),
+      minHitAt1:
+        thresholds.minHitAt1 === undefined
+          ? undefined
+          : asPositiveNumber(thresholds.minHitAt1, `${sourceLabel}.thresholds.minHitAt1`),
       minHitAt5:
         thresholds.minHitAt5 === undefined
           ? undefined

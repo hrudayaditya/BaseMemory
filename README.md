@@ -13,6 +13,7 @@
 ## 📌 Quick Navigation
 
 - [⚡ Quick Start](#-quick-start)
+- [🛰 HyperBase UI](#-hyperbase-ui)
 - [🌐 MCP Server (Cursor, Claude Code, Windsurf, etc.)](#-mcp-server-cursor-claude-code-windsurf-etc)
 - [🎯 When to Use What](#-when-to-use-what)
 - [🧰 Tools Available](#-tools-available)
@@ -36,6 +37,32 @@
 - 🔒 **Privacy Focused**: Your vector index is stored locally in your project.
 - 🔌 **Model Agnostic**: Works out-of-the-box with GitHub Copilot, OpenAI, Gemini, or local Ollama models.
 - 🌐 **MCP Server**: Use with Cursor, Claude Code, Windsurf, or any MCP-compatible client — index once, search from anywhere.
+
+## 🛰 HyperBase UI
+
+This repo also includes **HyperBase**, a local browser UI for exploring your indexed codebase as graphs.
+
+Use it when you want:
+
+- a landing screen that lets you upload a `codebase.db` or open demo repos
+- a directory-first `Folders` overview
+- file and full-symbol graph modes
+- search-driven navigation, blast radius, path finding, annotations, handoff export, and layout persistence
+
+Fastest way to run it:
+
+```bash
+npm run graph
+```
+
+Then open:
+
+- [http://127.0.0.1:7842](http://127.0.0.1:7842)
+
+For the full UI docs:
+
+- [HyperBase Overview](</Users/aady/Desktop/OpenSourceContributions/BaseMemory/docs/ui/README.md>)
+- [HyperBase Getting Started](</Users/aady/Desktop/OpenSourceContributions/BaseMemory/docs/ui/getting-started.md>)
 
 ## ⚡ Quick Start
 

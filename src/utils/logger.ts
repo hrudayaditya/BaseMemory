@@ -29,6 +29,14 @@ export interface Metrics {
   vectorSearchMs: number;
   keywordSearchMs: number;
   fusionMs: number;
+  rerankerMs: number;
+  rerankerAppliedCount: number;
+  rerankerFailureCount: number;
+  rerankerBackendCounts: Record<string, number>;
+  hotUpdateTtiCount: number;
+  hotUpdateTtiLastMs: number;
+  hotUpdateTtiMaxMs: number;
+  hotUpdateTtiOverTargetCount: number;
   
   cacheHits: number;
   cacheMisses: number;
@@ -71,6 +79,14 @@ function createEmptyMetrics(): Metrics {
     vectorSearchMs: 0,
     keywordSearchMs: 0,
     fusionMs: 0,
+    rerankerMs: 0,
+    rerankerAppliedCount: 0,
+    rerankerFailureCount: 0,
+    rerankerBackendCounts: {},
+    hotUpdateTtiCount: 0,
+    hotUpdateTtiLastMs: 0,
+    hotUpdateTtiMaxMs: 0,
+    hotUpdateTtiOverTargetCount: 0,
     cacheHits: 0,
     cacheMisses: 0,
     queryCacheHits: 0,
@@ -218,7 +234,10 @@ export class Logger {
     this.metrics.embeddingErrors++;
   }
 
-  recordSearch(durationMs: number, breakdown?: { embeddingMs: number; vectorMs: number; keywordMs: number; fusionMs: number }): void {
+  recordSearch(
+    durationMs: number,
+    breakdown?: { embeddingMs: number; vectorMs: number; keywordMs: number; fusionMs: number; rerankMs?: number }
+  ): void {
     if (!this.config.metrics) return;
     this.metrics.searchCount++;
     this.metrics.searchTotalMs += durationMs;
@@ -230,6 +249,34 @@ export class Logger {
       this.metrics.vectorSearchMs = breakdown.vectorMs;
       this.metrics.keywordSearchMs = breakdown.keywordMs;
       this.metrics.fusionMs = breakdown.fusionMs;
+      this.metrics.rerankerMs = breakdown.rerankMs ?? 0;
+    }
+  }
+
+  recordReranker(applied: boolean, backend: string | null, failedBackend?: string | null): void {
+    if (!this.config.metrics) return;
+
+    if (applied) {
+      this.metrics.rerankerAppliedCount++;
+    }
+
+    if (failedBackend) {
+      this.metrics.rerankerFailureCount++;
+    }
+
+    if (backend) {
+      this.metrics.rerankerBackendCounts[backend] = (this.metrics.rerankerBackendCounts[backend] ?? 0) + 1;
+    }
+  }
+
+  recordHotUpdateTti(durationMs: number, exceededTarget: boolean): void {
+    if (!this.config.metrics) return;
+
+    this.metrics.hotUpdateTtiCount++;
+    this.metrics.hotUpdateTtiLastMs = durationMs;
+    this.metrics.hotUpdateTtiMaxMs = Math.max(this.metrics.hotUpdateTtiMaxMs, durationMs);
+    if (exceededTarget) {
+      this.metrics.hotUpdateTtiOverTargetCount++;
     }
   }
 
@@ -339,7 +386,22 @@ export class Logger {
         lines.push(`    - Vector search: ${m.vectorSearchMs.toFixed(2)}ms`);
         lines.push(`    - Keyword search: ${m.keywordSearchMs.toFixed(2)}ms`);
         lines.push(`    - Fusion: ${m.fusionMs.toFixed(2)}ms`);
+        lines.push(`    - Final reranker: ${m.rerankerMs.toFixed(2)}ms`);
       }
+      lines.push(`  Reranker applied: ${m.rerankerAppliedCount}`);
+      lines.push(`  Reranker failures: ${m.rerankerFailureCount}`);
+      if (Object.keys(m.rerankerBackendCounts).length > 0) {
+        lines.push(`  Reranker backends: ${JSON.stringify(m.rerankerBackendCounts)}`);
+      }
+    }
+
+    if (m.hotUpdateTtiCount > 0) {
+      lines.push("");
+      lines.push("Hot Update TTI:");
+      lines.push(`  Measurements: ${m.hotUpdateTtiCount}`);
+      lines.push(`  Last TTI: ${m.hotUpdateTtiLastMs.toFixed(2)}ms`);
+      lines.push(`  Max TTI: ${m.hotUpdateTtiMaxMs.toFixed(2)}ms`);
+      lines.push(`  Over target: ${m.hotUpdateTtiOverTargetCount}`);
     }
     
     const totalCacheOps = m.cacheHits + m.cacheMisses;

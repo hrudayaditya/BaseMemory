@@ -1,0 +1,412 @@
+{
+  "version": "1.0.0",
+  "name": "axios-external",
+  "description": "40-query external benchmark for Axios",
+  "queries": [
+    {
+      "id": "axios-def-interceptor-use",
+      "source": "curated",
+      "query": "where is `InterceptorManager` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "lib/core/InterceptorManager.js",
+        "symbol": "InterceptorManager"
+      }
+    },
+    {
+      "id": "axios-def-merge-config",
+      "source": "curated",
+      "query": "where is `mergeConfig` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "lib/core/mergeConfig.js",
+        "symbol": "mergeConfig"
+      }
+    },
+    {
+      "id": "axios-def-transform-data",
+      "source": "curated",
+      "query": "where is `transformData` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "lib/core/transformData.js",
+        "symbol": "transformData"
+      }
+    },
+    {
+      "id": "axios-def-dispatch-request",
+      "source": "curated",
+      "query": "where is `dispatchRequest` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "lib/core/dispatchRequest.js",
+        "symbol": "dispatchRequest"
+      }
+    },
+    {
+      "id": "axios-def-settle",
+      "source": "curated",
+      "query": "where is `settle` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "lib/core/settle.js",
+        "symbol": "settle"
+      }
+    },
+    {
+      "id": "axios-def-build-full-path",
+      "source": "curated",
+      "query": "where is `buildFullPath` implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "lib/core/buildFullPath.js",
+        "symbol": "buildFullPath"
+      }
+    },
+    {
+      "id": "axios-def-combine-urls",
+      "source": "curated",
+      "query": "where is `combineURLs` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "lib/helpers/combineURLs.js",
+        "symbol": "combineURLs"
+      }
+    },
+    {
+      "id": "axios-def-is-absolute-url",
+      "source": "curated",
+      "query": "where is `isAbsoluteURL` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "lib/helpers/isAbsoluteURL.js",
+        "symbol": "isAbsoluteURL"
+      }
+    },
+    {
+      "id": "axios-def-axios-error-class",
+      "source": "curated",
+      "query": "where is `AxiosError` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "lib/core/AxiosError.js",
+        "symbol": "AxiosError"
+      }
+    },
+    {
+      "id": "axios-def-axios-headers-class",
+      "source": "curated",
+      "query": "where is `AxiosHeaders` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "lib/core/AxiosHeaders.js",
+        "symbol": "AxiosHeaders"
+      }
+    },
+    {
+      "id": "axios-def-bind-helper",
+      "source": "curated",
+      "query": "where is the `bind` function defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "lib/helpers/bind.js",
+        "symbol": "bind"
+      }
+    },
+    {
+      "id": "axios-def-cancel-token-class",
+      "source": "curated",
+      "query": "where is `CancelToken` defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "lib/cancel/CancelToken.js",
+        "symbol": "CancelToken"
+      }
+    },
+    {
+      "id": "axios-xf-private-request-orchestrator",
+      "source": "curated",
+      "query": "which axios instance method builds the interceptor chains and ultimately invokes the core send routine",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "lib/core/Axios.js",
+        "symbol": "_request"
+      }
+    },
+    {
+      "id": "axios-xf-create-instance-factory",
+      "source": "curated",
+      "query": "what factory wraps a fresh axios type instance copies prototype helpers and wires instance dot create",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "lib/axios.js",
+        "symbol": "createInstance"
+      }
+    },
+    {
+      "id": "axios-xf-xhr-promise-entry",
+      "source": "curated",
+      "query": "what named xhr adapter closure receives resolve reject and forwards the synthetic response into status settlement",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "lib/adapters/xhr.js",
+        "symbol": "dispatchXhrRequest"
+      }
+    },
+    {
+      "id": "axios-xf-fetch-capability-factory",
+      "source": "curated",
+      "query": "what module level factory in the fetch adapter file constructs the async transport closure after feature probing",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "lib/adapters/fetch.js",
+        "symbol": "factory"
+      }
+    },
+    {
+      "id": "axios-xf-get-uri",
+      "source": "curated",
+      "query": "which axios instance method only resolves the fully built url string without performing a network round trip",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "lib/core/Axios.js",
+        "symbol": "getUri"
+      }
+    },
+    {
+      "id": "axios-xf-node-http-entry",
+      "source": "curated",
+      "query": "what named function in the node http adapter file is the main config handling entry for non xhr transports",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "lib/adapters/http.js",
+        "symbol": "httpAdapter"
+      }
+    },
+    {
+      "id": "axios-xf-set-proxy",
+      "source": "curated",
+      "query": "what helper in the node adapter applies proxy from env and may throw on malformed proxy auth before opening sockets",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "lib/adapters/http.js",
+        "symbol": "setProxy"
+      }
+    },
+    {
+      "id": "axios-xf-before-redirect-hook",
+      "source": "curated",
+      "query": "what named callback function is passed as the beforeRedirect option when follow redirects handles hop by hop tweaks",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "lib/adapters/http.js",
+        "symbol": "dispatchBeforeRedirect"
+      }
+    },
+    {
+      "id": "axios-concept-compose-abort",
+      "source": "curated",
+      "query": "what helper merges abort signals optional legacy cancel bridge and timeout into one controller for fetch",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "lib/helpers/composeSignals.js",
+        "symbol": "composeSignals"
+      }
+    },
+    {
+      "id": "axios-concept-cancel-predicate",
+      "source": "curated",
+      "query": "what one line predicate checks the private cancel marker on thrown values inside the dispatcher",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "lib/cancel/isCancel.js",
+        "symbol": "isCancel"
+      }
+    },
+    {
+      "id": "axios-concept-header-value-sanitize",
+      "source": "curated",
+      "query": "what routine strips illegal control characters from header values before they are normalized for storage",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "lib/core/AxiosHeaders.js",
+        "symbol": "sanitizeHeaderValue"
+      }
+    },
+    {
+      "id": "axios-concept-formdata-to-json",
+      "source": "curated",
+      "query": "what helper turns a form data payload into a plain json friendly object graph for stringify transforms",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "lib/helpers/formDataToJSON.js",
+        "symbol": "formDataToJSON"
+      }
+    },
+    {
+      "id": "axios-concept-data-uri-parse",
+      "source": "curated",
+      "query": "what helper validates data urls decodes embedded payloads and throws when protocol or blob support is missing",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "lib/helpers/fromDataURI.js",
+        "symbol": "fromDataURI"
+      }
+    },
+    {
+      "id": "axios-concept-to-form-data",
+      "source": "curated",
+      "query": "what visitor driven routine recursively flattens objects into multipart style fields with depth guards",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "lib/helpers/toFormData.js",
+        "symbol": "toFormData"
+      }
+    },
+    {
+      "id": "axios-concept-track-stream",
+      "source": "curated",
+      "query": "what helper wraps readable streams so each pulled chunk can invoke a progress callback with running byte totals",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "lib/helpers/trackStream.js",
+        "symbol": "trackStream"
+      }
+    },
+    {
+      "id": "axios-concept-normalize-header-name",
+      "source": "curated",
+      "query": "what helper lowercases and trims a raw header label before it is used as an internal lookup key",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "lib/core/AxiosHeaders.js",
+        "symbol": "normalizeHeader"
+      }
+    },
+    {
+      "id": "axios-concept-header-accept-tokens",
+      "source": "curated",
+      "query": "what small lexer builds a token map from header field strings like accept parameters before matching",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "lib/core/AxiosHeaders.js",
+        "symbol": "parseTokens"
+      }
+    },
+    {
+      "id": "axios-concept-axios-class",
+      "source": "curated",
+      "query": "what class owns defaults interceptors the public entry method and shorthand verbs for http calls",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "lib/core/Axios.js",
+        "symbol": "Axios"
+      }
+    },
+    {
+      "id": "axios-bug-aborted-signal-throw",
+      "source": "curated",
+      "query": "in the preflight cancellation guard before headers are normalized where does config.signal.aborted cause new CanceledError null config to be thrown",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "lib/core/dispatchRequest.js",
+        "symbol": "throwIfCancellationRequested",
+        "startLine": 17,
+        "endLine": 25
+      }
+    },
+    {
+      "id": "axios-bug-cancel-token-throw-if",
+      "source": "curated",
+      "query": "on the legacy cancel token class where does throwIfRequested rethrow this.reason after the executor already set token.reason",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "lib/cancel/CancelToken.js",
+        "symbol": "throwIfRequested",
+        "startLine": 68,
+        "endLine": 71
+      }
+    },
+    {
+      "id": "axios-bug-transitional-removed",
+      "source": "curated",
+      "query": "in validator helpers where does the function returned from validators.transitional throw AxiosError ERR_DEPRECATED when its factory first argument validator is false and the message includes has been removed plus optional in version suffix from formatMessage",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "lib/helpers/validator.js",
+        "symbol": "validators.transitional",
+        "startLine": 40,
+        "endLine": 46
+      }
+    },
+    {
+      "id": "axios-bug-stringify-safely-rethrow",
+      "source": "curated",
+      "query": "inside defaults stringifySafely when rawValue is a string and JSON.parse probe throws where does e.name not SyntaxError cause the catch to rethrow the original error instead of falling through to JSON.stringify",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "lib/defaults/index.js",
+        "symbol": "stringifySafely",
+        "startLine": 21,
+        "endLine": 33
+      }
+    },
+    {
+      "id": "axios-bug-unknown-adapter",
+      "source": "curated",
+      "query": "inside getAdapter when the adapter entry is a string and knownAdapters lookup yields undefined where is AxiosError thrown with template Unknown adapter and the resolved id",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "lib/adapters/adapters.js",
+        "symbol": "getAdapter",
+        "startLine": 78,
+        "endLine": 83
+      }
+    },
+    {
+      "id": "axios-test-axios-headers",
+      "source": "curated",
+      "query": "what unit test file exercises the case insensitive header container normalization and merging rules",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/unit/axiosHeaders.test.js"
+      }
+    },
+    {
+      "id": "axios-test-merge-config",
+      "source": "curated",
+      "query": "what unit tests cover merging defaults with per request overrides for urls transforms and headers",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/unit/core/mergeConfig.test.js"
+      }
+    },
+    {
+      "id": "axios-test-compose-signals",
+      "source": "curated",
+      "query": "what unit file validates composing abort signals with optional timeout behavior",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/unit/composeSignals.test.js"
+      }
+    },
+    {
+      "id": "axios-test-transform-data",
+      "source": "curated",
+      "query": "what unit tests exercise the transformData helper that dispatchRequest calls for request and response transforms",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/unit/core/transformData.test.js"
+      }
+    },
+    {
+      "id": "axios-test-validator",
+      "source": "curated",
+      "query": "what unit tests cover assertOptions including unknown option errors and option type validation",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/unit/helpers/validator.test.js"
+      }
+    }
+  ]
+}

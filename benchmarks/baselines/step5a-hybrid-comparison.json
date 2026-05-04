@@ -1,0 +1,75 @@
+{
+  "dataset": "small",
+  "note": "Corrected Step 5A eval baseline after fixing the eval-only mock embedding bootstrap. The previous zero-hit summaries were invalid because the configured local mock embedding endpoint was offline and eval continued against an empty retrievable corpus.",
+  "baseline": {
+    "generatedAt": "2026-04-07T05:21:07.845Z",
+    "metrics": {
+      "hitAt1": 1,
+      "hitAt3": 1,
+      "hitAt5": 1,
+      "hitAt10": 1,
+      "mrrAt10": 1,
+      "ndcgAt10": 0.9032867981913646,
+      "latencyMs": {
+        "p50": 2.4781664999991335,
+        "p95": 4.67187944999996,
+        "p99": 4.913309490000156
+      },
+      "tokenEstimate": {
+        "queryTokens": 43,
+        "embeddingTokensUsed": 17288
+      },
+      "embedding": {
+        "callCount": 150,
+        "estimatedCostUsd": 0,
+        "costPer1MTokensUsd": 0
+      },
+      "failureBuckets": {
+        "wrong-file": 0,
+        "wrong-symbol": 2,
+        "docs-tests-outranking-source": 0,
+        "no-relevant-hit-top-k": 0
+      }
+    }
+  },
+  "post": {
+    "generatedAt": "2026-04-07T05:21:07.845Z",
+    "metrics": {
+      "hitAt1": 1,
+      "hitAt3": 1,
+      "hitAt5": 1,
+      "hitAt10": 1,
+      "mrrAt10": 1,
+      "ndcgAt10": 0.9032867981913646,
+      "latencyMs": {
+        "p50": 2.4781664999991335,
+        "p95": 4.67187944999996,
+        "p99": 4.913309490000156
+      },
+      "tokenEstimate": {
+        "queryTokens": 43,
+        "embeddingTokensUsed": 17288
+      },
+      "embedding": {
+        "callCount": 150,
+        "estimatedCostUsd": 0,
+        "costPer1MTokensUsd": 0
+      },
+      "failureBuckets": {
+        "wrong-file": 0,
+        "wrong-symbol": 2,
+        "docs-tests-outranking-source": 0,
+        "no-relevant-hit-top-k": 0
+      }
+    }
+  },
+  "comparison": {
+    "hitAt1Delta": 0,
+    "hitAt3Delta": 0,
+    "hitAt5Delta": 0,
+    "hitAt10Delta": 0,
+    "mrrAt10Delta": 0,
+    "ndcgAt10Delta": 0,
+    "p95LatencyDeltaMs": 0
+  }
+}

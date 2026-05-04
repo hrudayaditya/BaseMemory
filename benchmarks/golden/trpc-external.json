@@ -1,0 +1,402 @@
+{
+  "version": "1.0.0",
+  "name": "trpc-external",
+  "description": "40-query external benchmark for tRPC",
+  "queries": [
+    {
+      "id": "trpc-def-init-root",
+      "source": "curated",
+      "query": "where is the singleton builder object exported that every tRPC server bootstraps from exactly once",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/initTRPC.ts",
+        "symbol": "initTRPC"
+      }
+    },
+    {
+      "id": "trpc-def-retry-link",
+      "source": "curated",
+      "query": "where is the client link that retries failed operations based on configurable retry rules implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/client/src/links/retryLink.ts",
+        "symbol": "retryLink"
+      }
+    },
+    {
+      "id": "trpc-def-procedure-builder-factory",
+      "source": "curated",
+      "query": "where is the factory that returns the mutable procedure builder used by initTRPC.procedure defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/procedureBuilder.ts",
+        "symbol": "createBuilder"
+      }
+    },
+    {
+      "id": "trpc-def-trpc-error-class",
+      "source": "curated",
+      "query": "where is the structured server error class carrying TRPC error codes defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/error/TRPCError.ts",
+        "symbol": "TRPCError"
+      }
+    },
+    {
+      "id": "trpc-def-observable-factory",
+      "source": "curated",
+      "query": "where is the observable factory function implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/server/src/observable/observable.ts",
+        "symbol": "observable"
+      }
+    },
+    {
+      "id": "trpc-def-tracked-envelope",
+      "source": "curated",
+      "query": "where is the tracked function defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/stream/tracked.ts",
+        "symbol": "tracked"
+      }
+    },
+    {
+      "id": "trpc-def-error-shape-builder",
+      "source": "curated",
+      "query": "where is the routine that builds the serializable error shape including HTTP status before the errorFormatter runs defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/error/getErrorShape.ts",
+        "symbol": "getErrorShape"
+      }
+    },
+    {
+      "id": "trpc-def-router-factory",
+      "source": "curated",
+      "query": "where is the internal factory that closes over root config and returns the function which materializes a router record into a router instance defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/router.ts",
+        "symbol": "createRouterFactory"
+      }
+    },
+    {
+      "id": "trpc-def-transform-wire-result",
+      "source": "curated",
+      "query": "where is transformResult implemented",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/transformer.ts",
+        "symbol": "transformResult"
+      }
+    },
+    {
+      "id": "trpc-def-flat-proxy",
+      "source": "curated",
+      "query": "where is the non-recursive createFlatProxy helper defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/createProxy.ts",
+        "symbol": "createFlatProxy"
+      }
+    },
+    {
+      "id": "trpc-def-sse-producer",
+      "source": "curated",
+      "query": "where is the server-side async generator that encodes Server-Sent Events for streaming procedures defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/stream/sse.ts",
+        "symbol": "sseStreamProducer"
+      }
+    },
+    {
+      "id": "trpc-def-request-info-parser",
+      "source": "curated",
+      "query": "where is getRequestInfo defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/http/contentType.ts",
+        "symbol": "getRequestInfo"
+      }
+    },
+    {
+      "id": "trpc-rel-await-request-info",
+      "source": "curated",
+      "query": "what function awaits parsing of headers and URL into TRPCRequestInfo at the start of the shared HTTP response resolver",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/http/resolveResponse.ts",
+        "symbol": "resolveResponse"
+      }
+    },
+    {
+      "id": "trpc-rel-fetch-adapter-resolve",
+      "source": "curated",
+      "query": "what exported fetch adapter entrypoint forwards the trimmed path and Request into the shared HTTP resolver",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "packages/server/src/adapters/fetch/fetchRequestHandler.ts",
+        "symbol": "fetchRequestHandler"
+      }
+    },
+    {
+      "id": "trpc-rel-node-http-resolve",
+      "source": "curated",
+      "query": "which Node IncomingMessage handler awaits the shared resolveResponse after wrapping the socket pair as a Request",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "packages/server/src/adapters/node-http/nodeHTTPRequestHandler.ts",
+        "symbol": "nodeHTTPRequestHandler"
+      }
+    },
+    {
+      "id": "trpc-rel-fastify-resolve",
+      "source": "curated",
+      "query": "which Fastify reply handler bridges raw Node messages into resolveResponse using the node-http request shim",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "packages/server/src/adapters/fastify/fastifyRequestHandler.ts",
+        "symbol": "fastifyRequestHandler"
+      }
+    },
+    {
+      "id": "trpc-rel-lambda-planner",
+      "source": "curated",
+      "query": "what non-streaming AWS Lambda handler closure calls the planner to derive path and Request before resolveResponse",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "packages/server/src/adapters/aws-lambda/index.ts",
+        "symbol": "awsLambdaRequestHandler"
+      }
+    },
+    {
+      "id": "trpc-rel-local-link-transformer",
+      "source": "curated",
+      "query": "which terminating in-process client link reads transformer options once when the link is constructed before calling the router",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "packages/client/src/links/localLink.ts",
+        "symbol": "unstable_localLink"
+      }
+    },
+    {
+      "id": "trpc-rel-grace-abort-throw",
+      "source": "curated",
+      "query": "what async generator helper throws the ponyfilled DOMException AbortError when the grace timer wins the race",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/stream/utils/asyncIterable.ts",
+        "symbol": "takeWithGrace"
+      }
+    },
+    {
+      "id": "trpc-rel-caller-proxy-recursive",
+      "source": "curated",
+      "query": "what exported factory wraps createRecursiveProxy when building the server-side typesafe caller proxy",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/router.ts",
+        "symbol": "createCallerFactory"
+      }
+    },
+    {
+      "id": "trpc-concept-default-formatter",
+      "source": "curated",
+      "query": "where does the framework keep the pass-through errorFormatter implementation used when callers do not supply a custom one",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/error/formatter.ts",
+        "symbol": "defaultFormatter"
+      }
+    },
+    {
+      "id": "trpc-concept-parse-fn",
+      "source": "curated",
+      "query": "where is a Zod schema or parser metadata turned into an actual parse function the procedure pipeline can invoke",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/parser.ts",
+        "symbol": "getParseFn"
+      }
+    },
+    {
+      "id": "trpc-concept-abort-sniff",
+      "source": "curated",
+      "query": "where does the server normalize checking whether an unknown value represents an aborted request by name",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/http/abortError.ts",
+        "symbol": "isAbortError"
+      }
+    },
+    {
+      "id": "trpc-concept-ping-stream",
+      "source": "curated",
+      "query": "where are periodic ping symbols merged into an async iterable so idle streams still emit heartbeats",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/stream/utils/withPing.ts",
+        "symbol": "withPing"
+      }
+    },
+    {
+      "id": "trpc-concept-middleware-factory",
+      "source": "curated",
+      "query": "where is the factory constructed by initTRPC.middleware implemented so procedures can stack reusable middleware",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/middleware.ts",
+        "symbol": "createMiddlewareFactory"
+      }
+    },
+    {
+      "id": "trpc-concept-jsonl-consumer",
+      "source": "curated",
+      "query": "where does the runtime decode newline-delimited JSON RPC chunks from a readable byte stream on the consumer side",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/stream/jsonl.ts",
+        "symbol": "jsonlStreamConsumer"
+      }
+    },
+    {
+      "id": "trpc-concept-http-status-from-error",
+      "source": "curated",
+      "query": "where is a TRPCError code translated into the numeric HTTP status used in the default error data payload",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/http/getHTTPStatusCode.ts",
+        "symbol": "getHTTPStatusCodeFromError"
+      }
+    },
+    {
+      "id": "trpc-concept-next-redirect",
+      "source": "curated",
+      "query": "where is the Next App Router helper that throws a redirect-specific TRPC error subclass implemented",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/server/src/adapters/next-app-dir/redirect.ts",
+        "symbol": "redirect"
+      }
+    },
+    {
+      "id": "trpc-concept-client-error-from",
+      "source": "curated",
+      "query": "where does the typed client coerce arbitrary causes into a TRPCClientError with optional meta decoration",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/client/src/TRPCClientError.ts",
+        "symbol": "TRPCClientError"
+      }
+    },
+    {
+      "id": "trpc-concept-standalone-mw",
+      "source": "curated",
+      "query": "where is the experimental middleware entry exported for defining middleware without an initTRPC root first",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/middleware.ts",
+        "symbol": "experimental_standaloneMiddleware"
+      }
+    },
+    {
+      "id": "trpc-bug-non-server-init",
+      "source": "curated",
+      "query": "where does bootstrapping the root object throw if the runtime is treated as non-server and allowOutsideOfServer is not opted in",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/initTRPC.ts",
+        "symbol": "TRPCBuilder"
+      }
+    },
+    {
+      "id": "trpc-bug-http-link-subscription",
+      "source": "curated",
+      "query": "where does the plain JSON HTTP client link throw explaining subscriptions need a different link implementation",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "packages/client/src/links/httpLink.ts",
+        "symbol": "httpLink"
+      }
+    },
+    {
+      "id": "trpc-bug-http-subscription-link-type",
+      "source": "curated",
+      "query": "where does the EventSource subscription link throw when the operation is not a subscription",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "packages/client/src/links/httpSubscriptionLink.ts",
+        "symbol": "httpSubscriptionLink"
+      }
+    },
+    {
+      "id": "trpc-bug-merge-routers-transformer",
+      "source": "curated",
+      "query": "where does merging routers throw if more than one distinct non-default transformer configuration is present",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/router.ts",
+        "symbol": "mergeRouters"
+      }
+    },
+    {
+      "id": "trpc-bug-merge-without-overrides",
+      "source": "curated",
+      "query": "where does shallow record merging throw when the same key already exists with a different value",
+      "queryType": "bug-error-lookup",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/utils.ts",
+        "symbol": "mergeWithoutOverrides"
+      }
+    },
+    {
+      "id": "trpc-test-incoming-message",
+      "source": "curated",
+      "query": "what tests cover converting Node IncomingMessage pairs into a Fetch Request for adapters",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "packages/server/src/adapters/node-http/incomingMessageToRequest.test.ts"
+      }
+    },
+    {
+      "id": "trpc-test-recursive-proxy",
+      "source": "curated",
+      "query": "what tests cover the recursive proxy helper used for path and args capture",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/createProxy.test.ts"
+      }
+    },
+    {
+      "id": "trpc-test-fetch-adapter",
+      "source": "curated",
+      "query": "what integration tests exercise the fetch request handler adapter end to end",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "packages/tests/server/adapters/fetch.test.ts"
+      }
+    },
+    {
+      "id": "trpc-test-init-trpc",
+      "source": "curated",
+      "query": "what tests validate initTRPC context meta and transformer typing behavior",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/initTRPC.test.ts"
+      }
+    },
+    {
+      "id": "trpc-test-with-ping",
+      "source": "curated",
+      "query": "what tests cover the streaming helper that injects ping yields alongside source events",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "packages/server/src/unstable-core-do-not-import/stream/utils/withPing.test.ts"
+      }
+    }
+  ]
+}

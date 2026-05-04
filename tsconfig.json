@@ -20,5 +20,5 @@
     "allowSyntheticDefaultImports": true
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "native", "tests"]
+  "exclude": ["node_modules", "dist", "native", "tests", "src/hyperbase"]
 }

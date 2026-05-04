@@ -1,0 +1,396 @@
+{
+  "version": "1.0.0",
+  "name": "agentic",
+  "description": "Agentic-coder style golden eval set. Queries are rewritten to match how coding agents typically search: symbol-aware, task-oriented, and operational.",
+  "queries": [
+    {
+      "id": "agt-def-rank-hybrid-results",
+      "query": "where is rankHybridResults defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/indexer/index.ts",
+        "symbol": "rankHybridResults"
+      }
+    },
+    {
+      "id": "agt-impl-codebase-search-tool",
+      "query": "where is the codebase_search tool implemented",
+      "queryType": "implementation-intent",
+      "expected": {
+        "filePath": "src/tools/index.ts",
+        "symbol": "codebase_search"
+      }
+    },
+    {
+      "id": "agt-sim-find-similar",
+      "query": "find the tool that implements find_similar",
+      "queryType": "similarity",
+      "expected": {
+        "filePath": "src/tools/index.ts",
+        "symbol": "find_similar"
+      }
+    },
+    {
+      "id": "agt-kw-search-config-knobs",
+      "query": "show me where fusionStrategy hybridWeight rrfK and rerankTopN are defined in config",
+      "queryType": "keyword-heavy",
+      "expected": {
+        "filePath": "src/config/schema.ts"
+      }
+    },
+    {
+      "id": "agt-sem-finalize-eval-artifacts",
+      "query": "what function writes eval artifacts and final summary output",
+      "queryType": "similarity",
+      "expected": {
+        "filePath": "src/eval/runner.ts",
+        "symbol": "finalizeEvaluationRun"
+      }
+    },
+    {
+      "id": "agt-impl-implementation-lookup-tool",
+      "query": "where is implementation_lookup implemented",
+      "queryType": "implementation-intent",
+      "expected": {
+        "filePath": "src/tools/index.ts",
+        "symbol": "implementation_lookup"
+      }
+    },
+    {
+      "id": "agt-def-typescript-chunker-policy",
+      "query": "where is classify_ts_js_node_impl defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "native/src/chunker/languages/typescript.rs",
+        "symbol": "classify_ts_js_node_impl"
+      }
+    },
+    {
+      "id": "agt-def-build-merkle-snapshot",
+      "query": "where is buildMerkleSnapshot defined",
+      "queryType": "definition",
+      "expected": {
+        "filePath": "src/native/index.ts",
+        "symbol": "buildMerkleSnapshot"
+      }
+    },
+    {
+      "id": "agt-sem-index-codebase-caller",
+      "query": "which tool returns the foreground indexing ready message and streams indexing progress",
+      "queryType": "similarity",
+      "expected": {
+        "filePath": "src/tools/index.ts",
+        "symbol": "index_codebase"
+      }
+    },
+    {
+      "id": "agt-impl-call-graph-tool",
+      "query": "where is call_graph implemented",
+      "queryType": "implementation-intent",
+      "expected": {
+        "filePath": "src/tools/index.ts",
+        "symbol": "call_graph"
+      }
+    },
+    {
+      "id": "agt-cfg-sqlite-busy-timeout",
+      "query": "where is SQLITE_BUSY_TIMEOUT_MS defined",
+      "queryType": "config-lookup",
+      "expected": {
+        "filePath": "native/src/db.rs",
+        "symbol": "SQLITE_BUSY_TIMEOUT_MS",
+        "startLine": 19,
+        "endLine": 19
+      }
+    },
+    {
+      "id": "agt-cfg-arctic-query-prefix",
+      "query": "where is ARCTIC_QUERY_PREFIX defined",
+      "queryType": "config-lookup",
+      "expected": {
+        "filePath": "src/embeddings/provider.ts",
+        "symbol": "ARCTIC_QUERY_PREFIX",
+        "startLine": 28,
+        "endLine": 28
+      }
+    },
+    {
+      "id": "agt-cfg-voyage-default-model",
+      "query": "where is VOYAGE_DEFAULT_MODEL_ID defined",
+      "queryType": "config-lookup",
+      "expected": {
+        "filePath": "src/embeddings/provider.ts",
+        "symbol": "VOYAGE_DEFAULT_MODEL_ID",
+        "startLine": 31,
+        "endLine": 31
+      }
+    },
+    {
+      "id": "agt-cfg-default-final-rerank",
+      "query": "where is DEFAULT_FINAL_RERANK_TOP_N defined",
+      "queryType": "config-lookup",
+      "expected": {
+        "filePath": "src/indexer/search-recipes.ts",
+        "symbol": "DEFAULT_FINAL_RERANK_TOP_N",
+        "startLine": 32,
+        "endLine": 33
+      }
+    },
+    {
+      "id": "agt-cfg-general-final-rerank",
+      "query": "where is GENERAL_FINAL_RERANK_TOP_N defined",
+      "queryType": "config-lookup",
+      "expected": {
+        "filePath": "src/indexer/search-recipes.ts",
+        "symbol": "GENERAL_FINAL_RERANK_TOP_N",
+        "startLine": 33,
+        "endLine": 34
+      }
+    },
+    {
+      "id": "agt-test-call-graph-branch-awareness",
+      "query": "show me the tests for branch-aware call graph filtering",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/call-graph.test.ts"
+      }
+    },
+    {
+      "id": "agt-test-eval-runner",
+      "query": "where are the eval runner tests",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/eval-runner.test.ts"
+      }
+    },
+    {
+      "id": "agt-test-voyage-indexing-failure",
+      "query": "show me the tests covering voyage-only embedding failure handling",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/incremental-orchestrator.test.ts"
+      }
+    },
+    {
+      "id": "agt-test-task-inference-ranking",
+      "query": "where are the tests for retrieval task inference and ranking",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/retrieval-ranking.test.ts"
+      }
+    },
+    {
+      "id": "agt-test-search-integration-graph-expansion",
+      "query": "show me the graph expansion search integration tests",
+      "queryType": "test-discovery",
+      "expected": {
+        "filePath": "tests/search-integration.test.ts"
+      }
+    },
+    {
+      "id": "agt-bug-graph-expansion-branch-leak",
+      "query": "find the code responsible for graph expansion leaking symbols from another branch",
+      "queryType": "bug-report",
+      "expected": {
+        "filePath": "src/indexer/graph-expansion.ts",
+        "symbol": "expandGraphContext",
+        "startLine": 223,
+        "endLine": 448
+      }
+    },
+    {
+      "id": "agt-bug-preserve-voyage-on-arctic-failure",
+      "query": "find the code path that discards successful Voyage embeddings when Arctic fails",
+      "queryType": "bug-report",
+      "expected": {
+        "filePath": "src/indexer/incremental-index-orchestrator.ts",
+        "symbol": "processEmbedStage",
+        "startLine": 2349,
+        "endLine": 2734
+      }
+    },
+    {
+      "id": "agt-bug-default-branch-filtering",
+      "query": "find the branch filtering fallback bug for a branch literally named default",
+      "queryType": "bug-report",
+      "expected": {
+        "filePath": "src/indexer/index.ts",
+        "symbol": "getActiveBranchKey",
+        "startLine": 4078,
+        "endLine": 4080
+      }
+    },
+    {
+      "id": "agt-bug-indexed-snippet-content",
+      "query": "find the code that makes search snippets read from live disk instead of indexed chunk content",
+      "queryType": "bug-report",
+      "expected": {
+        "filePath": "src/indexer/index.ts",
+        "symbol": "materializeRankedResults",
+        "startLine": 5754,
+        "endLine": 5808
+      }
+    },
+    {
+      "id": "agt-bug-sqlite-busy-locks",
+      "query": "find the SQLite busy retry logic that should wait through transient lock contention",
+      "queryType": "bug-report",
+      "expected": {
+        "filePath": "native/src/db.rs",
+        "symbol": "retry_busy_sqlite",
+        "startLine": 67,
+        "endLine": 85
+      }
+    },
+    {
+      "id": "agt-rel-build-per-query-result-caller",
+      "query": "what calls buildPerQueryResult",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/eval/runner.ts",
+        "symbol": "finalizeEvaluationRun",
+        "startLine": 390,
+        "endLine": 547
+      }
+    },
+    {
+      "id": "agt-rel-compute-eval-metrics-caller",
+      "query": "what calls computeEvalMetrics",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/eval/runner.ts",
+        "symbol": "finalizeEvaluationRun",
+        "startLine": 390,
+        "endLine": 547
+      }
+    },
+    {
+      "id": "agt-rel-evaluate-budget-gate-caller",
+      "query": "what calls evaluateBudgetGate",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/eval/runner.ts",
+        "symbol": "finalizeEvaluationRun",
+        "startLine": 390,
+        "endLine": 547
+      }
+    },
+    {
+      "id": "agt-rel-map-query-type-caller",
+      "query": "what calls mapEvalQueryTypeToTaskType during eval",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/eval/runner.ts",
+        "symbol": "resolveEvalTaskType",
+        "startLine": 316,
+        "endLine": 334
+      }
+    },
+    {
+      "id": "agt-rel-create-embedding-text-caller",
+      "query": "what calls createEmbeddingText during indexing",
+      "queryType": "cross-file-relationship",
+      "expected": {
+        "filePath": "src/indexer/incremental-index-orchestrator.ts",
+        "symbol": "buildChunkRecords",
+        "startLine": 2985,
+        "endLine": 3053
+      }
+    },
+    {
+      "id": "agt-file-eval-runner-intent",
+      "query": "which file implements the eval runner",
+      "queryType": "file-intent",
+      "expected": {
+        "filePath": "src/eval/runner.ts"
+      }
+    },
+    {
+      "id": "agt-file-eval-cli-intent",
+      "query": "which file implements the eval cli",
+      "queryType": "file-intent",
+      "expected": {
+        "filePath": "src/eval/cli.ts"
+      }
+    },
+    {
+      "id": "agt-file-graph-expansion-intent",
+      "query": "which file owns graph expansion",
+      "queryType": "file-intent",
+      "expected": {
+        "filePath": "src/indexer/graph-expansion.ts"
+      }
+    },
+    {
+      "id": "agt-file-watcher-intent",
+      "query": "which file implements the watcher module",
+      "queryType": "file-intent",
+      "expected": {
+        "filePath": "src/watcher/index.ts"
+      }
+    },
+    {
+      "id": "agt-file-tools-intent",
+      "query": "which file implements the tools module",
+      "queryType": "file-intent",
+      "expected": {
+        "filePath": "src/tools/index.ts"
+      }
+    },
+    {
+      "id": "agt-concept-budget-gate",
+      "query": "where is budget gate logic handled in eval",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/eval/budget.ts",
+        "symbol": "checkGate",
+        "startLine": 16,
+        "endLine": 80
+      }
+    },
+    {
+      "id": "agt-concept-embedding-text-prefix",
+      "query": "where is createEmbeddingText implemented",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/native/index.ts",
+        "symbol": "createEmbeddingText",
+        "startLine": 654,
+        "endLine": 697
+      }
+    },
+    {
+      "id": "agt-concept-eval-task-type-resolution",
+      "query": "where is resolveEvalTaskType defined",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/eval/runner.ts",
+        "symbol": "resolveEvalTaskType",
+        "startLine": 316,
+        "endLine": 334
+      }
+    },
+    {
+      "id": "agt-concept-query-type-recipe-mapping",
+      "query": "where is mapEvalQueryTypeToTaskType defined",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/indexer/search-recipes.ts",
+        "symbol": "mapEvalQueryTypeToTaskType",
+        "startLine": 133,
+        "endLine": 170
+      }
+    },
+    {
+      "id": "agt-concept-watcher-event-timestamps",
+      "query": "where is watcher event timestamp tracking implemented",
+      "queryType": "concept",
+      "expected": {
+        "filePath": "src/indexer/watcher-tti.ts",
+        "symbol": "recordWatcherEventTimestamp",
+        "startLine": 14,
+        "endLine": 19
+      }
+    }
+  ]
+}

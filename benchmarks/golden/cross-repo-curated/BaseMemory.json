@@ -1,0 +1,206 @@
+{
+  "version": "1.0.0",
+  "name": "cross-repo-BaseMemory-curated",
+  "description": "Hand-authored golden benchmark for BaseMemory covering definition lookup, identifier-heavy lookup, cross-file relationships, bug/error lookup, and config/constant lookup.",
+  "queries": [
+    {
+      "id": "basememory-definition-rank-hybrid-results",
+      "query": "where is rankHybridResults implementation",
+      "query_type": "definition",
+      "source": "curated",
+      "expected": {
+        "filePath": "src/indexer/index.ts",
+        "symbol": "rankHybridResults"
+      }
+    },
+    {
+      "id": "basememory-definition-build-merkle-snapshot",
+      "query": "where is buildMerkleSnapshot implementation",
+      "query_type": "definition",
+      "source": "curated",
+      "expected": {
+        "filePath": "src/native/index.ts",
+        "symbol": "buildMerkleSnapshot"
+      }
+    },
+    {
+      "id": "basememory-definition-typescript-chunker-policy",
+      "query": "where is classify_ts_js_node implementation",
+      "query_type": "definition",
+      "source": "curated",
+      "expected": {
+        "filePath": "native/src/chunker/languages/typescript.rs",
+        "symbol": "classify_ts_js_node"
+      }
+    },
+    {
+      "id": "basememory-definition-call-graph-tool",
+      "query": "where is call_graph tool implementation",
+      "query_type": "definition",
+      "source": "curated",
+      "expected": {
+        "filePath": "src/tools/index.ts",
+        "symbol": "call_graph"
+      }
+    },
+    {
+      "id": "basememory-identifier-embedding-input-format-version",
+      "query": "EMBEDDING_INPUT_FORMAT_VERSION",
+      "query_type": "identifier-heavy",
+      "source": "curated",
+      "expected": {
+        "filePath": "src/native/index.ts",
+        "symbol": "EMBEDDING_INPUT_FORMAT_VERSION"
+      }
+    },
+    {
+      "id": "basememory-identifier-codebase-search-tool",
+      "query": "codebase_search ToolDefinition",
+      "query_type": "identifier-heavy",
+      "source": "curated",
+      "expected": {
+        "filePath": "src/tools/index.ts",
+        "symbol": "codebase_search"
+      }
+    },
+    {
+      "id": "basememory-identifier-sqlite-busy-timeout",
+      "query": "SQLITE_BUSY_TIMEOUT_MS",
+      "query_type": "identifier-heavy",
+      "source": "curated",
+      "expected": {
+        "filePath": "native/src/db.rs",
+        "symbol": "SQLITE_BUSY_TIMEOUT_MS"
+      }
+    },
+    {
+      "id": "basememory-identifier-search-config-knobs",
+      "query": "fusionStrategy hybridWeight rrfK rerankTopN",
+      "query_type": "identifier-heavy",
+      "source": "curated",
+      "expected": {
+        "filePath": "src/config/schema.ts"
+      }
+    },
+    {
+      "id": "basememory-relationship-build-per-query-result",
+      "query": "what calls buildPerQueryResult",
+      "query_type": "cross-file-relationship",
+      "source": "curated",
+      "expected": {
+        "filePath": "src/eval/runner.ts",
+        "symbol": "finalizeEvaluationRun"
+      }
+    },
+    {
+      "id": "basememory-relationship-compute-eval-metrics",
+      "query": "what calls computeEvalMetrics",
+      "query_type": "cross-file-relationship",
+      "source": "curated",
+      "expected": {
+        "filePath": "src/eval/runner.ts",
+        "symbol": "finalizeEvaluationRun"
+      }
+    },
+    {
+      "id": "basememory-relationship-evaluate-budget-gate",
+      "query": "what calls evaluateBudgetGate",
+      "query_type": "cross-file-relationship",
+      "source": "curated",
+      "expected": {
+        "filePath": "src/eval/runner.ts",
+        "symbol": "finalizeEvaluationRun"
+      }
+    },
+    {
+      "id": "basememory-relationship-create-embedding-text",
+      "query": "what calls createEmbeddingText during indexing",
+      "query_type": "cross-file-relationship",
+      "source": "curated",
+      "expected": {
+        "filePath": "src/indexer/incremental-index-orchestrator.ts",
+        "symbol": "toEmbeddingWorkChunk"
+      }
+    },
+    {
+      "id": "basememory-bug-graph-expansion-branch-leak",
+      "query": "Expected behavior: graph expansion should stay on the current branch. Actual behavior: expanded context leaks symbols from another branch.",
+      "query_type": "bug-error-lookup",
+      "source": "curated",
+      "expected": {
+        "filePath": "src/indexer/graph-expansion.ts",
+        "symbol": "expandGraphContext"
+      }
+    },
+    {
+      "id": "basememory-bug-indexed-snippet-content",
+      "query": "Expected behavior: search snippets should show indexed chunk content. Actual behavior: they reflect live disk edits.",
+      "query_type": "bug-error-lookup",
+      "source": "curated",
+      "expected": {
+        "filePath": "src/indexer/index.ts",
+        "symbol": "materializeRankedResults"
+      }
+    },
+    {
+      "id": "basememory-bug-sqlite-busy-locks",
+      "query": "Expected behavior: SQLite writes should wait through transient lock contention. Actual behavior: SQLITE_BUSY fails immediately.",
+      "query_type": "bug-error-lookup",
+      "source": "curated",
+      "expected": {
+        "filePath": "native/src/db.rs",
+        "symbol": "retry_busy_sqlite"
+      }
+    },
+    {
+      "id": "basememory-bug-default-branch-filtering",
+      "query": "Expected behavior: branch filtering should stay active on a branch literally named default. Actual behavior: it falls back to unfiltered results.",
+      "query_type": "bug-error-lookup",
+      "source": "curated",
+      "expected": {
+        "filePath": "src/indexer/index.ts",
+        "symbol": "buildAllowedChunkIds"
+      }
+    },
+    {
+      "id": "basememory-config-sqlite-busy-timeout",
+      "query": "what is the sqlite busy timeout value",
+      "query_type": "config-constant-lookup",
+      "source": "curated",
+      "expected": {
+        "filePath": "native/src/db.rs",
+        "symbol": "SQLITE_BUSY_TIMEOUT_MS"
+      }
+    },
+    {
+      "id": "basememory-config-arctic-query-prefix",
+      "query": "what query prefix does arctic use for search embeddings",
+      "query_type": "config-constant-lookup",
+      "source": "curated",
+      "expected": {
+        "filePath": "src/embeddings/provider.ts",
+        "symbol": "ARCTIC_QUERY_PREFIX"
+      }
+    },
+    {
+      "id": "basememory-config-voyage-default-model",
+      "query": "what is the default voyage model id",
+      "query_type": "config-constant-lookup",
+      "source": "curated",
+      "expected": {
+        "filePath": "src/embeddings/provider.ts",
+        "symbol": "VOYAGE_DEFAULT_MODEL_ID"
+      }
+    },
+    {
+      "id": "basememory-config-default-final-rerank",
+      "query": "what is the default final rerank top n",
+      "query_type": "config-constant-lookup",
+      "source": "curated",
+      "expected": {
+        "filePath": "src/indexer/search-recipes.ts",
+        "symbol": "DEFAULT_FINAL_RERANK_TOP_N"
+      }
+    }
+  ]
+}

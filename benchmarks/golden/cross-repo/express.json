@@ -7,6 +7,8 @@
       "id": "express-definition-01",
       "query": "where is authenticate defined",
       "queryType": "definition",
+      "source": "generated",
+      "heuristic": "symbol-candidate-definition",
       "expected": {
         "filePath": "examples/auth/index.js",
         "symbol": "authenticate"
@@ -16,6 +18,8 @@
       "id": "express-definition-02",
       "query": "where is format defined",
       "queryType": "definition",
+      "source": "generated",
+      "heuristic": "symbol-candidate-definition",
       "expected": {
         "filePath": "examples/content-negotiation/index.js",
         "symbol": "format"
@@ -25,6 +29,8 @@
       "id": "express-definition-03",
       "query": "where is error defined",
       "queryType": "definition",
+      "source": "generated",
+      "heuristic": "symbol-candidate-definition",
       "expected": {
         "filePath": "examples/error/index.js",
         "symbol": "error"
@@ -34,6 +40,8 @@
       "id": "express-implementation-intent-04",
       "query": "how does index handle middleware",
       "queryType": "implementation-intent",
+      "source": "generated",
+      "heuristic": "module-and-concept-from-symbol-content",
       "expected": {
         "acceptableFiles": [
           "examples/error/index.js"
@@ -44,6 +52,8 @@
       "id": "express-implementation-intent-05",
       "query": "how does index handle core behavior",
       "queryType": "implementation-intent",
+      "source": "generated",
+      "heuristic": "module-and-concept-from-symbol-content",
       "expected": {
         "acceptableFiles": [
           "examples/online/index.js"
@@ -54,6 +64,8 @@
       "id": "express-implementation-intent-06",
       "query": "how does index handle error handling",
       "queryType": "implementation-intent",
+      "source": "generated",
+      "heuristic": "module-and-concept-from-symbol-content",
       "expected": {
         "acceptableFiles": [
           "examples/route-middleware/index.js"
@@ -64,6 +76,8 @@
       "id": "express-similarity-07",
       "query": "error handling function pattern with andRestrictToSelf",
       "queryType": "similarity",
+      "source": "generated",
+      "heuristic": "concept-and-symbol-pattern",
       "expected": {
         "acceptableFiles": [
           "examples/route-middleware/index.js"
@@ -74,6 +88,8 @@
       "id": "express-similarity-08",
       "query": "core behavior function pattern with GithubView",
       "queryType": "similarity",
+      "source": "generated",
+      "heuristic": "concept-and-symbol-pattern",
       "expected": {
         "acceptableFiles": [
           "examples/view-constructor/github-view.js"
@@ -84,6 +100,8 @@
       "id": "express-keyword-heavy-09",
       "query": "GithubView name options templates",
       "queryType": "keyword-heavy",
+      "source": "generated",
+      "heuristic": "identifier-extraction-from-symbol-content",
       "expected": {
         "acceptableFiles": [
           "examples/view-constructor/github-view.js"
@@ -94,6 +112,8 @@
       "id": "express-keyword-heavy-10",
       "query": "ferrets ferrets user filter",
       "queryType": "keyword-heavy",
+      "source": "generated",
+      "heuristic": "identifier-extraction-from-symbol-content",
       "expected": {
         "acceptableFiles": [
           "examples/view-locals/index.js"

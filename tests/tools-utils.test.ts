@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  formatForegroundReadyMessage,
   formatIndexStats,
   formatStatus,
   formatProgressTitle,
@@ -9,7 +10,14 @@ import {
   formatLogs,
   formatSearchResults,
 } from "../src/tools/utils.js";
-import type { IndexStats, IndexProgress, SearchResult, HealthCheckResult, StatusResult } from "../src/indexer/index.js";
+import type {
+  ForegroundIndexResult,
+  IndexStats,
+  IndexProgress,
+  SearchResult,
+  HealthCheckResult,
+  StatusResult,
+} from "../src/indexer/index.js";
 import type { LogEntry } from "../src/utils/logger.js";
 
 function createBaseStats(overrides: Partial<IndexStats> = {}): IndexStats {
@@ -24,6 +32,29 @@ function createBaseStats(overrides: Partial<IndexStats> = {}): IndexStats {
     removedChunks: 0,
     skippedFiles: [],
     parseFailures: [],
+    ...overrides,
+  };
+}
+
+function createForegroundResult(
+  overrides: Partial<ForegroundIndexResult> = {}
+): ForegroundIndexResult {
+  return {
+    filesProcessed: 10,
+    totalChunks: 20,
+    chunksIndexed: 20,
+    removedChunks: 0,
+    durationMs: 1000,
+    bm25Ready: true,
+    callGraphReady: true,
+    embeddingStatus: "pending",
+    embeddingProgress: {
+      embedded: 0,
+      total: 20,
+      startedAt: null,
+      updatedAt: null,
+      failed: null,
+    },
     ...overrides,
   };
 }
@@ -165,6 +196,18 @@ describe("tools utils", () => {
         currentBranch: "default",
         baseBranch: "default",
         compatibility: { compatible: true },
+        foreground: {
+          bm25Ready: true,
+          callGraphReady: true,
+        },
+        embedding: {
+          status: "in_progress",
+          embedded: 5,
+          total: 10,
+          startedAt: null,
+          updatedAt: null,
+          failed: null,
+        },
       };
       const result = formatStatus(status);
 
@@ -174,6 +217,44 @@ describe("tools utils", () => {
       expect(result).toContain("/tmp/index");
       expect(result).not.toContain("Current branch");
       expect(result).toContain("compatible");
+      expect(result).toContain("BM25 + call graph: complete");
+      expect(result).toContain("Semantic search: indexing in background (5/10)");
+    });
+
+    it("should show reranker health and truncation summary when present", () => {
+      const status: StatusResult = {
+        indexed: true,
+        vectorCount: 500,
+        provider: "openai",
+        model: "text-embedding-3-small",
+        indexPath: "/tmp/index",
+        currentBranch: "default",
+        baseBranch: "default",
+        compatibility: { compatible: true },
+        foreground: {
+          bm25Ready: true,
+          callGraphReady: true,
+        },
+        embedding: null,
+        rerankerHealth: {
+          backend: "heuristic-local",
+          status: "failed",
+          model: "Xenova/ms-marco-MiniLM-L-6-v2",
+          error: "boom",
+          updatedAt: 123,
+        },
+        chunkCapSummary: {
+          truncatedFiles: 3,
+          totalDroppedChunks: 42,
+          totalDroppedNamedSymbols: 7,
+        },
+      };
+      const result = formatStatus(status);
+
+      expect(result).toContain("Reranker: heuristic-local (DEGRADED");
+      expect(result).toContain("Reranker model: Xenova/ms-marco-MiniLM-L-6-v2");
+      expect(result).toContain("Last reranker error: boom");
+      expect(result).toContain("Chunk cap: 3 files truncated (42 chunks dropped, 7 named symbols invisible)");
     });
 
     it("should show branch info when not on default branch", () => {
@@ -186,6 +267,18 @@ describe("tools utils", () => {
         currentBranch: "feature-x",
         baseBranch: "main",
         compatibility: { compatible: true },
+        foreground: {
+          bm25Ready: true,
+          callGraphReady: true,
+        },
+        embedding: {
+          status: "complete",
+          embedded: 100,
+          total: 100,
+          startedAt: null,
+          updatedAt: null,
+          failed: null,
+        },
       };
       const result = formatStatus(status);
 
@@ -237,6 +330,36 @@ describe("tools utils", () => {
       const result = formatStatus(status);
 
       expect(result).toContain("No compatibility information found");
+    });
+  });
+
+  describe("formatForegroundReadyMessage", () => {
+    it("shows foreground-ready output while embeddings continue in background", () => {
+      const result = formatForegroundReadyMessage(createForegroundResult());
+
+      expect(result).toContain("Index ready. BM25 search, call graph, and symbol navigation are available now.");
+      expect(result).toContain("Files processed: 10");
+      expect(result).toContain("Chunks indexed: 20");
+      expect(result).toContain("Semantic search: indexing in background (0/20 chunks embedded)");
+    });
+
+    it("shows already-in-progress message without starting another background run", () => {
+      const result = formatForegroundReadyMessage(
+        createForegroundResult({
+          alreadyInProgress: true,
+          embeddingStatus: "in_progress",
+          embeddingProgress: {
+            embedded: 8,
+            total: 20,
+            startedAt: null,
+            updatedAt: null,
+            failed: null,
+          },
+        })
+      );
+
+      expect(result).toContain("already in progress");
+      expect(result).toContain("(8/20 chunks embedded)");
     });
   });
 

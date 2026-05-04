@@ -34,6 +34,7 @@ export interface SearchConfig {
   rrfK: number;
   rerankTopN: number;
   contextLines: number;
+  experimentalIdentifierRiskPolicy: boolean;
 }
 
 export type LogLevel = "error" | "warn" | "info" | "debug";
@@ -47,6 +48,10 @@ export interface DebugConfig {
   logGc: boolean;
   logBranch: boolean;
   metrics: boolean;
+}
+
+export interface EvalConfig {
+  useQueryTypes: boolean;
 }
 
 export interface CustomProviderConfig {
@@ -75,10 +80,15 @@ export interface CodebaseIndexConfig {
   embeddingModel?: EmbeddingModelName;
   /** Configuration for custom OpenAI-compatible embedding providers (required when embeddingProvider is 'custom') */
   customProvider?: CustomProviderConfig;
+  jinaApiKey?: string;
+  jinaRerankerModel?: string;
+  voyageApiKey?: string;
+  voyageModelId?: string;
   scope: IndexScope;
   indexing?: Partial<IndexingConfig>;
   search?: Partial<SearchConfig>;
   debug?: Partial<DebugConfig>;
+  eval?: Partial<EvalConfig>;
   include: string[];
   exclude: string[];
 }
@@ -87,6 +97,7 @@ export type ParsedCodebaseIndexConfig = CodebaseIndexConfig & {
   indexing: IndexingConfig;
   search: SearchConfig;
   debug: DebugConfig;
+  eval: EvalConfig;
 };
 
 function getDefaultIndexingConfig(): IndexingConfig {
@@ -94,7 +105,7 @@ function getDefaultIndexingConfig(): IndexingConfig {
     autoIndex: false,
     watchFiles: true,
     maxFileSize: 1048576,
-    maxChunksPerFile: 100,
+    maxChunksPerFile: 300,
     semanticOnly: false,
     retries: 3,
     retryDelayMs: 1000,
@@ -115,6 +126,7 @@ function getDefaultSearchConfig(): SearchConfig {
     rrfK: 60,
     rerankTopN: 20,
     contextLines: 0,
+    experimentalIdentifierRiskPolicy: false,
   };
 }
 
@@ -132,6 +144,12 @@ function getDefaultDebugConfig(): DebugConfig {
     logGc: true,
     logBranch: true,
     metrics: true,
+  };
+}
+
+function getDefaultEvalConfig(): EvalConfig {
+  return {
+    useQueryTypes: true,
   };
 }
 
@@ -180,6 +198,10 @@ function isValidLogLevel(value: unknown): value is LogLevel {
 export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
   const input = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   const embeddingProviderValue = getResolvedString(input.embeddingProvider, "$root.embeddingProvider");
+  const jinaApiKeyValue = getResolvedString(input.jinaApiKey, "$root.jinaApiKey");
+  const jinaRerankerModelValue = getResolvedString(input.jinaRerankerModel, "$root.jinaRerankerModel");
+  const voyageApiKeyValue = getResolvedString(input.voyageApiKey, "$root.voyageApiKey");
+  const voyageModelIdValue = getResolvedString(input.voyageModelId, "$root.voyageModelId");
   const scopeValue = getResolvedString(input.scope, "$root.scope");
   const includeValue = getResolvedStringArray(input.include, "$root.include");
   const excludeValue = getResolvedStringArray(input.exclude, "$root.exclude");
@@ -187,6 +209,7 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
   const defaultIndexing = getDefaultIndexingConfig();
   const defaultSearch = getDefaultSearchConfig();
   const defaultDebug = getDefaultDebugConfig();
+  const defaultEval = getDefaultEvalConfig();
 
   const rawIndexing = (input.indexing && typeof input.indexing === "object" ? input.indexing : {}) as Record<string, unknown>;
   const indexing: IndexingConfig = {
@@ -213,6 +236,10 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
     rrfK: typeof rawSearch.rrfK === "number" ? Math.max(1, Math.floor(rawSearch.rrfK)) : defaultSearch.rrfK,
     rerankTopN: typeof rawSearch.rerankTopN === "number" ? Math.min(200, Math.max(0, Math.floor(rawSearch.rerankTopN))) : defaultSearch.rerankTopN,
     contextLines: typeof rawSearch.contextLines === "number" ? Math.min(50, Math.max(0, rawSearch.contextLines)) : defaultSearch.contextLines,
+    experimentalIdentifierRiskPolicy:
+      typeof rawSearch.experimentalIdentifierRiskPolicy === "boolean"
+        ? rawSearch.experimentalIdentifierRiskPolicy
+        : defaultSearch.experimentalIdentifierRiskPolicy,
   };
 
   const rawDebug = (input.debug && typeof input.debug === "object" ? input.debug : {}) as Record<string, unknown>;
@@ -227,21 +254,39 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
     metrics: typeof rawDebug.metrics === "boolean" ? rawDebug.metrics : defaultDebug.metrics,
   };
 
+  const rawEval = (input.eval && typeof input.eval === "object" ? input.eval : {}) as Record<string, unknown>;
+  const evalConfig: EvalConfig = {
+    useQueryTypes:
+      typeof rawEval.useQueryTypes === "boolean"
+        ? rawEval.useQueryTypes
+        : defaultEval.useQueryTypes,
+  };
+
   let embeddingProvider: EmbeddingProvider | 'custom' | 'auto';
   let embeddingModel: EmbeddingModelName | undefined = undefined;
   let customProvider: CustomProviderConfig | undefined = undefined;
-  
-  if (embeddingProviderValue === 'custom') {
-    embeddingProvider = 'custom';
+
+  if (embeddingProviderValue === 'custom' || embeddingProviderValue === 'voyage') {
     const rawCustom = (input.customProvider && typeof input.customProvider === 'object' ? input.customProvider : null) as Record<string, unknown> | null;
     const baseUrlValue = getResolvedString(rawCustom?.baseUrl, "$root.customProvider.baseUrl");
     const modelValue = getResolvedString(rawCustom?.model, "$root.customProvider.model");
     const apiKeyValue = getResolvedString(rawCustom?.apiKey, "$root.customProvider.apiKey");
-    if (rawCustom && typeof baseUrlValue === 'string' && baseUrlValue.trim().length > 0 && typeof modelValue === 'string' && modelValue.trim().length > 0 && typeof rawCustom.dimensions === 'number' && Number.isInteger(rawCustom.dimensions) && rawCustom.dimensions > 0) {
-      customProvider = {
+    const dimensionsValue = typeof rawCustom?.dimensions === 'number' ? rawCustom.dimensions : null;
+    const hasValidCustomProvider =
+      rawCustom &&
+      typeof baseUrlValue === 'string' &&
+      baseUrlValue.trim().length > 0 &&
+      typeof modelValue === 'string' &&
+      modelValue.trim().length > 0 &&
+      typeof dimensionsValue === 'number' &&
+      Number.isInteger(dimensionsValue) &&
+      dimensionsValue > 0;
+
+    if (hasValidCustomProvider) {
+      const parsedCustomProvider: CustomProviderConfig = {
         baseUrl: baseUrlValue.trim().replace(/\/+$/, ''),
         model: modelValue,
-        dimensions: rawCustom.dimensions,
+        dimensions: dimensionsValue,
         apiKey: apiKeyValue,
         maxTokens: typeof rawCustom.maxTokens === 'number' ? rawCustom.maxTokens : undefined,
         timeoutMs: typeof rawCustom.timeoutMs === 'number' ? Math.max(1000, rawCustom.timeoutMs) : undefined,
@@ -250,19 +295,23 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
         maxBatchSize: typeof rawCustom.maxBatchSize === 'number'
           ? Math.max(1, Math.floor(rawCustom.maxBatchSize))
           : typeof rawCustom.max_batch_size === 'number'
-            ? Math.max(1, Math.floor(rawCustom.max_batch_size))
+          ? Math.max(1, Math.floor(rawCustom.max_batch_size))
             : undefined,
       };
-      // Warn if baseUrl doesn't end with an API version path like /v1.
-      // Note: using console.warn here because Logger isn't initialized yet at config parse time.
-      if (!/\/v\d+\/?$/.test(customProvider.baseUrl)) {
+      customProvider = parsedCustomProvider;
+      if (!/\/v\d+\/?$/.test(parsedCustomProvider.baseUrl)) {
         console.warn(
-          `[codebase-index] Warning: customProvider.baseUrl ("${customProvider.baseUrl}") does not end with an API version path like /v1. ` +
-          `The plugin appends /embeddings automatically, so the full URL will be "${customProvider.baseUrl}/embeddings". ` +
-          `If your provider expects /v1/embeddings, set baseUrl to "${customProvider.baseUrl}/v1".`
+          `[codebase-index] Warning: customProvider.baseUrl ("${parsedCustomProvider.baseUrl}") does not end with an API version path like /v1. ` +
+          `The plugin appends /embeddings automatically, so the full URL will be "${parsedCustomProvider.baseUrl}/embeddings". ` +
+          `If your provider expects /v1/embeddings, set baseUrl to "${parsedCustomProvider.baseUrl}/v1".`
         );
       }
-    } else {
+    }
+  }
+
+  if (embeddingProviderValue === 'custom') {
+    embeddingProvider = 'custom';
+    if (!customProvider) {
       throw new Error(
         "embeddingProvider is 'custom' but customProvider config is missing or invalid. " +
         "Required fields: baseUrl (string), model (string), dimensions (positive integer)."
@@ -287,12 +336,17 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
     embeddingProvider,
     embeddingModel,
     customProvider,
+    jinaApiKey: jinaApiKeyValue?.trim() || undefined,
+    jinaRerankerModel: jinaRerankerModelValue?.trim() || "jina-reranker-v3",
+    voyageApiKey: voyageApiKeyValue?.trim() || undefined,
+    voyageModelId: voyageModelIdValue?.trim() || "voyage-code-3",
     scope: isValidScope(scopeValue) ? scopeValue : "project",
     include: includeValue ?? DEFAULT_INCLUDE,
     exclude: excludeValue ?? DEFAULT_EXCLUDE,
     indexing,
     search,
     debug,
+    eval: evalConfig,
   };
 }
 
