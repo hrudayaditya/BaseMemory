@@ -105,6 +105,7 @@ export interface SemanticChunk {
   symbolName?: string;
   symbolAliases?: string[];
   symbolKind?: ChunkSymbolKind;
+  logicalSymbolKey?: string;
   chunkKind: ChunkKind;
   granularity: Granularity;
   startByte: number;
@@ -197,6 +198,12 @@ export interface SymbolChunkData {
   chunkKind?: string;
   symbolKind?: string;
   language: string;
+}
+
+export interface ChunkSymbolLinkData {
+  chunkId: string;
+  symbolId: string;
+  branch: string;
 }
 
 export interface SearchResult {
@@ -293,6 +300,7 @@ function mapSemanticChunk(c: any): SemanticChunk {
     symbolName: c.symbolName ?? c.symbol_name ?? undefined,
     symbolAliases: c.symbolAliases ?? c.symbol_aliases ?? [],
     symbolKind: c.symbolKind ?? c.symbol_kind ?? undefined,
+    logicalSymbolKey: c.logicalSymbolKey ?? c.logical_symbol_key ?? undefined,
     chunkKind: c.chunkKind ?? c.chunk_kind,
     granularity: c.granularity,
     startByte: c.startByte ?? c.start_byte,
@@ -1293,6 +1301,28 @@ export class Database {
     }));
   }
 
+  getChunksForSymbolIds(
+    symbolIds: string[],
+    branch: string,
+    allowedChunkIds?: string[]
+  ): SymbolChunkData[] {
+    return this.inner.getChunksForSymbolIds(symbolIds, branch, allowedChunkIds ?? null).map((item: any) => normalizeSymbolChunkData({
+      symbolId: item.symbolId ?? item.symbol_id,
+      chunkId: item.chunkId ?? item.chunk_id,
+      contentHash: item.contentHash ?? item.content_hash,
+      embeddingInputHash: item.embeddingInputHash ?? item.embedding_input_hash,
+      filePath: item.filePath ?? item.file_path,
+      startLine: item.startLine ?? item.start_line,
+      endLine: item.endLine ?? item.end_line,
+      nodeType: item.nodeType ?? item.node_type ?? undefined,
+      name: item.name ?? undefined,
+      symbolAliases: item.symbolAliases ?? item.symbol_aliases ?? [],
+      chunkKind: item.chunkKind ?? item.chunk_kind ?? undefined,
+      symbolKind: item.symbolKind ?? item.symbol_kind ?? undefined,
+      language: item.language,
+    }));
+  }
+
   getChunksByName(name: string): ChunkData[] {
     return this.inner.getChunksByName(name).map(normalizeChunkDataFromRead);
   }
@@ -1635,6 +1665,25 @@ export class Database {
   upsertSymbolsBatch(symbols: SymbolData[]): void {
     if (symbols.length === 0) return;
     this.inner.upsertSymbolsBatch(symbols.map(normalizeSymbolDataForWrite));
+  }
+
+  upsertChunkSymbol(chunkId: string, symbolId: string, branch: string): void {
+    this.inner.upsertChunkSymbol(chunkId, symbolId, branch);
+  }
+
+  upsertChunkSymbolsBatch(rows: ChunkSymbolLinkData[]): void {
+    if (rows.length === 0) return;
+    this.inner.upsertChunkSymbolsBatch(
+      rows.map((row) => ({
+        chunkId: row.chunkId,
+        symbolId: row.symbolId,
+        branch: row.branch,
+      }))
+    );
+  }
+
+  deleteChunkSymbolsForSymbol(symbolId: string, branch: string): number {
+    return this.inner.deleteChunkSymbolsForSymbol(symbolId, branch);
   }
 
   getSymbolsByFile(filePath: string): SymbolData[] {

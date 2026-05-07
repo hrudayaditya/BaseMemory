@@ -14,7 +14,7 @@ pub enum DbError {
 pub type DbResult<T> = Result<T, DbError>;
 
 /// Schema version for migrations
-const SCHEMA_VERSION: i32 = 16;
+const SCHEMA_VERSION: i32 = 17;
 
 pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
 const INIT_DB_BUSY_RETRY_ATTEMPTS: usize = 2;
@@ -160,6 +160,15 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> DbResult<()> {
                 PRIMARY KEY (branch, chunk_id)
             );
 
+            CREATE TABLE IF NOT EXISTS chunk_symbols (
+                chunk_id TEXT NOT NULL,
+                symbol_id TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                PRIMARY KEY (chunk_id, symbol_id, branch),
+                FOREIGN KEY (chunk_id) REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+                FOREIGN KEY (symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+            );
+
             -- Indexes for fast lookups
             CREATE INDEX IF NOT EXISTS idx_chunks_content_hash ON chunks(content_hash);
             CREATE INDEX IF NOT EXISTS idx_chunks_file_path ON chunks(file_path);
@@ -168,6 +177,10 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> DbResult<()> {
             CREATE INDEX IF NOT EXISTS idx_chunks_name_lower ON chunks(lower(name));
             CREATE INDEX IF NOT EXISTS idx_branch_chunks_branch ON branch_chunks(branch);
             CREATE INDEX IF NOT EXISTS idx_branch_chunks_chunk_id ON branch_chunks(chunk_id);
+            CREATE INDEX IF NOT EXISTS idx_chunk_symbols_symbol_id
+                ON chunk_symbols(symbol_id, branch);
+            CREATE INDEX IF NOT EXISTS idx_chunk_symbols_chunk_id
+                ON chunk_symbols(chunk_id, branch);
             "#,
         )?;
 
@@ -692,6 +705,31 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> DbResult<()> {
             r#"
             ALTER TABLE chunks ADD COLUMN symbol_aliases TEXT NOT NULL DEFAULT '';
             ALTER TABLE symbols ADD COLUMN symbol_aliases TEXT NOT NULL DEFAULT '';
+            "#,
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
+            params![SCHEMA_VERSION.to_string()],
+        )?;
+    }
+
+    if from_version < 17 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS chunk_symbols (
+                chunk_id TEXT NOT NULL,
+                symbol_id TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                PRIMARY KEY (chunk_id, symbol_id, branch),
+                FOREIGN KEY (chunk_id) REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+                FOREIGN KEY (symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunk_symbols_symbol_id
+                ON chunk_symbols(symbol_id, branch);
+            CREATE INDEX IF NOT EXISTS idx_chunk_symbols_chunk_id
+                ON chunk_symbols(chunk_id, branch);
             "#,
         )?;
 
@@ -1657,6 +1695,13 @@ pub struct SymbolChunkRow {
     pub language: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ChunkSymbolLinkRow {
+    pub chunk_id: String,
+    pub symbol_id: String,
+    pub branch: String,
+}
+
 /// Get chunk_kind and symbol_kind for multiple chunk ids
 pub fn get_chunk_kinds_batch(
     conn: &Connection,
@@ -1740,7 +1785,7 @@ pub fn get_chunk_metadata_batch(
     Ok(results)
 }
 
-pub fn get_chunks_for_symbols_batch(
+fn get_chunks_for_symbols_batch_legacy(
     conn: &Connection,
     symbol_ids: &[String],
     branch: &str,
@@ -1835,6 +1880,142 @@ pub fn get_chunks_for_symbols_batch(
             }
         }
 
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let symbol_aliases: String = row.get(9)?;
+            Ok(SymbolChunkRow {
+                symbol_id: row.get(0)?,
+                chunk_id: row.get(1)?,
+                content_hash: row.get(2)?,
+                embedding_input_hash: row.get(3)?,
+                file_path: row.get(4)?,
+                start_line: row.get(5)?,
+                end_line: row.get(6)?,
+                node_type: row.get(7)?,
+                name: row.get(8)?,
+                symbol_aliases: deserialize_symbol_aliases(&symbol_aliases),
+                chunk_kind: row.get(10)?,
+                symbol_kind: row.get(11)?,
+                language: row.get(12)?,
+            })
+        })?;
+
+        for row in rows {
+            results.push(row?);
+        }
+    }
+
+    Ok(results)
+}
+
+fn has_chunk_symbol_links_for_symbol_ids(
+    conn: &Connection,
+    symbol_ids: &[String],
+    branch: &str,
+) -> DbResult<bool> {
+    if symbol_ids.is_empty() {
+        return Ok(false);
+    }
+
+    for symbol_batch in symbol_ids.chunks(SQL_BIND_PARAM_BATCH_SIZE.saturating_sub(1).max(1)) {
+        let symbol_placeholders = symbol_batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT COUNT(*) FROM chunk_symbols WHERE branch = ? AND symbol_id IN ({symbol_placeholders})"
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(symbol_batch.len() + 1);
+        params.push(&branch);
+        for symbol_id in symbol_batch {
+            params.push(symbol_id as &dyn rusqlite::ToSql);
+        }
+
+        let count: i64 = conn.query_row(&query, params.as_slice(), |row| row.get(0))?;
+        if count > 0 {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+pub fn get_chunks_for_symbols_batch(
+    conn: &Connection,
+    symbol_ids: &[String],
+    branch: &str,
+    allowed_chunk_ids: Option<&[String]>,
+) -> DbResult<Vec<SymbolChunkRow>> {
+    if has_chunk_symbol_links_for_symbol_ids(conn, symbol_ids, branch)? {
+        return get_chunks_for_symbol_ids(conn, symbol_ids, branch, allowed_chunk_ids);
+    }
+
+    get_chunks_for_symbols_batch_legacy(conn, symbol_ids, branch, allowed_chunk_ids)
+}
+
+pub fn get_chunks_for_symbol_ids(
+    conn: &Connection,
+    symbol_ids: &[String],
+    branch: &str,
+    allowed_chunk_ids: Option<&[String]>,
+) -> DbResult<Vec<SymbolChunkRow>> {
+    if symbol_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut results = Vec::new();
+    let reserved_params = 2 + allowed_chunk_ids.map_or(0, |ids| ids.len());
+    let symbol_batch_size = SQL_BIND_PARAM_BATCH_SIZE.saturating_sub(reserved_params).max(1);
+
+    for symbol_batch in symbol_ids.chunks(symbol_batch_size) {
+        let symbol_placeholders = symbol_batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let allowed_clause = allowed_chunk_ids
+            .filter(|ids| !ids.is_empty())
+            .map(|ids| {
+                format!(
+                    " AND cs.chunk_id IN ({})",
+                    ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+                )
+            })
+            .unwrap_or_default();
+
+        let query = format!(
+            r#"
+            SELECT
+                cs.symbol_id,
+                c.chunk_id,
+                c.content_hash,
+                c.embedding_input_hash,
+                c.file_path,
+                c.start_line,
+                c.end_line,
+                c.node_type,
+                c.name,
+                c.symbol_aliases,
+                c.chunk_kind,
+                c.symbol_kind,
+                c.language
+            FROM chunk_symbols cs
+            INNER JOIN chunks c ON c.chunk_id = cs.chunk_id
+            INNER JOIN branch_chunks bc ON bc.chunk_id = cs.chunk_id
+            WHERE cs.symbol_id IN ({symbol_placeholders})
+              AND cs.branch = ?
+              AND bc.branch = ?
+              {allowed_clause}
+            ORDER BY cs.symbol_id, c.start_line ASC, c.chunk_id ASC
+            "#
+        );
+
+        let mut params: Vec<&dyn rusqlite::ToSql> =
+            Vec::with_capacity(symbol_batch.len() + reserved_params);
+        for symbol_id in symbol_batch {
+            params.push(symbol_id as &dyn rusqlite::ToSql);
+        }
+        params.push(&branch);
+        params.push(&branch);
+        if let Some(ids) = allowed_chunk_ids {
+            for chunk_id in ids {
+                params.push(chunk_id as &dyn rusqlite::ToSql);
+            }
+        }
+
+        let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map(params.as_slice(), |row| {
             let symbol_aliases: String = row.get(9)?;
             Ok(SymbolChunkRow {
@@ -2179,6 +2360,61 @@ pub fn upsert_symbols_batch(conn: &mut Connection, symbols: &[SymbolRow]) -> DbR
     }
     tx.commit()?;
     Ok(())
+}
+
+pub fn upsert_chunk_symbol(
+    conn: &Connection,
+    chunk_id: &str,
+    symbol_id: &str,
+    branch: &str,
+) -> DbResult<()> {
+    conn.execute(
+        r#"
+        INSERT INTO chunk_symbols (chunk_id, symbol_id, branch)
+        VALUES (?, ?, ?)
+        ON CONFLICT(chunk_id, symbol_id, branch) DO NOTHING
+        "#,
+        params![chunk_id, symbol_id, branch],
+    )?;
+    Ok(())
+}
+
+pub fn upsert_chunk_symbols_batch(
+    conn: &mut Connection,
+    rows: &[ChunkSymbolLinkRow],
+) -> DbResult<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            r#"
+            INSERT INTO chunk_symbols (chunk_id, symbol_id, branch)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chunk_id, symbol_id, branch) DO NOTHING
+            "#,
+        )?;
+
+        for row in rows {
+            stmt.execute(params![row.chunk_id, row.symbol_id, row.branch])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn delete_chunk_symbols_for_symbol(
+    conn: &Connection,
+    symbol_id: &str,
+    branch: &str,
+) -> DbResult<usize> {
+    let count = conn.execute(
+        "DELETE FROM chunk_symbols WHERE symbol_id = ? AND branch = ?",
+        params![symbol_id, branch],
+    )?;
+    Ok(count)
 }
 
 /// Get all symbols in a file

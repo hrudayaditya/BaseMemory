@@ -62,12 +62,14 @@ export interface OrchestratorParsedChunk {
   startByte: number;
   endByte: number;
   chunkType: ChunkMetadata["chunkType"];
+  chunkId: string;
   name?: string;
   symbolAliases: string[];
   chunkKind?: string;
   symbolKind?: string;
   language: string;
   chunkHash: string;
+  logicalSymbolKey?: string;
 }
 
 export interface OrchestratorParsedFile {
@@ -82,6 +84,7 @@ type OrchestratorGraphEdgeData = Omit<CallEdgeData, "branch">;
 export interface OrchestratorFileGraphData {
   symbols: SymbolData[];
   edges: OrchestratorGraphEdgeData[];
+  chunkSymbolLinks: Array<{ chunkId: string; symbolId: string }>;
 }
 
 export interface InitializationResources {
@@ -1282,6 +1285,36 @@ export class IncrementalIndexOrchestrator {
         context,
         unfinishedFiles
       );
+      const queuedFileSet = new Set(queuedFiles);
+      const completedFiles = unfinishedFiles.filter((filePath) => !queuedFileSet.has(filePath));
+
+      for (const filePath of completedFiles) {
+        if (!existsSync(filePath)) {
+          continue;
+        }
+
+        const fileContent = readFileSync(filePath, "utf-8");
+        const fileContentHash = context.fileHashes.get(filePath) ?? hashContent(fileContent);
+        const filePlan = await this.buildFileJobPlan(
+          context,
+          filePath,
+          fileContent,
+          fileContentHash
+        );
+        const indexState = this.checkpoints.getStageState(branch, filePath, "index");
+        if (indexState?.status === "in_progress") {
+          filePlan.indexStarted = true;
+        }
+
+        await this.processGraphStage(context, filePath, fileContent, fileContentHash, filePlan);
+        this.recordSuccessfulFile(
+          context,
+          filePath,
+          fileContentHash,
+          Buffer.byteLength(fileContent, "utf-8"),
+          filePlan
+        );
+      }
 
       for (const filePath of queuedFiles) {
         this.queue.enqueue({
@@ -2136,6 +2169,29 @@ export class IncrementalIndexOrchestrator {
               updatedAt: Date.now(),
               activeRunId: context.runId,
             });
+          } else {
+            const indexState = this.checkpoints.getStageState(
+              context.branch,
+              job.filePath,
+              "index"
+            );
+            if (indexState?.status === "in_progress") {
+              filePlan.indexStarted = true;
+            }
+            await this.processGraphStage(
+              context,
+              job.filePath,
+              fileContent,
+              fileContentHash,
+              filePlan
+            );
+            this.recordSuccessfulFile(
+              context,
+              job.filePath,
+              fileContentHash,
+              Buffer.byteLength(fileContent, "utf-8"),
+              filePlan
+            );
           }
         }
         return;
@@ -2261,7 +2317,39 @@ export class IncrementalIndexOrchestrator {
       this.checkpoints.markStageComplete(context.branch, filePath, "chunk", chunkInputHash);
       chunkRan = true;
     } else {
-      currentChunks = this.loadCurrentBranchChunkRecords(context, filePath);
+      const unfinishedFiles = new Set(context.database.getUnfinishedPipelineFiles(context.branch));
+      if (unfinishedFiles.has(filePath)) {
+        const parsed = this.host.parseFilesForIndexing([
+          {
+            path: absolutePath,
+            content: fileContent,
+            hash: fileContentHash,
+          },
+        ]);
+        context.stats.parseFailures.push(...parsed.failedFilePaths);
+        if (parsed.failedFilePaths.length > 0 || parsed.parsedFiles.length !== 1) {
+          const error = `Chunking failed for ${filePath}`;
+          this.checkpoints.markStageFailed(context.branch, filePath, "chunk", error, chunkInputHash);
+          throw new Error(error);
+        }
+
+        parsedFile = parsed.parsedFiles[0] ?? null;
+        currentChunks = this.buildChunkRecords(
+          absolutePath,
+          parsedFile,
+          this.getEffectiveEmbeddingMaxTokens(context),
+          {
+            branch: context.branch,
+            database: context.database,
+          }
+        );
+        const diff = this.diffChunksForFile(currentChunks, oldChunkIds, context);
+        dirtyChunks = diff.dirtyChunks;
+        removedChunkIds = diff.removedChunkIds;
+        indexNeedsUpdate = dirtyChunks.length > 0 || removedChunkIds.size > 0;
+      } else {
+        currentChunks = this.loadCurrentBranchChunkRecords(context, filePath);
+      }
     }
 
     const embedConfigHash = hashEmbedConfig(
@@ -2914,7 +3002,45 @@ export class IncrementalIndexOrchestrator {
 
       // Deviation from the Step 4 placeholder: this codebase already has call graph
       // extraction in production, and keeping it active avoids regressing existing behavior.
-      const graph = this.host.buildFileGraphData([parsedFile]).get(parsedFile.path);
+      const currentChunkIdsBySignature = new Map(
+        plan.currentChunks.map((chunk) => [
+          `${chunk.startLine}:${chunk.endLine}:${chunk.name ?? ""}:${chunk.nodeType ?? ""}`,
+          chunk.chunkId,
+        ])
+      );
+      const graphParsedFile = {
+        ...parsedFile,
+        chunks: parsedFile.chunks
+          .map((chunk) => {
+            const persistedChunkId = currentChunkIdsBySignature.get(
+              `${chunk.startLine}:${chunk.endLine}:${chunk.name ?? ""}:${chunk.chunkType}`
+            );
+            return persistedChunkId
+              ? {
+                  ...chunk,
+                  chunkId: persistedChunkId,
+                }
+              : null;
+          })
+          .filter((chunk): chunk is OrchestratorParsedChunk => chunk !== null),
+      };
+      const graph = this.host.buildFileGraphData([graphParsedFile]).get(parsedFile.path);
+      context.database.upsertChunksBatch(
+        plan.currentChunks.map((chunk) => ({
+          chunkId: chunk.chunkId,
+          contentHash: chunk.contentHash,
+          embeddingInputHash: chunk.embeddingInputHash,
+          filePath: chunk.filePath,
+          startLine: chunk.startLine,
+          endLine: chunk.endLine,
+          nodeType: chunk.nodeType,
+          name: chunk.name,
+          symbolAliases: chunk.symbolAliases ?? [],
+          chunkKind: chunk.chunkKind,
+          symbolKind: chunk.symbolKind,
+          language: chunk.language,
+        }))
+      );
       for (const symbolId of plan.oldSymbolIds) {
         this.host.clearCallEdgesForSymbolIfUnreferenced(context.database, symbolId);
       }
@@ -2923,6 +3049,17 @@ export class IncrementalIndexOrchestrator {
       if (graph) {
         if (graph.symbols.length > 0) {
           context.database.upsertSymbolsBatch(graph.symbols);
+          for (const symbol of graph.symbols) {
+            context.database.deleteChunkSymbolsForSymbol(symbol.id, context.branch);
+          }
+        }
+        if (graph.chunkSymbolLinks.length > 0) {
+          context.database.upsertChunkSymbolsBatch(
+            graph.chunkSymbolLinks.map((link) => ({
+              ...link,
+              branch: context.branch,
+            }))
+          );
         }
         if (graph.edges.length > 0) {
           const edgesToPersist: CallEdgeData[] = graph.edges.map((edge) => ({

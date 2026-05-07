@@ -591,6 +591,13 @@ pub struct SymbolChunkData {
 }
 
 #[napi(object)]
+pub struct ChunkSymbolLinkData {
+    pub chunk_id: String,
+    pub symbol_id: String,
+    pub branch: String,
+}
+
+#[napi(object)]
 pub struct KeywordSearchResult {
     pub chunk_id: String,
     pub score: f64,
@@ -1381,6 +1388,44 @@ impl Database {
     }
 
     #[napi]
+    pub fn get_chunks_for_symbol_ids(
+        &self,
+        symbol_ids: Vec<String>,
+        branch: String,
+        allowed_chunk_ids: Option<Vec<String>>,
+    ) -> Result<Vec<SymbolChunkData>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let rows = db::get_chunks_for_symbol_ids(
+            &conn,
+            &symbol_ids,
+            &branch,
+            allowed_chunk_ids.as_deref(),
+        )
+        .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| SymbolChunkData {
+                symbol_id: row.symbol_id,
+                chunk_id: row.chunk_id,
+                content_hash: row.content_hash,
+                embedding_input_hash: row.embedding_input_hash,
+                file_path: row.file_path,
+                start_line: row.start_line,
+                end_line: row.end_line,
+                node_type: row.node_type,
+                name: row.name,
+                symbol_aliases: row.symbol_aliases,
+                chunk_kind: row.chunk_kind,
+                symbol_kind: row.symbol_kind,
+                language: row.language,
+            })
+            .collect())
+    }
+
+    #[napi]
     pub fn get_chunks_by_name(&self, name: String) -> Result<Vec<ChunkData>> {
         let conn = self
             .conn
@@ -2108,6 +2153,49 @@ impl Database {
             })
             .collect();
         retry_busy_write(|| db::upsert_symbols_batch(&mut conn, &rows))
+    }
+
+    #[napi]
+    pub fn upsert_chunk_symbol(
+        &self,
+        chunk_id: String,
+        symbol_id: String,
+        branch: String,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        db::upsert_chunk_symbol(&conn, &chunk_id, &symbol_id, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn upsert_chunk_symbols_batch(&self, rows: Vec<ChunkSymbolLinkData>) -> Result<()> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let batch: Vec<db::ChunkSymbolLinkRow> = rows
+            .into_iter()
+            .map(|row| db::ChunkSymbolLinkRow {
+                chunk_id: row.chunk_id,
+                symbol_id: row.symbol_id,
+                branch: row.branch,
+            })
+            .collect();
+        retry_busy_write(|| db::upsert_chunk_symbols_batch(&mut conn, &batch))
+    }
+
+    #[napi]
+    pub fn delete_chunk_symbols_for_symbol(&self, symbol_id: String, branch: String) -> Result<u32> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        let count = db::delete_chunk_symbols_for_symbol(&conn, &symbol_id, &branch)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(count as u32)
     }
 
     #[napi]

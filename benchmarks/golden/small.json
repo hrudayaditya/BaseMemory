@@ -194,8 +194,8 @@
       "expected": {
         "filePath": "src/indexer/graph-expansion.ts",
         "symbol": "expandGraphContext",
-        "startLine": 223,
-        "endLine": 448
+        "startLine": 225,
+        "endLine": 459
       }
     },
     {
@@ -205,8 +205,8 @@
       "expected": {
         "filePath": "src/indexer/incremental-index-orchestrator.ts",
         "symbol": "processEmbedStage",
-        "startLine": 2349,
-        "endLine": 2734
+        "startLine": 2384,
+        "endLine": 2769
       }
     },
     {
@@ -216,8 +216,8 @@
       "expected": {
         "filePath": "src/indexer/index.ts",
         "symbol": "getActiveBranchKey",
-        "startLine": 4130,
-        "endLine": 4132
+        "startLine": 4134,
+        "endLine": 4136
       }
     },
     {
@@ -227,8 +227,8 @@
       "expected": {
         "filePath": "src/indexer/index.ts",
         "symbol": "materializeRankedResults",
-        "startLine": 5806,
-        "endLine": 5860
+        "startLine": 5875,
+        "endLine": 5929
       }
     },
     {
@@ -293,8 +293,8 @@
       "expected": {
         "filePath": "src/indexer/incremental-index-orchestrator.ts",
         "symbol": "buildChunkRecords",
-        "startLine": 2985,
-        "endLine": 3053
+        "startLine": 3053,
+        "endLine": 3121
       }
     },
     {
@@ -355,8 +355,8 @@
       "expected": {
         "filePath": "src/native/index.ts",
         "symbol": "createEmbeddingText",
-        "startLine": 654,
-        "endLine": 697
+        "startLine": 662,
+        "endLine": 705
       }
     },
     {

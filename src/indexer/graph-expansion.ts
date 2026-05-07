@@ -162,7 +162,7 @@ function resolveChunksForSymbolsBatch(
   symbols: SymbolData[],
   branch: string,
   allowedChunkIds: Set<string> | null
-): Map<string, GraphExpansionSeed> {
+): Map<string, GraphExpansionSeed[]> {
   if (symbols.length === 0) {
     return new Map();
   }
@@ -173,9 +173,11 @@ function resolveChunksForSymbolsBatch(
     allowedChunkIds ? [...allowedChunkIds] : undefined
   );
 
-  const resolved = new Map<string, GraphExpansionSeed>();
+  const resolved = new Map<string, GraphExpansionSeed[]>();
   for (const row of rows) {
-    resolved.set(row.symbolId, chunkRowToSeed(row));
+    const existing = resolved.get(row.symbolId) ?? [];
+    existing.push(chunkRowToSeed(row));
+    resolved.set(row.symbolId, existing);
   }
   return resolved;
 }
@@ -365,21 +367,24 @@ export function expandGraphContext(
             continue;
           }
 
-          const callerChunk = chunksBySymbolId.get(callerSymbol.id);
-          if (!callerChunk || seenChunkIds.has(callerChunk.id)) {
-            continue;
+          const callerChunks = chunksBySymbolId.get(callerSymbol.id) ?? [];
+          let emittedCallerChunk = false;
+          for (const callerChunk of callerChunks) {
+            if (seenChunkIds.has(callerChunk.id)) {
+              continue;
+            }
+            seenChunkIds.add(callerChunk.id);
+            expanded.push({
+              id: callerChunk.id,
+              metadata: callerChunk.metadata,
+              relation: "caller",
+              depth: nextDepth,
+              viaSymbol: current.symbol.name,
+            });
+            emittedCallerChunk = true;
           }
 
-          seenChunkIds.add(callerChunk.id);
-          expanded.push({
-            id: callerChunk.id,
-            metadata: callerChunk.metadata,
-            relation: "caller",
-            depth: nextDepth,
-            viaSymbol: current.symbol.name,
-          });
-
-          if (!seenSymbols.has(callerSymbol.id)) {
+          if (emittedCallerChunk && !seenSymbols.has(callerSymbol.id)) {
             seenSymbols.add(callerSymbol.id);
             nextFrontier.push({ symbol: callerSymbol, depth: nextDepth });
           }
@@ -397,42 +402,48 @@ export function expandGraphContext(
             continue;
           }
 
-          const calleeChunk = chunksBySymbolId.get(calleeSymbol.id);
-          if (!calleeChunk || seenChunkIds.has(calleeChunk.id)) {
-            continue;
+          const calleeChunks = chunksBySymbolId.get(calleeSymbol.id) ?? [];
+          let emittedCalleeChunk = false;
+          for (const calleeChunk of calleeChunks) {
+            if (seenChunkIds.has(calleeChunk.id)) {
+              continue;
+            }
+            seenChunkIds.add(calleeChunk.id);
+            expanded.push({
+              id: calleeChunk.id,
+              metadata: calleeChunk.metadata,
+              relation: "callee",
+              depth: nextDepth,
+              viaSymbol: current.symbol.name,
+            });
+            emittedCalleeChunk = true;
           }
 
-          seenChunkIds.add(calleeChunk.id);
-          expanded.push({
-            id: calleeChunk.id,
-            metadata: calleeChunk.metadata,
-            relation: "callee",
-            depth: nextDepth,
-            viaSymbol: current.symbol.name,
-          });
-
-          if (!seenSymbols.has(calleeSymbol.id)) {
+          if (emittedCalleeChunk && !seenSymbols.has(calleeSymbol.id)) {
             seenSymbols.add(calleeSymbol.id);
             nextFrontier.push({ symbol: calleeSymbol, depth: nextDepth });
           }
         }
 
         for (const unresolved of unresolvedCalleesBySource.get(current.symbol.id) ?? []) {
-          const calleeChunk = chunksBySymbolId.get(unresolved.target.id);
-          if (!calleeChunk || seenChunkIds.has(calleeChunk.id)) {
-            continue;
+          const calleeChunks = chunksBySymbolId.get(unresolved.target.id) ?? [];
+          let emittedUnresolvedChunk = false;
+          for (const calleeChunk of calleeChunks) {
+            if (seenChunkIds.has(calleeChunk.id)) {
+              continue;
+            }
+            seenChunkIds.add(calleeChunk.id);
+            expanded.push({
+              id: calleeChunk.id,
+              metadata: calleeChunk.metadata,
+              relation: "callee",
+              depth: nextDepth,
+              viaSymbol: current.symbol.name,
+            });
+            emittedUnresolvedChunk = true;
           }
 
-          seenChunkIds.add(calleeChunk.id);
-          expanded.push({
-            id: calleeChunk.id,
-            metadata: calleeChunk.metadata,
-            relation: "callee",
-            depth: nextDepth,
-            viaSymbol: current.symbol.name,
-          });
-
-          if (!seenSymbols.has(unresolved.target.id)) {
+          if (emittedUnresolvedChunk && !seenSymbols.has(unresolved.target.id)) {
             seenSymbols.add(unresolved.target.id);
             nextFrontier.push({ symbol: unresolved.target, depth: nextDepth });
           }

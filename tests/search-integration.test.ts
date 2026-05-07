@@ -2907,7 +2907,7 @@ export function graphCallHelper(value: string) { return graphTargetHelper(value)
     const database = new Database(path.join(tempDir, ".opencode", "index", "codebase.db"));
     const branch = (indexer as unknown as { currentBranch: string }).currentBranch;
     const splitSymbols = database.getSymbolsByNameOnBranch("computeMetrics", branch);
-    expect(splitSymbols.length).toBeGreaterThan(1);
+    expect(splitSymbols).toHaveLength(1);
 
     const runMetrics = database.getSymbolsByNameOnBranch("runMetrics", branch)[0];
     expect(runMetrics).toBeDefined();
