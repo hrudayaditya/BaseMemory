@@ -14,6 +14,7 @@ struct PendingChunk {
     symbol_name: Option<String>,
     symbol_aliases: Vec<String>,
     symbol_kind: Option<SymbolKind>,
+    logical_symbol_key: Option<String>,
     chunk_kind: ChunkKind,
     delegate_target_name: Option<String>,
     granularity: Granularity,
@@ -79,6 +80,7 @@ impl<'a> WalkerContext<'a> {
             symbol_name: pending.symbol_name,
             symbol_aliases: pending.symbol_aliases,
             symbol_kind: pending.symbol_kind,
+            logical_symbol_key: pending.logical_symbol_key,
             chunk_kind: pending.chunk_kind,
             granularity: pending.granularity,
             start_byte: pending.start_byte as u32,
@@ -321,6 +323,7 @@ fn emit_gap(ctx: &WalkerContext<'_>, start: usize, end: usize, chunks: &mut Vec<
         symbol_name: None,
         symbol_aliases: Vec::new(),
         symbol_kind: Some(SymbolKind::Block),
+        logical_symbol_key: None,
         chunk_kind: ChunkKind::Code,
         delegate_target_name: None,
         granularity: Granularity::Fine,
@@ -596,6 +599,18 @@ fn split_oversized_leaf_node_by_statements(
         return None;
     }
 
+    let logical_key = format!(
+        "{}:{}:{}:{}",
+        ctx.file_path,
+        template.symbol_name.as_deref().unwrap_or(""),
+        template
+            .symbol_kind
+            .as_ref()
+            .map(|kind| kind.as_str())
+            .unwrap_or(""),
+        template.start_byte
+    );
+
     let mut chunks = Vec::new();
     let mut group_start = template.start_byte;
     let mut first_statement_index = 0usize;
@@ -620,6 +635,7 @@ fn split_oversized_leaf_node_by_statements(
                 } else {
                     template.symbol_kind.clone()
                 },
+                logical_symbol_key: Some(logical_key.clone()),
                 chunk_kind,
                 delegate_target_name: template.delegate_target_name.clone(),
                 granularity: template.granularity.clone(),
@@ -641,6 +657,7 @@ fn split_oversized_leaf_node_by_statements(
         } else {
             template.symbol_kind.clone()
         },
+        logical_symbol_key: Some(logical_key),
         chunk_kind: final_chunk_kind,
         delegate_target_name: template.delegate_target_name.clone(),
         granularity: template.granularity.clone(),
@@ -716,10 +733,25 @@ fn try_emit_semantic_parent_header_gap(
         return None;
     }
 
+    let logical_symbol_key = template
+        .symbol_name
+        .as_ref()
+        .zip(template.symbol_kind.as_ref())
+        .map(|(parent_symbol_name, parent_symbol_kind)| {
+            format!(
+                "{}:{}:{}:{}",
+                ctx.file_path,
+                parent_symbol_name,
+                parent_symbol_kind.as_str(),
+                node.start_byte()
+            )
+        });
+
     chunks.push(PendingChunk {
         symbol_name: template.symbol_name.clone(),
         symbol_aliases: template.symbol_aliases.clone(),
         symbol_kind: template.symbol_kind.clone(),
+        logical_symbol_key,
         chunk_kind: template.chunk_kind.clone(),
         delegate_target_name: template.delegate_target_name.clone(),
         granularity: Granularity::Fine,
@@ -789,6 +821,7 @@ fn build_semantic_chunk(
         symbol_name: info.symbol_name,
         symbol_aliases: info.symbol_aliases,
         symbol_kind: info.symbol_kind,
+        logical_symbol_key: None,
         chunk_kind: info.chunk_kind,
         delegate_target_name: info.delegate_target_name,
         granularity: Granularity::Fine,
@@ -801,6 +834,7 @@ fn build_semantic_chunk(
             symbol_name: template.symbol_name,
             symbol_aliases: template.symbol_aliases,
             symbol_kind: template.symbol_kind,
+            logical_symbol_key: template.logical_symbol_key,
             chunk_kind: template.chunk_kind,
             delegate_target_name: template.delegate_target_name,
             granularity: template.granularity,
@@ -831,6 +865,19 @@ fn build_semantic_chunk(
 
     let mut chunks = Vec::new();
     let mut cursor = node_start;
+    let inherited_parent_logical_key = template
+        .symbol_name
+        .as_ref()
+        .zip(template.symbol_kind.as_ref())
+        .map(|(parent_symbol_name, parent_symbol_kind)| {
+            format!(
+                "{}:{}:{}:{}",
+                ctx.file_path,
+                parent_symbol_name,
+                parent_symbol_kind.as_str(),
+                node.start_byte()
+            )
+        });
 
     for child in split_children {
         let child_chunks = build_node_chunks(ctx, child);
@@ -898,6 +945,14 @@ fn build_semantic_chunk(
             .map(|chunk| chunk.end_byte)
             .unwrap_or(first_start);
 
+        if let Some(logical_key) = inherited_parent_logical_key.as_ref() {
+            for chunk in &mut child_chunks {
+                if chunk.symbol_name.as_ref() == template.symbol_name.as_ref() {
+                    chunk.logical_symbol_key = Some(logical_key.clone());
+                }
+            }
+        }
+
         chunks.extend(child_chunks);
         cursor = child_end;
     }
@@ -924,6 +979,7 @@ fn build_node_chunks(ctx: &WalkerContext<'_>, node: Node<'_>) -> Vec<PendingChun
             symbol_name: None,
             symbol_aliases: Vec::new(),
             symbol_kind: Some(SymbolKind::Block),
+            logical_symbol_key: None,
             chunk_kind: ChunkKind::Code,
             delegate_target_name: None,
             granularity: Granularity::Fine,
@@ -1053,6 +1109,7 @@ fn maybe_emit_file_module_header_chunk(
         symbol_name: Some(symbol_name),
         symbol_aliases: Vec::new(),
         symbol_kind: Some(SymbolKind::Module),
+        logical_symbol_key: None,
         chunk_kind: ChunkKind::File,
         delegate_target_name: None,
         granularity: Granularity::Coarse,
@@ -1285,6 +1342,7 @@ pub fn chunk_tree(
                 symbol_name: info.symbol_name,
                 symbol_aliases: info.symbol_aliases,
                 symbol_kind: info.symbol_kind,
+                logical_symbol_key: None,
                 chunk_kind: info.chunk_kind,
                 delegate_target_name: None,
                 granularity: Granularity::Coarse,

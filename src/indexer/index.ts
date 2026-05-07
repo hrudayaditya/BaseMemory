@@ -57,6 +57,7 @@ import {
   chunkFile,
   ChunkMetadata,
   ChunkData,
+  generateChunkId,
   hashContent,
   extractCalls,
   diffMerkleFromEvents,
@@ -785,12 +786,14 @@ interface ParsedChunkCandidate {
   startByte: number;
   endByte: number;
   chunkType: ChunkMetadata["chunkType"];
+  chunkId: string;
   name?: string;
   symbolAliases: string[];
   chunkKind?: string;
   symbolKind?: string;
   language: string;
   chunkHash: string;
+  logicalSymbolKey?: string;
 }
 
 interface ParsedFileCandidate {
@@ -805,6 +808,7 @@ type GraphEdgeData = Omit<CallEdgeData, "branch">;
 interface FileGraphData {
   symbols: SymbolData[];
   edges: GraphEdgeData[];
+  chunkSymbolLinks: Array<{ chunkId: string; symbolId: string }>;
 }
 
 interface FailedBatch {
@@ -5062,12 +5066,22 @@ export class Indexer {
             startByte: chunk.startByte,
             endByte: chunk.endByte,
             chunkType: mapSemanticChunkType(chunk.symbolKind),
+            chunkId: generateChunkId(file.path, {
+              content: chunk.text,
+              startLine: chunk.startLine,
+              endLine: chunk.endLine,
+              chunkType: mapSemanticChunkType(chunk.symbolKind),
+              name: chunk.symbolName,
+              symbolKind: chunk.symbolKind,
+              language: chunk.language,
+            }),
             name: chunk.symbolName,
             symbolAliases: chunk.symbolAliases ?? [],
             chunkKind: chunk.chunkKind,
             symbolKind: chunk.symbolKind,
             language: chunk.language,
             chunkHash: chunk.chunkHash,
+            logicalSymbolKey: chunk.logicalSymbolKey,
           }));
 
         parsedFiles.push({
@@ -5096,7 +5110,14 @@ export class Indexer {
     const graphData = new Map<string, FileGraphData>();
 
     for (const parsed of parsedFiles) {
-      const fileSymbols: Array<SymbolData & { startByte: number; endByte: number }> = [];
+      const chunkBackedSymbols: Array<
+        SymbolData & {
+          startByte: number;
+          endByte: number;
+          chunkId: string;
+          logicalSymbolKey?: string;
+        }
+      > = [];
       for (const chunk of parsed.chunks) {
         if (
           chunk.chunkKind === "File" ||
@@ -5107,7 +5128,7 @@ export class Indexer {
         }
 
         const symbolId = `sym_${hashContent(parsed.path + ":" + chunk.name + ":" + chunk.chunkType + ":" + chunk.startLine).slice(0, 16)}`;
-        fileSymbols.push({
+        chunkBackedSymbols.push({
           id: symbolId,
           filePath: parsed.path,
           name: chunk.name,
@@ -5120,7 +5141,53 @@ export class Indexer {
           language: chunk.language,
           startByte: chunk.startByte,
           endByte: chunk.endByte,
+          chunkId: chunk.chunkId,
+          logicalSymbolKey: chunk.logicalSymbolKey,
         });
+      }
+
+      const fileSymbols: Array<SymbolData & { startByte: number; endByte: number }> = [];
+      const chunkSymbolLinks: Array<{ chunkId: string; symbolId: string }> = [];
+      const groupedSymbols: Array<typeof chunkBackedSymbols> = [];
+      const groupedByLogicalKey = new Map<string, typeof chunkBackedSymbols>();
+
+      for (const symbol of chunkBackedSymbols) {
+        if (!symbol.logicalSymbolKey) {
+          groupedSymbols.push([symbol]);
+          continue;
+        }
+        const existing = groupedByLogicalKey.get(symbol.logicalSymbolKey) ?? [];
+        existing.push(symbol);
+        groupedByLogicalKey.set(symbol.logicalSymbolKey, existing);
+      }
+      groupedSymbols.push(...groupedByLogicalKey.values());
+
+      for (const group of groupedSymbols) {
+        const first = group[0];
+        const canonicalId = first.logicalSymbolKey
+          ? `sym_${hashContent(first.logicalSymbolKey).slice(0, 16)}`
+          : first.id;
+        const canonicalSymbol: SymbolData & { startByte: number; endByte: number } = {
+          id: canonicalId,
+          filePath: parsed.path,
+          name: first.name,
+          symbolAliases: first.symbolAliases ?? [],
+          kind: first.kind,
+          startLine: Math.min(...group.map((symbol) => symbol.startLine)),
+          startCol: 0,
+          endLine: Math.max(...group.map((symbol) => symbol.endLine)),
+          endCol: 0,
+          language: first.language,
+          startByte: Math.min(...group.map((symbol) => symbol.startByte)),
+          endByte: Math.max(...group.map((symbol) => symbol.endByte)),
+        };
+        fileSymbols.push(canonicalSymbol);
+        for (const chunk of group) {
+          chunkSymbolLinks.push({
+            chunkId: chunk.chunkId,
+            symbolId: canonicalId,
+          });
+        }
       }
 
       const symbolsByName = new Map<string, SymbolData[]>();
@@ -5135,7 +5202,7 @@ export class Indexer {
 
       const fileLanguage = parsed.chunks[0]?.language;
       if (!fileLanguage || !CALL_GRAPH_LANGUAGES.has(fileLanguage)) {
-        graphData.set(parsed.path, { symbols: fileSymbols, edges: [] });
+        graphData.set(parsed.path, { symbols: fileSymbols, edges: [], chunkSymbolLinks });
         continue;
       }
 
@@ -5144,6 +5211,7 @@ export class Indexer {
         graphData.set(parsed.path, {
           symbols: fileSymbols.map(({ startByte: _startByte, endByte: _endByte, ...symbol }) => symbol),
           edges: [],
+          chunkSymbolLinks,
         });
         continue;
       }
@@ -5198,6 +5266,7 @@ export class Indexer {
       graphData.set(parsed.path, {
         symbols: fileSymbols.map(({ startByte: _startByte, endByte: _endByte, ...symbol }) => symbol),
         edges,
+        chunkSymbolLinks,
       });
     }
 

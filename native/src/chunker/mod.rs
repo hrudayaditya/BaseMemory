@@ -44,6 +44,23 @@ pub enum SymbolKind {
     Block,
 }
 
+impl SymbolKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Function => "Function",
+            Self::Method => "Method",
+            Self::Class => "Class",
+            Self::Interface => "Interface",
+            Self::Struct => "Struct",
+            Self::Type => "Type",
+            Self::Constant => "Constant",
+            Self::Test => "Test",
+            Self::Module => "Module",
+            Self::Block => "Block",
+        }
+    }
+}
+
 #[napi(string_enum)]
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Granularity {
@@ -136,6 +153,7 @@ pub struct Chunk {
     pub symbol_name: Option<String>,
     pub symbol_aliases: Vec<String>,
     pub symbol_kind: Option<SymbolKind>,
+    pub logical_symbol_key: Option<String>,
     pub chunk_kind: ChunkKind,
     pub granularity: Granularity,
     pub start_byte: u32,
@@ -227,6 +245,7 @@ fn append_small_file_module_chunk(
         symbol_name: Some(symbol_name),
         symbol_aliases: Vec::new(),
         symbol_kind: Some(SymbolKind::Module),
+        logical_symbol_key: None,
         chunk_kind: ChunkKind::File,
         granularity: Granularity::Coarse,
         start_byte: 0,
@@ -271,6 +290,7 @@ fn ensure_non_empty_chunks(
         symbol_name: None,
         symbol_aliases: Vec::new(),
         symbol_kind: None,
+        logical_symbol_key: None,
         chunk_kind: ChunkKind::Code,
         granularity: Granularity::Fine,
         start_byte: 0,
@@ -333,6 +353,7 @@ fn gap_fill_chunk(
         symbol_name: None,
         symbol_aliases: Vec::new(),
         symbol_kind: Some(SymbolKind::Block),
+        logical_symbol_key: None,
         chunk_kind: ChunkKind::Code,
         granularity: Granularity::Fine,
         start_byte: start as u32,
@@ -405,6 +426,21 @@ pub(crate) fn split_range_to_max_sized_chunks(
     let max_len = config.effective_max_non_whitespace_chars_usize();
     let chunk_non_whitespace = non_whitespace_len(&base_chunk.text);
     let estimated_tokens = estimate_token_count(chunk_non_whitespace);
+    let logical_symbol_key = base_chunk.logical_symbol_key.clone().or_else(|| {
+        base_chunk.symbol_name.as_ref().map(|symbol_name| {
+            format!(
+                "{}:{}:{}:{}",
+                file_path,
+                symbol_name,
+                base_chunk
+                    .symbol_kind
+                    .as_ref()
+                    .map(|kind| kind.as_str())
+                    .unwrap_or(""),
+                start
+            )
+        })
+    });
 
     log_warn(format!(
         "chunker force-split on line boundaries file_path={} language={} chunk_non_whitespace_chars={} estimated_tokens={} max_chunk_chars={} target_token_budget={} symbol_name={}",
@@ -490,6 +526,7 @@ pub(crate) fn split_range_to_max_sized_chunks(
             symbol_name: base_chunk.symbol_name.clone(),
             symbol_aliases: base_chunk.symbol_aliases.clone(),
             symbol_kind,
+            logical_symbol_key: logical_symbol_key.clone(),
             chunk_kind,
             granularity: Granularity::Fine,
             start_byte: segment_start as u32,
@@ -554,6 +591,7 @@ fn single_fallback_chunk(file_path: &str, language: &str, source_code: &str) -> 
             symbol_name: None,
             symbol_aliases: Vec::new(),
             symbol_kind: None,
+            logical_symbol_key: None,
             chunk_kind: ChunkKind::Code,
             granularity: Granularity::Fine,
             start_byte: 0,

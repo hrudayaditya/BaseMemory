@@ -341,7 +341,7 @@ export function buildDirectoryGraph(
         symbolCount: row.symbol_count,
         directory: toDirectoryPath(row.file_path),
         degree: 0,
-        role: "internal" as const,
+        role: "internal" as "internal" | ExternalRole,
       },
     ]),
   );
